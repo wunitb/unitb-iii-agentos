@@ -677,7 +677,7 @@ async fn consolidate(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 fn memory_summary_payload(chunk: &str) -> Value {
     json!({
         "provider": "anthropic",
-        "model": "claude-haiku-4-5",
+        "model": "claude-haiku-4-5-20251001",
         "systemPrompt": "Summarize this conversation concisely. Preserve key facts, decisions, and context. Be brief.",
         "messages": [{ "role": "user", "content": chunk }],
     })
@@ -1050,7 +1050,7 @@ mod tests {
         let payload = memory_summary_payload("conversation");
 
         assert_eq!(payload["provider"], "anthropic");
-        assert_eq!(payload["model"], "claude-haiku-4-5");
+        assert_eq!(payload["model"], "claude-haiku-4-5-20251001");
         assert!(payload.get("config").is_none());
     }
 

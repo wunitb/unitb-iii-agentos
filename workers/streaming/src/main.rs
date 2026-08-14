@@ -12,6 +12,35 @@ fn payload_body(input: &Value) -> Value {
     input.get("body").cloned().unwrap_or_else(|| input.clone())
 }
 
+fn stream_route_payload(message: &str, model_config: Option<&Value>) -> Value {
+    let mut payload = json!({
+        "message": message,
+        "toolCount": 0,
+    });
+    if let Some(model) = model_config.and_then(Value::as_object) {
+        if let Some(provider) = model.get("provider").and_then(Value::as_str) {
+            payload["provider"] = json!(provider);
+        }
+        if let Some(model) = model.get("model").and_then(Value::as_str) {
+            payload["model"] = json!(model);
+        }
+    }
+    payload
+}
+
+fn stream_completion_payload(
+    route: &Value,
+    system_prompt: &str,
+    messages: &[Value],
+) -> Value {
+    json!({
+        "provider": route.get("provider").cloned().unwrap_or(Value::Null),
+        "model": route.get("model").cloned().unwrap_or(Value::Null),
+        "systemPrompt": system_prompt,
+        "messages": messages,
+    })
+}
+
 fn completion_id() -> String {
     format!(
         "chatcmpl-{}",
@@ -55,15 +84,12 @@ async fn stream_chat(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         .await
         .unwrap_or_else(|_| json!([]));
 
-    let model_config = config
-        .as_ref()
-        .and_then(|c| c.get("model").cloned())
-        .unwrap_or(Value::Null);
+    let model_config = config.as_ref().and_then(|c| c.get("model"));
 
-    let model = iii
+    let route = iii
         .trigger(TriggerRequest {
             function_id: "llm::route".into(),
-            payload: json!({ "message": &message, "toolCount": 0, "config": model_config }),
+            payload: stream_route_payload(&message, model_config),
             action: None,
             timeout_ms: None,
         })
@@ -82,11 +108,7 @@ async fn stream_chat(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let response = iii
         .trigger(TriggerRequest {
             function_id: "llm::complete".into(),
-            payload: json!({
-                "model": model,
-                "systemPrompt": system_prompt,
-                "messages": messages,
-            }),
+            payload: stream_completion_payload(&route, &system_prompt, &messages),
             action: None,
             timeout_ms: None,
         })
@@ -290,7 +312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::stream_chat_response;
+    use super::{stream_chat_response, stream_completion_payload, stream_route_payload};
     use serde_json::json;
 
     #[test]
@@ -311,5 +333,38 @@ mod tests {
         );
         assert!(response.get("status_code").is_none());
         assert!(response.get("body").is_none());
+    }
+
+    #[test]
+    fn stream_route_payload_uses_top_level_model_strings() {
+        let config = json!({
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "maxTokens": 1024,
+        });
+        let payload = stream_route_payload("hello", Some(&config));
+
+        assert_eq!(payload["provider"], "codex");
+        assert_eq!(payload["model"], "gpt-5.6-sol");
+        assert!(payload.get("config").is_none());
+    }
+
+    #[test]
+    fn stream_completion_payload_consumes_route_fields() {
+        let route = json!({
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+        });
+        let payload = stream_completion_payload(
+            &route,
+            "system",
+            &[json!({"role": "user", "content": "hello"})],
+        );
+
+        assert_eq!(payload["provider"], "codex");
+        assert_eq!(payload["model"], "gpt-5.6-sol");
+        assert!(payload["provider"].is_string());
+        assert!(payload["model"].is_string());
+        assert!(payload.get("route").is_none());
     }
 }

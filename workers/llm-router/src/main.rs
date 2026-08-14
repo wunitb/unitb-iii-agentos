@@ -60,6 +60,8 @@ fn default_providers() -> Vec<(
                 "claude-opus-4-20250514",
                 "claude-sonnet-4-20250514",
                 "claude-haiku-4-5-20251001",
+                "claude-opus-4-6",
+                "claude-sonnet-4-6",
             ],
         ),
         (
@@ -989,6 +991,18 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_registry_includes_current_agent_models() {
+        let (_, _, _, driver, models) = default_providers()
+            .into_iter()
+            .find(|(name, ..)| *name == "anthropic")
+            .expect("anthropic provider");
+
+        assert!(matches!(driver, Driver::Anthropic));
+        assert!(models.contains(&"claude-opus-4-6"));
+        assert!(models.contains(&"claude-sonnet-4-6"));
+    }
+
+    #[test]
     fn test_default_providers_openai_exists() {
         let providers = default_providers();
         assert!(providers.iter().any(|p| p.0 == "openai"));
@@ -1175,7 +1189,7 @@ mod tests {
             );
         }
         let anthropic = providers.iter().find(|p| p.0 == "anthropic").unwrap();
-        assert_eq!(anthropic.4.len(), 3);
+        assert_eq!(anthropic.4.len(), 5);
         let openai = providers.iter().find(|p| p.0 == "openai").unwrap();
         assert_eq!(openai.4.len(), 4);
     }

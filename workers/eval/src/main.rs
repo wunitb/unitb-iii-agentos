@@ -94,7 +94,7 @@ async fn score_exact_match(output: &Value, expected: &Value) -> f64 {
 fn llm_judge_payload(prompt: &str) -> Value {
     json!({
         "provider": "anthropic",
-        "model": "claude-haiku-4-5",
+        "model": "claude-haiku-4-5-20251001",
         "systemPrompt": "You are an eval judge. Score the output 0.0-1.0 for correctness. Respond with ONLY a number.",
         "messages": [{ "role": "user", "content": prompt }],
     })
@@ -805,7 +805,7 @@ mod tests {
         let payload = llm_judge_payload("prompt");
 
         assert_eq!(payload["provider"], "anthropic");
-        assert_eq!(payload["model"], "claude-haiku-4-5");
+        assert_eq!(payload["model"], "claude-haiku-4-5-20251001");
         assert!(payload.get("config").is_none());
     }
 

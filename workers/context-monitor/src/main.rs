@@ -40,7 +40,7 @@ fn payload_body(input: &Value) -> Value {
 fn summary_completion_payload(user_msg: &str) -> Value {
     json!({
         "provider": "anthropic",
-        "model": "claude-haiku-4-5",
+        "model": "claude-haiku-4-5-20251001",
         "systemPrompt": "Summarize this conversation into the structured template. Preserve key facts and decisions.",
         "messages": [
             { "role": "user", "content": user_msg }
@@ -698,7 +698,7 @@ mod tests {
         let payload = summary_completion_payload("conversation");
 
         assert_eq!(payload["provider"], "anthropic");
-        assert_eq!(payload["model"], "claude-haiku-4-5");
+        assert_eq!(payload["model"], "claude-haiku-4-5-20251001");
         assert!(payload.get("config").is_none());
     }
 
