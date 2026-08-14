@@ -346,6 +346,17 @@ fn resolve_complete_route(state: &RouterState, input: &Value) -> Result<Route, E
     }
     resolve_route(state, input)
 }
+fn client_for_provider<'a>(
+    provider: &str,
+    shared_client: &'a reqwest::Client,
+    direct_client: &'a reqwest::Client,
+) -> &'a reqwest::Client {
+    if provider == CODEX_PROVIDER {
+        direct_client
+    } else {
+        shared_client
+    }
+}
 
 async fn call_anthropic(
     client: &reqwest::Client,
@@ -435,7 +446,8 @@ async fn route_handler(state: Arc<RouterState>, input: Value) -> Result<Value, E
 
 async fn complete_handler(
     state: Arc<RouterState>,
-    client: reqwest::Client,
+    shared_client: reqwest::Client,
+    direct_client: reqwest::Client,
     input: Value,
 ) -> Result<Value, Error> {
     let route = resolve_complete_route(&state, &input)?;
@@ -444,6 +456,7 @@ async fn complete_handler(
         .get(&route.provider)
         .ok_or_else(|| Error::Handler(format!("unknown provider: {}", route.provider)))?;
     let model = route.model.as_str();
+    let client = client_for_provider(&route.provider, &shared_client, &direct_client);
     let messages = input["messages"].as_array().cloned().unwrap_or_default();
     let tools = input["tools"].as_array().cloned().unwrap_or_default();
     let max_tokens = input["max_tokens"].as_u64().unwrap_or(4096);
@@ -458,11 +471,11 @@ async fn complete_handler(
 
     let result = match provider.driver {
         Driver::Anthropic => {
-            call_anthropic(&client, &api_key, model, &messages, &tools, max_tokens).await?
+            call_anthropic(client, &api_key, model, &messages, &tools, max_tokens).await?
         }
         Driver::OpenAiCompat | Driver::Gemini | Driver::Bedrock => {
             call_openai_compat(
-                &client,
+                client,
                 &provider.base_url,
                 &api_key,
                 model,
@@ -601,6 +614,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let shared_client = reqwest::Client::new();
+    let direct_client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build direct HTTP client");
 
     {
         let state = state.clone();
@@ -616,13 +633,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     {
         let state = state.clone();
-        let client = shared_client.clone();
+        let shared_client = shared_client.clone();
+        let direct_client = direct_client.clone();
         iii.register_function(
             "llm::complete",
             RegisterFunction::new_async(move |input: Value| {
                 let state = state.clone();
-                let client = client.clone();
-                async move { complete_handler(state, client, input).await }
+                let shared_client = shared_client.clone();
+                let direct_client = direct_client.clone();
+                async move { complete_handler(state, shared_client, direct_client, input).await }
             })
             .description("Send completion request to routed provider"),
         );
@@ -663,6 +682,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
     use super::*;
 
     #[test]
@@ -897,6 +923,64 @@ mod tests {
                 "unsafe Codex base URL was accepted: {value}"
             );
         }
+    }
+    fn spawn_counting_http_server(listener: TcpListener) -> mpsc::Receiver<usize> {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut requests = 0;
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        requests += 1;
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(500)))
+                            .unwrap();
+                        let mut request = [0; 8192];
+                        let _ = stream.read(&mut request);
+                        let response =
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+                        let _ = stream.write_all(response);
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = sender.send(requests);
+        });
+        receiver
+    }
+
+    #[tokio::test]
+    async fn codex_completion_client_bypasses_shared_proxy() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_url = format!("http://{}", target_listener.local_addr().unwrap());
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("http://{}", proxy_listener.local_addr().unwrap());
+        let shared_client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(&proxy_url).unwrap())
+            .build()
+            .unwrap();
+        let direct_client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let target_requests = spawn_counting_http_server(target_listener);
+        let proxy_requests = spawn_counting_http_server(proxy_listener);
+
+        client_for_provider("openai", &shared_client, &direct_client)
+            .get(&target_url)
+            .send()
+            .await
+            .unwrap();
+        client_for_provider(CODEX_PROVIDER, &shared_client, &direct_client)
+            .get(&target_url)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(target_requests.recv_timeout(Duration::from_secs(4)).unwrap(), 1);
+        assert_eq!(proxy_requests.recv_timeout(Duration::from_secs(4)).unwrap(), 1);
     }
 
     #[test]
