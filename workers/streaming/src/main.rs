@@ -61,11 +61,7 @@ fn agent_chat_payload(body: &Value, message: &str) -> Value {
     })
 }
 
-fn stream_route_payload(
-    message: &str,
-    provider: Option<&str>,
-    model: Option<&str>,
-) -> Value {
+fn stream_route_payload(message: &str, provider: Option<&str>, model: Option<&str>) -> Value {
     let mut payload = json!({
         "messages": [{ "role": "user", "content": message }],
         "tools": [],
@@ -137,8 +133,7 @@ async fn stream_chat(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         .unwrap_or_else(|_| json!([]));
 
     let model_config = config.as_ref().and_then(|c| c.get("model"));
-    let (preferred_provider, preferred_model) =
-        stream_route_preferences(&body, model_config);
+    let (preferred_provider, preferred_model) = stream_route_preferences(&body, model_config);
 
     let route = iii
         .trigger(TriggerRequest {
@@ -501,7 +496,10 @@ mod tests {
     #[test]
     fn stream_route_preferences_drop_config_provider_only() {
         let config = json!({ "provider": "config-provider" });
-        assert_eq!(stream_route_preferences(&json!({}), Some(&config)), (None, None));
+        assert_eq!(
+            stream_route_preferences(&json!({}), Some(&config)),
+            (None, None)
+        );
     }
 
     #[test]

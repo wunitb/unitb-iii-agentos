@@ -29,7 +29,10 @@ const DEFAULT_CODEX_BASE_URL: &str = "http://127.0.0.1:8317/v1";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
 
 fn resolve_codex_base_url(override_value: Option<&str>) -> String {
-    let Some(raw) = override_value.map(str::trim).filter(|value| !value.is_empty()) else {
+    let Some(raw) = override_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return DEFAULT_CODEX_BASE_URL.to_string();
     };
 
@@ -252,7 +255,11 @@ fn resolve_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
     let requested_model = route_field(input, "model")?;
     let explicit_model = requested_model
         .filter(|value| *value != "agentos-default")
-        .map(|model| model_alias(model).map(|(_, canonical)| canonical).unwrap_or(model));
+        .map(|model| {
+            model_alias(model)
+                .map(|(_, canonical)| canonical)
+                .unwrap_or(model)
+        });
 
     if let (Some(provider), Some(model)) = (explicit_provider, explicit_model) {
         let config = state
@@ -565,21 +572,25 @@ async fn usage_handler(state: Arc<RouterState>, _input: Value) -> Result<Value, 
 }
 
 async fn providers_handler(state: Arc<RouterState>, _input: Value) -> Result<Value, Error> {
-    let list: Vec<Value> = state.providers.iter().map(|entry| {
-        let name = entry.key();
-        let provider = entry.value();
-        json!({
-            "name": name,
-            "base_url": &provider.base_url,
-            "env_key": &provider.env_key,
-            "models": &provider.models,
-            "configured": if provider.env_key.is_empty() { true } else {
-                std::env::var(&provider.env_key)
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false)
-            },
+    let list: Vec<Value> = state
+        .providers
+        .iter()
+        .map(|entry| {
+            let name = entry.key();
+            let provider = entry.value();
+            json!({
+                "name": name,
+                "base_url": &provider.base_url,
+                "env_key": &provider.env_key,
+                "models": &provider.models,
+                "configured": if provider.env_key.is_empty() { true } else {
+                    std::env::var(&provider.env_key)
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+                },
+            })
         })
-    }).collect();
+        .collect();
     Ok(json!({ "providers": list }))
 }
 
@@ -682,6 +693,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::{
         io::{ErrorKind, Read, Write},
         net::TcpListener,
@@ -689,7 +701,6 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
-    use super::*;
 
     #[test]
     fn test_score_complexity_empty_messages() {
@@ -890,10 +901,7 @@ mod tests {
 
     #[test]
     fn codex_base_url_accepts_default_and_loopback_overrides() {
-        assert_eq!(
-            resolve_codex_base_url(None),
-            DEFAULT_CODEX_BASE_URL
-        );
+        assert_eq!(resolve_codex_base_url(None), DEFAULT_CODEX_BASE_URL);
         assert_eq!(
             resolve_codex_base_url(Some("http://127.0.0.2:8317/v1/")),
             "http://127.0.0.2:8317/v1"
@@ -979,8 +987,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(target_requests.recv_timeout(Duration::from_secs(4)).unwrap(), 1);
-        assert_eq!(proxy_requests.recv_timeout(Duration::from_secs(4)).unwrap(), 1);
+        assert_eq!(
+            target_requests
+                .recv_timeout(Duration::from_secs(4))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            proxy_requests.recv_timeout(Duration::from_secs(4)).unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -1049,11 +1065,8 @@ mod tests {
             provider: "codex".into(),
             model: "gpt-5.6-sol".into(),
         }));
-        let route = resolve_route(
-            &state,
-            &json!({ "provider": "openai", "model": "gpt-4o" }),
-        )
-        .unwrap();
+        let route =
+            resolve_route(&state, &json!({ "provider": "openai", "model": "gpt-4o" })).unwrap();
         assert_eq!(route.provider, "openai");
         assert_eq!(route.model, "gpt-4o");
     }

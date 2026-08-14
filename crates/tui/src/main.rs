@@ -303,10 +303,7 @@ impl App {
 
     async fn refresh_registry(&mut self) {
         let client = Self::client();
-        if let Ok(resp) = client
-            .get(format!("{}/api/health", API_BASE))
-            .send()
-            .await
+        if let Ok(resp) = client.get(format!("{}/api/health", API_BASE)).send().await
             && let Ok(data) = resp.json::<Value>().await
         {
             self.worker_count = data["workers"]

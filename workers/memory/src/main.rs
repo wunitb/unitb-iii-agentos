@@ -739,12 +739,14 @@ async fn compact_session(iii: &IIIClient, input: Value) -> Result<Value, Error> 
     let mut summaries = Vec::new();
 
     for chunk in &chunks {
-        let summary = iii.trigger(TriggerRequest {
-            function_id: "llm::complete".to_string(),
-            payload: memory_summary_payload(chunk),
-            action: None,
-            timeout_ms: None,
-        }).await;
+        let summary = iii
+            .trigger(TriggerRequest {
+                function_id: "llm::complete".to_string(),
+                payload: memory_summary_payload(chunk),
+                action: None,
+                timeout_ms: None,
+            })
+            .await;
 
         if let Ok(resp) = summary {
             summaries.push(resp["content"].as_str().unwrap_or("").to_string());

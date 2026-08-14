@@ -232,7 +232,10 @@ fn route_preferences(
     let config_model =
         model_config.and_then(|model| valid_route_preference(model.model.as_deref()));
     if config_model.is_some() {
-        (config_provider.map(str::to_owned), config_model.map(str::to_owned))
+        (
+            config_provider.map(str::to_owned),
+            config_model.map(str::to_owned),
+        )
     } else {
         (None, None)
     }
@@ -358,13 +361,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
     let mut response: Value = iii
         .trigger(TriggerRequest {
             function_id: "llm::complete".to_string(),
-            payload: completion_payload(
-                &provider,
-                &model,
-                &system_prompt,
-                &messages,
-                &functions,
-            ),
+            payload: completion_payload(&provider, &model, &system_prompt, &messages, &functions),
             action: None,
             timeout_ms: None,
         })
@@ -604,13 +601,7 @@ mod tests {
     fn llm_complete_payload_consumes_route_fields() {
         let messages = vec![json!({"role": "user"})];
         let functions = json!([]);
-        let payload = completion_payload(
-            "codex",
-            "gpt-5.6-sol",
-            "system",
-            &messages,
-            &functions,
-        );
+        let payload = completion_payload("codex", "gpt-5.6-sol", "system", &messages, &functions);
 
         assert_eq!(payload["provider"], "codex");
         assert_eq!(payload["model"], "gpt-5.6-sol");
