@@ -865,7 +865,8 @@ async function processRequest(config: FleetConfig, runtime: RuntimePaths, store:
       if (![repository, `https://github.com/${repository}`, `https://github.com/${repository}.git`].includes(declaredRepository)) {
         throw new Error(`repository must identify the active origin ${repository}`);
       }
-      const baseBranch = await defaultBranch(repository);
+      const baseBranch = typeof data.baseBranch === "string" ? data.baseBranch : await defaultBranch(repository);
+      await spawnChecked(["git", "check-ref-format", "--branch", baseBranch]);
       const remoteLine = await spawnCheckedRaw(["git", "ls-remote", origin, `refs/heads/${baseBranch}`]);
       const verifiedBaseSha = remoteLine.split(/\s+/, 1)[0] ?? "";
       if (!/^[0-9a-f]{40}$/.test(verifiedBaseSha)) {
