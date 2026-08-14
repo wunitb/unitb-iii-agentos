@@ -32,7 +32,7 @@ fn stream_route_preferences(
     let config_provider =
         model_config.and_then(|model| valid_route_preference(model.get("provider")));
     let config_model = model_config.and_then(|model| valid_route_preference(model.get("model")));
-    if config_provider.is_some() && config_model.is_some() {
+    if config_model.is_some() {
         (config_provider, config_model)
     } else {
         (None, None)
@@ -487,6 +487,21 @@ mod tests {
             stream_route_preferences(&body, Some(&configured_route())),
             (Some("config-provider".into()), Some("config-model".into()))
         );
+    }
+
+    #[test]
+    fn stream_route_preferences_preserve_config_model_only() {
+        let config = json!({ "model": "config-model" });
+        assert_eq!(
+            stream_route_preferences(&json!({}), Some(&config)),
+            (None, Some("config-model".into()))
+        );
+    }
+
+    #[test]
+    fn stream_route_preferences_drop_config_provider_only() {
+        let config = json!({ "provider": "config-provider" });
+        assert_eq!(stream_route_preferences(&json!({}), Some(&config)), (None, None));
     }
 
     #[test]

@@ -231,7 +231,7 @@ fn route_preferences(
         model_config.and_then(|model| valid_route_preference(model.provider.as_deref()));
     let config_model =
         model_config.and_then(|model| valid_route_preference(model.model.as_deref()));
-    if config_provider.is_some() && config_model.is_some() {
+    if config_model.is_some() {
         (config_provider.map(str::to_owned), config_model.map(str::to_owned))
     } else {
         (None, None)
@@ -689,6 +689,29 @@ mod tests {
             route_preferences(None, None, Some(&configured_model())),
             (Some("config-provider".into()), Some("config-model".into()))
         );
+    }
+
+    #[test]
+    fn route_preferences_preserve_config_model_only() {
+        let config = ModelConfig {
+            provider: None,
+            model: Some("config-model".into()),
+            max_tokens: None,
+        };
+        assert_eq!(
+            route_preferences(None, None, Some(&config)),
+            (None, Some("config-model".into()))
+        );
+    }
+
+    #[test]
+    fn route_preferences_drop_config_provider_only() {
+        let config = ModelConfig {
+            provider: Some("config-provider".into()),
+            model: None,
+            max_tokens: None,
+        };
+        assert_eq!(route_preferences(None, None, Some(&config)), (None, None));
     }
 
     #[test]
