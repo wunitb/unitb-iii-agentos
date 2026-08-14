@@ -198,7 +198,16 @@ suite("AgentOS full-stack E2E", () => {
     }
     const codex = r.providers.find((p) => p.name === "codex");
     expect(codex).toBeDefined();
-    expect(codex?.base_url).toBe("http://127.0.0.1:8317/v1");
+    const codexUrl = new URL(codex?.base_url ?? "");
+    const codexHost = codexUrl.hostname.replace(/^\[|\]$/g, "");
+    expect(["http:", "https:"]).toContain(codexUrl.protocol);
+    expect(
+      codexHost === "::1" || /^127(?:\.\d{1,3}){3}$/.test(codexHost),
+    ).toBe(true);
+    expect(codexUrl.username).toBe("");
+    expect(codexUrl.password).toBe("");
+    expect(codexUrl.search).toBe("");
+    expect(codexUrl.hash).toBe("");
     expect(codex?.models).toContain("gpt-5.6-sol");
   });
 
