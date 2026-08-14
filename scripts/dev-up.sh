@@ -19,7 +19,24 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIDFILE="$ROOT/.agentos-dev.pids"
 RELEASE_DIR="$ROOT/target/release"
 
+# `set -a` + `source .env` exports every assignment, so a blank entry in .env
+# (e.g. `ANTHROPIC_API_KEY=`) would clobber a credential inherited from the
+# caller's environment. Put the inherited value back, or unset the variable so
+# nothing downstream mistakes an empty credential for a configured one.
+restore_inherited_credential() {
+    local name="$1" inherited="$2"
+    if [[ -n "${!name:-}" ]]; then
+        return 0
+    fi
+    if [[ -n "$inherited" ]]; then
+        export "$name=$inherited"
+    else
+        unset "$name"
+    fi
+}
+
 if [[ -f "$ROOT/.env" ]]; then
+    # Prefixed so a stray assignment inside .env cannot overwrite the snapshot.
     __agentos_anthropic_api_key="${ANTHROPIC_API_KEY:-}"
     __agentos_openai_api_key="${OPENAI_API_KEY:-}"
     __agentos_codex_proxy_api_key="${CODEX_PROXY_API_KEY:-}"
@@ -28,34 +45,10 @@ if [[ -f "$ROOT/.env" ]]; then
     # shellcheck disable=SC1091
     source "$ROOT/.env"
     set +a
-    if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-        if [[ -n "$__agentos_anthropic_api_key" ]]; then
-            export ANTHROPIC_API_KEY="$__agentos_anthropic_api_key"
-        else
-            unset ANTHROPIC_API_KEY
-        fi
-    fi
-    if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-        if [[ -n "$__agentos_openai_api_key" ]]; then
-            export OPENAI_API_KEY="$__agentos_openai_api_key"
-        else
-            unset OPENAI_API_KEY
-        fi
-    fi
-    if [[ -z "${CODEX_PROXY_API_KEY:-}" ]]; then
-        if [[ -n "$__agentos_codex_proxy_api_key" ]]; then
-            export CODEX_PROXY_API_KEY="$__agentos_codex_proxy_api_key"
-        else
-            unset CODEX_PROXY_API_KEY
-        fi
-    fi
-    if [[ -z "${AGENTOS_API_KEY:-}" ]]; then
-        if [[ -n "$__agentos_agentos_api_key" ]]; then
-            export AGENTOS_API_KEY="$__agentos_agentos_api_key"
-        else
-            unset AGENTOS_API_KEY
-        fi
-    fi
+    restore_inherited_credential ANTHROPIC_API_KEY "$__agentos_anthropic_api_key"
+    restore_inherited_credential OPENAI_API_KEY "$__agentos_openai_api_key"
+    restore_inherited_credential CODEX_PROXY_API_KEY "$__agentos_codex_proxy_api_key"
+    restore_inherited_credential AGENTOS_API_KEY "$__agentos_agentos_api_key"
     unset __agentos_anthropic_api_key __agentos_openai_api_key __agentos_codex_proxy_api_key __agentos_agentos_api_key
 fi
 
