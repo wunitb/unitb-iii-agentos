@@ -8,15 +8,12 @@ import { startCredentialProxy } from "./credential-proxy";
 
 const ROOT = resolve(import.meta.dir, "..");
 const DEFAULT_CONFIG = join(import.meta.dir, "fleet.config.json");
-const HOST_OMP_AGENT_DIR = resolve(process.env.HOME ?? "", ".omp/agent");
+const HOST_HOME = process.env.HOME ?? "";
+const HOST_OMP_AGENT_DIR = resolve(HOST_HOME, ".omp/agent");
 const HOST_HERDR_EXTENSION = join(HOST_OMP_AGENT_DIR, "extensions", "herdr-omp-agent-state.ts");
 const FLEET_EXTENSION = join(import.meta.dir, "fleet-extension.ts");
 const ROLE_GUARD = join(import.meta.dir, "role-guard.ts");
 const OMP_WRAPPER_DIR = join(import.meta.dir, "bin");
-const HOST_OMP_ENTRY = realpathSync(resolve(process.env.HOME ?? "", ".bun/bin/omp"));
-const HOST_OMP_PACKAGE = resolve(dirname(HOST_OMP_ENTRY), "..");
-const HOST_NODE_MODULES = resolve(HOST_OMP_PACKAGE, "..", "..");
-const HOST_BUN = realpathSync(process.execPath);
 
 interface RuntimePaths {
   runtimeDir: string;
@@ -130,7 +127,6 @@ async function stageNetworkPolicy(config: FleetConfig, model: string, agentRunti
   return { hosts, resolv, nft };
 }
 
-
 async function stageOmpAgent(
   agentRuntime: string,
   model: string,
@@ -145,6 +141,10 @@ async function stageOmpAgent(
   ompPackage: string;
   bun: string;
 }> {
+  const hostOmpEntry = realpathSync(resolve(HOST_HOME, ".bun/bin/omp"));
+  const hostOmpPackage = resolve(dirname(hostOmpEntry), "..");
+  const hostNodeModules = resolve(hostOmpPackage, "..", "..");
+  const hostBun = realpathSync(process.execPath);
   const agentDir = join(agentRuntime, "omp-agent");
   const home = join(agentRuntime, "home");
   const toolchain = join(agentRuntime, "toolchain");
@@ -166,16 +166,16 @@ async function stageOmpAgent(
   rmSync(toolchain, { recursive: true, force: true });
   mkdirSync(ompPackage, { recursive: true, mode: 0o700 });
   const packages = [
-    [HOST_OMP_PACKAGE, ompPackage],
-    [join(HOST_NODE_MODULES, "@babel/parser"), join(nodeModules, "@babel/parser")],
-    [join(HOST_NODE_MODULES, "@oh-my-pi/pi-natives"), join(nodeModules, "@oh-my-pi/pi-natives")],
-    [join(HOST_NODE_MODULES, "@oh-my-pi/pi-natives-linux-arm64"), join(nodeModules, "@oh-my-pi/pi-natives-linux-arm64")],
+    [hostOmpPackage, ompPackage],
+    [join(hostNodeModules, "@babel/parser"), join(nodeModules, "@babel/parser")],
+    [join(hostNodeModules, "@oh-my-pi/pi-natives"), join(nodeModules, "@oh-my-pi/pi-natives")],
+    [join(hostNodeModules, "@oh-my-pi/pi-natives-linux-arm64"), join(nodeModules, "@oh-my-pi/pi-natives-linux-arm64")],
   ];
   for (const [source, target] of packages) {
     mkdirSync(target, { recursive: true, mode: 0o700 });
     await spawnChecked(["cp", "-aL", "--reflink=auto", `${source}/.`, target]);
   }
-  copyFileSync(HOST_BUN, bun);
+  copyFileSync(hostBun, bun);
   chmodSync(bun, 0o500);
   copyFileSync(HOST_HERDR_EXTENSION, extension);
   copyFileSync(FLEET_EXTENSION, fleetExtension);
@@ -228,7 +228,7 @@ async function startProxy(config: FleetConfig, runtime: RuntimePaths, identity: 
   mkdirSync(agentRuntime, { recursive: true, mode: 0o700 });
   const listenPath = join(agentRuntime, "herdr.sock");
   if (existsSync(listenPath)) rmSync(listenPath);
-  const upstream = resolve(process.env.HOME ?? "", `.config/herdr/sessions/${config.session}/herdr.sock`);
+  const upstream = resolve(HOST_HOME, `.config/herdr/sessions/${config.session}/herdr.sock`);
   const unit = unitName("unitb-herdr-proxy", identity);
   await stopUnit(unit);
   await spawnChecked([
@@ -657,6 +657,13 @@ function normalizedPaths(paths: unknown): string[] {
   return normalized.sort();
 }
 
+export async function changedPathsSince(worktree: string, base: string, exactHead: string): Promise<string[]> {
+  return (await spawnCheckedRaw(["git", "diff", "--no-renames", "--name-only", "-z", base, exactHead], worktree))
+    .split("\0")
+    .filter(Boolean)
+    .sort();
+}
+
 async function validateAndImportSubmission(work: Record<string, unknown>, data: Record<string, unknown>): Promise<void> {
   const worktree = String(work.worktree);
   const exactHead = String(data.exactHead ?? "");
@@ -672,10 +679,7 @@ async function validateAndImportSubmission(work: Record<string, unknown>, data: 
   }
   await spawnChecked(["git", "merge-base", "--is-ancestor", base, exactHead], worktree);
   await spawnChecked(["git", "fsck", "--strict", "--no-dangling"], worktree);
-  const actualPaths = (await spawnCheckedRaw(["git", "diff", "--name-only", "-z", base, exactHead], worktree))
-    .split("\0")
-    .filter(Boolean)
-    .sort();
+  const actualPaths = await changedPathsSince(worktree, base, exactHead);
   const reportedPaths = normalizedPaths(data.changedPaths);
   if (JSON.stringify(actualPaths) !== JSON.stringify(reportedPaths)) {
     throw new Error(`Reported changedPaths do not match Git: expected ${JSON.stringify(actualPaths)}`);
@@ -1047,4 +1051,4 @@ async function main(): Promise<void> {
   process.exitCode = 2;
 }
 
-await main();
+if (import.meta.main) await main();

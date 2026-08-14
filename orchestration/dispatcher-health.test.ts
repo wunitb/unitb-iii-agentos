@@ -16,7 +16,6 @@ interface HealthReport {
 
 interface Fixture {
   configPath: string;
-  runtimeDir: string;
   socketPath: string;
 }
 
@@ -28,7 +27,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function fixture(): Fixture {
+function fixture(schemaVersion: string): Fixture {
   const runtimeDir = join(tmpdir(), `unitb-dispatcher-health-${crypto.randomUUID()}`);
   mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
   roots.push(runtimeDir);
@@ -62,13 +61,11 @@ function fixture(): Fixture {
     },
   }));
 
-  return { configPath, runtimeDir, socketPath: join(runtimeDir, "dispatcher.sock") };
-}
-
-function seedSchema(runtimeDir: string, version: string): void {
   const store = new FleetStore(join(runtimeDir, "fleet.sqlite"), runtimeDir);
-  store.setMeta("schema_version", version);
+  store.setMeta("schema_version", schemaVersion);
   store.close();
+
+  return { configPath, socketPath: join(runtimeDir, "dispatcher.sock") };
 }
 
 async function listen(socketPath: string): Promise<void> {
@@ -101,8 +98,7 @@ async function runHealth(configPath: string): Promise<{ exitCode: number; report
 
 describe("dispatcher health command", () => {
   test("reports ok and exits zero when the schema matches and the socket is present", async () => {
-    const { configPath, runtimeDir, socketPath } = fixture();
-    seedSchema(runtimeDir, FLEET_SCHEMA_VERSION);
+    const { configPath, socketPath } = fixture(FLEET_SCHEMA_VERSION);
     await listen(socketPath);
 
     const { exitCode, report } = await runHealth(configPath);
@@ -112,8 +108,7 @@ describe("dispatcher health command", () => {
   });
 
   test("fails closed when the dispatcher socket is missing", async () => {
-    const { configPath, runtimeDir } = fixture();
-    seedSchema(runtimeDir, FLEET_SCHEMA_VERSION);
+    const { configPath } = fixture(FLEET_SCHEMA_VERSION);
 
     const { exitCode, report } = await runHealth(configPath);
 
@@ -122,8 +117,7 @@ describe("dispatcher health command", () => {
   });
 
   test("fails closed when the recorded schema version is wrong", async () => {
-    const { configPath, runtimeDir, socketPath } = fixture();
-    seedSchema(runtimeDir, `${FLEET_SCHEMA_VERSION}-stale`);
+    const { configPath, socketPath } = fixture(`${FLEET_SCHEMA_VERSION}-stale`);
     await listen(socketPath);
 
     const { exitCode, report } = await runHealth(configPath);

@@ -36,12 +36,15 @@ systemctl --user daemon-reload
 systemctl --user enable unitb-omp-auth-broker.service unitb-herdr-supervisor.service unitb-fleet-dispatcher.service unitb-fleet-main.service
 systemctl --user restart unitb-omp-auth-broker.service unitb-herdr-supervisor.service unitb-fleet-dispatcher.service
 systemctl --user restart unitb-fleet-main.service
-dispatcher_health=$(bun "$ROOT/orchestration/dispatcher.ts" health)
+if ! dispatcher_health=$(bun "$ROOT/orchestration/dispatcher.ts" health); then
+  printf 'Fleet dispatcher health check failed: %s\n' "$dispatcher_health" >&2
+  exit 1
+fi
 if ! bun --eval '
 const health = JSON.parse(await new Response(Bun.stdin.stream()).text());
 if (health.ok !== true) process.exit(1);
-' <<<"$dispatcher_health" >/dev/null; then
-  printf 'Fleet dispatcher health check failed: %s\n' "$dispatcher_health" >&2
+' <<<"$dispatcher_health"; then
+  printf 'Fleet dispatcher returned an invalid health report: %s\n' "$dispatcher_health" >&2
   exit 1
 fi
 printf 'UnitB fleet installation completed.\n'

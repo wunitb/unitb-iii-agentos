@@ -109,6 +109,13 @@ function requiredString(value: unknown, field: string): string {
   return value.trim();
 }
 
+function requiredCredentialId(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error("credentialId must be a positive integer");
+  }
+  return value;
+}
+
 function stringArray(value: unknown, field: string, required = false): string[] {
   if (value === undefined && !required) return [];
   if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.trim() === "")) {
@@ -182,9 +189,7 @@ export function loadFleetConfig(path: string): FleetConfig {
   requiredString(parsed.network?.dnsForward, "network.dnsForward");
   for (const agent of [parsed.main, ...parsed.teams, ...Object.values(parsed.reviewer.routes)]) {
     const provider = requiredString(agent.model, "model").split("/", 1)[0]!;
-    if (!Number.isSafeInteger(agent.credentialId) || agent.credentialId < 1) {
-      throw new Error("credentialId must be a positive integer");
-    }
+    requiredCredentialId(agent.credentialId);
     stringArray(parsed.network.allowedHostsByProvider?.[provider], `network.allowedHostsByProvider.${provider}`, true);
   }
   for (const team of parsed.teams) {
@@ -578,9 +583,7 @@ export class FleetStore {
 
   assignCredential(identityId: string, model: string, credentialId: number): void {
     const provider = requiredString(model, "model").split("/", 1)[0];
-    if (!Number.isSafeInteger(credentialId) || credentialId < 1) {
-      throw new Error("credentialId must be a positive integer");
-    }
+    requiredCredentialId(credentialId);
     const result = this.db.query(`
       INSERT INTO credential_assignments(identity_id, provider, credential_id)
       SELECT identity_id, ?, ? FROM auth_tokens WHERE identity_id=?
