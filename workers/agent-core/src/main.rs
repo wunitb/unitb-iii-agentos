@@ -9,7 +9,7 @@ use std::time::Instant;
 
 mod types;
 
-use types::{AgentConfig, ChatRequest, FunctionCall, ModelConfig};
+use types::{AgentConfig, ChatRequest, FunctionCall};
 
 const MAX_ITERATIONS: u32 = 50;
 
@@ -190,35 +190,51 @@ fn spawn_trigger(iii: &IIIClient, function_id: &'static str, payload: Value) {
     });
 }
 
-fn route_payload(message: &str, function_count: usize, model: Option<&ModelConfig>) -> Value {
+fn route_payload(
+    message: &str,
+    functions: &Value,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Value {
     let mut payload = json!({
-        "message": message,
-        "functionCount": function_count,
+        "messages": [{ "role": "user", "content": message }],
+        "tools": functions,
     });
+    if let Some(provider) = provider {
+        payload["provider"] = json!(provider);
+    }
     if let Some(model) = model {
-        if let Some(provider) = model.provider.as_deref() {
-            payload["provider"] = json!(provider);
-        }
-        if let Some(model) = model.model.as_deref() {
-            payload["model"] = json!(model);
-        }
+        payload["model"] = json!(model);
     }
     payload
 }
 
 fn completion_payload(
-    route: &Value,
+    provider: &str,
+    model: &str,
     system_prompt: &str,
     messages: &[Value],
     functions: &Value,
 ) -> Value {
     json!({
-        "provider": route.get("provider").cloned().unwrap_or(Value::Null),
-        "model": route.get("model").cloned().unwrap_or(Value::Null),
+        "provider": provider,
+        "model": model,
         "systemPrompt": system_prompt,
         "messages": messages,
         "functions": functions,
     })
+}
+
+fn route_fields(route: &Value) -> Result<(String, String), Error> {
+    let provider = route["provider"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Handler("llm::route omitted provider".into()))?;
+    let model = route["model"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Handler("llm::route omitted model".into()))?;
+    Ok((provider.into(), model.into()))
 }
 
 async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
@@ -267,19 +283,30 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
         .or_else(|| config.as_ref().and_then(|c| c.system_prompt.clone()))
         .unwrap_or_default();
 
-    let model: Value = iii
+    let model_config = config.as_ref().and_then(|agent| agent.model.as_ref());
+    let preferred_provider = req.provider.as_deref().or_else(|| {
+        model_config.and_then(|model| model.provider.as_deref())
+    });
+    let preferred_model = req
+        .model
+        .as_deref()
+        .or_else(|| model_config.and_then(|model| model.model.as_deref()));
+
+    let route: Value = iii
         .trigger(TriggerRequest {
             function_id: "llm::route".to_string(),
             payload: route_payload(
                 &req.message,
-                functions.as_array().map_or(0, |entries| entries.len()),
-                config.as_ref().and_then(|agent| agent.model.as_ref()),
+                &functions,
+                preferred_provider,
+                preferred_model,
             ),
             action: None,
             timeout_ms: None,
         })
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
+    let (provider, model) = route_fields(&route)?;
 
     let scan_result = iii
         .trigger(TriggerRequest {
@@ -307,7 +334,13 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
     let mut response: Value = iii
         .trigger(TriggerRequest {
             function_id: "llm::complete".to_string(),
-            payload: completion_payload(&model, &system_prompt, &messages, &functions),
+            payload: completion_payload(
+                &provider,
+                &model,
+                &system_prompt,
+                &messages,
+                &functions,
+            ),
             action: None,
             timeout_ms: None,
         })
@@ -382,7 +415,13 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
         response = iii
             .trigger(TriggerRequest {
                 function_id: "llm::complete".to_string(),
-                payload: completion_payload(&model, &system_prompt, &messages, &functions),
+                payload: completion_payload(
+                    &provider,
+                    &model,
+                    &system_prompt,
+                    &messages,
+                    &functions,
+                ),
                 action: None,
                 timeout_ms: None,
             })
@@ -514,21 +553,24 @@ mod tests {
 
     #[test]
     fn llm_route_payload_uses_top_level_model_strings() {
-        let config = ModelConfig {
-            provider: Some("anthropic".into()),
-            model: Some("haiku".into()),
-            max_tokens: Some(1024),
-        };
-        let payload = route_payload("hello", 2, Some(&config));
+        let functions = json!([{ "id": "memory::recall" }]);
+        let payload = route_payload("hello", &functions, Some("anthropic"), Some("haiku"));
 
         assert_eq!(payload["provider"], "anthropic");
         assert_eq!(payload["model"], "haiku");
+        assert_eq!(
+            payload["messages"],
+            json!([{ "role": "user", "content": "hello" }])
+        );
+        assert_eq!(payload["tools"], functions);
         assert!(payload.get("config").is_none());
+        assert!(payload.get("message").is_none());
+        assert!(payload.get("functionCount").is_none());
     }
 
     #[test]
     fn llm_route_payload_omits_missing_route_fields() {
-        let payload = route_payload("hello", 0, None);
+        let payload = route_payload("hello", &json!([]), None, None);
 
         assert!(payload.get("provider").is_none());
         assert!(payload.get("model").is_none());
@@ -536,17 +578,37 @@ mod tests {
 
     #[test]
     fn llm_complete_payload_consumes_route_fields() {
-        let route = json!({
-            "provider": "codex",
-            "model": "gpt-5.6-sol",
-        });
         let messages = vec![json!({"role": "user"})];
         let functions = json!([]);
-        let payload = completion_payload(&route, "system", &messages, &functions);
+        let payload = completion_payload(
+            "codex",
+            "gpt-5.6-sol",
+            "system",
+            &messages,
+            &functions,
+        );
 
         assert_eq!(payload["provider"], "codex");
         assert_eq!(payload["model"], "gpt-5.6-sol");
+        assert!(payload["provider"].is_string());
+        assert!(payload["model"].is_string());
         assert!(payload.get("config").is_none());
+        assert!(payload.get("route").is_none());
+    }
+
+    #[test]
+    fn route_fields_extract_provider_and_model() {
+        let fields = route_fields(&json!({
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+        }))
+        .unwrap();
+        assert_eq!(fields, ("codex".into(), "gpt-5.6-sol".into()));
+    }
+
+    #[test]
+    fn route_fields_reject_nested_model_object() {
+        assert!(route_fields(&json!({ "model": { "provider": "codex" } })).is_err());
     }
 
     #[test]

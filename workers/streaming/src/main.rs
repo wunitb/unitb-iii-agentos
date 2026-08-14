@@ -12,30 +12,43 @@ fn payload_body(input: &Value) -> Value {
     input.get("body").cloned().unwrap_or_else(|| input.clone())
 }
 
-fn stream_route_payload(message: &str, model_config: Option<&Value>) -> Value {
-    let mut payload = json!({
+fn agent_chat_payload(body: &Value, message: &str) -> Value {
+    json!({
+        "agentId": body["agentId"].as_str().unwrap_or("default"),
         "message": message,
-        "toolCount": 0,
+        "sessionId": body.get("sessionId").cloned().unwrap_or(Value::Null),
+        "provider": body.get("provider").cloned().unwrap_or(Value::Null),
+        "model": body.get("model").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn stream_route_payload(
+    message: &str,
+    provider: Option<&Value>,
+    model: Option<&Value>,
+) -> Value {
+    let mut payload = json!({
+        "messages": [{ "role": "user", "content": message }],
+        "tools": [],
     });
-    if let Some(model) = model_config.and_then(Value::as_object) {
-        if let Some(provider) = model.get("provider").and_then(Value::as_str) {
-            payload["provider"] = json!(provider);
-        }
-        if let Some(model) = model.get("model").and_then(Value::as_str) {
-            payload["model"] = json!(model);
-        }
+    if let Some(provider) = provider {
+        payload["provider"] = provider.clone();
+    }
+    if let Some(model) = model {
+        payload["model"] = model.clone();
     }
     payload
 }
 
 fn stream_completion_payload(
-    route: &Value,
+    provider: &str,
+    model: &str,
     system_prompt: &str,
     messages: &[Value],
 ) -> Value {
     json!({
-        "provider": route.get("provider").cloned().unwrap_or(Value::Null),
-        "model": route.get("model").cloned().unwrap_or(Value::Null),
+        "provider": provider,
+        "model": model,
         "systemPrompt": system_prompt,
         "messages": messages,
     })
@@ -85,16 +98,30 @@ async fn stream_chat(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         .unwrap_or_else(|_| json!([]));
 
     let model_config = config.as_ref().and_then(|c| c.get("model"));
+    let preferred_provider = body
+        .get("provider")
+        .or_else(|| model_config.and_then(|model| model.get("provider")));
+    let preferred_model = body
+        .get("model")
+        .or_else(|| model_config.and_then(|model| model.get("model")));
 
     let route = iii
         .trigger(TriggerRequest {
             function_id: "llm::route".into(),
-            payload: stream_route_payload(&message, model_config),
+            payload: stream_route_payload(&message, preferred_provider, preferred_model),
             action: None,
             timeout_ms: None,
         })
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
+    let provider = route["provider"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Handler("llm::route omitted provider".into()))?;
+    let model = route["model"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Handler("llm::route omitted model".into()))?;
 
     let system_prompt = config
         .as_ref()
@@ -108,7 +135,7 @@ async fn stream_chat(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let response = iii
         .trigger(TriggerRequest {
             function_id: "llm::complete".into(),
-            payload: stream_completion_payload(&route, &system_prompt, &messages),
+            payload: stream_completion_payload(provider, model, &system_prompt, &messages),
             action: None,
             timeout_ms: None,
         })
@@ -136,18 +163,12 @@ fn latest_user_message(body: &Value) -> Result<String, Error> {
 async fn chat_completion(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let body = payload_body(&input);
     let message = latest_user_message(&body)?;
-    let agent_id = body["agentId"].as_str().unwrap_or("default");
     let requested_model = body["model"].as_str().unwrap_or("agentos-default");
-    let session_id = body.get("sessionId").cloned().unwrap_or(Value::Null);
 
     let response = iii
         .trigger(TriggerRequest {
             function_id: "agent::chat".into(),
-            payload: json!({
-                "agentId": agent_id,
-                "message": message,
-                "sessionId": session_id,
-            }),
+            payload: agent_chat_payload(&body, &message),
             action: None,
             timeout_ms: None,
         })
@@ -176,21 +197,15 @@ async fn chat_completion(iii: &IIIClient, input: Value) -> Result<Value, Error> 
 
 async fn stream_sse(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let body = payload_body(&input);
-    let agent_id = body["agentId"].as_str().unwrap_or("default").to_string();
     let message = body["message"]
         .as_str()
         .ok_or_else(|| Error::Handler("message required".into()))?
         .to_string();
-    let session_id = body.get("sessionId").cloned().unwrap_or(Value::Null);
 
     let response = iii
         .trigger(TriggerRequest {
             function_id: "agent::chat".into(),
-            payload: json!({
-                "agentId": &agent_id,
-                "message": &message,
-                "sessionId": session_id,
-            }),
+            payload: agent_chat_payload(&body, &message),
             action: None,
             timeout_ms: None,
         })
@@ -200,7 +215,7 @@ async fn stream_sse(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let content = response["content"].as_str().unwrap_or("").to_string();
     let model = response["model"]
         .as_str()
-        .unwrap_or("claude-sonnet-4-6")
+        .unwrap_or("agentos-default")
         .to_string();
 
     let chunks = chunk_markdown_aware(&content, 20, 100);
@@ -312,7 +327,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{stream_chat_response, stream_completion_payload, stream_route_payload};
+    use super::{
+        agent_chat_payload, stream_chat_response, stream_completion_payload, stream_route_payload,
+    };
     use serde_json::json;
 
     #[test]
@@ -342,21 +359,26 @@ mod tests {
             "model": "gpt-5.6-sol",
             "maxTokens": 1024,
         });
-        let payload = stream_route_payload("hello", Some(&config));
+        let payload =
+            stream_route_payload("hello", config.get("provider"), config.get("model"));
 
         assert_eq!(payload["provider"], "codex");
         assert_eq!(payload["model"], "gpt-5.6-sol");
+        assert_eq!(
+            payload["messages"],
+            json!([{ "role": "user", "content": "hello" }])
+        );
+        assert_eq!(payload["tools"], json!([]));
         assert!(payload.get("config").is_none());
+        assert!(payload.get("message").is_none());
+        assert!(payload.get("toolCount").is_none());
     }
 
     #[test]
     fn stream_completion_payload_consumes_route_fields() {
-        let route = json!({
-            "provider": "codex",
-            "model": "gpt-5.6-sol",
-        });
         let payload = stream_completion_payload(
-            &route,
+            "codex",
+            "gpt-5.6-sol",
             "system",
             &[json!({"role": "user", "content": "hello"})],
         );
@@ -366,5 +388,18 @@ mod tests {
         assert!(payload["provider"].is_string());
         assert!(payload["model"].is_string());
         assert!(payload.get("route").is_none());
+    }
+    #[test]
+    fn agent_chat_payload_forwards_provider_and_model() {
+        let body = json!({
+            "agentId": "agent-2",
+            "sessionId": "sess-42",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+        });
+        let payload = agent_chat_payload(&body, "hello");
+
+        assert_eq!(payload["provider"], "codex");
+        assert_eq!(payload["model"], "gpt-5.6-sol");
     }
 }
