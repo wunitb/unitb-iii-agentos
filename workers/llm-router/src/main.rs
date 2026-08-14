@@ -8,6 +8,7 @@ use std::time::Instant;
 struct RouterState {
     usage: DashMap<String, Usage>,
     providers: DashMap<String, ProviderConfig>,
+    default_route: Option<Route>,
 }
 
 struct Usage {
@@ -21,6 +22,16 @@ struct ProviderConfig {
     env_key: String,
     driver: Driver,
     models: Vec<String>,
+}
+
+const CODEX_PROVIDER: &str = "codex";
+const DEFAULT_CODEX_BASE_URL: &str = "http://127.0.0.1:8317/v1";
+const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Route {
+    provider: String,
+    model: String,
 }
 
 #[derive(Clone, Copy)]
@@ -120,7 +131,33 @@ fn default_providers() -> Vec<(
             Driver::OpenAiCompat,
             &["llama3.3", "qwen2.5", "deepseek-r1"],
         ),
+        (
+            CODEX_PROVIDER,
+            DEFAULT_CODEX_BASE_URL,
+            "CODEX_PROXY_API_KEY",
+            Driver::OpenAiCompat,
+            &["gpt-5.4", "gpt-5.4-mini", "gpt-5.6-sol"],
+        ),
     ]
+}
+
+fn runtime_default_route<F>(get_env: F) -> Option<Route>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let key = get_env("CODEX_PROXY_API_KEY")?;
+    if key.trim().is_empty() {
+        return None;
+    }
+
+    Some(Route {
+        provider: get_env("AGENTOS_DEFAULT_PROVIDER")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| CODEX_PROVIDER.to_string()),
+        model: get_env("AGENTOS_DEFAULT_MODEL")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_CODEX_MODEL.to_string()),
+    })
 }
 
 fn score_complexity(messages: &[Value], tools: &[Value]) -> u32 {
@@ -159,6 +196,72 @@ fn select_model(complexity: u32, preferred: Option<&str>) -> (&'static str, &'st
         11..=40 => ("anthropic", "claude-sonnet-4-20250514"),
         _ => ("anthropic", "claude-opus-4-20250514"),
     }
+}
+
+fn resolve_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
+    let explicit_provider = input["provider"].as_str().filter(|value| !value.is_empty());
+    let explicit_model = input["model"]
+        .as_str()
+        .filter(|value| !value.is_empty() && *value != "agentos-default");
+
+    if let (Some(provider), Some(model)) = (explicit_provider, explicit_model) {
+        let config = state
+            .providers
+            .get(provider)
+            .ok_or_else(|| Error::Handler(format!("unknown provider: {provider}")))?;
+        if !config.models.iter().any(|candidate| candidate == model) {
+            return Err(Error::Handler(format!(
+                "model {model} is not registered for provider {provider}"
+            )));
+        }
+        return Ok(Route {
+            provider: provider.into(),
+            model: model.into(),
+        });
+    }
+
+    if let Some(model) = explicit_model {
+        let owners: Vec<String> = state
+            .providers
+            .iter()
+            .filter(|entry| entry.models.iter().any(|candidate| candidate == model))
+            .map(|entry| entry.key().clone())
+            .collect();
+        return match owners.as_slice() {
+            [provider] => Ok(Route {
+                provider: provider.clone(),
+                model: model.into(),
+            }),
+            [] => Err(Error::Handler(format!("unknown model: {model}"))),
+            _ => Err(Error::Handler(format!("ambiguous model: {model}"))),
+        };
+    }
+
+    if explicit_provider.is_some() {
+        return Err(Error::Handler("provider requires model".into()));
+    }
+
+    if let Some(route) = &state.default_route {
+        let config = state.providers.get(&route.provider).ok_or_else(|| {
+            Error::Handler(format!("unknown default provider: {}", route.provider))
+        })?;
+        if !config.models.iter().any(|candidate| candidate == &route.model) {
+            return Err(Error::Handler(format!(
+                "model {} is not registered for provider {}",
+                route.model, route.provider
+            )));
+        }
+        return Ok(route.clone());
+    }
+
+    let messages = input["messages"].as_array().cloned().unwrap_or_default();
+    let tools = input["tools"].as_array().cloned().unwrap_or_default();
+    let complexity = score_complexity(&messages, &tools);
+    let (provider, model) = select_model(complexity, None);
+    Ok(Route {
+        provider: provider.into(),
+        model: model.into(),
+    })
 }
 
 async fn call_anthropic(
@@ -235,15 +338,14 @@ async fn call_openai_compat(
     Ok(resp)
 }
 
-async fn route_handler(_state: Arc<RouterState>, input: Value) -> Result<Value, Error> {
+async fn route_handler(state: Arc<RouterState>, input: Value) -> Result<Value, Error> {
     let messages = input["messages"].as_array().cloned().unwrap_or_default();
     let tools = input["tools"].as_array().cloned().unwrap_or_default();
-    let preferred = input["model"].as_str();
     let complexity = score_complexity(&messages, &tools);
-    let (provider, model) = select_model(complexity, preferred);
+    let route = resolve_route(&state, &input)?;
     Ok(json!({
-        "provider": provider,
-        "model": model,
+        "provider": route.provider,
+        "model": route.model,
         "complexity": complexity,
     }))
 }
@@ -253,18 +355,15 @@ async fn complete_handler(
     client: reqwest::Client,
     input: Value,
 ) -> Result<Value, Error> {
-    let provider_name = input["provider"].as_str().unwrap_or("anthropic");
-    let model = input["model"]
-        .as_str()
-        .unwrap_or("claude-sonnet-4-20250514");
+    let route = resolve_route(&state, &input)?;
+    let provider = state
+        .providers
+        .get(&route.provider)
+        .ok_or_else(|| Error::Handler(format!("unknown provider: {}", route.provider)))?;
+    let model = route.model.as_str();
     let messages = input["messages"].as_array().cloned().unwrap_or_default();
     let tools = input["tools"].as_array().cloned().unwrap_or_default();
     let max_tokens = input["max_tokens"].as_u64().unwrap_or(4096);
-
-    let provider = state
-        .providers
-        .get(provider_name)
-        .ok_or_else(|| Error::Handler(format!("unknown provider: {}", provider_name)))?;
 
     let api_key = if provider.env_key.is_empty() {
         String::new()
@@ -303,7 +402,7 @@ async fn complete_handler(
         .or(result["usage"]["completion_tokens"].as_u64())
         .unwrap_or(0);
 
-    let key = format!("{}:{}", provider_name, model);
+    let key = format!("{}:{}", route.provider, model);
     let mut usage = state.usage.entry(key).or_insert(Usage {
         input_tokens: 0,
         output_tokens: 0,
@@ -378,7 +477,11 @@ async fn providers_handler(state: Arc<RouterState>, _input: Value) -> Result<Val
             "base_url": &provider.base_url,
             "env_key": &provider.env_key,
             "models": &provider.models,
-            "configured": if provider.env_key.is_empty() { true } else { std::env::var(&provider.env_key).is_ok() },
+            "configured": if provider.env_key.is_empty() { true } else {
+                std::env::var(&provider.env_key)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+            },
         })
     }).collect();
     Ok(json!({ "providers": list }))
@@ -391,16 +494,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
     let iii = register_worker(&ws_url, InitOptions::default());
 
+    let default_route = runtime_default_route(|name| std::env::var(name).ok());
     let state = Arc::new(RouterState {
         usage: DashMap::new(),
         providers: DashMap::new(),
+        default_route,
     });
 
     for (name, base_url, env_key, driver, models) in default_providers() {
         state.providers.insert(
             name.to_string(),
             ProviderConfig {
-                base_url: base_url.to_string(),
+                base_url: if name == CODEX_PROVIDER {
+                    std::env::var("CODEX_PROXY_BASE_URL")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| DEFAULT_CODEX_BASE_URL.to_string())
+                } else {
+                    base_url.to_string()
+                },
                 env_key: env_key.to_string(),
                 driver,
                 models: models.iter().map(|s| s.to_string()).collect(),
@@ -654,7 +766,102 @@ mod tests {
     #[test]
     fn test_default_providers_count() {
         let providers = default_providers();
-        assert_eq!(providers.len(), 10);
+        assert_eq!(providers.len(), 11);
+    }
+
+    #[test]
+    fn codex_provider_is_registered() {
+        let (_, base_url, env_key, driver, models) = default_providers()
+            .into_iter()
+            .find(|(name, ..)| *name == "codex")
+            .expect("codex provider");
+
+        assert_eq!(base_url, "http://127.0.0.1:8317/v1");
+        assert_eq!(env_key, "CODEX_PROXY_API_KEY");
+        assert!(matches!(driver, Driver::OpenAiCompat));
+        assert!(models.contains(&"gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn configured_codex_is_the_default_route() {
+        let route = runtime_default_route(|name| match name {
+            "CODEX_PROXY_API_KEY" => Some("local-secret".into()),
+            "AGENTOS_DEFAULT_PROVIDER" => Some("codex".into()),
+            "AGENTOS_DEFAULT_MODEL" => Some("gpt-5.6-sol".into()),
+            _ => None,
+        });
+
+        assert_eq!(
+            route,
+            Some(Route {
+                provider: "codex".into(),
+                model: "gpt-5.6-sol".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn missing_codex_key_disables_the_local_default() {
+        let route = runtime_default_route(|name| match name {
+            "AGENTOS_DEFAULT_PROVIDER" => Some("codex".into()),
+            "AGENTOS_DEFAULT_MODEL" => Some("gpt-5.6-sol".into()),
+            _ => None,
+        });
+
+        assert_eq!(route, None);
+    }
+
+    fn test_state(default_route: Option<Route>) -> RouterState {
+        let providers = DashMap::new();
+        for (name, base_url, env_key, driver, models) in default_providers() {
+            providers.insert(
+                name.to_string(),
+                ProviderConfig {
+                    base_url: base_url.to_string(),
+                    env_key: env_key.to_string(),
+                    driver,
+                    models: models.iter().map(|model| model.to_string()).collect(),
+                },
+            );
+        }
+        RouterState {
+            usage: DashMap::new(),
+            providers,
+            default_route,
+        }
+    }
+
+    #[test]
+    fn explicit_model_resolves_to_codex_owner() {
+        let state = test_state(Some(Route {
+            provider: "codex".into(),
+            model: "gpt-5.6-sol".into(),
+        }));
+        let route = resolve_route(&state, &json!({ "model": "gpt-5.4-mini" })).unwrap();
+        assert_eq!(route.provider, "codex");
+        assert_eq!(route.model, "gpt-5.4-mini");
+    }
+
+    #[test]
+    fn explicit_provider_and_model_override_default() {
+        let state = test_state(Some(Route {
+            provider: "codex".into(),
+            model: "gpt-5.6-sol".into(),
+        }));
+        let route = resolve_route(
+            &state,
+            &json!({ "provider": "openai", "model": "gpt-4o" }),
+        )
+        .unwrap();
+        assert_eq!(route.provider, "openai");
+        assert_eq!(route.model, "gpt-4o");
+    }
+
+    #[test]
+    fn unknown_explicit_model_is_rejected() {
+        let state = test_state(None);
+        let error = resolve_route(&state, &json!({ "model": "not-a-model" })).unwrap_err();
+        assert!(error.to_string().contains("unknown model"));
     }
 
     #[test]
