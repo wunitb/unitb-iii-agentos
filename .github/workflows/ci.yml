@@ -305,7 +305,7 @@ jobs:
         env:
           AGENTOS_E2E: "1"
           AGENTOS_BASE_URL: http://127.0.0.1:3111
-          AGENTOS_E2E_MODEL: claude-sonnet-4-6
+          AGENTOS_E2E_MODEL: claude-sonnet-4-20250514
           III_URL: ws://localhost:49134
           AGENTOS_API_KEY: ${{ secrets.AGENTOS_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

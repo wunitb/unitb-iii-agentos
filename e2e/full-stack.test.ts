@@ -183,15 +183,23 @@ suite("AgentOS full-stack E2E", () => {
     expect(stored.id || stored.deduplicated !== undefined).toBeTruthy();
   });
 
-  it("llm::providers — 10 providers registered", async () => {
+  it("llm::providers — 11 providers registered", async () => {
     const r = await call<{
-      providers: { name: string; configured: boolean }[];
+      providers: {
+        name: string;
+        base_url: string;
+        models: string[];
+      }[];
     }>("llm::providers", {});
-    expect(r.providers.length).toBeGreaterThanOrEqual(10);
+    expect(r.providers.length).toBeGreaterThanOrEqual(11);
     const names = r.providers.map((p) => p.name);
     for (const expected of ["anthropic", "openai", "google", "ollama"]) {
       expect(names).toContain(expected);
     }
+    const codex = r.providers.find((p) => p.name === "codex");
+    expect(codex).toBeDefined();
+    expect(codex?.base_url).toBe("http://127.0.0.1:8317/v1");
+    expect(codex?.models).toContain("gpt-5.6-sol");
   });
 
   it("llm::route — resolves default and explicit model contracts", async () => {
