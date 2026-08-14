@@ -194,7 +194,7 @@ omp
 bun orchestration/dispatcher.ts health
 ```
 
-The fleet is host-specific infrastructure. `orchestration/fleet.config.json` pins Main and each Team to one model and one centralized-broker credential slot, then routes Reviewer to the opposite model family for the submitting Team. Every launched worker gets a reset OMP home with no copied credentials, a scoped credential-proxy token, a generated config that binds all internal model roles to that session's assigned model, and auto-approval inside the already-confined boundary. The committed default routes require two OpenAI Codex credentials and two Anthropic credentials. Run the state-machine suite with:
+The fleet is host-specific infrastructure. `orchestration/fleet.config.json` pins Main and each Team to one model and one centralized-broker credential slot, then routes Reviewer to the opposite model family for the submitting Team. Every launched worker gets a reset OMP home with no copied credentials, a scoped credential-proxy token, a generated config that binds all internal model roles to that session's assigned model, and auto-approval inside the already-confined boundary. The committed default routes require two OpenAI Codex credentials and one Anthropic credential. Run the state-machine suite with:
 
 ```bash
 npm run test:fleet

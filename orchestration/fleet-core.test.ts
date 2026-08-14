@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FleetStore, type FleetConfig, type FleetRequest } from "./fleet-core";
+import { FleetStore, loadFleetConfig, type FleetConfig, type FleetRequest } from "./fleet-core";
 
 const roots: string[] = [];
 const config: FleetConfig = {
@@ -63,6 +63,18 @@ function contract(ownedPaths = ["src/feature"]) {
     mergeAuthority: "principal",
   };
 }
+
+test("rejects a reviewer from the submitting Team's provider", () => {
+  const root = mkdtempSync(join(tmpdir(), "unitb-fleet-config-"));
+  roots.push(root);
+  const path = join(root, "fleet.config.json");
+  const invalid = structuredClone(config);
+  invalid.teams[0].model = "anthropic/team";
+  invalid.reviewer.routes["TEAM-01"].model = "anthropic/reviewer";
+  writeFileSync(path, JSON.stringify(invalid));
+
+  expect(() => loadFleetConfig(path)).toThrow("Reviewer for TEAM-01 must use a different model provider");
+});
 
 describe("FleetStore", () => {
   test("enforces the exact-head writer-reviewer-handoff lifecycle", () => {

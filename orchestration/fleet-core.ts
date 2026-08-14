@@ -160,6 +160,12 @@ export function loadFleetConfig(path: string): FleetConfig {
       throw new Error("credentialSlot must be a non-negative integer");
     }
   }
+  for (const team of parsed.teams) {
+    const reviewer = reviewerModelFor(parsed, team.id);
+    if (team.model.split("/", 1)[0] === reviewer.model.split("/", 1)[0]) {
+      throw new Error(`Reviewer for ${team.id} must use a different model provider`);
+    }
+  }
   return parsed;
 }
 
