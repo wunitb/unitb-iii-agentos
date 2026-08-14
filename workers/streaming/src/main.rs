@@ -12,6 +12,45 @@ fn payload_body(input: &Value) -> Value {
     input.get("body").cloned().unwrap_or_else(|| input.clone())
 }
 
+fn valid_route_preference(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && *value != "agentos-default")
+        .map(str::to_owned)
+}
+
+fn stream_route_preferences(
+    body: &Value,
+    model_config: Option<&Value>,
+) -> (Option<String>, Option<String>) {
+    let request_provider = valid_route_preference(body.get("provider"));
+    let request_model = valid_route_preference(body.get("model"));
+    if request_provider.is_some() || request_model.is_some() {
+        return (request_provider, request_model);
+    }
+
+    let config_provider =
+        model_config.and_then(|model| valid_route_preference(model.get("provider")));
+    let config_model = model_config.and_then(|model| valid_route_preference(model.get("model")));
+    if config_provider.is_some() && config_model.is_some() {
+        (config_provider, config_model)
+    } else {
+        (None, None)
+    }
+}
+
+fn stream_route_fields(route: &Value) -> Result<(&str, &str), Error> {
+    let provider = route["provider"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Handler("llm::route omitted provider".into()))?;
+    let model = route["model"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Handler("llm::route omitted model".into()))?;
+    Ok((provider, model))
+}
+
 fn agent_chat_payload(body: &Value, message: &str) -> Value {
     json!({
         "agentId": body["agentId"].as_str().unwrap_or("default"),
@@ -24,18 +63,18 @@ fn agent_chat_payload(body: &Value, message: &str) -> Value {
 
 fn stream_route_payload(
     message: &str,
-    provider: Option<&Value>,
-    model: Option<&Value>,
+    provider: Option<&str>,
+    model: Option<&str>,
 ) -> Value {
     let mut payload = json!({
         "messages": [{ "role": "user", "content": message }],
         "tools": [],
     });
     if let Some(provider) = provider {
-        payload["provider"] = provider.clone();
+        payload["provider"] = json!(provider);
     }
     if let Some(model) = model {
-        payload["model"] = model.clone();
+        payload["model"] = json!(model);
     }
     payload
 }
@@ -98,30 +137,24 @@ async fn stream_chat(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         .unwrap_or_else(|_| json!([]));
 
     let model_config = config.as_ref().and_then(|c| c.get("model"));
-    let preferred_provider = body
-        .get("provider")
-        .or_else(|| model_config.and_then(|model| model.get("provider")));
-    let preferred_model = body
-        .get("model")
-        .or_else(|| model_config.and_then(|model| model.get("model")));
+    let (preferred_provider, preferred_model) =
+        stream_route_preferences(&body, model_config);
 
     let route = iii
         .trigger(TriggerRequest {
             function_id: "llm::route".into(),
-            payload: stream_route_payload(&message, preferred_provider, preferred_model),
+            payload: stream_route_payload(
+                &message,
+                preferred_provider.as_deref(),
+                preferred_model.as_deref(),
+            ),
             action: None,
             timeout_ms: None,
         })
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
-    let provider = route["provider"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::Handler("llm::route omitted provider".into()))?;
-    let model = route["model"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::Handler("llm::route omitted model".into()))?;
+
+    let (provider, model) = stream_route_fields(&route)?;
 
     let system_prompt = config
         .as_ref()
@@ -328,7 +361,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_chat_payload, stream_chat_response, stream_completion_payload, stream_route_payload,
+        agent_chat_payload, stream_chat_response, stream_completion_payload, stream_route_fields,
+        stream_route_payload, stream_route_preferences,
     };
     use serde_json::json;
 
@@ -354,13 +388,7 @@ mod tests {
 
     #[test]
     fn stream_route_payload_uses_top_level_model_strings() {
-        let config = json!({
-            "provider": "codex",
-            "model": "gpt-5.6-sol",
-            "maxTokens": 1024,
-        });
-        let payload =
-            stream_route_payload("hello", config.get("provider"), config.get("model"));
+        let payload = stream_route_payload("hello", Some("codex"), Some("gpt-5.6-sol"));
 
         assert_eq!(payload["provider"], "codex");
         assert_eq!(payload["model"], "gpt-5.6-sol");
@@ -401,5 +429,102 @@ mod tests {
 
         assert_eq!(payload["provider"], "codex");
         assert_eq!(payload["model"], "gpt-5.6-sol");
+    }
+
+    fn configured_route() -> serde_json::Value {
+        json!({
+            "provider": "config-provider",
+            "model": "config-model",
+        })
+    }
+
+    #[test]
+    fn stream_route_preferences_use_request_pair() {
+        let body = json!({
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+        });
+        assert_eq!(
+            stream_route_preferences(&body, Some(&configured_route())),
+            (Some("codex".into()), Some("gpt-5.6-sol".into()))
+        );
+    }
+
+    #[test]
+    fn stream_route_preferences_model_only_does_not_combine_config_provider() {
+        let body = json!({ "model": "gpt-5.6-sol" });
+        assert_eq!(
+            stream_route_preferences(&body, Some(&configured_route())),
+            (None, Some("gpt-5.6-sol".into()))
+        );
+    }
+
+    #[test]
+    fn stream_route_preferences_filter_agentos_default() {
+        let body = json!({
+            "provider": "agentos-default",
+            "model": "agentos-default",
+        });
+        assert_eq!(
+            stream_route_preferences(&body, Some(&configured_route())),
+            (Some("config-provider".into()), Some("config-model".into()))
+        );
+    }
+
+    #[test]
+    fn stream_route_preferences_filter_empty_strings() {
+        let body = json!({ "provider": "", "model": "" });
+        assert_eq!(
+            stream_route_preferences(&body, Some(&configured_route())),
+            (Some("config-provider".into()), Some("config-model".into()))
+        );
+    }
+
+    #[test]
+    fn stream_route_preferences_fallback_to_complete_config_pair() {
+        let body = json!({});
+        assert_eq!(
+            stream_route_preferences(&body, Some(&configured_route())),
+            (Some("config-provider".into()), Some("config-model".into()))
+        );
+    }
+
+    #[test]
+    fn stream_route_preferences_ignore_non_string_request_values() {
+        let body = json!({ "provider": null, "model": 42 });
+        assert_eq!(
+            stream_route_preferences(&body, Some(&configured_route())),
+            (Some("config-provider".into()), Some("config-model".into()))
+        );
+    }
+
+    #[test]
+    fn stream_route_fields_extract_provider_and_model() {
+        let route = json!({
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+        });
+        let fields = stream_route_fields(&route).unwrap();
+        assert_eq!(fields, ("codex", "gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn stream_route_fields_reject_missing_empty_or_non_string_values() {
+        assert!(stream_route_fields(&json!({ "provider": "", "model": "x" })).is_err());
+        assert!(stream_route_fields(&json!({ "provider": "codex" })).is_err());
+        assert!(stream_route_fields(&json!({ "provider": 42, "model": "x" })).is_err());
+        assert!(
+            stream_route_fields(&json!({ "provider": "codex", "model": { "id": "nested" } }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_chat_payload_omitted_preferences_remain_null() {
+        let payload = agent_chat_payload(&json!({ "agentId": "agent-2" }), "hello");
+
+        assert!(payload["provider"].is_null());
+        assert!(payload["model"].is_null());
+        assert_ne!(payload["model"], "agentos-default");
     }
 }

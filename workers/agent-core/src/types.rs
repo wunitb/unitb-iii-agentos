@@ -79,6 +79,20 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_request_null_route_fields_deserialize_to_none() {
+        let req: ChatRequest = serde_json::from_value(json!({
+            "agentId": "agent-1",
+            "message": "Hello",
+            "provider": null,
+            "model": null,
+        }))
+        .unwrap();
+
+        assert!(req.provider.is_none());
+        assert!(req.model.is_none());
+    }
+
+    #[test]
     fn test_chat_request_with_optional_fields() {
         let json_val = json!({
             "agentId": "agent-2",

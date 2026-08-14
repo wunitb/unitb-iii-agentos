@@ -9,7 +9,7 @@ use std::time::Instant;
 
 mod types;
 
-use types::{AgentConfig, ChatRequest, FunctionCall};
+use types::{AgentConfig, ChatRequest, FunctionCall, ModelConfig};
 
 const MAX_ITERATIONS: u32 = 50;
 
@@ -209,6 +209,35 @@ fn route_payload(
     payload
 }
 
+fn valid_route_preference(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty() && *value != "agentos-default")
+}
+
+fn route_preferences(
+    request_provider: Option<&str>,
+    request_model: Option<&str>,
+    model_config: Option<&ModelConfig>,
+) -> (Option<String>, Option<String>) {
+    let request_provider = valid_route_preference(request_provider);
+    let request_model = valid_route_preference(request_model);
+    if request_provider.is_some() || request_model.is_some() {
+        return (
+            request_provider.map(str::to_owned),
+            request_model.map(str::to_owned),
+        );
+    }
+
+    let config_provider =
+        model_config.and_then(|model| valid_route_preference(model.provider.as_deref()));
+    let config_model =
+        model_config.and_then(|model| valid_route_preference(model.model.as_deref()));
+    if config_provider.is_some() && config_model.is_some() {
+        (config_provider.map(str::to_owned), config_model.map(str::to_owned))
+    } else {
+        (None, None)
+    }
+}
+
 fn completion_payload(
     provider: &str,
     model: &str,
@@ -284,13 +313,8 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
         .unwrap_or_default();
 
     let model_config = config.as_ref().and_then(|agent| agent.model.as_ref());
-    let preferred_provider = req.provider.as_deref().or_else(|| {
-        model_config.and_then(|model| model.provider.as_deref())
-    });
-    let preferred_model = req
-        .model
-        .as_deref()
-        .or_else(|| model_config.and_then(|model| model.model.as_deref()));
+    let (preferred_provider, preferred_model) =
+        route_preferences(req.provider.as_deref(), req.model.as_deref(), model_config);
 
     let route: Value = iii
         .trigger(TriggerRequest {
@@ -298,8 +322,8 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
             payload: route_payload(
                 &req.message,
                 &functions,
-                preferred_provider,
-                preferred_model,
+                preferred_provider.as_deref(),
+                preferred_model.as_deref(),
             ),
             action: None,
             timeout_ms: None,
@@ -609,6 +633,62 @@ mod tests {
     #[test]
     fn route_fields_reject_nested_model_object() {
         assert!(route_fields(&json!({ "model": { "provider": "codex" } })).is_err());
+    }
+
+    fn configured_model() -> ModelConfig {
+        ModelConfig {
+            provider: Some("config-provider".into()),
+            model: Some("config-model".into()),
+            max_tokens: None,
+        }
+    }
+
+    #[test]
+    fn route_preferences_use_request_pair() {
+        assert_eq!(
+            route_preferences(
+                Some("codex"),
+                Some("gpt-5.6-sol"),
+                Some(&configured_model()),
+            ),
+            (Some("codex".into()), Some("gpt-5.6-sol".into()))
+        );
+    }
+
+    #[test]
+    fn route_preferences_model_only_does_not_combine_config_provider() {
+        assert_eq!(
+            route_preferences(None, Some("gpt-5.6-sol"), Some(&configured_model())),
+            (None, Some("gpt-5.6-sol".into()))
+        );
+    }
+
+    #[test]
+    fn route_preferences_filter_agentos_default() {
+        assert_eq!(
+            route_preferences(
+                Some("agentos-default"),
+                Some("agentos-default"),
+                Some(&configured_model()),
+            ),
+            (Some("config-provider".into()), Some("config-model".into()))
+        );
+    }
+
+    #[test]
+    fn route_preferences_filter_empty_strings() {
+        assert_eq!(
+            route_preferences(Some(""), Some(""), Some(&configured_model())),
+            (Some("config-provider".into()), Some("config-model".into()))
+        );
+    }
+
+    #[test]
+    fn route_preferences_fallback_to_complete_agent_config_pair() {
+        assert_eq!(
+            route_preferences(None, None, Some(&configured_model())),
+            (Some("config-provider".into()), Some("config-model".into()))
+        );
     }
 
     #[test]
