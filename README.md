@@ -54,9 +54,9 @@ git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos
 # 2. install the pinned iii v0.22.1 release with checksum verification
 bash scripts/install-iii.sh
 
-# 3. add your model key
+# 3. configure the local model proxy
 cp .env.example .env
-$EDITOR .env   # set ANTHROPIC_API_KEY=sk-ant-…
+$EDITOR .env   # set CODEX_PROXY_API_KEY for http://127.0.0.1:8317/v1
 
 # 4. build the workspace
 cargo build --workspace --release
@@ -68,6 +68,7 @@ bash scripts/dev-up.sh
 # 6. open the chat
 cargo run --release -p agentos-tui
 ```
+Quickstart uses the local Codex proxy at `http://127.0.0.1:8317/v1`. Anthropic is optional and selected only by an explicit provider/model or when no configured local default exists.
 
 Engine boots on port 49134. 62 Rust workers and one Python worker connect. The source declares 267 literal function registrations. The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
 
@@ -196,7 +197,7 @@ If the engine is offline or no workers are connected, the TUI shows a first-run 
 cargo build --workspace --release                                    # 62 Rust workers + CLI + TUI + HTTP adapter
 cargo test --workspace --release                                     # 1,330 Rust tests; 2 live-engine checks ignored by default
 uv run --no-project --with pytest python -m pytest workers/embedding/test_main.py -q  # 161 Python tests
-npm ci && npm run test:e2e                                           # live engine + workers; model credentials required for chat
+bun install && bun run test:e2e                                      # live engine + workers; model credentials required for chat
 ```
 
 ## § 11 · Versioning

@@ -10,13 +10,21 @@
 #
 # Env:
 #   III_URL                          (default: ws://localhost:49134)
-#   ANTHROPIC_API_KEY                required for llm-router
+#   CODEX_PROXY_API_KEY              local proxy credential (preferred)
+#   ANTHROPIC_API_KEY                optional cloud credential
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIDFILE="$ROOT/.agentos-dev.pids"
 RELEASE_DIR="$ROOT/target/release"
+
+if [[ -f "$ROOT/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$ROOT/.env"
+    set +a
+fi
 
 export III_URL="${III_URL:-ws://localhost:49134}"
 
@@ -50,8 +58,8 @@ if [[ ! -d "$RELEASE_DIR" ]]; then
     exit 1
 fi
 
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-    echo "warning: ANTHROPIC_API_KEY not set — llm-router will fall through to mocks"
+if [[ -z "${CODEX_PROXY_API_KEY:-}" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    echo "warning: no model provider credential is configured"
 fi
 
 > "$PIDFILE"
