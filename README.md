@@ -197,7 +197,7 @@ If the engine is offline or no workers are connected, the TUI shows a first-run 
 cargo build --workspace --release                                    # 62 Rust workers + CLI + TUI + HTTP adapter
 cargo test --workspace --release                                     # 1,330 Rust tests; 2 live-engine checks ignored by default
 uv run --no-project --with pytest python -m pytest workers/embedding/test_main.py -q  # 161 Python tests
-bun install && bun run test:e2e                                      # live engine + workers; model credentials required for chat
+bun install --frozen-lockfile && bun run test:e2e                       # live engine + workers; model credentials required for chat
 ```
 
 ## § 11 · Versioning
