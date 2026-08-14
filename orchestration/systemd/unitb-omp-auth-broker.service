@@ -1,0 +1,15 @@
+[Unit]
+Description=UnitB centralized OMP credential broker
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.bun/bin/omp auth-broker serve --bind=127.0.0.1:8765
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=default.target

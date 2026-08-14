@@ -19,6 +19,7 @@ unitb-iii-agentos/
 ├── workflows/                Pre-defined workflow YAMLs
 ├── plugin/                   Reusable agent/command/skill/hook bundles
 ├── config.yaml               iii engine boot config
+├── orchestration/            Deterministic Herdr + OMP fleet control plane
 └── .github/workflows/ci.yml  Build + test + e2e
 ```
 
@@ -117,6 +118,36 @@ These are **declarative config**, not workers:
 - `workflows/<name>.yaml` — pre-defined workflow definitions for the `workflow` worker.
 
 None ship as registered functions; they configure workers that do.
+
+## OMP fleet control plane
+
+`orchestration/` is independent of the iii worker runtime. It coordinates repository changes through four durable roles:
+
+```text
+Principal
+   │
+   ▼
+Main (read-only control plane)
+   │ assign exact contract + verified base SHA
+   ▼
+Team (single writer in branch-scoped worktree)
+   │ submit exact committed head + verification evidence
+   ▼
+Reviewer (read-only disposable worktree at exact head)
+   │ approved / changes_requested
+   ▼
+Main (principal-only merge handoff)
+```
+
+`FleetStore` persists commands, events, work-item transitions, path locks, messages, and agent bindings in SQLite. Command IDs are idempotency keys. Every operation authenticates through a per-identity token and a role-specific transition allowlist. The dispatcher is the only process that creates worktrees, launches OMP sessions, or mutates authoritative fleet state.
+
+Worker sessions run through the dedicated root-owned bubblewrap binary and AppArmor profile. The host filesystem is read-only by default; the principal's home and user runtime directory are hidden, then only read-only toolchain directories and the session-specific mounts are restored. A Team receives write mounts only for its assigned worktree, Git worktree metadata, object database, branch namespace, and isolated runtime. Reviewer receives no repository write mount. Both roles get a reset OMP home with no copied credentials, role extensions, a pane-bound lifecycle proxy, and one bearer token for the loopback credential proxy. That proxy exposes only the configured provider and credential slot from the host-only centralized broker and denies credential-management, usage, history, and stream endpoints. The generated OMP config binds every internal model role to the assigned model and enables auto-approval because privilege is bounded by the outer role, tool, credential, and mount policy rather than interactive prompts.
+
+Main and each Team have fixed model assignments. Reviewer is routed deterministically by the submitting Team to the opposite model family, preserving implementation-review independence without allowing the worker to choose its own model.
+
+Herdr owns terminal lifecycle and reports `working`, `blocked`, `idle`, and `done`. A narrow Unix-socket proxy binds lifecycle reports to the launched pane identity; agents cannot claim another pane. systemd keeps Herdr and the Dispatcher resident across failures. On dispatcher restart, `fleet.config.json` is reapplied without rotating identity tokens, then the SQLite ledger resumes in-flight work.
+
+The exact-head invariant is enforced twice: Team submission must equal the assigned branch HEAD, and Reviewer must review the same stored SHA. Approved work becomes `handoff_ready`; merge remains outside the fleet and reserved for the principal.
 
 ## Versioning
 

@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAL_OMP=${UNITB_REAL_OMP:-"$HOME/.bun/bin/omp"}
+ROLE=${UNITB_FLEET_ROLE:-main}
+
+if [[ "$ROLE" == "main" ]]; then
+  exec "$REAL_OMP" "$@"
+fi
+
+: "${UNITB_FLEET_ID:?}"
+: "${UNITB_FLEET_RUNTIME_ROOT:?}"
+: "${UNITB_FLEET_AGENT_RUNTIME:?}"
+: "${UNITB_FLEET_AGENT_HOME:?}"
+: "${UNITB_FLEET_WORKTREE:?}"
+: "${UNITB_FLEET_SOCKET_HOST:?}"
+: "${UNITB_FLEET_CONFIG:?}"
+: "${UNITB_FLEET_TOKEN_FILE:?}"
+: "${OMP_AUTH_BROKER_URL:?}"
+: "${PI_CODING_AGENT_DIR:?}"
+: "${HERDR_SOCKET_PATH:?}"
+: "${HERDR_PANE_ID:?}"
+
+HOST_HOME=$HOME
+auth_broker_token=$(<"$UNITB_FLEET_TOKEN_FILE")
+BWRAP=/usr/local/libexec/unitb-fleet/bwrap
+bwrap_args=(
+  --die-with-parent
+  --new-session
+  --unshare-user
+  --unshare-pid
+  --unshare-uts
+  --unshare-ipc
+  --share-net
+  --clearenv
+  --ro-bind / /
+  --dev-bind /dev /dev
+  --proc /proc
+  --tmpfs /tmp
+  --tmpfs "$HOST_HOME"
+  --dir "$UNITB_FLEET_AGENT_RUNTIME"
+  --bind "$UNITB_FLEET_AGENT_RUNTIME" "$UNITB_FLEET_AGENT_RUNTIME"
+  --ro-bind "$UNITB_FLEET_SOCKET_HOST" "$UNITB_FLEET_AGENT_RUNTIME/dispatcher.sock"
+  --chdir "$UNITB_FLEET_WORKTREE"
+  --setenv HOME "$UNITB_FLEET_AGENT_HOME"
+  --setenv USER "${USER:-wunitb}"
+  --setenv LOGNAME "${LOGNAME:-wunitb}"
+  --setenv PATH "$PATH"
+  --setenv TERM "${TERM:-xterm-256color}"
+  --setenv LANG "${LANG:-C.UTF-8}"
+  --setenv SSH_AUTH_SOCK ""
+  --setenv PI_CODING_AGENT_DIR "$PI_CODING_AGENT_DIR"
+  --setenv OMP_AUTH_BROKER_URL "$OMP_AUTH_BROKER_URL"
+  --setenv OMP_AUTH_BROKER_TOKEN "$auth_broker_token"
+  --setenv UNITB_FLEET_ROLE "$UNITB_FLEET_ROLE"
+  --setenv UNITB_FLEET_ID "$UNITB_FLEET_ID"
+  --setenv UNITB_FLEET_CONFIG "$UNITB_FLEET_CONFIG"
+  --setenv UNITB_FLEET_REPO_ROOT "$UNITB_FLEET_REPO_ROOT"
+  --setenv UNITB_FLEET_WORKTREE "$UNITB_FLEET_WORKTREE"
+  --setenv UNITB_FLEET_TOKEN_FILE "$UNITB_FLEET_TOKEN_FILE"
+  --setenv UNITB_FLEET_SOCKET "$UNITB_FLEET_AGENT_RUNTIME/dispatcher.sock"
+  --setenv HERDR_SOCKET_PATH "$HERDR_SOCKET_PATH"
+  --setenv HERDR_ENV "1"
+  --setenv HERDR_PANE_ID "$HERDR_PANE_ID"
+  --setenv GIT_AUTHOR_NAME "$GIT_AUTHOR_NAME"
+  --setenv GIT_AUTHOR_EMAIL "$GIT_AUTHOR_EMAIL"
+  --setenv GIT_COMMITTER_NAME "$GIT_COMMITTER_NAME"
+  --setenv GIT_COMMITTER_EMAIL "$GIT_COMMITTER_EMAIL"
+  --setenv RUSTUP_HOME "$HOST_HOME/.rustup"
+  --setenv CARGO_HOME "$UNITB_FLEET_AGENT_HOME/.cargo"
+)
+
+if [[ -d /run/user ]]; then
+  bwrap_args+=(--tmpfs /run/user)
+fi
+
+for tool_dir in \
+  "$HOST_HOME/.bun" \
+  "$HOST_HOME/.rustup" \
+  "$HOST_HOME/.cargo/bin" \
+  "$HOST_HOME/.local/bin"; do
+  if [[ -d "$tool_dir" ]]; then
+    bwrap_args+=(--dir "$tool_dir" --ro-bind "$tool_dir" "$tool_dir")
+  fi
+done
+
+
+: "${UNITB_GIT_COMMON:?}"
+: "${UNITB_GIT_WORKTREE_DIR:?}"
+bwrap_args+=(
+  --dir "$UNITB_FLEET_WORKTREE"
+  --dir "$UNITB_GIT_COMMON"
+  --ro-bind "$UNITB_GIT_COMMON" "$UNITB_GIT_COMMON"
+)
+
+if [[ "$ROLE" == "team" ]]; then
+  : "${UNITB_GIT_BRANCH_NAMESPACE:?}"
+  : "${UNITB_GIT_LOG_NAMESPACE:?}"
+  bwrap_args+=(
+    --bind "$UNITB_FLEET_WORKTREE" "$UNITB_FLEET_WORKTREE"
+    --bind "$UNITB_GIT_COMMON/objects" "$UNITB_GIT_COMMON/objects"
+    --bind "$UNITB_GIT_WORKTREE_DIR" "$UNITB_GIT_WORKTREE_DIR"
+    --bind "$UNITB_GIT_BRANCH_NAMESPACE" "$UNITB_GIT_BRANCH_NAMESPACE"
+    --bind "$UNITB_GIT_LOG_NAMESPACE" "$UNITB_GIT_LOG_NAMESPACE"
+  )
+else
+  bwrap_args+=(--ro-bind "$UNITB_FLEET_WORKTREE" "$UNITB_FLEET_WORKTREE")
+fi
+
+"$BWRAP" "${bwrap_args[@]}" -- "$REAL_OMP" "$@"

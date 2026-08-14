@@ -163,6 +163,7 @@ integrations/    MCP server configs (TOML, consumed by mcp-client)
 agents/          agent templates
 workflows/       workflow definitions (YAML)
 plugin/          reusable agent/command/skill/hook bundles
+orchestration/   deterministic Main → Team → Reviewer OMP fleet control plane
 config.yaml      iii v0.22.1 engine and configuration-worker boot list
 config/           committed values for the seven built-in iii workers
 website/         agentsos.sh — design.md aesthetic, three themes
@@ -170,7 +171,36 @@ website/         agentsos.sh — design.md aesthetic, three themes
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full primitive flow and worker manifest spec.
 
-## § 09 · TUI
+## § 09 · OMP fleet orchestration
+
+`orchestration/` runs a persistent Herdr-managed OMP fleet without giving worker sessions the host's global credentials or writable configuration. Main owns planning and handoff; each Team is the sole writer for an explicit path contract; Reviewer independently checks the submitted exact SHA.
+
+| Boundary | Enforcement |
+|---|---|
+| Durable coordination | SQLite command/event ledger behind a mode-0600 Unix socket |
+| Identity | Per-role bearer tokens and role-specific fleet tools |
+| Write isolation | Dedicated Git worktree plus bubblewrap mounts scoped to the Team branch |
+| Review isolation | Disposable read-only worktree pinned to the submitted exact SHA |
+| Credentials | Host-only OMP auth broker; each role sees only its assigned provider and credential slot through a scoped loopback proxy |
+| Agent autonomy | OMP `--auto-approve`; tool, credential, and filesystem boundaries enforce the role contract |
+| Recovery | systemd restarts the dispatcher and Herdr supervisor; SQLite restores authoritative state |
+| Merge authority | Main may hand off an approved exact head; only the principal may merge |
+
+Install the root-owned bubblewrap boundary, AppArmor rule, and persistent user services from the repository checkout. Then start OMP from the repository root; `.omp/extensions/` automatically turns that top-level session into the read-only Main control plane.
+
+```bash
+./orchestration/install.sh
+omp
+bun orchestration/dispatcher.ts health
+```
+
+The fleet is host-specific infrastructure. `orchestration/fleet.config.json` pins Main and each Team to one model and one centralized-broker credential slot, then routes Reviewer to the opposite model family for the submitting Team. Every launched worker gets a reset OMP home with no copied credentials, a scoped credential-proxy token, a generated config that binds all internal model roles to that session's assigned model, and auto-approval inside the already-confined boundary. The committed default routes require two OpenAI Codex credentials and two Anthropic credentials. Run the state-machine suite with:
+
+```bash
+npm run test:fleet
+```
+
+## § 10 · TUI
 
 Chat-first terminal UI lives in `crates/tui`:
 
@@ -190,7 +220,7 @@ cargo run --release -p agentos-tui
 
 If the engine is offline or no workers are connected, the TUI shows a first-run overlay with copy-paste commands instead of an empty list. Slash completions pull from `GET /iii/functions` so anything a worker registers is immediately discoverable.
 
-## § 10 · Build and test
+## § 11 · Build and test
 
 ```bash
 cargo build --workspace --release                                    # 62 Rust workers + CLI + TUI + HTTP adapter
@@ -199,7 +229,7 @@ uv run --no-project --with pytest python -m pytest workers/embedding/test_main.p
 npm ci && npm run test:e2e                                           # live engine + workers; model credentials required for chat
 ```
 
-## § 11 · Versioning
+## § 12 · Versioning
 
 | | version |
 |---|---|
@@ -209,7 +239,7 @@ npm ci && npm run test:e2e                                           # live engi
 | iii-sdk (Python) | pinned at `0.22.1` for the embedding worker |
 | agentos | `0.1.0` — first UnitB-owned release on iii v0.22.1 |
 
-## § 12 · Provenance and license
+## § 13 · Provenance and license
 
 This independent repository started from [`iii-experimental/agentos@caca2b4`](https://github.com/iii-experimental/agentos/commit/caca2b439ff62499f0d4a5af30c2601302238890) and was migrated to the `iii-hq/iii` v0.22.1 engine and SDK contracts. It is not a GitHub fork and carries its own history.
 
