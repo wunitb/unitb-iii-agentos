@@ -132,7 +132,7 @@ Eight jobs run on every PR:
 
 | job | gate |
 |---|---|
-| `rust build + test` | `cargo check --all-targets` + `cargo build --release` + `cargo test --workspace --release` (1,382 tests; 3 live-engine checks ignored by default) |
+| `rust build + test` | `cargo check --all-targets` + `cargo build --release` + `cargo test --workspace --release` (1,393 tests; 3 live-engine checks ignored by default) |
 | `python worker tests` | `pytest workers/embedding/test_main.py` |
 | `website build` | `npm ci` + `npm run build` in `website/` |
 | `installer shellcheck` | `shellcheck --severity=warning` over `scripts/install.sh`, `scripts/dev-up.sh`, `website/public/install.sh`, `scripts/install-iii.sh` |

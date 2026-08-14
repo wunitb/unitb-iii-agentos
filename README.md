@@ -10,7 +10,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-apache_2.0-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Apache 2.0"></a>
   <img src="https://img.shields.io/badge/workers-63-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Workers">
   <img src="https://img.shields.io/badge/functions-267-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Functions">
-  <img src="https://img.shields.io/badge/rust_tests-1382_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="1,382 Rust tests">
+  <img src="https://img.shields.io/badge/rust_tests-1393_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="1,393 Rust tests">
   <img src="https://img.shields.io/badge/iii--sdk-0.22.1-d96e2e?style=flat-square&labelColor=f2ede1" alt="iii-sdk 0.22.1">
 </p>
 
@@ -201,7 +201,7 @@ If the engine is offline or no workers are connected, the TUI shows a first-run 
 
 ```bash
 cargo build --workspace --release                                    # 62 Rust workers + CLI + TUI + HTTP adapter
-cargo test --workspace --release                                     # 1,382 Rust tests; 3 live-engine checks ignored by default
+cargo test --workspace --release                                     # 1,393 Rust tests; 3 live-engine checks ignored by default
 uv run --no-project --with pytest python -m pytest workers/embedding/test_main.py -q  # 161 Python tests
 bun install --frozen-lockfile && bun run test:e2e                    # live engine + workers; model credentials required for chat
 ```

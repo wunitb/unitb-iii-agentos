@@ -1018,6 +1018,43 @@ mod tests {
     }
 
     #[test]
+    fn codex_key_only_runtime_default_uses_codex_model() {
+        let resolution = resolve_runtime_default(|name| match name {
+            "CODEX_PROXY_API_KEY" => Some("local-secret".into()),
+            _ => None,
+        });
+
+        assert_eq!(
+            resolution.route,
+            Some(Route {
+                provider: "codex".into(),
+                model: "gpt-5.6-sol".into(),
+            })
+        );
+        assert_eq!(resolution.disabled_provider, None);
+    }
+
+    #[test]
+    fn no_codex_key_and_no_configured_default_leave_route_unset() {
+        let resolution = resolve_runtime_default(|_| None);
+
+        assert_eq!(resolution.route, None);
+        assert_eq!(resolution.disabled_provider, None);
+    }
+
+    #[test]
+    fn whitespace_codex_key_with_model_only_default_disables_codex() {
+        let resolution = resolve_runtime_default(|name| match name {
+            "CODEX_PROXY_API_KEY" => Some("   ".into()),
+            "AGENTOS_DEFAULT_MODEL" => Some("gpt-5.6-sol".into()),
+            _ => None,
+        });
+
+        assert_eq!(resolution.route, None);
+        assert_eq!(resolution.disabled_provider.as_deref(), Some("codex"));
+    }
+
+    #[test]
     fn configured_codex_is_the_default_route() {
         let resolution = resolve_runtime_default(|name| match name {
             "CODEX_PROXY_API_KEY" => Some("local-secret".into()),
@@ -1080,6 +1117,53 @@ mod tests {
     }
 
     #[test]
+    fn invalid_configured_default_provider_reports_specific_error() {
+        let state = test_state(Some(Route {
+            provider: "missing-provider".into(),
+            model: DEFAULT_CODEX_MODEL.into(),
+        }));
+        let error = resolve_complete_route(&state, &json!({})).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown default provider: missing-provider")
+        );
+    }
+
+    #[test]
+    fn invalid_configured_default_model_reports_specific_error() {
+        let state = test_state(Some(Route {
+            provider: "anthropic".into(),
+            model: "missing-model".into(),
+        }));
+        let error = resolve_complete_route(&state, &json!({})).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("model missing-model is not registered for provider anthropic")
+        );
+    }
+
+    #[test]
+    fn configured_default_sonnet_alias_resolves_to_registered_model() {
+        let state = test_state(Some(Route {
+            provider: "anthropic".into(),
+            model: "sonnet".into(),
+        }));
+        let route = resolve_complete_route(&state, &json!({})).unwrap();
+
+        assert_eq!(
+            route,
+            Route {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-20250514".into(),
+            }
+        );
+    }
+
+    #[test]
     fn explicit_model_resolves_to_codex_owner() {
         let state = test_state(Some(Route {
             provider: "codex".into(),
@@ -1103,10 +1187,82 @@ mod tests {
     }
 
     #[test]
+    fn explicit_unknown_provider_reports_specific_error() {
+        let state = test_state(None);
+        let error = resolve_route(
+            &state,
+            &json!({ "provider": "missing-provider", "model": "gpt-4o" }),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown provider: missing-provider")
+        );
+    }
+
+    #[test]
+    fn explicit_provider_model_mismatch_reports_specific_error() {
+        let state = test_state(None);
+        let error = resolve_route(
+            &state,
+            &json!({ "provider": "anthropic", "model": "gpt-4o" }),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("model gpt-4o is not registered for provider anthropic")
+        );
+    }
+
+    #[test]
+    fn explicit_provider_without_model_reports_specific_error() {
+        let state = test_state(None);
+        let error = resolve_route(&state, &json!({ "provider": "anthropic" })).unwrap_err();
+
+        assert!(error.to_string().contains("provider requires model"));
+    }
+
+    #[test]
     fn unknown_explicit_model_is_rejected() {
         let state = test_state(None);
         let error = resolve_route(&state, &json!({ "model": "not-a-model" })).unwrap_err();
         assert!(error.to_string().contains("unknown model"));
+    }
+
+    #[tokio::test]
+    async fn llm_route_treats_agentos_default_as_absent() {
+        let state = Arc::new(test_state(Some(Route {
+            provider: "codex".into(),
+            model: "gpt-5.6-sol".into(),
+        })));
+        let route = route_handler(state, json!({ "model": "agentos-default" }))
+            .await
+            .unwrap();
+
+        assert_eq!(route["provider"], "codex");
+        assert_eq!(route["model"], "gpt-5.6-sol");
+        assert_eq!(route["complexity"], 0);
+    }
+
+    #[tokio::test]
+    async fn llm_route_uses_messages_for_automatic_complexity() {
+        let content = format!("{} analyze this function ```code```", "x".repeat(600));
+        let route = route_handler(
+            Arc::new(test_state(None)),
+            json!({
+                "messages": [{"role": "user", "content": content}],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(route["provider"], "anthropic");
+        assert_eq!(route["model"], "claude-opus-4-20250514");
+        assert_eq!(route["complexity"], 41);
     }
 
     #[tokio::test]
