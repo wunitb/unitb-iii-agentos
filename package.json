@@ -7,6 +7,7 @@
     "test:e2e": "AGENTOS_E2E=1 vitest --run --config vitest.e2e.config.ts",
     "test:e2e:smoke": "AGENTOS_E2E=1 vitest --run --config vitest.e2e.config.ts --testNamePattern=\"health|chat_completions\"",
     "test:examples": "vitest --run examples/shared.test.ts",
+    "test:scripts": "vitest --run scripts/dev-up.test.ts",
     "typecheck:examples": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck examples/*.ts"
   },
   "dependencies": {

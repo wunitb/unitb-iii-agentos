@@ -75,6 +75,11 @@ if [[ -e "$env_file" || -L "$env_file" ]]; then
         esac
         name="${env_line%%=*}"
         value="${env_line#*=}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        case "$value" in
+            '"'*'"' | "'"*"'") value="${value:1:${#value}-2}" ;;
+        esac
         if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
             echo "error: invalid dotenv variable name on line $line_number" >&2
             exit 1
@@ -141,7 +146,7 @@ if [[ -z "${CODEX_PROXY_API_KEY:-}" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
     echo "warning: no model provider credential is configured"
 fi
 
-> "$PIDFILE"
+: > "$PIDFILE"
 spawned=0
 for bin in "$RELEASE_DIR"/agentos-*; do
     name="$(basename "$bin")"

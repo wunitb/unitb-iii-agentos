@@ -178,23 +178,33 @@ fn default_providers() -> Vec<(
     ]
 }
 
-fn runtime_default_route<F>(get_env: F) -> Option<Route>
+struct RuntimeDefaultResolution {
+    route: Option<Route>,
+    disabled_provider: Option<String>,
+}
+
+fn resolve_runtime_default<F>(get_env: F) -> RuntimeDefaultResolution
 where
     F: Fn(&str) -> Option<String>,
 {
-    let key = get_env("CODEX_PROXY_API_KEY")?;
-    if key.trim().is_empty() {
-        return None;
+    let configured = |name: &str| get_env(name).filter(|value| !value.trim().is_empty());
+    let provider = configured("AGENTOS_DEFAULT_PROVIDER");
+
+    if configured("CODEX_PROXY_API_KEY").is_none() {
+        return RuntimeDefaultResolution {
+            route: None,
+            disabled_provider: provider,
+        };
     }
 
-    Some(Route {
-        provider: get_env("AGENTOS_DEFAULT_PROVIDER")
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| CODEX_PROVIDER.to_string()),
-        model: get_env("AGENTOS_DEFAULT_MODEL")
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_CODEX_MODEL.to_string()),
-    })
+    RuntimeDefaultResolution {
+        route: Some(Route {
+            provider: provider.unwrap_or_else(|| CODEX_PROVIDER.to_string()),
+            model: configured("AGENTOS_DEFAULT_MODEL")
+                .unwrap_or_else(|| DEFAULT_CODEX_MODEL.to_string()),
+        }),
+        disabled_provider: None,
+    }
 }
 
 fn score_complexity(messages: &[Value], tools: &[Value]) -> u32 {
@@ -601,11 +611,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
     let iii = register_worker(&ws_url, InitOptions::default());
 
-    let default_route = runtime_default_route(|name| std::env::var(name).ok());
+    let default_resolution = resolve_runtime_default(|name| std::env::var(name).ok());
+    if let Some(provider) = &default_resolution.disabled_provider {
+        tracing::warn!(
+            provider,
+            "configured default provider disabled because CODEX_PROXY_API_KEY is empty; requests will use legacy routing"
+        );
+    }
     let state = Arc::new(RouterState {
         usage: DashMap::new(),
         providers: DashMap::new(),
-        default_route,
+        default_route: default_resolution.route,
     });
 
     for (name, base_url, env_key, driver, models) in default_providers() {
@@ -1001,7 +1017,7 @@ mod tests {
 
     #[test]
     fn configured_codex_is_the_default_route() {
-        let route = runtime_default_route(|name| match name {
+        let resolution = resolve_runtime_default(|name| match name {
             "CODEX_PROXY_API_KEY" => Some("local-secret".into()),
             "AGENTOS_DEFAULT_PROVIDER" => Some("codex".into()),
             "AGENTOS_DEFAULT_MODEL" => Some("gpt-5.6-sol".into()),
@@ -1009,23 +1025,36 @@ mod tests {
         });
 
         assert_eq!(
-            route,
+            resolution.route,
             Some(Route {
                 provider: "codex".into(),
                 model: "gpt-5.6-sol".into(),
             })
         );
+        assert_eq!(resolution.disabled_provider, None);
     }
 
     #[test]
     fn missing_codex_key_disables_the_local_default() {
-        let route = runtime_default_route(|name| match name {
+        let resolution = resolve_runtime_default(|name| match name {
+            "AGENTOS_DEFAULT_MODEL" => Some("gpt-5.6-sol".into()),
+            _ => None,
+        });
+
+        assert_eq!(resolution.route, None);
+        assert_eq!(resolution.disabled_provider, None);
+    }
+
+    #[test]
+    fn configured_default_without_codex_key_reports_disablement() {
+        let resolution = resolve_runtime_default(|name| match name {
             "AGENTOS_DEFAULT_PROVIDER" => Some("codex".into()),
             "AGENTOS_DEFAULT_MODEL" => Some("gpt-5.6-sol".into()),
             _ => None,
         });
 
-        assert_eq!(route, None);
+        assert_eq!(resolution.route, None);
+        assert_eq!(resolution.disabled_provider.as_deref(), Some("codex"));
     }
 
     fn test_state(default_route: Option<Route>) -> RouterState {
