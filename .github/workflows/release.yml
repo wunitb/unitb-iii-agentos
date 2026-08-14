@@ -1,0 +1,102 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}-${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            os: linux
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            os: linux
+            arch: aarch64
+          - runner: macos-15-intel
+            os: darwin
+            arch: x86_64
+          - runner: macos-15
+            os: darwin
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build runtime
+        run: cargo build --workspace --release --locked
+
+      - name: stage bundle
+        env:
+          VERSION: ${{ github.ref_name }}
+          TARGET: ${{ matrix.arch }}-${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          ASSET="agentos-${VERSION#v}-$TARGET"
+          STAGE="dist/$ASSET"
+          mkdir -p "$STAGE/bin" "$STAGE/runtime/target/release"
+          cp target/release/agentos "$STAGE/bin/agentos"
+          cp target/release/agentos-tui "$STAGE/bin/agentos-tui"
+          cp config.yaml "$STAGE/runtime/config.yaml"
+          cp -R config agents hands identity integrations plugin workflows "$STAGE/runtime/"
+          while IFS= read -r manifest; do
+            destination="$STAGE/runtime/$(dirname "$manifest")"
+            mkdir -p "$destination"
+            cp "$manifest" "$destination/iii.worker.yaml"
+            packaged_binary="agentos-$(basename "$(dirname "$manifest")")"
+            cargo_toml="$(dirname "$manifest")/Cargo.toml"
+            if [ -f "$cargo_toml" ]; then
+              source_binary="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^name *=/{gsub(/^name *= *"|"$/,"");print;exit}' "$cargo_toml")"
+              cp "target/release/$source_binary" "$STAGE/runtime/target/release/$packaged_binary"
+            elif [ "$packaged_binary" = "agentos-embedding" ]; then
+              cp workers/embedding/{main.py,pyproject.toml,uv.lock} "$destination/"
+            else
+              echo "worker has no package definition: $packaged_binary" >&2
+              exit 1
+            fi
+          done < <(find workers -name iii.worker.yaml -type f | sort)
+          tar -czf "dist/$ASSET.tar.gz" -C "$STAGE" .
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256")
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agentos-${{ matrix.arch }}-${{ matrix.os }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

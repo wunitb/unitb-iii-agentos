@@ -1,0 +1,8 @@
+iii: v1
+scripts:
+  install: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo build --release'
+  start: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo run --release'
+name: council
+runtime:
+  kind: rust
+description: Multi-agent decision-making — proposals, voting, override, hash-chained activity log

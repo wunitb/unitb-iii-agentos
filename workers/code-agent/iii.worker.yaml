@@ -1,0 +1,8 @@
+iii: v1
+scripts:
+  install: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo build --release'
+  start: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo run --release'
+name: code-agent
+runtime:
+  kind: rust
+description: Detect and execute agent-written code — regex detect + sandboxed JS execution via QuickJS

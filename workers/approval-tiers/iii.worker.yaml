@@ -1,0 +1,8 @@
+iii: v1
+scripts:
+  install: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo build --release'
+  start: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo run --release'
+name: approval-tiers
+runtime:
+  kind: rust
+description: "Tiered approval routing — auto/async/sync classification by function capability"

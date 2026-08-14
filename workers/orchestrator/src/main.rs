@@ -1,0 +1,731 @@
+use iii_sdk::errors::Error;
+use iii_sdk::{
+    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Plan {
+    id: String,
+    description: String,
+    complexity: String,
+    agents: Vec<String>,
+    reactions: Vec<Reaction>,
+    #[serde(rename = "createdAt")]
+    created_at: i64,
+    status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Reaction {
+    from: String,
+    to: String,
+    action: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Run {
+    #[serde(rename = "planId")]
+    plan_id: String,
+    #[serde(rename = "rootId")]
+    root_id: String,
+    #[serde(rename = "startedAt")]
+    started_at: i64,
+    status: String,
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn strip_code_fences(s: &str) -> String {
+    let trimmed = s.trim();
+    let trimmed = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed);
+    let trimmed = trimmed.strip_suffix("```").unwrap_or(trimmed);
+    trimmed.trim().to_string()
+}
+
+/// Validate an id against the same rules as `task-decomposer/types.rs:53-75`:
+/// alphanumeric plus `_-:.`, max 256 chars, non-empty. Filtering or
+/// truncating silently aliases distinct inputs onto the same workspace
+/// scope/key, which lets one request read or overwrite another plan's data,
+/// so we reject instead.
+fn validate_id(s: &str) -> Result<String, Error> {
+    if s.is_empty() {
+        return Err(Error::Handler("id must not be empty".into()));
+    }
+    if s.len() > 256 {
+        return Err(Error::Handler("id exceeds 256 characters".into()));
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))
+    {
+        return Err(Error::Handler(format!(
+            "id contains invalid characters: {s}"
+        )));
+    }
+    Ok(s.to_string())
+}
+
+async fn state_get(iii: &IIIClient, scope: &str, key: &str) -> Result<Value, Error> {
+    iii.trigger(TriggerRequest {
+        function_id: "state::get".into(),
+        payload: json!({ "scope": scope, "key": key }),
+        action: None,
+        timeout_ms: None,
+    })
+    .await
+    .map_err(|e| Error::Handler(e.to_string()))
+}
+
+async fn state_set(iii: &IIIClient, scope: &str, key: &str, value: Value) -> Result<Value, Error> {
+    iii.trigger(TriggerRequest {
+        function_id: "state::set".into(),
+        payload: json!({ "scope": scope, "key": key, "value": value }),
+        action: None,
+        timeout_ms: None,
+    })
+    .await
+    .map_err(|e| Error::Handler(e.to_string()))
+}
+
+async fn state_list(iii: &IIIClient, scope: &str) -> Vec<Value> {
+    iii.trigger(TriggerRequest {
+        function_id: "state::list".into(),
+        payload: json!({ "scope": scope }),
+        action: None,
+        timeout_ms: None,
+    })
+    .await
+    .ok()
+    .and_then(|v| v.as_array().cloned())
+    .unwrap_or_default()
+}
+
+async fn plan_handler(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    let body = input.get("body").cloned().unwrap_or(input.clone());
+    let description = body["description"]
+        .as_str()
+        .ok_or_else(|| Error::Handler("description is required".into()))?
+        .to_string();
+    let model = body["model"].as_str().unwrap_or("default").to_string();
+
+    let llm_result = iii
+        .trigger(TriggerRequest {
+            function_id: "llm::chat".into(),
+            payload: json!({
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Analyze the following feature request. Return JSON: { \"complexity\": \"low\"|\"medium\"|\"high\", \"agents\": [\"<template-name>\", ...], \"reactions\": [{ \"from\": \"<lifecycle-state>\", \"to\": \"<lifecycle-state>\", \"action\": \"send_to_agent\"|\"notify\"|\"escalate\", \"payload\": {} }], \"summary\": \"...\" }",
+                    },
+                    { "role": "user", "content": description },
+                ],
+            }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .unwrap_or(Value::Null);
+
+    let content = llm_result
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("{}");
+    let parsed: Value = serde_json::from_str(&strip_code_fences(content)).unwrap_or_else(|_| {
+        tracing::warn!("Failed to parse LLM plan");
+        json!({
+            "complexity": "medium",
+            "agents": ["general"],
+            "reactions": [],
+            "summary": description,
+        })
+    });
+
+    let plan_id = uuid::Uuid::new_v4().to_string();
+    let plan = Plan {
+        id: plan_id.clone(),
+        description: description.clone(),
+        complexity: parsed["complexity"]
+            .as_str()
+            .unwrap_or("medium")
+            .to_string(),
+        agents: parsed["agents"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["general".to_string()]),
+        reactions: parsed["reactions"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        created_at: now_ms(),
+        status: "planned".into(),
+    };
+
+    let plan_value = serde_json::to_value(&plan).map_err(|e| Error::Handler(e.to_string()))?;
+    state_set(iii, "orchestrator_plans", &plan_id, plan_value).await?;
+
+    tracing::info!(plan_id = %plan_id, complexity = %plan.complexity, "Plan created");
+    Ok(serde_json::to_value(&plan).unwrap())
+}
+
+async fn execute_handler(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    let body = input.get("body").cloned().unwrap_or(input.clone());
+    let plan_id = body["planId"]
+        .as_str()
+        .ok_or_else(|| Error::Handler("planId is required".into()))?
+        .to_string();
+
+    let plan_val = state_get(iii, "orchestrator_plans", &plan_id).await?;
+    if plan_val.is_null() {
+        return Err(Error::Handler("Plan not found".into()));
+    }
+    let mut plan: Plan = serde_json::from_value(plan_val.clone())
+        .map_err(|e| Error::Handler(format!("plan decode: {e}")))?;
+    if plan.status != "planned" {
+        return Err(Error::Handler(format!(
+            "Cannot execute plan in status: {}",
+            plan.status
+        )));
+    }
+
+    let decompose = iii
+        .trigger(TriggerRequest {
+            function_id: "task::decompose".into(),
+            payload: json!({ "description": plan.description }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|e| Error::Handler(format!("task::decompose failed: {e}")))?;
+
+    let root_id = decompose["rootId"]
+        .as_str()
+        .ok_or_else(|| Error::Handler("Task decomposition failed".into()))?
+        .to_string();
+
+    let run = Run {
+        plan_id: plan_id.clone(),
+        root_id: root_id.clone(),
+        started_at: now_ms(),
+        status: "running".into(),
+    };
+
+    state_set(
+        iii,
+        "orchestrator_runs",
+        &plan_id,
+        serde_json::to_value(&run).unwrap(),
+    )
+    .await?;
+
+    for reaction in &plan.reactions {
+        let reaction_id = uuid::Uuid::new_v4().to_string();
+        let _ = state_set(
+            iii,
+            "lifecycle_reactions",
+            &reaction_id,
+            json!({
+                "id": reaction_id,
+                "from": reaction.from,
+                "to": reaction.to,
+                "action": reaction.action,
+                "payload": reaction.payload,
+                "escalateAfter": 3,
+                "attempts": 0,
+            }),
+        )
+        .await;
+    }
+
+    plan.status = "executing".into();
+    state_set(
+        iii,
+        "orchestrator_plans",
+        &plan_id,
+        serde_json::to_value(&plan).unwrap(),
+    )
+    .await?;
+
+    let workspace_scope = format!("workspace:{plan_id}");
+    let _ = state_set(
+        iii,
+        &workspace_scope,
+        "_meta",
+        json!({
+            "key": "_meta",
+            "value": { "planId": plan_id, "rootId": root_id, "description": plan.description },
+            "writtenBy": "orchestrator",
+            "writtenAt": now_ms(),
+        }),
+    )
+    .await;
+
+    // task::spawn_workers must succeed or the run is wedged in `executing`
+    // with no workers. On failure, roll the plan + run state back to the
+    // pre-execute snapshot so the caller can retry idempotently.
+    let spawn_result = match iii
+        .trigger(TriggerRequest {
+            function_id: "task::spawn_workers".into(),
+            payload: json!({ "rootId": root_id }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            plan.status = "planned".into();
+            let _ = state_set(
+                iii,
+                "orchestrator_plans",
+                &plan_id,
+                serde_json::to_value(&plan).unwrap(),
+            )
+            .await;
+            let mut failed_run = run.clone();
+            failed_run.status = "failed".into();
+            let _ = state_set(
+                iii,
+                "orchestrator_runs",
+                &plan_id,
+                serde_json::to_value(&failed_run).unwrap(),
+            )
+            .await;
+            return Err(Error::Handler(format!("task::spawn_workers failed: {e}")));
+        }
+    };
+
+    let spawned = spawn_result
+        .get("spawned")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+
+    Ok(json!({
+        "planId": plan_id,
+        "rootId": root_id,
+        "workspaceScope": workspace_scope,
+        "spawned": spawned,
+    }))
+}
+
+async fn status_handler(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    let body = input.get("body").cloned().unwrap_or(input.clone());
+    let plan_id = body["planId"].as_str().map(String::from);
+
+    let Some(plan_id) = plan_id else {
+        let plans = state_list(iii, "orchestrator_plans").await;
+        let summaries: Vec<Value> = plans
+            .into_iter()
+            .map(|p| {
+                let p = p.get("value").cloned().unwrap_or(p);
+                json!({
+                    "id": p.get("id"),
+                    "status": p.get("status"),
+                    "complexity": p.get("complexity"),
+                    "createdAt": p.get("createdAt"),
+                })
+            })
+            .collect();
+        let count = summaries.len();
+        return Ok(json!({ "count": count, "plans": summaries }));
+    };
+
+    let plan = state_get(iii, "orchestrator_plans", &plan_id).await?;
+    if plan.is_null() {
+        return Err(Error::Handler("Plan not found".into()));
+    }
+
+    let run = state_get(iii, "orchestrator_runs", &plan_id)
+        .await
+        .unwrap_or(Value::Null);
+    if run.is_null() {
+        return Ok(json!({ "plan": plan, "progress": null }));
+    }
+
+    let root_id = run.get("rootId").and_then(|v| v.as_str()).unwrap_or("");
+    let task_scope = format!("tasks:{root_id}");
+    let task_entries = state_list(iii, &task_scope).await;
+    let tasks: Vec<Value> = task_entries
+        .into_iter()
+        .map(|e| e.get("value").cloned().unwrap_or(e))
+        .collect();
+    let total = tasks.len();
+    let completed = tasks
+        .iter()
+        .filter(|t| t.get("status").and_then(|v| v.as_str()) == Some("complete"))
+        .count();
+    let failed = tasks
+        .iter()
+        .filter(|t| t.get("status").and_then(|v| v.as_str()) == Some("failed"))
+        .count();
+    let percentage = if total > 0 {
+        (completed as f64 / total as f64 * 100.0).round() as i64
+    } else {
+        0
+    };
+
+    Ok(json!({
+        "plan": plan,
+        "progress": {
+            "rootId": root_id,
+            "total": total,
+            "completed": completed,
+            "failed": failed,
+            "percentage": percentage,
+            "runStatus": run.get("status"),
+        },
+    }))
+}
+
+async fn intervene_handler(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    let body = input.get("body").cloned().unwrap_or(input.clone());
+    let plan_id = body["planId"]
+        .as_str()
+        .ok_or_else(|| Error::Handler("planId and action are required".into()))?
+        .to_string();
+    let action = body["action"]
+        .as_str()
+        .ok_or_else(|| Error::Handler("planId and action are required".into()))?
+        .to_string();
+    let redirect_to = body["redirectTo"].as_str().map(String::from);
+
+    let valid = ["pause", "resume", "cancel", "redirect"];
+    if !valid.contains(&action.as_str()) {
+        return Err(Error::Handler(format!(
+            "Invalid action: {action}. Must be one of: pause, resume, cancel, redirect"
+        )));
+    }
+
+    let plan_val = state_get(iii, "orchestrator_plans", &plan_id).await?;
+    if plan_val.is_null() {
+        return Err(Error::Handler("Plan not found".into()));
+    }
+    let mut plan: Plan = serde_json::from_value(plan_val)
+        .map_err(|e| Error::Handler(format!("plan decode: {e}")))?;
+
+    let run_val = state_get(iii, "orchestrator_runs", &plan_id)
+        .await
+        .unwrap_or(Value::Null);
+    let mut run: Option<Run> = if run_val.is_null() {
+        None
+    } else {
+        serde_json::from_value(run_val).ok()
+    };
+
+    match action.as_str() {
+        "pause" => {
+            plan.status = "paused".into();
+            if let Some(r) = run.as_mut() {
+                r.status = "paused".into();
+                let _ = state_set(
+                    iii,
+                    "orchestrator_runs",
+                    &plan_id,
+                    serde_json::to_value(r).unwrap(),
+                )
+                .await;
+            }
+        }
+        "resume" => {
+            plan.status = "executing".into();
+            if let Some(r) = run.as_mut() {
+                r.status = "running".into();
+                let root_id = r.root_id.clone();
+                state_set(
+                    iii,
+                    "orchestrator_runs",
+                    &plan_id,
+                    serde_json::to_value(&*r).unwrap(),
+                )
+                .await?;
+                // Await the spawn so resume only reports success when workers
+                // actually started. If it fails, revert plan + run before
+                // returning the error to the caller.
+                if let Err(e) = iii
+                    .trigger(TriggerRequest {
+                        function_id: "task::spawn_workers".into(),
+                        payload: json!({ "rootId": root_id }),
+                        action: None,
+                        timeout_ms: None,
+                    })
+                    .await
+                {
+                    plan.status = "paused".into();
+                    r.status = "paused".into();
+                    let _ = state_set(
+                        iii,
+                        "orchestrator_runs",
+                        &plan_id,
+                        serde_json::to_value(&*r).unwrap(),
+                    )
+                    .await;
+                    let _ = state_set(
+                        iii,
+                        "orchestrator_plans",
+                        &plan_id,
+                        serde_json::to_value(&plan).unwrap(),
+                    )
+                    .await;
+                    return Err(Error::Handler(format!(
+                        "resume task::spawn_workers failed: {e}"
+                    )));
+                }
+            }
+        }
+        "cancel" => {
+            plan.status = "cancelled".into();
+            if let Some(r) = run.as_mut() {
+                r.status = "cancelled".into();
+                let _ = state_set(
+                    iii,
+                    "orchestrator_runs",
+                    &plan_id,
+                    serde_json::to_value(r).unwrap(),
+                )
+                .await;
+            }
+        }
+        "redirect" => {
+            let new_desc = redirect_to.ok_or_else(|| {
+                Error::Handler("redirectTo is required for redirect action".into())
+            })?;
+            plan.description = new_desc;
+            plan.status = "planned".into();
+            if let Some(r) = run.as_mut() {
+                r.status = "cancelled".into();
+                let _ = state_set(
+                    iii,
+                    "orchestrator_runs",
+                    &plan_id,
+                    serde_json::to_value(r).unwrap(),
+                )
+                .await;
+            }
+        }
+        _ => unreachable!(),
+    }
+
+    state_set(
+        iii,
+        "orchestrator_plans",
+        &plan_id,
+        serde_json::to_value(&plan).unwrap(),
+    )
+    .await?;
+
+    Ok(json!({
+        "planId": plan_id,
+        "action": action,
+        "newStatus": plan.status,
+    }))
+}
+
+async fn workspace_write_handler(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    let body = input.get("body").cloned().unwrap_or(input.clone());
+    let plan_id = body["planId"]
+        .as_str()
+        .ok_or_else(|| Error::Handler("planId and key are required".into()))?
+        .to_string();
+    let key = body["key"]
+        .as_str()
+        .ok_or_else(|| Error::Handler("planId and key are required".into()))?
+        .to_string();
+    let value = body.get("value").cloned().unwrap_or(Value::Null);
+    let agent_id = body["agentId"].as_str().map(String::from);
+
+    let safe_plan_id = validate_id(&plan_id)?;
+    let safe_key = validate_id(&key)?;
+    let written_by = match agent_id.as_deref() {
+        Some(a) => validate_id(a)?,
+        None => "system".to_string(),
+    };
+
+    let entry = json!({
+        "key": &safe_key,
+        "value": value,
+        "writtenBy": written_by,
+        "writtenAt": now_ms(),
+    });
+
+    let scope = format!("workspace:{safe_plan_id}");
+    state_set(iii, &scope, &safe_key, entry).await?;
+
+    Ok(json!({ "written": true, "key": safe_key, "planId": safe_plan_id }))
+}
+
+async fn workspace_read_handler(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    let body = input.get("body").cloned().unwrap_or(input.clone());
+    let plan_id = body["planId"]
+        .as_str()
+        .ok_or_else(|| Error::Handler("planId is required".into()))?
+        .to_string();
+    let key = body["key"].as_str().map(String::from);
+
+    let safe_plan_id = validate_id(&plan_id)?;
+    let scope = format!("workspace:{safe_plan_id}");
+
+    if let Some(k) = key {
+        let safe_key = validate_id(&k)?;
+        let entry = state_get(iii, &scope, &safe_key).await?;
+        return Ok(entry);
+    }
+
+    let entries = state_list(iii, &scope).await;
+    let count = entries.len();
+    let mapped: Vec<Value> = entries
+        .into_iter()
+        .map(|e| e.get("value").cloned().unwrap_or(e))
+        .collect();
+
+    Ok(json!({
+        "planId": safe_plan_id,
+        "count": count,
+        "entries": mapped,
+    }))
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+
+    let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
+    let iii = register_worker(&ws_url, InitOptions::default());
+
+    let iii_clone = iii.clone();
+    iii.register_function(
+        "orchestrator::plan",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_clone.clone();
+            async move { plan_handler(&iii, input).await }
+        })
+        .description(
+            "Analyze a feature request and create an execution plan with agents and reactions",
+        ),
+    );
+
+    let iii_clone = iii.clone();
+    iii.register_function(
+        "orchestrator::execute",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_clone.clone();
+            async move { execute_handler(&iii, input).await }
+        })
+        .description("Decompose tasks, register lifecycle reactions, and spawn workers for a plan"),
+    );
+
+    let iii_clone = iii.clone();
+    iii.register_function(
+        "orchestrator::status",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_clone.clone();
+            async move { status_handler(&iii, input).await }
+        })
+        .description("Get plan progress or list all plans"),
+    );
+
+    let iii_clone = iii.clone();
+    iii.register_function(
+        "orchestrator::intervene",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_clone.clone();
+            async move { intervene_handler(&iii, input).await }
+        })
+        .description("Intervene in plan execution: pause, resume, cancel, or redirect"),
+    );
+
+    let iii_clone = iii.clone();
+    iii.register_function(
+        "orchestrator::workspace_write",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_clone.clone();
+            async move { workspace_write_handler(&iii, input).await }
+        })
+        .description("Write to shared plan workspace"),
+    );
+
+    let iii_clone = iii.clone();
+    iii.register_function(
+        "orchestrator::workspace_read",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_clone.clone();
+            async move { workspace_read_handler(&iii, input).await }
+        })
+        .description("Read from shared plan workspace"),
+    );
+
+    let triggers = [
+        ("orchestrator::plan", "POST", "api/orchestrator/plan"),
+        ("orchestrator::execute", "POST", "api/orchestrator/execute"),
+        ("orchestrator::status", "POST", "api/orchestrator/status"),
+        (
+            "orchestrator::intervene",
+            "POST",
+            "api/orchestrator/intervene",
+        ),
+        (
+            "orchestrator::workspace_write",
+            "POST",
+            "api/orchestrator/workspace",
+        ),
+        (
+            "orchestrator::workspace_read",
+            "GET",
+            "api/orchestrator/workspace",
+        ),
+    ];
+    for (fid, method, path) in triggers {
+        agentos_http_adapter::register_http_trigger(
+            &iii,
+            fid.to_string(),
+            json!({ "http_method": method, "api_path": path }),
+            None,
+        )?;
+    }
+
+    tracing::info!("orchestrator worker started");
+    tokio::signal::ctrl_c().await?;
+    iii.shutdown_async().await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_json_fence() {
+        assert_eq!(strip_code_fences("```json\n{\"a\":1}\n```"), "{\"a\":1}");
+        assert_eq!(strip_code_fences("```\nx\n```"), "x");
+        assert_eq!(strip_code_fences("plain"), "plain");
+    }
+
+    #[test]
+    fn validate_id_rejects_unsafe_chars() {
+        assert!(validate_id("plan/../etc").is_err());
+        assert!(validate_id("plan with space").is_err());
+        assert!(validate_id("").is_err());
+        assert!(validate_id(&"x".repeat(257)).is_err());
+        assert_eq!(
+            validate_id("workspace:abc-123").unwrap(),
+            "workspace:abc-123"
+        );
+        assert_eq!(validate_id("plan_1.0").unwrap(), "plan_1.0");
+    }
+}

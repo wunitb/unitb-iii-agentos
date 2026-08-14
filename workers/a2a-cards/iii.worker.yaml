@@ -1,0 +1,8 @@
+iii: v1
+scripts:
+  install: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo build --release'
+  start: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo run --release'
+name: a2a-cards
+runtime:
+  kind: rust
+description: A2A agent card discovery — generate, list, and serve agent cards for the .well-known/agent.json protocol

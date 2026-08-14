@@ -1,0 +1,8 @@
+iii: v1
+scripts:
+  install: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo build --release'
+  start: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo run --release'
+name: channel-slack
+runtime:
+  kind: rust
+description: "Slack channel adapter — send/receive via Slack Web API + Events API"

@@ -1,0 +1,8 @@
+iii: v1
+scripts:
+  install: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo build --release'
+  start: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo run --release'
+name: a2a
+runtime:
+  kind: rust
+description: Agent-to-agent messaging — JSON-RPC tasks/send/get/cancel, agent card, discovery

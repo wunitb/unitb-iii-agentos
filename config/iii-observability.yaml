@@ -1,0 +1,21 @@
+id: iii-observability
+name: Observability
+description: OpenTelemetry settings — trace/metric/log exporters, sampling (ratio, per-operation rules, rate limits), in-memory store limits and retention, alert rules, span-collapse rules, and the engine log level/format.
+value:
+  alerts:
+  - action:
+      type: log
+    cooldown_seconds: 60
+    enabled: true
+    metric: iii.invocations.error
+    name: high-error-rate
+    operator: greaterthan
+    threshold: 10.0
+    window_seconds: 60
+  enabled: true
+  exporter: memory
+  logs_console_output: true
+  logs_enabled: true
+  logs_sampling_ratio: 1.0
+  metrics_enabled: true
+  service_name: agentos

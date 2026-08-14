@@ -1,0 +1,8 @@
+iii: v1
+scripts:
+  install: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo build --release'
+  start: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo run --release'
+name: channel-reddit
+runtime:
+  kind: rust
+description: "Reddit channel adapter — handle webhook, reply via Reddit OAuth REST API"

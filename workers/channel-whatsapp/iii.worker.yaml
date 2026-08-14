@@ -1,0 +1,8 @@
+iii: v1
+scripts:
+  install: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo build --release'
+  start: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo run --release'
+name: channel-whatsapp
+runtime:
+  kind: rust
+description: "WhatsApp Business API channel adapter — inbound webhook + outbound Graph API"

@@ -1,0 +1,8 @@
+iii: v1
+scripts:
+  install: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo build --release'
+  start: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo run --release'
+name: rate-limiter
+runtime:
+  kind: rust
+description: GCRA token-bucket rate limiter — per-IP, per-agent, per-function, plus concurrency slots

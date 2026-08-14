@@ -1,0 +1,8 @@
+iii: v1
+scripts:
+  install: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo build --release'
+  start: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo run --release'
+name: security-zeroize
+runtime:
+  kind: rust
+description: Secret zeroization — wrap secrets in zeroized buffers, scan KV state for leaks

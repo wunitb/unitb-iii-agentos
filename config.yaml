@@ -1,0 +1,24 @@
+# iii v0.22.1 configuration-worker layout.
+#
+# The `configuration` worker is the source of truth for every other worker's
+# settings: each `- name: X` entry below reads its value from ./config/X.yaml.
+# Inline `config:` blocks on those entries are no longer read — change a value
+# with `iii config set X` (or the `configuration::set` function) at runtime, or
+# by editing ./config/X.yaml.
+
+workers:
+  - name: configuration
+    config:
+      adapter:
+        name: fs
+        config:
+          directory: ./config
+      ttl_seconds: 0
+
+  - name: iii-http
+  - name: iii-state
+  - name: iii-stream
+  - name: iii-queue
+  - name: iii-pubsub
+  - name: iii-cron
+  - name: iii-observability

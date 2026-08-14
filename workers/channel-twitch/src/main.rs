@@ -1,0 +1,340 @@
+use hmac::{Hmac, Mac};
+use iii_sdk::errors::Error;
+use iii_sdk::protocol::TriggerAction;
+use iii_sdk::{
+    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
+};
+use serde_json::{Value, json};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
+
+const TWITCH_API: &str = "https://api.twitch.tv/helix";
+const MAX_MESSAGE_LEN: usize = 500;
+
+fn split_message(text: &str, max_len: usize) -> Vec<String> {
+    if text.chars().count() <= max_len {
+        return vec![text.to_string()];
+    }
+    let mut chunks: Vec<String> = Vec::new();
+    let mut remaining: &str = text;
+    while !remaining.is_empty() {
+        if remaining.chars().count() <= max_len {
+            chunks.push(remaining.to_string());
+            break;
+        }
+        let split_idx = remaining
+            .char_indices()
+            .nth(max_len)
+            .map(|(i, _)| i)
+            .unwrap_or(remaining.len());
+        chunks.push(remaining[..split_idx].to_string());
+        remaining = &remaining[split_idx..];
+    }
+    chunks
+}
+
+async fn get_secret(iii: &IIIClient, key: &str) -> String {
+    let result = iii
+        .trigger(TriggerRequest {
+            function_id: "vault::get".to_string(),
+            payload: json!({ "key": key }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await;
+    if let Ok(v) = result
+        && let Some(value) = v.get("value").and_then(|s| s.as_str())
+        && !value.is_empty()
+    {
+        return value.to_string();
+    }
+    std::env::var(key).unwrap_or_default()
+}
+
+async fn resolve_agent(iii: &IIIClient, channel: &str, channel_id: &str) -> String {
+    let result = iii
+        .trigger(TriggerRequest {
+            function_id: "state::get".to_string(),
+            payload: json!({
+                "scope": "channel_agents",
+                "key": format!("{channel}:{channel_id}"),
+            }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await;
+    match result {
+        Ok(v) => v
+            .get("agentId")
+            .and_then(|a| a.as_str())
+            .unwrap_or("default")
+            .to_string(),
+        Err(_) => "default".to_string(),
+    }
+}
+
+/// Constant-time signature comparison to defeat timing attacks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Verify Twitch EventSub signature per
+/// https://dev.twitch.tv/docs/eventsub/handling-webhook-events
+/// The HMAC input is `message_id + timestamp + raw_body`.
+fn verify_eventsub_signature(
+    secret: &str,
+    message_id: &str,
+    timestamp: &str,
+    raw_body: &str,
+    signature: &str,
+) -> Result<(), String> {
+    if secret.is_empty() {
+        return Err("Twitch EventSub secret not configured".into());
+    }
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|e| format!("HMAC init error: {e}"))?;
+    mac.update(message_id.as_bytes());
+    mac.update(timestamp.as_bytes());
+    mac.update(raw_body.as_bytes());
+    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    if !constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+        return Err("Invalid Twitch EventSub signature".into());
+    }
+    Ok(())
+}
+
+async fn send_message(
+    iii: &IIIClient,
+    client: &reqwest::Client,
+    broadcaster_id: &str,
+    text: &str,
+) -> Result<(), Error> {
+    let token = get_secret(iii, "TWITCH_TOKEN").await;
+    if token.is_empty() {
+        return Err(Error::Handler("TWITCH_TOKEN not configured".into()));
+    }
+    let client_id = get_secret(iii, "TWITCH_CLIENT_ID").await;
+    if client_id.is_empty() {
+        return Err(Error::Handler("TWITCH_CLIENT_ID not configured".into()));
+    }
+    let bot_id = get_secret(iii, "TWITCH_BOT_USER_ID").await;
+    if bot_id.is_empty() {
+        return Err(Error::Handler("TWITCH_BOT_USER_ID not configured".into()));
+    }
+    for chunk in split_message(text, MAX_MESSAGE_LEN) {
+        let url = format!("{TWITCH_API}/chat/messages");
+        let res = client
+            .post(&url)
+            .bearer_auth(&token)
+            .header("Client-Id", &client_id)
+            .header("Content-Type", "application/json")
+            .json(&json!({
+                "broadcaster_id": broadcaster_id,
+                "sender_id": bot_id,
+                "message": chunk,
+            }))
+            .send()
+            .await
+            .map_err(|e| Error::Handler(format!("Twitch send error: {e}")))?;
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            return Err(Error::Handler(format!(
+                "Twitch send failed ({status}): {}",
+                body.chars().take(300).collect::<String>()
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn webhook_handler(
+    iii: &IIIClient,
+    client: &reqwest::Client,
+    input: Value,
+) -> Result<Value, Error> {
+    let raw_body = input
+        .get("rawBody")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let headers = input.get("headers").cloned().unwrap_or_else(|| json!({}));
+    let message_id = headers
+        .get("twitch-eventsub-message-id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let timestamp = headers
+        .get("twitch-eventsub-message-timestamp")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let signature = headers
+        .get("twitch-eventsub-message-signature")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let secret = get_secret(iii, "TWITCH_EVENTSUB_SECRET").await;
+    if !secret.is_empty()
+        && let Some(raw) = raw_body.as_deref()
+    {
+        if message_id.is_empty() || timestamp.is_empty() || signature.is_empty() {
+            return Ok(json!({
+                "status_code": 401,
+                "body": { "error": "Missing Twitch EventSub headers" }
+            }));
+        }
+        if let Err(e) = verify_eventsub_signature(&secret, message_id, timestamp, raw, signature) {
+            tracing::warn!(error = %e, "twitch eventsub signature rejected");
+            return Ok(json!({
+                "status_code": 401,
+                "body": { "error": "Invalid Twitch EventSub signature" }
+            }));
+        }
+    }
+
+    let body = input.get("body").cloned().unwrap_or(input);
+
+    // EventSub challenge handshake.
+    if let Some(challenge) = body.get("challenge").and_then(|v| v.as_str()) {
+        return Ok(json!({
+            "status_code": 200,
+            "body": challenge,
+        }));
+    }
+
+    let event = body.get("event").cloned().unwrap_or_else(|| json!({}));
+    let text = event
+        .get("message")
+        .and_then(|m| m.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if text.is_empty() {
+        return Ok(json!({ "status_code": 200, "body": { "ok": true } }));
+    }
+
+    let channel_id = event
+        .get("broadcaster_user_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let user_id = event
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let agent_id = resolve_agent(iii, "twitch", &channel_id).await;
+
+    let chat = iii
+        .trigger(TriggerRequest {
+            function_id: "agent::chat".to_string(),
+            payload: json!({
+                "agentId": agent_id,
+                "message": text,
+                "sessionId": format!("twitch:{channel_id}"),
+            }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|e| Error::Handler(format!("agent::chat failed: {e}")))?;
+
+    let reply = chat
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if !reply.is_empty()
+        && !channel_id.is_empty()
+        && let Err(e) = send_message(iii, client, &channel_id, &reply).await
+    {
+        tracing::error!(error = %e, "failed to post Twitch reply");
+    }
+
+    let _ = iii
+        .trigger(TriggerRequest {
+            function_id: "security::audit".to_string(),
+            payload: json!({
+                "type": "channel_message",
+                "agentId": agent_id,
+                "detail": {
+                    "channel": "twitch",
+                    "channelId": channel_id,
+                    "userId": user_id,
+                },
+            }),
+            action: Some(TriggerAction::Void),
+            timeout_ms: None,
+        })
+        .await;
+
+    Ok(json!({ "status_code": 200, "body": { "ok": true } }))
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+    let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
+    let iii = register_worker(&ws_url, InitOptions::default());
+    let client = reqwest::Client::new();
+
+    let iii_clone = iii.clone();
+    let client_clone = client.clone();
+    iii.register_function(
+        "channel::twitch::webhook",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_clone.clone();
+            let client = client_clone.clone();
+            async move { webhook_handler(&iii, &client, input).await }
+        })
+        .description("Handle Twitch EventSub webhook"),
+    );
+
+    agentos_http_adapter::register_http_trigger(
+        &iii,
+        "channel::twitch::webhook".to_string(),
+        json!({ "http_method": "POST", "api_path": "webhook/twitch" }),
+        None,
+    )?;
+
+    tracing::info!("channel-twitch worker started");
+    tokio::signal::ctrl_c().await?;
+    iii.shutdown_async().await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_short_returns_single_chunk() {
+        let chunks = split_message("hello", 500);
+        assert_eq!(chunks, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn split_long_chunks_at_limit() {
+        let text = "x".repeat(1200);
+        let chunks = split_message(&text, 500);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|c| c.chars().count() <= 500));
+    }
+
+    #[test]
+    fn split_handles_multibyte_chars() {
+        let text: String = "🦀".repeat(10);
+        let chunks = split_message(&text, 3);
+        let joined: String = chunks.concat();
+        assert_eq!(joined, text);
+    }
+}

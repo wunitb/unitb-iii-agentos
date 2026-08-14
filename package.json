@@ -1,0 +1,20 @@
+{
+  "name": "unitb-iii-agentos",
+  "version": "0.1.0",
+  "description": "UnitB continuation of AgentOS on iii v0.22.1 primitives",
+  "type": "module",
+  "scripts": {
+    "test:e2e": "AGENTOS_E2E=1 vitest --run --config vitest.e2e.config.ts",
+    "test:e2e:smoke": "AGENTOS_E2E=1 vitest --run --config vitest.e2e.config.ts --testNamePattern=\"health|chat_completions\"",
+    "test:examples": "vitest --run examples/shared.test.ts",
+    "typecheck:examples": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck examples/*.ts"
+  },
+  "dependencies": {
+    "iii-sdk": "0.22.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.2",
+    "typescript": "^5.4.0",
+    "vitest": "^3.2.4"
+  }
+}

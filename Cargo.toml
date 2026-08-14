@@ -1,0 +1,97 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cli",
+    "crates/http-adapter",
+    "crates/tui",
+    "workers/a2a",
+    "workers/a2a-cards",
+    "workers/agent-core",
+    "workers/approval",
+    "workers/approval-tiers",
+    "workers/bridge",
+    "workers/browser",
+    "workers/channel-bluesky",
+    "workers/channel-discord",
+    "workers/channel-email",
+    "workers/channel-linkedin",
+    "workers/channel-mastodon",
+    "workers/channel-matrix",
+    "workers/channel-reddit",
+    "workers/channel-signal",
+    "workers/channel-slack",
+    "workers/channel-teams",
+    "workers/channel-telegram",
+    "workers/channel-twitch",
+    "workers/channel-webex",
+    "workers/channel-whatsapp",
+    "workers/code-agent",
+    "workers/context-cache",
+    "workers/context-manager",
+    "workers/context-monitor",
+    "workers/coordination",
+    "workers/council",
+    "workers/cron",
+    "workers/directive",
+    "workers/eval",
+    "workers/evolve",
+    "workers/feedback",
+    "workers/hand-runner",
+    "workers/hashline",
+    "workers/hierarchy",
+    "workers/hooks",
+    "workers/ledger",
+    "workers/llm-router",
+    "workers/mcp-client",
+    "workers/loop-guard",
+    "workers/lsp-tools",
+    "workers/memory",
+    "workers/mission",
+    "workers/orchestrator",
+    "workers/pulse",
+    "workers/rate-limiter",
+    "workers/realm",
+    "workers/security",
+    "workers/security-headers",
+    "workers/security-map",
+    "workers/security-zeroize",
+    "workers/session-lifecycle",
+    "workers/session-replay",
+    "workers/skill-security",
+    "workers/skillkit-bridge",
+    "workers/streaming",
+    "workers/telemetry",
+    "workers/vault",
+    "workers/swarm",
+    "workers/task-decomposer",
+    "workers/wasm-sandbox",
+    "workers/workflow",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+iii-sdk = "=0.22.1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+subtle = "2"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "6"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3

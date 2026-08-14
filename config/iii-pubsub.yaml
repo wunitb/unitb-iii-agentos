@@ -1,0 +1,6 @@
+id: iii-pubsub
+name: PubSub
+description: 'PubSub worker settings — the pub/sub backend adapter (`local` in-process broadcast, or `redis` for cross-instance delivery). The adapter hot-swaps at runtime: a change rebuilds the backend and re-subscribes live subscriptions onto it.'
+value:
+  adapter:
+    name: local

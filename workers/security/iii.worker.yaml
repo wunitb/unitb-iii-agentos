@@ -1,0 +1,8 @@
+iii: v1
+scripts:
+  install: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo build --release'
+  start: '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo run --release'
+name: security
+runtime:
+  kind: rust
+description: Combined guardrails + audit — HMAC-chained log, prompt-injection scan, capability checks, function-call policy, signing, taint
