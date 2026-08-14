@@ -4,6 +4,7 @@ const shouldRunE2E = process.env.AGENTOS_E2E === "1";
 const suite = shouldRunE2E ? describe : describe.skip;
 
 const baseUrl = process.env.AGENTOS_BASE_URL || "http://127.0.0.1:3111";
+const chatModel = process.env.AGENTOS_E2E_MODEL || "gpt-5.6-sol";
 const apiKey = process.env.AGENTOS_API_KEY || "";
 
 function authHeaders(): Record<string, string> {
@@ -29,7 +30,7 @@ suite("AgentOS E2E", () => {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({
-        model: "claude-sonnet-4-6",
+        model: chatModel,
         messages: [{ role: "user", content: "Reply with the word READY only." }],
       }),
     });
