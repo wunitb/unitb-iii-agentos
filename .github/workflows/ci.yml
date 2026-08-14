@@ -152,6 +152,9 @@ jobs:
       - name: test Node example adapters
         run: bun run test:examples
 
+      - name: typecheck startup configuration tests
+        run: bun run typecheck:scripts
+
       - name: test startup configuration
         run: bun run test:scripts
 

@@ -142,6 +142,11 @@ if [[ ! -d "$RELEASE_DIR" ]]; then
     exit 1
 fi
 
+if [[ -z "${CODEX_PROXY_API_KEY:-}" &&
+    ( -n "${AGENTOS_DEFAULT_PROVIDER:-}" || -n "${AGENTOS_DEFAULT_MODEL:-}" ) ]]; then
+    echo "warning: configured default provider '${AGENTOS_DEFAULT_PROVIDER:-codex}' disabled because CODEX_PROXY_API_KEY is empty; unqualified requests can fall back to the Anthropic cloud API" >&2
+fi
+
 if [[ -z "${CODEX_PROXY_API_KEY:-}" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
     echo "warning: no model provider credential is configured"
 fi

@@ -189,19 +189,21 @@ where
 {
     let configured = |name: &str| get_env(name).filter(|value| !value.trim().is_empty());
     let provider = configured("AGENTOS_DEFAULT_PROVIDER");
+    let model = configured("AGENTOS_DEFAULT_MODEL");
 
     if configured("CODEX_PROXY_API_KEY").is_none() {
+        let default_requested = provider.is_some() || model.is_some();
         return RuntimeDefaultResolution {
             route: None,
-            disabled_provider: provider,
+            disabled_provider: default_requested
+                .then(|| provider.unwrap_or_else(|| CODEX_PROVIDER.to_string())),
         };
     }
 
     RuntimeDefaultResolution {
         route: Some(Route {
             provider: provider.unwrap_or_else(|| CODEX_PROVIDER.to_string()),
-            model: configured("AGENTOS_DEFAULT_MODEL")
-                .unwrap_or_else(|| DEFAULT_CODEX_MODEL.to_string()),
+            model: model.unwrap_or_else(|| DEFAULT_CODEX_MODEL.to_string()),
         }),
         disabled_provider: None,
     }
@@ -615,7 +617,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(provider) = &default_resolution.disabled_provider {
         tracing::warn!(
             provider,
-            "configured default provider disabled because CODEX_PROXY_API_KEY is empty; requests will use legacy routing"
+            "configured default provider disabled because CODEX_PROXY_API_KEY is empty; unqualified requests can fall back to the Anthropic cloud API"
         );
     }
     let state = Arc::new(RouterState {
@@ -1035,14 +1037,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_codex_key_disables_the_local_default() {
+    fn model_only_default_without_codex_key_reports_disablement() {
         let resolution = resolve_runtime_default(|name| match name {
             "AGENTOS_DEFAULT_MODEL" => Some("gpt-5.6-sol".into()),
             _ => None,
         });
 
         assert_eq!(resolution.route, None);
-        assert_eq!(resolution.disabled_provider, None);
+        assert_eq!(resolution.disabled_provider.as_deref(), Some("codex"));
     }
 
     #[test]
