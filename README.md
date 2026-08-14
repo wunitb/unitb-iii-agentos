@@ -80,6 +80,12 @@ curl -X POST http://127.0.0.1:3111/v1/realms \
   -d '{"name":"prod","description":"production"}'
 ```
 
+The live chat E2E test defaults to `gpt-5.6-sol`. To target a non-Codex backend, override it for the test command:
+
+```bash
+AGENTOS_E2E_MODEL=claude-sonnet-4-6 bun run test:e2e
+```
+
 ## § 04 · Calling a function
 
 ```rust
