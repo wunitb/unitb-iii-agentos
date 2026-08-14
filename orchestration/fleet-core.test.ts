@@ -274,6 +274,24 @@ describe("FleetStore", () => {
     reopened.close();
   });
 
+  test("restores a revoked agent credential assignment", () => {
+    const { store } = setup();
+    store.revokeAgentToken("Reviewer");
+
+    store.assignCredential("Reviewer", "anthropic/review-model", 2);
+    const tokenPath = store.rotateAgentToken("Reviewer");
+    const token = readFileSync(tokenPath, "utf8").trim();
+
+    expect(store.credentialAssignment(token)).toEqual({
+      id: "Reviewer",
+      role: "reviewer",
+      teamId: "Reviewer",
+      provider: "anthropic",
+      credentialId: 2,
+    });
+    store.close();
+  });
+
   test("reapplies model assignments without rotating credentials", () => {
     const { store, tokens } = setup();
     const updatedConfig = structuredClone(config);

@@ -582,7 +582,11 @@ export class FleetStore {
       throw new Error("credentialId must be a positive integer");
     }
     const result = this.db.query(`
-      UPDATE credential_assignments SET provider=?, credential_id=? WHERE identity_id=?
+      INSERT INTO credential_assignments(identity_id, provider, credential_id)
+      SELECT identity_id, ?, ? FROM auth_tokens WHERE identity_id=?
+      ON CONFLICT(identity_id) DO UPDATE SET
+        provider=excluded.provider,
+        credential_id=excluded.credential_id
     `).run(provider, credentialId, identityId);
     if (result.changes !== 1) throw new Error(`Unknown fleet identity: ${identityId}`);
   }
