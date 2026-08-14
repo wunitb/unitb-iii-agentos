@@ -23,6 +23,7 @@ if [[ -f "$ROOT/.env" ]]; then
     __agentos_anthropic_api_key="${ANTHROPIC_API_KEY:-}"
     __agentos_openai_api_key="${OPENAI_API_KEY:-}"
     __agentos_codex_proxy_api_key="${CODEX_PROXY_API_KEY:-}"
+    __agentos_agentos_api_key="${AGENTOS_API_KEY:-}"
     set -a
     # shellcheck disable=SC1091
     source "$ROOT/.env"
@@ -36,7 +37,10 @@ if [[ -f "$ROOT/.env" ]]; then
     if [[ -z "${CODEX_PROXY_API_KEY:-}" && -n "$__agentos_codex_proxy_api_key" ]]; then
         export CODEX_PROXY_API_KEY="$__agentos_codex_proxy_api_key"
     fi
-    unset __agentos_anthropic_api_key __agentos_openai_api_key __agentos_codex_proxy_api_key
+    if [[ -z "${AGENTOS_API_KEY:-}" && -n "$__agentos_agentos_api_key" ]]; then
+        export AGENTOS_API_KEY="$__agentos_agentos_api_key"
+    fi
+    unset __agentos_anthropic_api_key __agentos_openai_api_key __agentos_codex_proxy_api_key __agentos_agentos_api_key
 fi
 
 export III_URL="${III_URL:-ws://localhost:49134}"
