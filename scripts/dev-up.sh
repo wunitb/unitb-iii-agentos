@@ -19,37 +19,90 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIDFILE="$ROOT/.agentos-dev.pids"
 RELEASE_DIR="$ROOT/target/release"
 
-# `set -a` + `source .env` exports every assignment, so a blank entry in .env
-# (e.g. `ANTHROPIC_API_KEY=`) would clobber a credential inherited from the
-# caller's environment. Put the inherited value back, or unset the variable so
-# nothing downstream mistakes an empty credential for a configured one.
-restore_inherited_credential() {
-    local name="$1" inherited="$2"
-    if [[ -n "${!name:-}" ]]; then
-        return 0
+env_file="$ROOT/.env"
+if [[ -e "$env_file" || -L "$env_file" ]]; then
+    if [[ -L "$env_file" || ! -f "$env_file" ]]; then
+        echo "error: $env_file must be a regular file owned by the current user with mode 600" >&2
+        exit 1
     fi
-    if [[ -n "$inherited" ]]; then
-        export "$name=$inherited"
-    else
-        unset "$name"
+    if [[ ! -f "$ROOT/.env.example" ]]; then
+        echo "error: trusted dotenv allowlist is missing: $ROOT/.env.example" >&2
+        exit 1
     fi
-}
 
-if [[ -f "$ROOT/.env" ]]; then
-    # Prefixed so a stray assignment inside .env cannot overwrite the snapshot.
-    __agentos_anthropic_api_key="${ANTHROPIC_API_KEY:-}"
-    __agentos_openai_api_key="${OPENAI_API_KEY:-}"
-    __agentos_codex_proxy_api_key="${CODEX_PROXY_API_KEY:-}"
-    __agentos_agentos_api_key="${AGENTOS_API_KEY:-}"
-    set -a
-    # shellcheck disable=SC1091
-    source "$ROOT/.env"
-    set +a
-    restore_inherited_credential ANTHROPIC_API_KEY "$__agentos_anthropic_api_key"
-    restore_inherited_credential OPENAI_API_KEY "$__agentos_openai_api_key"
-    restore_inherited_credential CODEX_PROXY_API_KEY "$__agentos_codex_proxy_api_key"
-    restore_inherited_credential AGENTOS_API_KEY "$__agentos_agentos_api_key"
-    unset __agentos_anthropic_api_key __agentos_openai_api_key __agentos_codex_proxy_api_key __agentos_agentos_api_key
+    current_uid="$(id -u)"
+    if env_uid="$(stat -c '%u' "$env_file" 2>/dev/null)" &&
+        env_mode="$(stat -c '%a' "$env_file" 2>/dev/null)"; then
+        :
+    elif env_uid="$(stat -f '%u' "$env_file" 2>/dev/null)" &&
+        env_mode="$(stat -f '%Lp' "$env_file" 2>/dev/null)"; then
+        :
+    else
+        echo "error: unable to inspect ownership and mode for $env_file" >&2
+        exit 1
+    fi
+    if [[ "$env_uid" != "$current_uid" || "$env_mode" != "600" ]]; then
+        echo "error: $env_file must be owned by the current user and have mode 600" >&2
+        exit 1
+    fi
+
+    allowed_names=$'\n'
+    while IFS= read -r example_line || [[ -n "$example_line" ]]; do
+        case "$example_line" in
+            ''|'#'*) continue ;;
+            *=*) example_name="${example_line%%=*}" ;;
+            *) continue ;;
+        esac
+        if [[ "$example_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            case "$allowed_names" in
+                *$'\n'"$example_name"$'\n'*) ;;
+                *) allowed_names="${allowed_names}${example_name}"$'\n' ;;
+            esac
+        fi
+    done < "$ROOT/.env.example"
+
+    seen_names=$'\n'
+    line_number=0
+    while IFS= read -r env_line || [[ -n "$env_line" ]]; do
+        line_number=$((line_number + 1))
+        case "$env_line" in
+            ''|'#'*) continue ;;
+            *=*) ;;
+            *)
+                echo "error: malformed dotenv entry on line $line_number" >&2
+                exit 1
+                ;;
+        esac
+        name="${env_line%%=*}"
+        value="${env_line#*=}"
+        if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "error: invalid dotenv variable name on line $line_number" >&2
+            exit 1
+        fi
+        case "$allowed_names" in
+            *$'\n'"$name"$'\n'*) ;;
+            *)
+                echo "error: unknown dotenv variable '$name' on line $line_number" >&2
+                exit 1
+                ;;
+        esac
+        case "$seen_names" in
+            *$'\n'"$name"$'\n'*)
+                echo "error: duplicate dotenv variable '$name' on line $line_number" >&2
+                exit 1
+                ;;
+        esac
+        seen_names="${seen_names}${name}"$'\n'
+
+        inherited_value="${!name:-}"
+        if [[ -n "$value" ]]; then
+            export "$name=$value"
+        elif [[ -n "$inherited_value" ]]; then
+            export "$name=$inherited_value"
+        else
+            unset "$name"
+        fi
+    done < "$env_file"
 fi
 
 export III_URL="${III_URL:-ws://localhost:49134}"

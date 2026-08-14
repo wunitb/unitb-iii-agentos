@@ -55,7 +55,7 @@ git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos
 bash scripts/install-iii.sh
 
 # 3. configure the local model proxy
-cp .env.example .env
+install -m 600 .env.example .env
 $EDITOR .env   # set CODEX_PROXY_API_KEY for http://127.0.0.1:8317/v1
 
 # 4. build the workspace
