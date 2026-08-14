@@ -28,17 +28,33 @@ if [[ -f "$ROOT/.env" ]]; then
     # shellcheck disable=SC1091
     source "$ROOT/.env"
     set +a
-    if [[ -z "${ANTHROPIC_API_KEY:-}" && -n "$__agentos_anthropic_api_key" ]]; then
-        export ANTHROPIC_API_KEY="$__agentos_anthropic_api_key"
+    if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+        if [[ -n "$__agentos_anthropic_api_key" ]]; then
+            export ANTHROPIC_API_KEY="$__agentos_anthropic_api_key"
+        else
+            unset ANTHROPIC_API_KEY
+        fi
     fi
-    if [[ -z "${OPENAI_API_KEY:-}" && -n "$__agentos_openai_api_key" ]]; then
-        export OPENAI_API_KEY="$__agentos_openai_api_key"
+    if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+        if [[ -n "$__agentos_openai_api_key" ]]; then
+            export OPENAI_API_KEY="$__agentos_openai_api_key"
+        else
+            unset OPENAI_API_KEY
+        fi
     fi
-    if [[ -z "${CODEX_PROXY_API_KEY:-}" && -n "$__agentos_codex_proxy_api_key" ]]; then
-        export CODEX_PROXY_API_KEY="$__agentos_codex_proxy_api_key"
+    if [[ -z "${CODEX_PROXY_API_KEY:-}" ]]; then
+        if [[ -n "$__agentos_codex_proxy_api_key" ]]; then
+            export CODEX_PROXY_API_KEY="$__agentos_codex_proxy_api_key"
+        else
+            unset CODEX_PROXY_API_KEY
+        fi
     fi
-    if [[ -z "${AGENTOS_API_KEY:-}" && -n "$__agentos_agentos_api_key" ]]; then
-        export AGENTOS_API_KEY="$__agentos_agentos_api_key"
+    if [[ -z "${AGENTOS_API_KEY:-}" ]]; then
+        if [[ -n "$__agentos_agentos_api_key" ]]; then
+            export AGENTOS_API_KEY="$__agentos_agentos_api_key"
+        else
+            unset AGENTOS_API_KEY
+        fi
     fi
     unset __agentos_anthropic_api_key __agentos_openai_api_key __agentos_codex_proxy_api_key __agentos_agentos_api_key
 fi
