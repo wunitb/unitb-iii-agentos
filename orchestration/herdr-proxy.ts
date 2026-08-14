@@ -74,7 +74,8 @@ const server = createServer((client) => {
     void (async () => {
       try {
         const payload = validateRequest(raw, paneId);
-        client.end(await forward(upstreamPath, payload));
+        const response = await forward(upstreamPath, payload);
+        client.end(response);
       } catch (error) {
         console.error(error instanceof Error ? error.message : String(error));
         client.end(`${JSON.stringify({ error: error instanceof Error ? error.message : String(error) })}\n`);

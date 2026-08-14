@@ -194,12 +194,12 @@ export default function unitbFleet(pi: ExtensionAPI): void {
         name: "fleet_plan",
         loadMode: "essential",
         label: "fleet.plan",
-        description: "Create one durable work item from the Principal's verbatim goal and a verified base SHA.",
+        description: "Create one durable work item from the Principal's verbatim goal. The dispatcher resolves and records the active origin's current default-branch SHA.",
         parameters: pi.zod.object({
           workId: pi.zod.string().min(1),
           principalGoal: pi.zod.string().min(1),
-          repository: pi.zod.string().min(1),
-          verifiedBaseSha: pi.zod.string().regex(/^[0-9a-f]{40}$/),
+          repository: pi.zod.string().min(1).optional(),
+          verifiedBaseSha: pi.zod.string().regex(/^[0-9a-f]{40}$/).optional(),
         }),
         async execute(_id, params) {
           return toolResult(await request(active(), "plan", params));
@@ -236,6 +236,17 @@ export default function unitbFleet(pi: ExtensionAPI): void {
           return toolResult({ ok: true, requestId: assignment.requestId, result: { assignment: assignment.result, launch: launch.result } });
         },
       });
+      pi.registerTool({
+        name: "fleet_launch_team",
+        loadMode: "essential",
+        label: "fleet.launch_team",
+        description: "Launch or recover the assigned Team after an interrupted fleet.assign launch.",
+        parameters: pi.zod.object({ workId: pi.zod.string().min(1) }),
+        async execute(_id, params) {
+          return toolResult(await request(active(), "launch_team", params));
+        },
+      });
+
 
       pi.registerTool({
         name: "fleet_review",
@@ -252,15 +263,39 @@ export default function unitbFleet(pi: ExtensionAPI): void {
         name: "fleet_handoff",
         loadMode: "essential",
         label: "fleet.handoff",
-        description: "Record an approved exact-head PR handoff to the Principal; this never merges.",
+        description: "Push the approved exact Team head, create or verify its PR, and hand it to the Principal; never merge.",
         parameters: pi.zod.object({
           workId: pi.zod.string().min(1),
           exactHead: pi.zod.string().regex(/^[0-9a-f]{40}$/),
-          remoteHead: pi.zod.string().regex(/^[0-9a-f]{40}$/),
-          pullRequest: pi.zod.string().url(),
+          pullRequest: pi.zod.string().url().optional(),
         }),
         async execute(_id, params) {
           return toolResult(await request(active(), "handoff", params));
+        },
+      });
+
+      pi.registerTool({
+        name: "fleet_resume",
+        loadMode: "essential",
+        label: "fleet.resume",
+        description: "Resume blocked work into its exact prior lifecycle state.",
+        parameters: pi.zod.object({
+          workId: pi.zod.string().min(1),
+          reason: pi.zod.string().min(1),
+        }),
+        async execute(_id, params) {
+          return toolResult(await request(active(), "resume", params));
+        },
+      });
+
+      pi.registerTool({
+        name: "fleet_finish",
+        loadMode: "essential",
+        label: "fleet.finish",
+        description: "Verify that the handed-off exact-head PR was merged, then close the durable work item.",
+        parameters: pi.zod.object({ workId: pi.zod.string().min(1) }),
+        async execute(_id, params) {
+          return toolResult(await request(active(), "finish", params));
         },
       });
 

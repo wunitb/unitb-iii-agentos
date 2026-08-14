@@ -182,22 +182,22 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full primitive flow and worker ma
 | Write isolation | Dedicated Git worktree plus bubblewrap mounts scoped to the Team branch |
 | Review isolation | Disposable read-only worktree pinned to the submitted exact SHA |
 | Credentials | Host-only OMP auth broker; each role sees only its assigned provider and credential slot through a scoped loopback proxy |
-| Agent autonomy | OMP `--auto-approve`; tool, credential, and filesystem boundaries enforce the role contract |
+| Agent autonomy | OMP prompts for bash approval; role hooks, credentials, network, and filesystem boundaries remain authoritative |
 | Recovery | systemd restarts the dispatcher and Herdr supervisor; SQLite restores authoritative state |
-| Merge authority | Main may hand off an approved exact head; only the principal may merge |
+| Merge authority | Main may hand off an approved exact head; the principal or a separately authorized `PrincipalMergeAgent` may merge |
 
-Install the root-owned bubblewrap boundary, AppArmor rule, and persistent user services from the repository checkout. Then start OMP from the repository root; `.omp/extensions/` automatically turns that top-level session into the read-only Main control plane.
+Install the root-owned bubblewrap boundary, AppArmor rule, and four persistent user services. The installer starts the broker, Herdr supervisor, dispatcher, and interactive Main agent; attach to Main through Herdr:
 
 ```bash
 ./orchestration/install.sh
-omp
-bun orchestration/dispatcher.ts health
+herdr --session tldrsoc
+bun run fleet:health
 ```
 
 The fleet is host-specific infrastructure. `orchestration/fleet.config.json` pins Main and each Team to one model and one centralized-broker credential slot, then routes Reviewer to the opposite model family for the submitting Team. Every launched worker gets a reset OMP home with no copied credentials, a scoped credential-proxy token, a generated config that binds all internal model roles to that session's assigned model, and auto-approval inside the already-confined boundary. The committed default routes require two OpenAI Codex credentials and one Anthropic credential. Run the state-machine suite with:
 
 ```bash
-npm run test:fleet
+bun run test:fleet
 ```
 
 ## § 10 · TUI

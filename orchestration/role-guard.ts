@@ -22,11 +22,14 @@ const MAIN_TOOLS: Record<string, true> = {
   ask: true,
   fleet_plan: true,
   fleet_assign: true,
+  fleet_launch_team: true,
   fleet_status: true,
   fleet_message: true,
   fleet_review: true,
   fleet_handoff: true,
   fleet_cancel: true,
+  fleet_resume: true,
+  fleet_finish: true,
 };
 
 const TEAM_TOOLS: Record<string, true> = {

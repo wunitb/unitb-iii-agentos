@@ -136,7 +136,7 @@ Team (single writer in branch-scoped worktree)
 Reviewer (read-only disposable worktree at exact head)
    │ approved / changes_requested
    ▼
-Main (principal-only merge handoff)
+Main (exact-head PR handoff; no merge authority)
 ```
 
 `FleetStore` persists commands, events, work-item transitions, path locks, messages, and agent bindings in SQLite. Command IDs are idempotency keys. Every operation authenticates through a per-identity token and a role-specific transition allowlist. The dispatcher is the only process that creates worktrees, launches OMP sessions, or mutates authoritative fleet state.
@@ -145,9 +145,9 @@ Worker sessions run through the dedicated root-owned bubblewrap binary and AppAr
 
 Main and each Team have fixed model assignments. Reviewer is routed deterministically by the submitting Team to the opposite model family, preserving implementation-review independence without allowing the worker to choose its own model.
 
-Herdr owns terminal lifecycle and reports `working`, `blocked`, `idle`, and `done`. A narrow Unix-socket proxy binds lifecycle reports to the launched pane identity; agents cannot claim another pane. systemd keeps Herdr and the Dispatcher resident across failures. On dispatcher restart, `fleet.config.json` is reapplied without rotating identity tokens, then the SQLite ledger resumes in-flight work.
+Herdr owns terminal lifecycle and reports `working`, `blocked`, `idle`, and `done`. A narrow Unix-socket proxy binds lifecycle reports to the launched pane identity; agents cannot claim another pane. systemd keeps the broker, Herdr, Dispatcher, and interactive Main agent resident. On dispatcher restart, `fleet.config.json` is reapplied without rotating identity tokens, then the SQLite ledger resumes in-flight work.
 
-The exact-head invariant is enforced twice: Team submission must equal the assigned branch HEAD, and Reviewer must review the same stored SHA. Approved work becomes `handoff_ready`; merge remains outside the fleet and reserved for the principal.
+The exact-head invariant is enforced twice: Team submission must equal the assigned branch HEAD, and Reviewer must review the same stored SHA. Approved work becomes `handoff_ready`; merge remains outside the ordinary fleet and belongs to the principal or a separately authorized `PrincipalMergeAgent`.
 
 ## Versioning
 

@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
-import { mkdirSync, readFileSync, writeFileSync, chmodSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, chmodSync, existsSync, renameSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
+
+export const FLEET_SCHEMA_VERSION = "3";
 
 export const WORK_STATES = [
   "planned",
@@ -20,13 +22,17 @@ export type FleetRole = "main" | "team" | "reviewer";
 
 export interface FleetModelConfig {
   model: string;
-  credentialSlot: number;
+  credentialId: number;
 }
 
 export interface CredentialProxyConfig {
   bind: string;
   upstreamUrl: string;
   upstreamTokenFile: string;
+}
+export interface FleetNetworkConfig {
+  dnsForward: string;
+  allowedHostsByProvider: Record<string, string[]>;
 }
 
 export interface FleetConfig {
@@ -44,6 +50,7 @@ export interface FleetConfig {
     routes: Record<string, FleetModelConfig>;
   };
   credentialProxy: CredentialProxyConfig;
+  network: FleetNetworkConfig;
 }
 
 export interface AssignmentContract {
@@ -87,7 +94,7 @@ const TRANSITIONS: Record<WorkState, readonly WorkState[]> = {
   handoff_ready: ["handed_off", "cancelled", "blocked"],
   handed_off: ["merged", "blocked"],
   merged: [],
-  blocked: ["assigned", "implementing", "ready_for_review", "handoff_ready", "cancelled"],
+  blocked: ["planned", "assigned", "implementing", "ready_for_review", "changes_requested", "handoff_ready", "handed_off", "cancelled"],
   cancelled: [],
 };
 
@@ -109,6 +116,24 @@ function stringArray(value: unknown, field: string, required = false): string[] 
   }
   if (required && value.length === 0) throw new Error(`${field} must not be empty`);
   return [...new Set(value.map((entry) => entry.trim()))];
+}
+
+function repoPath(value: string, field: string): string {
+  const normalized = value.replace(/\/+$/, "");
+  if (
+    normalized === ""
+    || normalized.startsWith("/")
+    || normalized.includes("\\")
+    || normalized.includes("\0")
+    || normalized.split("/").some((component) => component === "" || component === "." || component === "..")
+  ) {
+    throw new Error(`${field} must be a normalized repository-relative path`);
+  }
+  return normalized;
+}
+
+function overlapsPath(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
 function parseJson<T>(value: unknown, fallback: T): T {
@@ -137,7 +162,7 @@ function reviewerModelPolicy(config: FleetConfig): string {
 
 export function loadFleetConfig(path: string): FleetConfig {
   const parsed = JSON.parse(readFileSync(path, "utf8")) as FleetConfig;
-  if (parsed.version !== 3) throw new Error(`Unsupported fleet config version: ${parsed.version}`);
+  if (parsed.version !== 4) throw new Error(`Unsupported fleet config version: ${parsed.version}`);
   if (!Array.isArray(parsed.teams) || parsed.teams.length === 0 || parsed.teams.length > parsed.maxTeams) {
     throw new Error("teams must contain between 1 and maxTeams entries");
   }
@@ -154,11 +179,13 @@ export function loadFleetConfig(path: string): FleetConfig {
   requiredString(parsed.credentialProxy?.bind, "credentialProxy.bind");
   requiredString(parsed.credentialProxy?.upstreamUrl, "credentialProxy.upstreamUrl");
   requiredString(parsed.credentialProxy?.upstreamTokenFile, "credentialProxy.upstreamTokenFile");
+  requiredString(parsed.network?.dnsForward, "network.dnsForward");
   for (const agent of [parsed.main, ...parsed.teams, ...Object.values(parsed.reviewer.routes)]) {
-    requiredString(agent.model, "model");
-    if (!Number.isSafeInteger(agent.credentialSlot) || agent.credentialSlot < 0) {
-      throw new Error("credentialSlot must be a non-negative integer");
+    const provider = requiredString(agent.model, "model").split("/", 1)[0]!;
+    if (!Number.isSafeInteger(agent.credentialId) || agent.credentialId < 1) {
+      throw new Error("credentialId must be a positive integer");
     }
+    stringArray(parsed.network.allowedHostsByProvider?.[provider], `network.allowedHostsByProvider.${provider}`, true);
   }
   for (const team of parsed.teams) {
     const reviewer = reviewerModelFor(parsed, team.id);
@@ -200,7 +227,7 @@ export class FleetStore {
       CREATE TABLE IF NOT EXISTS credential_assignments (
         identity_id TEXT PRIMARY KEY,
         provider TEXT NOT NULL,
-        credential_slot INTEGER NOT NULL CHECK(credential_slot >= 0),
+        credential_id INTEGER NOT NULL CHECK(credential_id >= 1),
         FOREIGN KEY(identity_id) REFERENCES auth_tokens(identity_id)
       );
       CREATE TABLE IF NOT EXISTS work_items (
@@ -277,6 +304,12 @@ export class FleetStore {
       CREATE INDEX IF NOT EXISTS events_work_idx ON events(work_id, seq);
       CREATE INDEX IF NOT EXISTS messages_recipient_idx ON messages(recipient, status, created_at);
     `);
+    this.db.transaction(() => {
+      const credentialColumns = this.db.query("PRAGMA table_info(credential_assignments)").all() as Array<{ name: string }>;
+      if (credentialColumns.some((column) => column.name === "credential_slot")) {
+        this.db.exec("ALTER TABLE credential_assignments RENAME COLUMN credential_slot TO credential_id");
+      }
+    }).immediate();
   }
 
   bootstrap(config: FleetConfig, mainPaneId?: string, coordinationIssue?: string): Record<string, string> {
@@ -291,16 +324,16 @@ export class FleetStore {
       teamId?: string;
       model: string;
       credentialModel: string;
-      credentialSlot: number;
+      credentialId: number;
     }> = [
-      { id: "Main", role: "main", model: config.main.model, credentialModel: config.main.model, credentialSlot: config.main.credentialSlot },
+      { id: "Main", role: "main", model: config.main.model, credentialModel: config.main.model, credentialId: config.main.credentialId },
       ...config.teams.map((team) => ({
         id: team.id,
         role: "team" as const,
         teamId: team.id,
         model: team.model,
         credentialModel: team.model,
-        credentialSlot: team.credentialSlot,
+        credentialId: team.credentialId,
       })),
       {
         id: config.reviewer.id,
@@ -308,7 +341,7 @@ export class FleetStore {
         teamId: config.reviewer.id,
         model: reviewerModelPolicy(config),
         credentialModel: reviewerDefault.model,
-        credentialSlot: reviewerDefault.credentialSlot,
+        credentialId: reviewerDefault.credentialId,
       },
     ];
     const tokens: Record<string, string> = {};
@@ -325,11 +358,11 @@ export class FleetStore {
     `);
 
     const insertCredentialAssignment = this.db.query(`
-      INSERT INTO credential_assignments(identity_id, provider, credential_slot)
+      INSERT INTO credential_assignments(identity_id, provider, credential_id)
       VALUES(?, ?, ?)
       ON CONFLICT(identity_id) DO UPDATE SET
         provider=excluded.provider,
-        credential_slot=excluded.credential_slot
+        credential_id=excluded.credential_id
     `);
     this.db.transaction(() => {
       for (const identity of identities) {
@@ -347,9 +380,9 @@ export class FleetStore {
           identity.id === "Main" ? mainPaneId ?? null : null,
           now(),
         );
-        insertCredentialAssignment.run(identity.id, identity.credentialModel.split("/", 1)[0], identity.credentialSlot);
+        insertCredentialAssignment.run(identity.id, identity.credentialModel.split("/", 1)[0], identity.credentialId);
       }
-      this.setMeta("schema_version", "2");
+      this.setMeta("schema_version", FLEET_SCHEMA_VERSION);
       this.setMeta("session", config.session);
       this.setMeta("repo", config.repo);
       if (coordinationIssue) this.setMeta("coordination_issue", coordinationIssue);
@@ -367,12 +400,13 @@ export class FleetStore {
     return row?.value;
   }
 
-  bindAgent(identityId: string, workspaceId: string, paneId: string, sessionRef?: string): void {
+  bindAgent(identityId: string, workspaceId: string, paneId: string, workId?: string, sessionRef?: string): void {
     const result = this.db.query(`
-      UPDATE agents SET workspace_id=?, pane_id=?, session_ref=?, status='idle', last_seen_at=? WHERE identity_id=?
-    `).run(workspaceId, paneId, sessionRef ?? null, now(), identityId);
+      UPDATE agents SET workspace_id=?, pane_id=?, session_ref=?, status='idle',
+        current_work_id=?, last_seen_at=? WHERE identity_id=?
+    `).run(workspaceId, paneId, sessionRef ?? null, workId ?? null, now(), identityId);
     if (result.changes !== 1) throw new Error(`Unknown fleet identity: ${identityId}`);
-    this.event("Dispatcher", "agent.bound", undefined, identityId, { workspaceId, paneId, sessionRef });
+    this.event("Dispatcher", "agent.bound", workId, identityId, { workspaceId, paneId, sessionRef });
   }
 
   releaseAgent(identityId: string): void {
@@ -383,6 +417,120 @@ export class FleetStore {
     `).run(now(), identityId);
     if (result.changes !== 1) throw new Error(`Unknown fleet identity: ${identityId}`);
     this.event("Dispatcher", "agent.released", undefined, identityId, {});
+  }
+  rotateAgentToken(identityId: string): string {
+    const row = this.db.query("SELECT role,team_id FROM auth_tokens WHERE identity_id=?").get(identityId) as
+      | { role: FleetRole; team_id: string | null }
+      | null;
+    if (!row) throw new Error(`Unknown fleet identity: ${identityId}`);
+    const token = crypto.randomUUID() + crypto.randomUUID();
+    const tokenPath = join(this.runtimeDir, "tokens", `${identityId}.token`);
+    const temporaryPath = `${tokenPath}.${process.pid}.tmp`;
+    writeFileSync(temporaryPath, `${token}\n`, { mode: 0o600 });
+    chmodSync(temporaryPath, 0o600);
+    this.db.query("UPDATE auth_tokens SET token_hash=? WHERE identity_id=?").run(tokenHash(token), identityId);
+    renameSync(temporaryPath, tokenPath);
+    this.event("Dispatcher", "agent.token_rotated", undefined, identityId);
+    return tokenPath;
+  }
+
+  revokeAgentToken(identityId: string): void {
+    const tokenPath = this.rotateAgentToken(identityId);
+    this.db.query("DELETE FROM credential_assignments WHERE identity_id=?").run(identityId);
+    rmSync(tokenPath, { force: true });
+    this.event("Dispatcher", "agent.token_revoked", undefined, identityId);
+  }
+
+  agentPlacement(identityId: string): Record<string, unknown> {
+    const row = this.db.query("SELECT * FROM agents WHERE identity_id=?").get(identityId) as Record<string, unknown> | null;
+    if (!row) throw new Error(`Unknown fleet identity: ${identityId}`);
+    return row;
+  }
+
+  getWork(workId: string): Record<string, unknown> {
+    return this.work(workId);
+  }
+
+  recordRejected(request: FleetRequest, error: unknown): void {
+    const actor = this.authenticate(requiredString(request.token, "token"));
+    const requestId = requiredString(request.id, "id");
+    const op = requiredString(request.op, "op");
+    const payload = JSON.stringify(request.data ?? {});
+    const existing = this.db.query("SELECT actor_id,op,payload_json,status FROM commands WHERE id=?").get(requestId) as
+      | { actor_id: string; op: string; payload_json: string; status: string }
+      | null;
+    if (existing) {
+      if (existing.actor_id !== actor.id || existing.op !== op || existing.payload_json !== payload) return;
+      if (existing.status === "accepted") {
+        this.db.query("UPDATE commands SET status='failed', error=?, updated_at=? WHERE id=?")
+          .run(error instanceof Error ? error.message : String(error), now(), requestId);
+      }
+      return;
+    }
+    const timestamp = now();
+    this.db.query(`
+      INSERT INTO commands(id,op,actor_id,work_id,payload_json,status,error,created_at,updated_at)
+      VALUES(?,?,?,?,?,'failed',?,?,?)
+    `).run(
+      requestId,
+      op,
+      actor.id,
+      typeof request.data?.workId === "string" ? request.data.workId : null,
+      payload,
+      error instanceof Error ? error.message : String(error),
+      timestamp,
+      timestamp,
+    );
+  }
+
+  cachedResponse(request: FleetRequest, actorId: string): FleetResponse | undefined {
+    const requestId = requiredString(request.id, "id");
+    const op = requiredString(request.op, "op");
+    const payload = JSON.stringify(request.data ?? {});
+    const row = this.db.query("SELECT actor_id,op,payload_json,status,result_json,error FROM commands WHERE id=?").get(requestId) as
+      | {
+        actor_id: string;
+        op: string;
+        payload_json: string;
+        status: string;
+        result_json: string | null;
+        error: string | null;
+      }
+      | null;
+    if (!row) return undefined;
+    if (row.actor_id !== actorId) throw new Error(`Request id ${requestId} belongs to another identity`);
+    if (row.op !== op || row.payload_json !== payload) {
+      throw new Error(`Request id ${requestId} was reused with a different command`);
+    }
+    if (row.status === "accepted") {
+      return { ok: false, requestId, error: "Command is still being processed" };
+    }
+    return row.status === "applied"
+      ? { ok: true, requestId, result: parseJson(row.result_json, null) }
+      : { ok: false, requestId, error: row.error ?? "Request failed" };
+  }
+
+  recordApplied(request: FleetRequest, result: unknown): FleetResponse {
+    const actor = this.authenticate(requiredString(request.token, "token"));
+    const requestId = requiredString(request.id, "id");
+    const op = requiredString(request.op, "op");
+    const payload = JSON.stringify(request.data ?? {});
+    const timestamp = now();
+    const response: FleetResponse = { ok: true, requestId, result };
+    this.db.query(`
+      INSERT INTO commands(id,actor_id,op,work_id,payload_json,status,result_json,created_at,updated_at)
+      VALUES(?,?,?,?,?,'applied',?,?,?)
+    `).run(
+      requestId,
+      actor.id,
+      op,
+      typeof request.data?.workId === "string" ? request.data.workId : null,
+      payload,
+      JSON.stringify(result ?? null) ?? "null",
+      timestamp,
+      timestamp,
+    );
+    return response;
   }
 
   updateAgentStatus(identityId: string, status: string, currentWorkId?: string): void {
@@ -399,14 +547,8 @@ export class FleetStore {
     const actor = this.authenticate(token);
     const payload = request.data ?? {};
 
-    const existing = this.db.query("SELECT status,result_json,error FROM commands WHERE id=?").get(requestId) as
-      | { status: string; result_json: string | null; error: string | null }
-      | null;
-    if (existing) {
-      return existing.status === "applied"
-        ? { ok: true, requestId, result: parseJson(existing.result_json, null) }
-        : { ok: false, requestId, error: existing.error ?? "Command did not apply" };
-    }
+    const existing = this.cachedResponse(request, actor.id);
+    if (existing) return existing;
 
     const createdAt = now();
     this.db.query(`
@@ -434,24 +576,24 @@ export class FleetStore {
     return { id: row.identity_id, role: row.role, teamId: row.team_id ?? undefined };
   }
 
-  assignCredential(identityId: string, model: string, credentialSlot: number): void {
+  assignCredential(identityId: string, model: string, credentialId: number): void {
     const provider = requiredString(model, "model").split("/", 1)[0];
-    if (!Number.isSafeInteger(credentialSlot) || credentialSlot < 0) {
-      throw new Error("credentialSlot must be a non-negative integer");
+    if (!Number.isSafeInteger(credentialId) || credentialId < 1) {
+      throw new Error("credentialId must be a positive integer");
     }
     const result = this.db.query(`
-      UPDATE credential_assignments SET provider=?, credential_slot=? WHERE identity_id=?
-    `).run(provider, credentialSlot, identityId);
+      UPDATE credential_assignments SET provider=?, credential_id=? WHERE identity_id=?
+    `).run(provider, credentialId, identityId);
     if (result.changes !== 1) throw new Error(`Unknown fleet identity: ${identityId}`);
   }
 
-  credentialAssignment(token: string): AuthIdentity & { provider: string; credentialSlot: number } {
+  credentialAssignment(token: string): AuthIdentity & { provider: string; credentialId: number } {
     const actor = this.authenticate(token);
     const row = this.db.query(`
-      SELECT provider, credential_slot FROM credential_assignments WHERE identity_id=?
-    `).get(actor.id) as { provider: string; credential_slot: number } | null;
+      SELECT provider, credential_id FROM credential_assignments WHERE identity_id=?
+    `).get(actor.id) as { provider: string; credential_id: number } | null;
     if (!row) throw new Error(`No credential assignment for ${actor.id}`);
-    return { ...actor, provider: row.provider, credentialSlot: row.credential_slot };
+    return { ...actor, provider: row.provider, credentialId: row.credential_id };
   }
 
   private apply(actor: AuthIdentity, op: string, data: Record<string, unknown>): unknown {
@@ -463,6 +605,8 @@ export class FleetStore {
       case "submit": return this.submit(actor, data);
       case "review": return this.review(actor, data);
       case "handoff": return this.handoff(actor, data);
+      case "resume": return this.resume(actor, data);
+      case "finish": return this.finish(actor, data);
       case "cancel": return this.cancel(actor, data);
       case "message": return this.message(actor, data);
       case "status": return this.status(actor, data);
@@ -491,7 +635,7 @@ export class FleetStore {
     if (!TRANSITIONS[current].includes(next)) throw new Error(`Invalid transition: ${current} -> ${next}`);
     let beforeBlock = work.state_before_block as WorkState | null;
     if (next === "blocked") beforeBlock = current;
-    else if (next === "cancelled") beforeBlock = null;
+    else if (current === "blocked" || next === "cancelled") beforeBlock = null;
     this.db.query(`
       UPDATE work_items SET state=?, state_before_block=?, status_reason=?, updated_at=? WHERE id=?
     `).run(next, beforeBlock, reason ?? null, now(), workId);
@@ -530,9 +674,12 @@ export class FleetStore {
     if (!rawContract) throw new Error("contract is required");
     const contract: AssignmentContract = {
       goal: requiredString(rawContract.goal, "contract.goal"),
-      ownedPaths: stringArray(rawContract.ownedPaths, "contract.ownedPaths", true),
-      readOnlyPaths: stringArray(rawContract.readOnlyPaths, "contract.readOnlyPaths"),
-      forbiddenPaths: stringArray(rawContract.forbiddenPaths, "contract.forbiddenPaths"),
+      ownedPaths: stringArray(rawContract.ownedPaths, "contract.ownedPaths", true)
+        .map((path) => repoPath(path, "contract.ownedPaths")),
+      readOnlyPaths: stringArray(rawContract.readOnlyPaths, "contract.readOnlyPaths")
+        .map((path) => repoPath(path, "contract.readOnlyPaths")),
+      forbiddenPaths: stringArray(rawContract.forbiddenPaths, "contract.forbiddenPaths")
+        .map((path) => repoPath(path, "contract.forbiddenPaths")),
       dependsOn: stringArray(rawContract.dependsOn, "contract.dependsOn"),
       nonGoals: stringArray(rawContract.nonGoals, "contract.nonGoals"),
       acceptance: stringArray(rawContract.acceptance, "contract.acceptance", true),
@@ -547,10 +694,16 @@ export class FleetStore {
         throw new Error(`Dependency ${dependency} is not ready`);
       }
     }
+    const lockedPaths = this.db.query("SELECT path,work_id,team_id FROM path_locks").all() as Array<{
+      path: string;
+      work_id: string;
+      team_id: string;
+    }>;
     for (const path of contract.ownedPaths) {
-      const conflict = this.db.query("SELECT work_id,team_id FROM path_locks WHERE path=?").get(path) as
-        | { work_id: string; team_id: string }
-        | null;
+      const policyConflict = [...(contract.readOnlyPaths ?? []), ...(contract.forbiddenPaths ?? [])]
+        .find((restricted) => overlapsPath(path, restricted));
+      if (policyConflict) throw new Error(`Owned path ${path} overlaps restricted path ${policyConflict}`);
+      const conflict = lockedPaths.find((lock) => overlapsPath(path, lock.path));
       if (conflict) throw new Error(`Path ${path} is locked by ${conflict.team_id}/${conflict.work_id}`);
     }
 
@@ -586,6 +739,9 @@ export class FleetStore {
     const workId = requiredString(data.workId, "workId");
     const work = this.work(workId);
     if (actor.role === "team") this.assertAssigned(actor, work);
+    else if (this.agentPlacement(actor.id).current_work_id !== workId) {
+      throw new Error(`Reviewer is not assigned to work item ${workId}`);
+    }
     const status = requiredString(data.status, "status");
     const reason = typeof data.reason === "string" ? data.reason : undefined;
     if (status === "blocked") {
@@ -613,7 +769,8 @@ export class FleetStore {
     }
     const exactHead = requiredString(data.exactHead, "exactHead");
     if (!/^[0-9a-f]{40}$/.test(exactHead)) throw new Error("exactHead must be a full 40-character SHA");
-    const changedPaths = stringArray(data.changedPaths, "changedPaths", true);
+    const changedPaths = stringArray(data.changedPaths, "changedPaths", true)
+      .map((path) => repoPath(path, "changedPaths"));
     const verification = stringArray(data.verification, "verification", true);
     this.validateOwnedPaths(work, changedPaths);
     this.db.query("UPDATE work_items SET exact_head=?, updated_at=? WHERE id=?").run(exactHead, now(), workId);
@@ -628,6 +785,14 @@ export class FleetStore {
     const workId = requiredString(data.workId, "workId");
     const work = this.work(workId);
     if (work.state !== "ready_for_review") throw new Error(`Work item ${workId} is not ready for review`);
+    const placement = this.agentPlacement(actor.id);
+    if (
+      placement.current_work_id !== workId
+      || typeof placement.workspace_id !== "string"
+      || typeof placement.pane_id !== "string"
+    ) {
+      throw new Error(`Reviewer is not bound to the active review session for ${workId}`);
+    }
     const exactHead = requiredString(data.exactHead, "exactHead");
     if (exactHead !== work.exact_head) throw new Error("Reviewer exactHead does not match submitted head");
     const verdict = requiredString(data.verdict, "verdict");
@@ -655,7 +820,34 @@ export class FleetStore {
     this.db.query("UPDATE work_items SET remote_head=?, pull_request=?, updated_at=? WHERE id=?")
       .run(remoteHead, pullRequest, now(), workId);
     this.transition(workId, "handed_off", actor, "Principal merge handoff recorded");
-    this.releaseLocks(workId);
+    return this.work(workId);
+  }
+
+  private resume(actor: AuthIdentity, data: Record<string, unknown>): unknown {
+    this.requireRole(actor, "main");
+    const workId = requiredString(data.workId, "workId");
+    const reason = requiredString(data.reason, "reason");
+    const work = this.work(workId);
+    if (work.state !== "blocked") throw new Error(`Work item ${workId} is not blocked`);
+    const previous = work.state_before_block as WorkState | null;
+    if (!previous || !TRANSITIONS.blocked.includes(previous)) {
+      throw new Error(`Work item ${workId} has no resumable state`);
+    }
+    this.transition(workId, previous, actor, reason);
+    return this.work(workId);
+  }
+
+  private finish(actor: AuthIdentity, data: Record<string, unknown>): unknown {
+    this.requireRole(actor, "main");
+    const workId = requiredString(data.workId, "workId");
+    const work = this.work(workId);
+    if (work.state !== "handed_off") throw new Error(`Work item ${workId} is not handed off`);
+    const exactHead = requiredString(data.exactHead, "exactHead");
+    const pullRequest = requiredString(data.pullRequest, "pullRequest");
+    if (exactHead !== work.exact_head || exactHead !== work.remote_head || pullRequest !== work.pull_request) {
+      throw new Error("Merged PR evidence does not match the handed-off exact head");
+    }
+    this.transition(workId, "merged", actor, "Protected PR merge observed");
     return this.work(workId);
   }
 
@@ -676,13 +868,14 @@ export class FleetStore {
     const workId = typeof data.workId === "string" ? data.workId : undefined;
     if (workId) {
       const work = this.work(workId);
-      if (actor.role !== "main" && work.team_id !== actor.teamId && actor.role !== "reviewer") {
-        throw new Error(`${actor.id} cannot message about work item ${workId}`);
-      }
+      const scoped = actor.role === "main"
+        || (actor.role === "team" && work.team_id === actor.teamId)
+        || (actor.role === "reviewer" && this.agentPlacement(actor.id).current_work_id === workId);
+      if (!scoped) throw new Error(`${actor.id} cannot message about work item ${workId}`);
     }
     const known = this.db.query("SELECT identity_id FROM agents WHERE identity_id=?").get(recipient);
     if (!known) throw new Error(`Unknown recipient: ${recipient}`);
-    const id = requiredString(data.messageId, "messageId");
+    const id = typeof data.messageId === "string" && data.messageId !== "" ? data.messageId : crypto.randomUUID();
     this.db.query("INSERT INTO messages(id,work_id,sender,recipient,body,created_at) VALUES(?,?,?,?,?,?)")
       .run(id, workId ?? null, actor.id, recipient, body, now());
     this.event(actor.id, "message.queued", workId, actor.teamId, { messageId: id, recipient });
@@ -694,22 +887,33 @@ export class FleetStore {
     const works = workId
       ? [this.work(workId)]
       : (this.db.query("SELECT * FROM work_items ORDER BY created_at DESC").all() as Array<Record<string, unknown>>);
-    const visible = actor.role === "main" || actor.role === "reviewer"
-      ? works
-      : works.filter((work) => work.team_id === actor.teamId);
+    let visible = works;
+    if (actor.role === "reviewer") {
+      visible = works.filter((work) => work.id === this.agentPlacement(actor.id).current_work_id);
+    } else if (actor.role === "team") {
+      visible = works.filter((work) => work.team_id === actor.teamId);
+    }
     const agents = this.db.query("SELECT * FROM agents ORDER BY identity_id").all();
     const queuedMessages = this.db.query("SELECT * FROM messages WHERE recipient=? AND status='queued' ORDER BY created_at")
-      .all(actor.id);
+      .all(actor.id) as Array<Record<string, unknown>>;
+    if (queuedMessages.length > 0) {
+      const deliveredAt = now();
+      this.db.transaction(() => {
+        for (const message of queuedMessages) {
+          this.db.query("UPDATE messages SET status='delivered', delivered_at=? WHERE id=?").run(deliveredAt, String(message.id));
+        }
+      })();
+    }
     return { actor: actor.id, workItems: visible, agents, messages: queuedMessages };
   }
 
   private validateOwnedPaths(work: Record<string, unknown>, changedPaths: string[]): void {
     const contract = parseJson<AssignmentContract>(work.contract_json, {} as AssignmentContract);
     const owned = contract.ownedPaths ?? [];
-    const forbidden = contract.forbiddenPaths ?? [];
+    const restricted = [...(contract.readOnlyPaths ?? []), ...(contract.forbiddenPaths ?? [])];
     for (const changedPath of changedPaths) {
-      if (forbidden.some((path) => changedPath === path || changedPath.startsWith(`${path}/`))) {
-        throw new Error(`Changed forbidden path: ${changedPath}`);
+      if (restricted.some((path) => overlapsPath(changedPath, path))) {
+        throw new Error(`Changed restricted path: ${changedPath}`);
       }
       if (!owned.some((path) => changedPath === path || changedPath.startsWith(`${path}/`))) {
         throw new Error(`Changed path is outside assignment ownership: ${changedPath}`);

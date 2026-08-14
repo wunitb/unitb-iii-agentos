@@ -6,7 +6,7 @@ import { FleetStore, loadFleetConfig, type FleetConfig, type FleetRequest } from
 
 const roots: string[] = [];
 const config: FleetConfig = {
-  version: 3,
+  version: 4,
   session: "test",
   workspaceLabel: "test",
   repo: "owner/repo",
@@ -18,16 +18,23 @@ const config: FleetConfig = {
     upstreamUrl: "http://127.0.0.1:8765",
     upstreamTokenFile: "~/.omp/auth-broker.token",
   },
-  main: { model: "main-model", credentialSlot: 0 },
+  network: {
+    dnsForward: "1.1.1.1",
+    allowedHostsByProvider: {
+      "openai-codex": ["api.openai.com"],
+      anthropic: ["api.anthropic.com"],
+    },
+  },
+  main: { model: "openai-codex/main-model", credentialId: 1 },
   teams: [
-    { id: "TEAM-01", model: "team-model-1", credentialSlot: 0 },
-    { id: "TEAM-02", model: "team-model-2", credentialSlot: 1 },
+    { id: "TEAM-01", model: "anthropic/team-model-1", credentialId: 2 },
+    { id: "TEAM-02", model: "openai-codex/team-model-2", credentialId: 3 },
   ],
   reviewer: {
     id: "Reviewer",
     routes: {
-      "TEAM-01": { model: "review-model-1", credentialSlot: 0 },
-      "TEAM-02": { model: "review-model-2", credentialSlot: 1 },
+      "TEAM-01": { model: "openai-codex/review-model-1", credentialId: 3 },
+      "TEAM-02": { model: "anthropic/review-model-2", credentialId: 2 },
     },
   },
 };
@@ -106,6 +113,7 @@ describe("FleetStore", () => {
       changedPaths: ["src/feature/index.ts"],
       verification: ["bun test: pass"],
     }).ok).toBe(true);
+    store.bindAgent("Reviewer", "workspace", "pane", "WORK-01", "session");
 
     expect(call(store, tokens.Reviewer, "review", {
       workId: "WORK-01",
@@ -137,6 +145,51 @@ describe("FleetStore", () => {
     store.close();
   });
 
+  test("resumes blocked revisions to changes_requested", () => {
+    const { root, store, tokens } = setup();
+    const base = "a".repeat(40);
+    const head = "b".repeat(40);
+    call(store, tokens.Main, "plan", {
+      workId: "WORK-01",
+      principalGoal: "\"Revise the feature\" — blocked revision recovery",
+      repository: "owner/repo",
+      verifiedBaseSha: base,
+    });
+    const assigned = call(store, tokens.Main, "assign", {
+      workId: "WORK-01",
+      teamId: "TEAM-01",
+      worktree: join(root, "worktrees", "TEAM-01", "WORK-01"),
+      contract: contract(),
+    });
+    call(store, tokens["TEAM-01"], "ack", {
+      workId: "WORK-01",
+      contractRevision: (assigned.result as Record<string, string>).updated_at,
+    });
+    call(store, tokens["TEAM-01"], "submit", {
+      workId: "WORK-01",
+      exactHead: head,
+      changedPaths: ["src/feature/index.ts"],
+      verification: ["bun test: pass"],
+    });
+    store.bindAgent("Reviewer", "workspace", "pane", "WORK-01", "session");
+    call(store, tokens.Reviewer, "review", {
+      workId: "WORK-01",
+      exactHead: head,
+      verdict: "changes_requested",
+      findings: ["Fix the boundary case"],
+    });
+
+    const blocked = call(store, tokens["TEAM-01"], "report", {
+      workId: "WORK-01",
+      status: "blocked",
+      reason: "Waiting for fixture",
+    });
+    expect((blocked.result as Record<string, string>).state).toBe("blocked");
+    const resumed = call(store, tokens.Main, "resume", { workId: "WORK-01", reason: "Fixture is available" });
+    expect((resumed.result as Record<string, string>).state).toBe("changes_requested");
+    store.close();
+  });
+
   test("serializes path ownership and command idempotency", () => {
     const { root, store, tokens } = setup();
     const base = "a".repeat(40);
@@ -163,6 +216,13 @@ describe("FleetStore", () => {
       contract: contract(["src/shared"]),
     }, idempotencyKey);
     expect(first).toEqual(duplicate);
+    expect(() => call(store, tokens.Main, "assign", {
+      workId: "WORK-02",
+      teamId: "TEAM-02",
+      worktree: join(root, "two"),
+      contract: contract(["src/other"]),
+    }, idempotencyKey)).toThrow("was reused with a different command");
+
 
     const conflict = call(store, tokens.Main, "assign", {
       workId: "WORK-02",
@@ -178,6 +238,22 @@ describe("FleetStore", () => {
       repository: "owner/repo",
       verifiedBaseSha: base,
     }).ok).toBe(false);
+    store.close();
+  });
+
+  test("persists dispatcher-side command results in the same idempotency ledger", () => {
+    const { store, tokens } = setup();
+    const request: FleetRequest = {
+      id: "launch-team-command",
+      op: "launch_team",
+      token: tokens.Main,
+      data: { workId: "WORK-01" },
+    };
+    const applied = store.recordApplied(request, { identity: "TEAM-01" });
+
+    expect(store.cachedResponse(request, "Main")).toEqual(applied);
+    expect(() => store.cachedResponse({ ...request, op: "launch_reviewer" }, "Main"))
+      .toThrow("was reused with a different command");
     store.close();
   });
 
@@ -209,7 +285,7 @@ describe("FleetStore", () => {
     const status = call(store, tokens.Main, "status", {});
     const reviewer = (status.result as { agents: Array<Record<string, string>> }).agents
       .find((agent) => agent.identity_id === "Reviewer");
-    expect(reviewer?.model).toBe("TEAM-01:replacement-review-model|TEAM-02:review-model-2");
+    expect(reviewer?.model).toBe("TEAM-01:replacement-review-model|TEAM-02:anthropic/review-model-2");
     store.close();
   });
 });

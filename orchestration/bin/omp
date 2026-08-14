@@ -1,29 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REAL_OMP=${UNITB_REAL_OMP:-"$HOME/.bun/bin/omp"}
-ROLE=${UNITB_FLEET_ROLE:-main}
-
-if [[ "$ROLE" == "main" ]]; then
-  exec "$REAL_OMP" "$@"
-fi
-
+: "${UNITB_FLEET_ROLE:?}"
 : "${UNITB_FLEET_ID:?}"
-: "${UNITB_FLEET_RUNTIME_ROOT:?}"
 : "${UNITB_FLEET_AGENT_RUNTIME:?}"
 : "${UNITB_FLEET_AGENT_HOME:?}"
 : "${UNITB_FLEET_WORKTREE:?}"
 : "${UNITB_FLEET_SOCKET_HOST:?}"
+: "${UNITB_CREDENTIAL_SOCKET_HOST:?}"
 : "${UNITB_FLEET_CONFIG:?}"
+: "${UNITB_ASSIGNMENT_PROMPT:?}"
 : "${UNITB_FLEET_TOKEN_FILE:?}"
-: "${OMP_AUTH_BROKER_URL:?}"
-: "${PI_CODING_AGENT_DIR:?}"
-: "${HERDR_SOCKET_PATH:?}"
+: "${UNITB_NETWORK_HOSTS:?}"
+: "${UNITB_NETWORK_RESOLV:?}"
+: "${UNITB_NETWORK_NFT:?}"
+: "${UNITB_STAGED_OMP:?}"
+: "${UNITB_STAGED_TOOLCHAIN:?}"
+: "${UNITB_STAGED_BUN:?}"
+: "${UNITB_HERDR_SOCKET_HOST:?}"
 : "${HERDR_PANE_ID:?}"
 
 HOST_HOME=$HOME
 auth_broker_token=$(<"$UNITB_FLEET_TOKEN_FILE")
 BWRAP=/usr/local/libexec/unitb-fleet/bwrap
+PASTA=/usr/local/libexec/unitb-fleet/pasta
+SESSIONS_DIR="$UNITB_FLEET_AGENT_RUNTIME/sessions"
+
 bwrap_args=(
   --die-with-parent
   --new-session
@@ -31,26 +33,49 @@ bwrap_args=(
   --unshare-pid
   --unshare-uts
   --unshare-ipc
-  --share-net
   --clearenv
-  --ro-bind / /
-  --dev-bind /dev /dev
+  --tmpfs /
+  --dir /usr
+  --ro-bind /usr /usr
+  --symlink usr/bin /bin
+  --symlink usr/sbin /sbin
+  --symlink usr/lib /lib
+  --dir /etc
+  --dir /etc/ssl
+  --ro-bind /etc/ssl/certs /etc/ssl/certs
+  --ro-bind /etc/passwd /etc/passwd
+  --ro-bind /etc/group /etc/group
+  --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf
+  --ro-bind "$UNITB_NETWORK_HOSTS" /etc/hosts
+  --ro-bind "$UNITB_NETWORK_RESOLV" /etc/resolv.conf
+  --dev /dev
   --proc /proc
   --tmpfs /tmp
-  --tmpfs "$HOST_HOME"
+  --dir /run
+  --tmpfs /run/user
+  --dir "$HOST_HOME"
   --dir "$UNITB_FLEET_AGENT_RUNTIME"
-  --bind "$UNITB_FLEET_AGENT_RUNTIME" "$UNITB_FLEET_AGENT_RUNTIME"
-  --ro-bind "$UNITB_FLEET_SOCKET_HOST" "$UNITB_FLEET_AGENT_RUNTIME/dispatcher.sock"
+  --bind "$UNITB_FLEET_AGENT_HOME" "$UNITB_FLEET_AGENT_HOME"
+  --bind "$PI_CODING_AGENT_DIR" "$PI_CODING_AGENT_DIR"
+  --bind "$SESSIONS_DIR" "$SESSIONS_DIR"
+  --ro-bind "$UNITB_STAGED_TOOLCHAIN" "$UNITB_STAGED_TOOLCHAIN"
+  --ro-bind "$UNITB_FLEET_CONFIG" "$UNITB_FLEET_CONFIG"
+  --ro-bind "$UNITB_FLEET_TOKEN_FILE" "$UNITB_FLEET_TOKEN_FILE"
+  --ro-bind "$UNITB_ASSIGNMENT_PROMPT" "$UNITB_ASSIGNMENT_PROMPT"
+  --ro-bind "$UNITB_FLEET_SOCKET_HOST" /run/dispatcher.sock
+  --ro-bind "$UNITB_CREDENTIAL_SOCKET_HOST" /run/credential.sock
+  --ro-bind "$UNITB_HERDR_SOCKET_HOST" /run/herdr.sock
+  --ro-bind "$UNITB_NETWORK_NFT" "$UNITB_NETWORK_NFT"
   --chdir "$UNITB_FLEET_WORKTREE"
   --setenv HOME "$UNITB_FLEET_AGENT_HOME"
   --setenv USER "${USER:-wunitb}"
   --setenv LOGNAME "${LOGNAME:-wunitb}"
-  --setenv PATH "$PATH"
+  --setenv PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOST_HOME/.cargo/bin"
   --setenv TERM "${TERM:-xterm-256color}"
   --setenv LANG "${LANG:-C.UTF-8}"
   --setenv SSH_AUTH_SOCK ""
   --setenv PI_CODING_AGENT_DIR "$PI_CODING_AGENT_DIR"
-  --setenv OMP_AUTH_BROKER_URL "$OMP_AUTH_BROKER_URL"
+  --setenv OMP_AUTH_BROKER_URL "http://127.0.0.1:8765"
   --setenv OMP_AUTH_BROKER_TOKEN "$auth_broker_token"
   --setenv UNITB_FLEET_ROLE "$UNITB_FLEET_ROLE"
   --setenv UNITB_FLEET_ID "$UNITB_FLEET_ID"
@@ -58,8 +83,8 @@ bwrap_args=(
   --setenv UNITB_FLEET_REPO_ROOT "$UNITB_FLEET_REPO_ROOT"
   --setenv UNITB_FLEET_WORKTREE "$UNITB_FLEET_WORKTREE"
   --setenv UNITB_FLEET_TOKEN_FILE "$UNITB_FLEET_TOKEN_FILE"
-  --setenv UNITB_FLEET_SOCKET "$UNITB_FLEET_AGENT_RUNTIME/dispatcher.sock"
-  --setenv HERDR_SOCKET_PATH "$HERDR_SOCKET_PATH"
+  --setenv UNITB_FLEET_SOCKET /run/dispatcher.sock
+  --setenv HERDR_SOCKET_PATH /run/herdr.sock
   --setenv HERDR_ENV "1"
   --setenv HERDR_PANE_ID "$HERDR_PANE_ID"
   --setenv GIT_AUTHOR_NAME "$GIT_AUTHOR_NAME"
@@ -70,41 +95,37 @@ bwrap_args=(
   --setenv CARGO_HOME "$UNITB_FLEET_AGENT_HOME/.cargo"
 )
 
-if [[ -d /run/user ]]; then
-  bwrap_args+=(--tmpfs /run/user)
+if [[ -d "$HOST_HOME/.rustup" ]]; then
+  bwrap_args+=(--dir "$HOST_HOME/.rustup" --ro-bind "$HOST_HOME/.rustup" "$HOST_HOME/.rustup")
+fi
+if [[ -d "$HOST_HOME/.cargo/bin" ]]; then
+  bwrap_args+=(--dir "$HOST_HOME/.cargo" --dir "$HOST_HOME/.cargo/bin" --ro-bind "$HOST_HOME/.cargo/bin" "$HOST_HOME/.cargo/bin")
 fi
 
-for tool_dir in \
-  "$HOST_HOME/.bun" \
-  "$HOST_HOME/.rustup" \
-  "$HOST_HOME/.cargo/bin" \
-  "$HOST_HOME/.local/bin"; do
-  if [[ -d "$tool_dir" ]]; then
-    bwrap_args+=(--dir "$tool_dir" --ro-bind "$tool_dir" "$tool_dir")
-  fi
-done
-
-
-: "${UNITB_GIT_COMMON:?}"
-: "${UNITB_GIT_WORKTREE_DIR:?}"
-bwrap_args+=(
-  --dir "$UNITB_FLEET_WORKTREE"
-  --dir "$UNITB_GIT_COMMON"
-  --ro-bind "$UNITB_GIT_COMMON" "$UNITB_GIT_COMMON"
-)
-
-if [[ "$ROLE" == "team" ]]; then
-  : "${UNITB_GIT_BRANCH_NAMESPACE:?}"
-  : "${UNITB_GIT_LOG_NAMESPACE:?}"
-  bwrap_args+=(
-    --bind "$UNITB_FLEET_WORKTREE" "$UNITB_FLEET_WORKTREE"
-    --bind "$UNITB_GIT_COMMON/objects" "$UNITB_GIT_COMMON/objects"
-    --bind "$UNITB_GIT_WORKTREE_DIR" "$UNITB_GIT_WORKTREE_DIR"
-    --bind "$UNITB_GIT_BRANCH_NAMESPACE" "$UNITB_GIT_BRANCH_NAMESPACE"
-    --bind "$UNITB_GIT_LOG_NAMESPACE" "$UNITB_GIT_LOG_NAMESPACE"
-  )
+if [[ "$UNITB_FLEET_ROLE" == "team" ]]; then
+  bwrap_args+=(--bind "$UNITB_FLEET_WORKTREE" "$UNITB_FLEET_WORKTREE")
 else
   bwrap_args+=(--ro-bind "$UNITB_FLEET_WORKTREE" "$UNITB_FLEET_WORKTREE")
 fi
 
-"$BWRAP" "${bwrap_args[@]}" -- "$REAL_OMP" "$@"
+exec /usr/bin/python3 "$UNITB_FLEET_REPO_ROOT/orchestration/bin/omp-supervisor.py" "$PASTA" \
+  --quiet \
+  --foreground \
+  --config-net \
+  --ipv4-only \
+  --no-map-gw \
+  --tcp-ports none \
+  --udp-ports none \
+  --tcp-ns none \
+  --udp-ns none \
+  -- \
+  /bin/bash -c '
+    /usr/sbin/nft -f "$1"
+    shift
+    exec "$@"
+  ' unitb-fleet "$UNITB_NETWORK_NFT" \
+  "$BWRAP" "${bwrap_args[@]}" -- \
+  /bin/bash -c '
+    /usr/bin/socat TCP-LISTEN:8765,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/run/credential.sock 2>/dev/null &
+    exec "$1" "$2/dist/cli.js" "${@:3}"
+  ' unitb-fleet "$UNITB_STAGED_BUN" "$UNITB_STAGED_OMP" "$@"

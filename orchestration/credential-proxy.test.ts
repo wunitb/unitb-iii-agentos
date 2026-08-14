@@ -47,7 +47,7 @@ function handler(upstreamUrl: string) {
     upstreamToken: "upstream-secret",
     resolveAssignment(token) {
       if (token !== "team-secret") throw new Error("Invalid fleet token");
-      return { id: "TEAM-01", role: "team", teamId: "TEAM-01", provider: "anthropic", credentialSlot: 1 };
+      return { id: "TEAM-01", role: "team", teamId: "TEAM-01", provider: "anthropic", credentialId: 2 };
     },
   });
 }
@@ -97,6 +97,34 @@ describe("scoped credential proxy", () => {
     expect(allowed.status).toBe(200);
     expect(broker.calls.at(-1)).toEqual({ method: "POST", path: "/v1/credential/2/refresh", body: "{}" });
   });
+  test("forwards observed usage only for the assigned provider", async () => {
+    const broker = fakeBroker();
+    const proxy = handler(broker.url);
+    const allowedBody = {
+      installId: "fleet-main",
+      entries: [{ at: Date.now(), provider: "anthropic", model: "claude-opus-5", requests: 1 }],
+    };
+    const allowed = await proxy(new Request("http://proxy/v1/usage/observed", {
+      method: "POST",
+      headers: { authorization: "Bearer team-secret", "content-type": "application/json" },
+      body: JSON.stringify(allowedBody),
+    }));
+    const forbidden = await proxy(new Request("http://proxy/v1/usage/observed", {
+      method: "POST",
+      headers: { authorization: "Bearer team-secret", "content-type": "application/json" },
+      body: JSON.stringify({
+        installId: "fleet-main",
+        entries: [{ at: Date.now(), provider: "openai-codex", model: "gpt-5.6-sol", requests: 1 }],
+      }),
+    }));
+
+    expect(allowed.status).toBe(200);
+    expect(forbidden.status).toBe(403);
+    expect(broker.calls).toEqual([
+      { method: "POST", path: "/v1/usage/observed", body: JSON.stringify(allowedBody) },
+    ]);
+  });
+
 
   test("does not expose cross-account usage or accept credential uploads", async () => {
     const broker = fakeBroker();

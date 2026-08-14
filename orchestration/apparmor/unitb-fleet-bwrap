@@ -1,5 +1,5 @@
-# Narrowly enables unprivileged user namespaces for the dedicated, root-owned
-# UnitB fleet bubblewrap binary.
+# Narrowly enables namespace operations for the dedicated, root-owned UnitB
+# fleet bubblewrap and pasta binaries.
 
 abi <abi/4.0>,
 include <tunables/global>
@@ -8,4 +8,11 @@ profile unitb-fleet-bwrap /usr/local/libexec/unitb-fleet/bwrap flags=(unconfined
   userns,
 
   include if exists <local/unitb-fleet-bwrap>
+}
+
+
+profile unitb-fleet-pasta /usr/local/libexec/unitb-fleet/pasta flags=(unconfined) {
+  userns,
+
+  include if exists <local/unitb-fleet-pasta>
 }

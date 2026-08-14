@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "session": "tldrsoc",
   "workspaceLabel": "unitb-iii-agentos",
   "repo": "wunitb/unitb-iii-agentos",
@@ -11,20 +11,27 @@
     "upstreamUrl": "http://127.0.0.1:8765",
     "upstreamTokenFile": "~/.omp/auth-broker.token"
   },
+  "network": {
+    "dnsForward": "1.1.1.1",
+    "allowedHostsByProvider": {
+      "anthropic": ["api.anthropic.com"],
+      "openai-codex": ["chatgpt.com", "chat.openai.com", "api.openai.com"]
+    }
+  },
   "main": {
     "model": "openai-codex/gpt-5.6-sol",
-    "credentialSlot": 0
+    "credentialId": 1
   },
   "teams": [
     {
       "id": "TEAM-01",
       "model": "anthropic/claude-opus-5",
-      "credentialSlot": 0
+      "credentialId": 4
     },
     {
       "id": "TEAM-02",
       "model": "openai-codex/gpt-5.6-terra",
-      "credentialSlot": 1
+      "credentialId": 3
     }
   ],
   "reviewer": {
@@ -32,11 +39,11 @@
     "routes": {
       "TEAM-01": {
         "model": "openai-codex/gpt-5.6-terra",
-        "credentialSlot": 1
+        "credentialId": 3
       },
       "TEAM-02": {
         "model": "anthropic/claude-opus-5",
-        "credentialSlot": 0
+        "credentialId": 4
       }
     }
   }
