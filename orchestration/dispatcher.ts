@@ -1037,7 +1037,10 @@ async function main(): Promise<void> {
     const store = new FleetStore(runtime.database, runtime.runtimeDir);
     const schema = store.getMeta("schema_version");
     store.close();
-    console.log(JSON.stringify({ ok: schema === FLEET_SCHEMA_VERSION && existsSync(runtime.socket), socket: existsSync(runtime.socket), schema }));
+    const socket = existsSync(runtime.socket);
+    const ok = schema === FLEET_SCHEMA_VERSION && socket;
+    console.log(JSON.stringify({ ok, socket, schema }));
+    if (!ok) process.exitCode = 1;
     return;
   }
   console.error("Usage: dispatcher.ts [--config path] serve|bootstrap|launch-main|request|health");
