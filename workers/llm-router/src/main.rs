@@ -28,6 +28,38 @@ const CODEX_PROVIDER: &str = "codex";
 const DEFAULT_CODEX_BASE_URL: &str = "http://127.0.0.1:8317/v1";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
 
+fn resolve_codex_base_url(override_value: Option<&str>) -> String {
+    let Some(raw) = override_value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return DEFAULT_CODEX_BASE_URL.to_string();
+    };
+
+    let Some(url) = reqwest::Url::parse(raw).ok() else {
+        return DEFAULT_CODEX_BASE_URL.to_string();
+    };
+    let is_loopback_literal = url
+        .host_str()
+        .and_then(|host| {
+            let host = host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(host);
+            host.parse::<std::net::IpAddr>().ok()
+        })
+        .is_some_and(|host| host.is_loopback());
+    let is_safe = matches!(url.scheme(), "http" | "https")
+        && is_loopback_literal
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none();
+
+    if !is_safe {
+        return DEFAULT_CODEX_BASE_URL.to_string();
+    }
+
+    url.to_string().trim_end_matches('/').to_string()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Route {
     provider: String,
@@ -557,10 +589,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             name.to_string(),
             ProviderConfig {
                 base_url: if name == CODEX_PROVIDER {
-                    std::env::var("CODEX_PROXY_BASE_URL")
-                        .ok()
-                        .filter(|value| !value.trim().is_empty())
-                        .unwrap_or_else(|| DEFAULT_CODEX_BASE_URL.to_string())
+                    resolve_codex_base_url(std::env::var("CODEX_PROXY_BASE_URL").ok().as_deref())
                 } else {
                     base_url.to_string()
                 },
@@ -831,6 +860,43 @@ mod tests {
         assert_eq!(env_key, "CODEX_PROXY_API_KEY");
         assert!(matches!(driver, Driver::OpenAiCompat));
         assert!(models.contains(&"gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn codex_base_url_accepts_default_and_loopback_overrides() {
+        assert_eq!(
+            resolve_codex_base_url(None),
+            DEFAULT_CODEX_BASE_URL
+        );
+        assert_eq!(
+            resolve_codex_base_url(Some("http://127.0.0.2:8317/v1/")),
+            "http://127.0.0.2:8317/v1"
+        );
+        assert_eq!(
+            resolve_codex_base_url(Some("https://[::1]:8317/v1/")),
+            "https://[::1]:8317/v1"
+        );
+    }
+
+    #[test]
+    fn codex_base_url_rejects_unsafe_overrides() {
+        for value in [
+            "not a url",
+            "http://",
+            "ftp://127.0.0.1:8317/v1",
+            "http://localhost:8317/v1",
+            "http://192.168.1.10:8317/v1",
+            "http://user@127.0.0.1:8317/v1",
+            "http://user:password@127.0.0.1:8317/v1",
+            "http://127.0.0.1:8317/v1?next=https://example.com",
+            "http://127.0.0.1:8317/v1#fragment",
+        ] {
+            assert_eq!(
+                resolve_codex_base_url(Some(value)),
+                DEFAULT_CODEX_BASE_URL,
+                "unsafe Codex base URL was accepted: {value}"
+            );
+        }
     }
 
     #[test]
