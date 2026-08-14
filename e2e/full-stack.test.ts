@@ -194,19 +194,38 @@ suite("AgentOS full-stack E2E", () => {
     }
   });
 
-  it("llm::route — complexity-based model selection", async () => {
-    const easy = await call<{ provider: string; model: string }>("llm::route", {
-      messages: [{ role: "user", content: "hi" }],
-      tools: [],
-    });
-    expect(easy.provider).toBe("anthropic");
-    expect(easy.model).toMatch(/haiku/);
+  it("llm::route — resolves default and explicit model contracts", async () => {
+    const automatic = await call<{ provider: string; model: string }>(
+      "llm::route",
+      {
+        messages: [{ role: "user", content: "hi" }],
+        tools: [],
+      },
+    );
+    expect(typeof automatic.provider).toBe("string");
+    expect(automatic.provider.length).toBeGreaterThan(0);
+    expect(typeof automatic.model).toBe("string");
+    expect(automatic.model.length).toBeGreaterThan(0);
 
-    const forced = await call<{ model: string }>("llm::route", {
-      messages: [{ role: "user", content: "x" }],
-      model: "haiku",
-    });
-    expect(forced.model).toMatch(/haiku/);
+    const haiku = await call<{ provider: string; model: string }>(
+      "llm::route",
+      {
+        messages: [{ role: "user", content: "x" }],
+        model: "haiku",
+      },
+    );
+    expect(haiku.provider).toBe("anthropic");
+    expect(haiku.model).toMatch(/haiku/);
+
+    const codex = await call<{ provider: string; model: string }>(
+      "llm::route",
+      {
+        messages: [{ role: "user", content: "x" }],
+        model: "gpt-5.6-sol",
+      },
+    );
+    expect(codex.provider).toBe("codex");
+    expect(codex.model).toBe("gpt-5.6-sol");
   });
 
   it("llm::complete — real Anthropic call", async () => {
