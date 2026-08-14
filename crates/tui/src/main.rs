@@ -304,7 +304,7 @@ impl App {
     async fn refresh_registry(&mut self) {
         let client = Self::client();
         if let Ok(resp) = client
-            .get(format!("{}/api/metrics/summary", API_BASE))
+            .get(format!("{}/api/health", API_BASE))
             .send()
             .await
             && let Ok(data) = resp.json::<Value>().await
@@ -3905,6 +3905,21 @@ mod tests {
         for required in ["memory", "browser", "llm-router", "agent-core", "approval"] {
             assert!(names.contains(required), "missing {}", required);
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live iii engine on :3111"]
+    async fn live_refresh_registry_counts_connected_workers() {
+        if std::env::var("AGENTOS_LIVE_TEST").is_err() {
+            return;
+        }
+        let mut app = App::new();
+        app.refresh_registry().await;
+        assert!(
+            app.worker_count > 1,
+            "refresh_registry reported {} connected workers; expected the live engine count",
+            app.worker_count
+        );
     }
 
     #[tokio::test]
