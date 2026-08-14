@@ -869,11 +869,7 @@ impl App {
         };
 
         let client = Self::client();
-        let body = serde_json::json!({
-            "messages": [{"role": "user", "content": msg}],
-            "agentId": agent_id,
-            "realm": self.chat_realm,
-        });
+        let body = chat_request_body(&msg, &agent_id, &self.chat_realm);
 
         let send_result = client
             .post(format!("{}/api/chat/stream", API_BASE))
@@ -1015,6 +1011,14 @@ impl App {
             _ => 0,
         }
     }
+}
+
+fn chat_request_body(message: &str, agent_id: &str, realm: &str) -> Value {
+    serde_json::json!({
+        "message": message,
+        "agentId": agent_id,
+        "realm": realm,
+    })
 }
 
 fn parse_chat_response(body: &str) -> String {
@@ -3835,6 +3839,16 @@ mod tests {
     fn test_chat_realm_default() {
         let app = App::new();
         assert_eq!(app.chat_realm, "default");
+    }
+
+    #[test]
+    fn test_chat_request_body_matches_stream_chat_contract() {
+        let body = chat_request_body("Reply with READY only.", "agent-7", "realm-3");
+
+        assert_eq!(body["message"], "Reply with READY only.");
+        assert_eq!(body["agentId"], "agent-7");
+        assert_eq!(body["realm"], "realm-3");
+        assert!(body.get("messages").is_none());
     }
 
     #[test]
