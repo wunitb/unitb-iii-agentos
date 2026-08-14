@@ -180,16 +180,31 @@ fn score_complexity(messages: &[Value], tools: &[Value]) -> u32 {
     score
 }
 
+fn route_field<'a>(input: &'a Value, name: &str) -> Result<Option<&'a str>, Error> {
+    match input.get(name) {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
+        Some(Value::String(_)) => Ok(None),
+        Some(_) => Err(Error::Handler(format!("{name} must be a string"))),
+    }
+}
+
+fn model_alias(model: &str) -> Option<(&'static str, &'static str)> {
+    match model {
+        "opus" | "claude-opus" => Some(("anthropic", "claude-opus-4-20250514")),
+        "sonnet" | "claude-sonnet" => Some(("anthropic", "claude-sonnet-4-20250514")),
+        "haiku" | "claude-haiku" => Some(("anthropic", "claude-haiku-4-5-20251001")),
+        "gpt-4o" => Some(("openai", "gpt-4o")),
+        "gemini" => Some(("google", "gemini-2.0-flash")),
+        _ => None,
+    }
+}
+
 fn select_model(complexity: u32, preferred: Option<&str>) -> (&'static str, &'static str) {
-    if let Some(p) = preferred {
-        match p {
-            "opus" | "claude-opus" => return ("anthropic", "claude-opus-4-20250514"),
-            "sonnet" | "claude-sonnet" => return ("anthropic", "claude-sonnet-4-20250514"),
-            "haiku" | "claude-haiku" => return ("anthropic", "claude-haiku-4-5-20251001"),
-            "gpt-4o" => return ("openai", "gpt-4o"),
-            "gemini" => return ("google", "gemini-2.0-flash"),
-            _ => {}
-        }
+    if let Some(preferred) = preferred
+        && let Some(route) = model_alias(preferred)
+    {
+        return route;
     }
     match complexity {
         0..=10 => ("anthropic", "claude-haiku-4-5-20251001"),
@@ -199,10 +214,11 @@ fn select_model(complexity: u32, preferred: Option<&str>) -> (&'static str, &'st
 }
 
 fn resolve_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
-    let explicit_provider = input["provider"].as_str().filter(|value| !value.is_empty());
-    let explicit_model = input["model"]
-        .as_str()
-        .filter(|value| !value.is_empty() && *value != "agentos-default");
+    let explicit_provider = route_field(input, "provider")?;
+    let requested_model = route_field(input, "model")?;
+    let explicit_model = requested_model
+        .filter(|value| *value != "agentos-default")
+        .map(|model| model_alias(model).map(|(_, canonical)| canonical).unwrap_or(model));
 
     if let (Some(provider), Some(model)) = (explicit_provider, explicit_model) {
         let config = state
@@ -245,13 +261,19 @@ fn resolve_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
         let config = state.providers.get(&route.provider).ok_or_else(|| {
             Error::Handler(format!("unknown default provider: {}", route.provider))
         })?;
-        if !config.models.iter().any(|candidate| candidate == &route.model) {
+        let model = model_alias(&route.model)
+            .map(|(_, canonical)| canonical)
+            .unwrap_or(route.model.as_str());
+        if !config.models.iter().any(|candidate| candidate == model) {
             return Err(Error::Handler(format!(
                 "model {} is not registered for provider {}",
                 route.model, route.provider
             )));
         }
-        return Ok(route.clone());
+        return Ok(Route {
+            provider: route.provider.clone(),
+            model: model.into(),
+        });
     }
 
     let messages = input["messages"].as_array().cloned().unwrap_or_default();
@@ -262,6 +284,33 @@ fn resolve_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
         provider: provider.into(),
         model: model.into(),
     })
+}
+
+fn has_explicit_route(input: &Value) -> bool {
+    let provider_explicit = match input.get("provider") {
+        None => false,
+        Some(Value::String(value)) => !value.is_empty(),
+        Some(_) => true,
+    };
+    let model_explicit = match input.get("model") {
+        None => false,
+        Some(Value::String(value)) => !value.is_empty() && value != "agentos-default",
+        Some(_) => true,
+    };
+    provider_explicit || model_explicit
+}
+
+fn resolve_complete_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
+    if state.default_route.is_none() && !has_explicit_route(input) {
+        return resolve_route(
+            state,
+            &json!({
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-20250514",
+            }),
+        );
+    }
+    resolve_route(state, input)
 }
 
 async fn call_anthropic(
@@ -355,7 +404,7 @@ async fn complete_handler(
     client: reqwest::Client,
     input: Value,
 ) -> Result<Value, Error> {
-    let route = resolve_route(&state, &input)?;
+    let route = resolve_complete_route(&state, &input)?;
     let provider = state
         .providers
         .get(&route.provider)
@@ -862,6 +911,70 @@ mod tests {
         let state = test_state(None);
         let error = resolve_route(&state, &json!({ "model": "not-a-model" })).unwrap_err();
         assert!(error.to_string().contains("unknown model"));
+    }
+
+    #[tokio::test]
+    async fn llm_route_resolves_legacy_model_aliases() {
+        let state = Arc::new(test_state(None));
+        let aliases = [
+            ("haiku", "anthropic", "claude-haiku-4-5-20251001"),
+            ("claude-haiku", "anthropic", "claude-haiku-4-5-20251001"),
+            ("sonnet", "anthropic", "claude-sonnet-4-20250514"),
+            ("claude-sonnet", "anthropic", "claude-sonnet-4-20250514"),
+            ("opus", "anthropic", "claude-opus-4-20250514"),
+            ("claude-opus", "anthropic", "claude-opus-4-20250514"),
+            ("gpt-4o", "openai", "gpt-4o"),
+            ("gemini", "google", "gemini-2.0-flash"),
+        ];
+
+        for (alias, provider, model) in aliases {
+            let route = route_handler(state.clone(), json!({ "model": alias }))
+                .await
+                .unwrap();
+            assert_eq!(route["provider"], provider, "alias {alias}");
+            assert_eq!(route["model"], model, "alias {alias}");
+        }
+    }
+
+    #[test]
+    fn object_model_is_rejected_instead_of_ignored() {
+        let state = test_state(None);
+        let error = resolve_route(
+            &state,
+            &json!({ "model": { "provider": "anthropic", "model": "haiku" } }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("model must be a string"));
+    }
+
+    #[test]
+    fn object_provider_is_rejected_instead_of_ignored() {
+        let state = test_state(None);
+        let error = resolve_route(
+            &state,
+            &json!({ "provider": { "name": "anthropic" }, "model": "gpt-4o" }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("provider must be a string"));
+    }
+
+    #[test]
+    fn complete_without_route_uses_legacy_sonnet() {
+        let state = test_state(None);
+        let route = resolve_complete_route(&state, &json!({ "messages": [] })).unwrap();
+        assert_eq!(route.provider, "anthropic");
+        assert_eq!(route.model, "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn complete_uses_configured_default_instead_of_legacy_sonnet() {
+        let state = test_state(Some(Route {
+            provider: CODEX_PROVIDER.into(),
+            model: DEFAULT_CODEX_MODEL.into(),
+        }));
+        let route = resolve_complete_route(&state, &json!({ "messages": [] })).unwrap();
+        assert_eq!(route.provider, CODEX_PROVIDER);
+        assert_eq!(route.model, DEFAULT_CODEX_MODEL);
     }
 
     #[test]
