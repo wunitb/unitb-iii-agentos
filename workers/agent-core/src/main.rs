@@ -9,7 +9,7 @@ use std::time::Instant;
 
 mod types;
 
-use types::{AgentConfig, ChatRequest, FunctionCall};
+use types::{AgentConfig, ChatRequest, FunctionCall, ModelConfig};
 
 const MAX_ITERATIONS: u32 = 50;
 
@@ -190,6 +190,85 @@ fn spawn_trigger(iii: &IIIClient, function_id: &'static str, payload: Value) {
     });
 }
 
+fn route_payload(
+    message: &str,
+    functions: &Value,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Value {
+    let mut payload = json!({
+        "messages": [{ "role": "user", "content": message }],
+        "tools": functions,
+    });
+    if let Some(provider) = provider {
+        payload["provider"] = json!(provider);
+    }
+    if let Some(model) = model {
+        payload["model"] = json!(model);
+    }
+    payload
+}
+
+fn valid_route_preference(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty() && *value != "agentos-default")
+}
+
+fn route_preferences(
+    request_provider: Option<&str>,
+    request_model: Option<&str>,
+    model_config: Option<&ModelConfig>,
+) -> (Option<String>, Option<String>) {
+    let request_provider = valid_route_preference(request_provider);
+    let request_model = valid_route_preference(request_model);
+    if request_provider.is_some() || request_model.is_some() {
+        return (
+            request_provider.map(str::to_owned),
+            request_model.map(str::to_owned),
+        );
+    }
+
+    let config_provider =
+        model_config.and_then(|model| valid_route_preference(model.provider.as_deref()));
+    let config_model =
+        model_config.and_then(|model| valid_route_preference(model.model.as_deref()));
+    if config_model.is_some() {
+        (
+            config_provider.map(str::to_owned),
+            config_model.map(str::to_owned),
+        )
+    } else {
+        (None, None)
+    }
+}
+
+fn completion_payload(
+    provider: &str,
+    model: &str,
+    system_prompt: &str,
+    messages: &[Value],
+    functions: &Value,
+) -> Value {
+    json!({
+        "provider": provider,
+        "model": model,
+        "systemPrompt": system_prompt,
+        "messages": messages,
+        "functions": functions,
+    })
+}
+
+fn route_fields(route: &Value) -> Result<(String, String), Error> {
+    let provider = route["provider"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Handler("llm::route omitted provider".into()))?;
+    let model = route["model"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Handler("llm::route omitted model".into()))?;
+    Ok((provider.into(), model.into()))
+}
+
 async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
     let start = Instant::now();
 
@@ -236,19 +315,25 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
         .or_else(|| config.as_ref().and_then(|c| c.system_prompt.clone()))
         .unwrap_or_default();
 
-    let model: Value = iii
+    let model_config = config.as_ref().and_then(|agent| agent.model.as_ref());
+    let (preferred_provider, preferred_model) =
+        route_preferences(req.provider.as_deref(), req.model.as_deref(), model_config);
+
+    let route: Value = iii
         .trigger(TriggerRequest {
             function_id: "llm::route".to_string(),
-            payload: json!({
-                "message": &req.message,
-                "functionCount": functions.as_array().map(|a| a.len()).unwrap_or(0),
-                "config": config.as_ref().and_then(|c| c.model.as_ref()),
-            }),
+            payload: route_payload(
+                &req.message,
+                &functions,
+                preferred_provider.as_deref(),
+                preferred_model.as_deref(),
+            ),
             action: None,
             timeout_ms: None,
         })
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
+    let (provider, model) = route_fields(&route)?;
 
     let scan_result = iii
         .trigger(TriggerRequest {
@@ -276,12 +361,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
     let mut response: Value = iii
         .trigger(TriggerRequest {
             function_id: "llm::complete".to_string(),
-            payload: json!({
-                "model": model,
-                "systemPrompt": system_prompt,
-                "messages": messages,
-                "functions": functions,
-            }),
+            payload: completion_payload(&provider, &model, &system_prompt, &messages, &functions),
             action: None,
             timeout_ms: None,
         })
@@ -356,12 +436,13 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
         response = iii
             .trigger(TriggerRequest {
                 function_id: "llm::complete".to_string(),
-                payload: json!({
-                    "model": model,
-                    "systemPrompt": system_prompt,
-                    "messages": messages,
-                    "functions": functions,
-                }),
+                payload: completion_payload(
+                    &provider,
+                    &model,
+                    &system_prompt,
+                    &messages,
+                    &functions,
+                ),
                 action: None,
                 timeout_ms: None,
             })
@@ -489,6 +570,139 @@ mod tests {
     #[test]
     fn test_max_iterations_constant() {
         assert_eq!(MAX_ITERATIONS, 50);
+    }
+
+    #[test]
+    fn llm_route_payload_uses_top_level_model_strings() {
+        let functions = json!([{ "id": "memory::recall" }]);
+        let payload = route_payload("hello", &functions, Some("anthropic"), Some("haiku"));
+
+        assert_eq!(payload["provider"], "anthropic");
+        assert_eq!(payload["model"], "haiku");
+        assert_eq!(
+            payload["messages"],
+            json!([{ "role": "user", "content": "hello" }])
+        );
+        assert_eq!(payload["tools"], functions);
+        assert!(payload.get("config").is_none());
+        assert!(payload.get("message").is_none());
+        assert!(payload.get("functionCount").is_none());
+    }
+
+    #[test]
+    fn llm_route_payload_omits_missing_route_fields() {
+        let payload = route_payload("hello", &json!([]), None, None);
+
+        assert!(payload.get("provider").is_none());
+        assert!(payload.get("model").is_none());
+    }
+
+    #[test]
+    fn llm_complete_payload_consumes_route_fields() {
+        let messages = vec![json!({"role": "user"})];
+        let functions = json!([]);
+        let payload = completion_payload("codex", "gpt-5.6-sol", "system", &messages, &functions);
+
+        assert_eq!(payload["provider"], "codex");
+        assert_eq!(payload["model"], "gpt-5.6-sol");
+        assert!(payload["provider"].is_string());
+        assert!(payload["model"].is_string());
+        assert!(payload.get("config").is_none());
+        assert!(payload.get("route").is_none());
+    }
+
+    #[test]
+    fn route_fields_extract_provider_and_model() {
+        let fields = route_fields(&json!({
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+        }))
+        .unwrap();
+        assert_eq!(fields, ("codex".into(), "gpt-5.6-sol".into()));
+    }
+
+    #[test]
+    fn route_fields_reject_nested_model_object() {
+        assert!(route_fields(&json!({ "model": { "provider": "codex" } })).is_err());
+    }
+
+    fn configured_model() -> ModelConfig {
+        ModelConfig {
+            provider: Some("config-provider".into()),
+            model: Some("config-model".into()),
+            max_tokens: None,
+        }
+    }
+
+    #[test]
+    fn route_preferences_use_request_pair() {
+        assert_eq!(
+            route_preferences(
+                Some("codex"),
+                Some("gpt-5.6-sol"),
+                Some(&configured_model()),
+            ),
+            (Some("codex".into()), Some("gpt-5.6-sol".into()))
+        );
+    }
+
+    #[test]
+    fn route_preferences_model_only_does_not_combine_config_provider() {
+        assert_eq!(
+            route_preferences(None, Some("gpt-5.6-sol"), Some(&configured_model())),
+            (None, Some("gpt-5.6-sol".into()))
+        );
+    }
+
+    #[test]
+    fn route_preferences_filter_agentos_default() {
+        assert_eq!(
+            route_preferences(
+                Some("agentos-default"),
+                Some("agentos-default"),
+                Some(&configured_model()),
+            ),
+            (Some("config-provider".into()), Some("config-model".into()))
+        );
+    }
+
+    #[test]
+    fn route_preferences_filter_empty_strings() {
+        assert_eq!(
+            route_preferences(Some(""), Some(""), Some(&configured_model())),
+            (Some("config-provider".into()), Some("config-model".into()))
+        );
+    }
+
+    #[test]
+    fn route_preferences_fallback_to_complete_agent_config_pair() {
+        assert_eq!(
+            route_preferences(None, None, Some(&configured_model())),
+            (Some("config-provider".into()), Some("config-model".into()))
+        );
+    }
+
+    #[test]
+    fn route_preferences_preserve_config_model_only() {
+        let config = ModelConfig {
+            provider: None,
+            model: Some("config-model".into()),
+            max_tokens: None,
+        };
+        assert_eq!(
+            route_preferences(None, None, Some(&config)),
+            (None, Some("config-model".into()))
+        );
+    }
+
+    #[test]
+    fn route_preferences_drop_config_provider_only() {
+        let config = ModelConfig {
+            provider: Some("config-provider".into()),
+            model: None,
+            max_tokens: None,
+        };
+        assert_eq!(route_preferences(None, None, Some(&config)), (None, None));
     }
 
     #[test]

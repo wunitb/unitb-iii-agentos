@@ -132,13 +132,13 @@ Eight jobs run on every PR:
 
 | job | gate |
 |---|---|
-| `rust build + test` | `cargo check --all-targets` + `cargo build --release` + `cargo test --workspace --release` (1,330 tests; 2 live-engine checks ignored by default) |
+| `rust build + test` | `cargo check --all-targets` + `cargo build --release` + `cargo test --workspace --release` (1,393 tests; 3 live-engine checks ignored by default) |
 | `python worker tests` | `pytest workers/embedding/test_main.py` |
 | `website build` | `npm ci` + `npm run build` in `website/` |
-| `installer shellcheck` | `shellcheck --severity=warning` over `scripts/install.sh`, `website/public/install.sh`, `scripts/install-iii.sh` |
+| `installer shellcheck` | `shellcheck --severity=warning` over `scripts/install.sh`, `scripts/dev-up.sh`, `website/public/install.sh`, `scripts/install-iii.sh` |
 | `validate iii.worker.yaml` | every `workers/<name>/iii.worker.yaml` parses, matches its folder, declares `runtime.kind` of `rust` or `python`, and carries a `scripts.start` string |
 | `no sandbox::* clash with builtin` | grep ensures no agentos worker registers `sandbox::*` |
-| `e2e smoke (no LLM key required)` | starts engine + workers, asserts ports listen, ≥30 functions register, no namespace clash |
+| `e2e smoke (no LLM key required)` | typechecks and tests the Node examples and startup configuration, then starts engine + workers, asserts ports listen, ≥30 functions register, no namespace clash |
 | `e2e full (requires AGENTOS_API_KEY secret)` | runs vitest e2e suite against the live stack — gated on `AGENTOS_API_KEY` secret |
 
 Plus `.github/workflows/vercel-deploy.yml`: pushes to `main` touching `website/**` trigger a Vercel Deploy Hook.

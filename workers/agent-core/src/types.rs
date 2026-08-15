@@ -10,6 +10,8 @@ pub struct ChatRequest {
     pub session_id: Option<String>,
     #[serde(rename = "systemPrompt")]
     pub system_prompt: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,6 +74,22 @@ mod tests {
         assert_eq!(req.message, "Hello");
         assert!(req.session_id.is_none());
         assert!(req.system_prompt.is_none());
+        assert!(req.provider.is_none());
+        assert!(req.model.is_none());
+    }
+
+    #[test]
+    fn test_chat_request_null_route_fields_deserialize_to_none() {
+        let req: ChatRequest = serde_json::from_value(json!({
+            "agentId": "agent-1",
+            "message": "Hello",
+            "provider": null,
+            "model": null,
+        }))
+        .unwrap();
+
+        assert!(req.provider.is_none());
+        assert!(req.model.is_none());
     }
 
     #[test]
@@ -81,6 +99,8 @@ mod tests {
             "message": "Hi there",
             "sessionId": "sess-42",
             "systemPrompt": "You are a helpful assistant",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
         });
         let req: ChatRequest = serde_json::from_value(json_val).unwrap();
         assert_eq!(req.session_id, Some("sess-42".to_string()));
@@ -88,6 +108,8 @@ mod tests {
             req.system_prompt,
             Some("You are a helpful assistant".to_string())
         );
+        assert_eq!(req.provider.as_deref(), Some("codex"));
+        assert_eq!(req.model.as_deref(), Some("gpt-5.6-sol"));
     }
 
     #[test]
@@ -97,6 +119,8 @@ mod tests {
             message: "test".to_string(),
             session_id: Some("s-1".to_string()),
             system_prompt: None,
+            provider: None,
+            model: None,
         };
         let val = serde_json::to_value(&req).unwrap();
         assert_eq!(val["agentId"], "a-1");
@@ -255,6 +279,8 @@ mod tests {
             message: "hello".to_string(),
             session_id: Some("s1".to_string()),
             system_prompt: Some("prompt".to_string()),
+            provider: None,
+            model: None,
         };
         let json_str = serde_json::to_string(&req).unwrap();
         let roundtripped: ChatRequest = serde_json::from_str(&json_str).unwrap();
@@ -492,6 +518,8 @@ mod tests {
             message: "".to_string(),
             session_id: Some("".to_string()),
             system_prompt: Some("".to_string()),
+            provider: None,
+            model: None,
         };
         let val = serde_json::to_value(&req).unwrap();
         assert_eq!(val["agentId"], "");

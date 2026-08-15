@@ -10,7 +10,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-apache_2.0-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Apache 2.0"></a>
   <img src="https://img.shields.io/badge/workers-63-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Workers">
   <img src="https://img.shields.io/badge/functions-267-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Functions">
-  <img src="https://img.shields.io/badge/rust_tests-1330_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="1,330 Rust tests">
+  <img src="https://img.shields.io/badge/rust_tests-1393_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="1,393 Rust tests">
   <img src="https://img.shields.io/badge/iii--sdk-0.22.1-d96e2e?style=flat-square&labelColor=f2ede1" alt="iii-sdk 0.22.1">
 </p>
 
@@ -54,9 +54,9 @@ git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos
 # 2. install the pinned iii v0.22.1 release with checksum verification
 bash scripts/install-iii.sh
 
-# 3. add your model key
-cp .env.example .env
-$EDITOR .env   # set ANTHROPIC_API_KEY=sk-ant-…
+# 3. configure the local model proxy
+install -m 600 .env.example .env
+$EDITOR .env   # set CODEX_PROXY_API_KEY for http://127.0.0.1:8317/v1
 
 # 4. build the workspace
 cargo build --workspace --release
@@ -68,6 +68,7 @@ bash scripts/dev-up.sh
 # 6. open the chat
 cargo run --release -p agentos-tui
 ```
+Quickstart uses the local Codex proxy at `http://127.0.0.1:8317/v1`. Anthropic is optional and selected only by an explicit provider/model or when no configured local default exists.
 
 Engine boots on port 49134. 62 Rust workers and one Python worker connect. The source declares 267 literal function registrations. The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
 
@@ -77,6 +78,12 @@ Prefer driving by HTTP? Same thing without the TUI:
 curl -X POST http://127.0.0.1:3111/v1/realms \
   -H 'Content-Type: application/json' \
   -d '{"name":"prod","description":"production"}'
+```
+
+The live chat E2E test defaults to `gpt-5.6-sol`. To target a non-Codex backend, override it for the test command:
+
+```bash
+AGENTOS_E2E_MODEL=claude-sonnet-4-20250514 bun run test:e2e
 ```
 
 ## § 04 · Calling a function
@@ -194,9 +201,9 @@ If the engine is offline or no workers are connected, the TUI shows a first-run 
 
 ```bash
 cargo build --workspace --release                                    # 62 Rust workers + CLI + TUI + HTTP adapter
-cargo test --workspace --release                                     # 1,330 Rust tests; 2 live-engine checks ignored by default
+cargo test --workspace --release                                     # 1,393 Rust tests; 3 live-engine checks ignored by default
 uv run --no-project --with pytest python -m pytest workers/embedding/test_main.py -q  # 161 Python tests
-npm ci && npm run test:e2e                                           # live engine + workers; model credentials required for chat
+bun install --frozen-lockfile && bun run test:e2e                    # live engine + workers; model credentials required for chat
 ```
 
 ## § 11 · Versioning
