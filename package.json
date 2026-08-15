@@ -7,10 +7,6 @@
     "test:e2e": "AGENTOS_E2E=1 vitest --run --config vitest.e2e.config.ts",
     "test:e2e:smoke": "AGENTOS_E2E=1 vitest --run --config vitest.e2e.config.ts --testNamePattern=\"health|chat_completions\"",
     "test:examples": "vitest --run examples/shared.test.ts",
-    "test:fleet": "bun test orchestration",
-    "fleet:health": "bun orchestration/dispatcher.ts health",
-    "fleet:main": "bun orchestration/dispatcher.ts launch-main",
-    "typecheck:fleet": "tsc --noEmit --types bun --target ES2022 --module ESNext --moduleResolution bundler --strict --skipLibCheck orchestration/*.ts .omp/extensions/*.ts",
     "typecheck:examples": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck examples/*.ts"
   },
   "dependencies": {

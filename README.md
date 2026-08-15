@@ -163,7 +163,6 @@ integrations/    MCP server configs (TOML, consumed by mcp-client)
 agents/          agent templates
 workflows/       workflow definitions (YAML)
 plugin/          reusable agent/command/skill/hook bundles
-orchestration/   deterministic Main → Team → Reviewer OMP fleet control plane
 config.yaml      iii v0.22.1 engine and configuration-worker boot list
 config/           committed values for the seven built-in iii workers
 website/         agentsos.sh — design.md aesthetic, three themes
@@ -171,34 +170,19 @@ website/         agentsos.sh — design.md aesthetic, three themes
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full primitive flow and worker manifest spec.
 
-## § 09 · OMP fleet orchestration
+## § 09 · Development control plane
 
-`orchestration/` runs a persistent Herdr-managed OMP fleet without giving worker sessions the host's global credentials or writable configuration. Main owns planning and handoff; each Team is the sole writer for an explicit path contract; Reviewer independently checks the submitted exact SHA.
+Repository development is coordinated by the globally installed UNITB DELIVERY control plane. Its configuration, SQLite ledger, credentials, agent sessions, and isolated worktrees live outside this repository under the user's UNITB DELIVERY config and data directories.
 
-| Boundary | Enforcement |
-|---|---|
-| Durable coordination | SQLite command/event ledger behind a mode-0600 Unix socket |
-| Identity | Per-role bearer tokens and role-specific fleet tools |
-| Write isolation | Dedicated Git worktree plus bubblewrap mounts scoped to the Team branch |
-| Review isolation | Disposable read-only worktree pinned to the submitted exact SHA |
-| Credentials | Host-only OMP auth broker; each role sees only its assigned provider and credential slot through a scoped loopback proxy |
-| Agent autonomy | OMP prompts for bash approval; role hooks, credentials, network, and filesystem boundaries remain authoritative |
-| Recovery | systemd restarts the dispatcher and Herdr supervisor; SQLite restores authoritative state |
-| Merge authority | Main may hand off an approved exact head; the principal or a separately authorized `PrincipalMergeAgent` may merge |
-
-Install the root-owned bubblewrap boundary, AppArmor rule, and four persistent user services. The installer starts the broker, Herdr supervisor, dispatcher, and interactive Main agent; attach to Main through Herdr:
+Use the managed Planner session rather than launching `omp` directly from this repository:
 
 ```bash
-./orchestration/install.sh
-herdr --session tldrsoc
-bun run fleet:health
+unitb-delivery up --project unitb-iii-agentos
+unitb-delivery health --project unitb-iii-agentos
+herdr session attach unitb-delivery-unitb-iii-agentos
 ```
 
-The fleet is host-specific infrastructure. `orchestration/fleet.config.json` pins Main and each Team to one model and one centralized-broker credential slot, then routes Reviewer to the opposite model family for the submitting Team. Every launched worker gets a reset OMP home with no copied credentials, a scoped credential-proxy token, a generated config that binds all internal model roles to that session's assigned model, and auto-approval inside the already-confined boundary. The committed default routes require two OpenAI Codex credentials and one Anthropic credential. Run the state-machine suite with:
-
-```bash
-bun run test:fleet
-```
+The managed Planner is read-only. It creates durable Work Items, assigns a single Writer in an isolated worktree, obtains independent review of the exact submitted commit, and publishes or merges only through protected fleet operations.
 
 ## § 10 · TUI
 
