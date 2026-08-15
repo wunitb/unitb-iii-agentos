@@ -170,7 +170,21 @@ website/         agentsos.sh — design.md aesthetic, three themes
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full primitive flow and worker manifest spec.
 
-## § 09 · TUI
+## § 09 · Development control plane
+
+Repository development is coordinated by the globally installed UNITB DELIVERY control plane. Its configuration, SQLite ledger, credentials, agent sessions, and isolated worktrees live outside this repository under the user's UNITB DELIVERY config and data directories.
+
+Use the managed Planner session rather than launching `omp` directly from this repository:
+
+```bash
+unitb-delivery up --project unitb-iii-agentos
+unitb-delivery health --project unitb-iii-agentos
+herdr session attach unitb-delivery-unitb-iii-agentos
+```
+
+The managed Planner is read-only. It creates durable Work Items, assigns a single Writer in an isolated worktree, obtains independent review of the exact submitted commit, and publishes or merges only through protected fleet operations.
+
+## § 10 · TUI
 
 Chat-first terminal UI lives in `crates/tui`:
 
@@ -190,7 +204,7 @@ cargo run --release -p agentos-tui
 
 If the engine is offline or no workers are connected, the TUI shows a first-run overlay with copy-paste commands instead of an empty list. Slash completions pull from `GET /iii/functions` so anything a worker registers is immediately discoverable.
 
-## § 10 · Build and test
+## § 11 · Build and test
 
 ```bash
 cargo build --workspace --release                                    # 62 Rust workers + CLI + TUI + HTTP adapter
@@ -199,7 +213,7 @@ uv run --no-project --with pytest python -m pytest workers/embedding/test_main.p
 npm ci && npm run test:e2e                                           # live engine + workers; model credentials required for chat
 ```
 
-## § 11 · Versioning
+## § 12 · Versioning
 
 | | version |
 |---|---|
@@ -209,7 +223,7 @@ npm ci && npm run test:e2e                                           # live engi
 | iii-sdk (Python) | pinned at `0.22.1` for the embedding worker |
 | agentos | `0.1.0` — first UnitB-owned release on iii v0.22.1 |
 
-## § 12 · Provenance and license
+## § 13 · Provenance and license
 
 This independent repository started from [`iii-experimental/agentos@caca2b4`](https://github.com/iii-experimental/agentos/commit/caca2b439ff62499f0d4a5af30c2601302238890) and was migrated to the `iii-hq/iii` v0.22.1 engine and SDK contracts. It is not a GitHub fork and carries its own history.
 

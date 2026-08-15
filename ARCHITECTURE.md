@@ -118,6 +118,12 @@ These are **declarative config**, not workers:
 
 None ship as registered functions; they configure workers that do.
 
+## Development control plane
+
+UNITB DELIVERY coordinates repository changes from a global installation outside this repository. The managed Planner is the read-only interactive entry point, each Worker is the single writer for an explicit path contract in an isolated worktree, and the Reviewer inspects the exact submitted commit independently.
+
+Project routing configuration, the SQLite ledger, credentials, agent sessions, and worktrees live under the user's UNITB DELIVERY config and data directories. This repository intentionally contains no embedded fleet runtime or `.omp` fleet extensions. Launching `omp` directly from the repository does not create a managed Planner; operators attach to the registered Herdr session instead.
+
 ## Versioning
 
 - iii engine: **v0.22.1**, pinned and checksum-verified by `scripts/install-iii.sh`

@@ -13,6 +13,7 @@
     "iii-sdk": "0.22.1"
   },
   "devDependencies": {
+    "@types/bun": "^1.3.14",
     "@types/node": "^25.3.2",
     "typescript": "^5.4.0",
     "vitest": "^3.2.4"
