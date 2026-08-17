@@ -342,6 +342,34 @@ impl App {
             .unwrap_or_default()
     }
 
+    fn action_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3_600))
+            .build()
+            .unwrap_or_default()
+    }
+
+    async fn action_result(
+        response: Result<reqwest::Response, reqwest::Error>,
+    ) -> Result<String, String> {
+        let response = response.map_err(|error| error.to_string())?;
+        let status = response.status();
+        let body = response.text().await.map_err(|error| error.to_string())?;
+        if !status.is_success() {
+            return Err(if body.is_empty() {
+                format!("HTTP {}", status.as_u16())
+            } else {
+                format!("HTTP {}: {body}", status.as_u16())
+            });
+        }
+
+        match serde_json::from_str::<Value>(&body) {
+            Ok(Value::String(text)) => Ok(text),
+            Ok(value) => serde_json::to_string_pretty(&value).map_err(|error| error.to_string()),
+            Err(_) => Ok(body),
+        }
+    }
+
     async fn refresh_health(&mut self) {
         let client = Self::client();
         match client.get(format!("{}/api/realms", API_BASE)).send().await {
@@ -799,31 +827,84 @@ impl App {
                 }
             }
             "hand" => {
-                self.chat_messages.push((
-                    "system".into(),
-                    format!("Hand invoke not yet wired: {}", args),
-                ));
+                if args.is_empty() {
+                    self.chat_messages
+                        .push(("system".into(), "Usage: /hand <name>".into()));
+                } else {
+                    let response = Self::action_client()
+                        .post(format!(
+                            "{}/api/hands/{}/trigger",
+                            API_BASE,
+                            urlencoding::encode(&args)
+                        ))
+                        .json(&serde_json::json!({ "id": args }))
+                        .send()
+                        .await;
+                    match Self::action_result(response).await {
+                        Ok(output) => self.chat_messages.push(("assistant".into(), output)),
+                        Err(error) => self
+                            .chat_messages
+                            .push(("system".into(), format!("hand failed: {error}"))),
+                    }
+                }
             }
             "skill" => {
-                self.chat_messages.push((
-                    "system".into(),
-                    format!("Skill invoke not yet wired: {}", args),
-                ));
+                if args.is_empty() {
+                    self.chat_messages
+                        .push(("system".into(), "Usage: /skill <id>".into()));
+                } else {
+                    let response = Self::action_client()
+                        .post(format!("{}/api/skillkit/run", API_BASE))
+                        .json(&serde_json::json!({ "skill": args }))
+                        .send()
+                        .await;
+                    match Self::action_result(response).await {
+                        Ok(output) => self.chat_messages.push(("assistant".into(), output)),
+                        Err(error) => self
+                            .chat_messages
+                            .push(("system".into(), format!("skill failed: {error}"))),
+                    }
+                }
             }
             "worker" => {
                 self.refresh_worker_catalog().await;
                 self.show_worker_picker = true;
                 self.worker_picker_selected = 0;
             }
-            "channel" => {
-                self.chat_messages.push((
-                    "system".into(),
-                    format!("Channel send not yet wired: {}", args),
-                ));
-            }
             "approve" | "deny" => {
-                self.chat_messages
-                    .push(("system".into(), format!("{}: {}", name, args)));
+                if args.is_empty() {
+                    self.chat_messages
+                        .push(("system".into(), format!("Usage: /{name} <request-id>")));
+                } else {
+                    let decision = if name == "approve" { "approve" } else { "deny" };
+                    let response = Self::client()
+                        .post(format!("{}/api/approvals/decide", API_BASE))
+                        .json(&serde_json::json!({
+                            "requestId": args,
+                            "decision": decision,
+                            "decidedBy": "tui",
+                        }))
+                        .send()
+                        .await;
+                    match Self::action_result(response).await {
+                        Ok(output) => {
+                            let status = if decision == "approve" {
+                                "approved"
+                            } else {
+                                "denied"
+                            };
+                            if let Some(approval) = self.approvals.iter_mut().find(|approval| {
+                                approval["requestId"].as_str() == Some(args.as_str())
+                            }) {
+                                approval["status"] = Value::String(status.into());
+                            }
+                            self.chat_messages.push(("system".into(), output));
+                        }
+                        Err(error) => self
+                            .chat_messages
+                            .push(("system".into(), format!("approval failed: {error}"))),
+                    }
+                }
             }
             "clear" => {
                 self.chat_messages.clear();

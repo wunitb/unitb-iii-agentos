@@ -5,6 +5,7 @@ use serde_json::Value;
 #[serde(rename_all = "lowercase")]
 pub enum StepMode {
     Sequential,
+    Parallel,
     Fanout,
     Collect,
     Conditional,
@@ -38,11 +39,30 @@ where
     }
 }
 
+fn deserialize_sanitized_ids<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<String>::deserialize(d)?
+        .into_iter()
+        .map(|id| sanitize_id(&id).map_err(serde::de::Error::custom))
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowStep {
     pub name: String,
     #[serde(rename = "functionId", deserialize_with = "deserialize_sanitized_id")]
     pub function_id: String,
+    #[serde(
+        default,
+        rename = "agentId",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_sanitized_id_opt"
+    )]
+    pub agent_id: Option<String>,
+    #[serde(default, rename = "dependsOn", skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     #[serde(
         default,
         rename = "promptTemplate",
@@ -85,6 +105,12 @@ pub struct Workflow {
     pub id: String,
     pub name: String,
     pub description: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_sanitized_ids"
+    )]
+    pub agents: Vec<String>,
     pub steps: Vec<WorkflowStep>,
 }
 
@@ -124,6 +150,10 @@ mod tests {
             "\"sequential\""
         );
         assert_eq!(
+            serde_json::to_string(&StepMode::Parallel).unwrap(),
+            "\"parallel\""
+        );
+        assert_eq!(
             serde_json::to_string(&StepMode::Fanout).unwrap(),
             "\"fanout\""
         );
@@ -159,6 +189,7 @@ mod tests {
         assert_eq!(wf.id, "wf-1");
         assert_eq!(wf.steps[0].mode, StepMode::Sequential);
         assert_eq!(wf.steps[0].error_mode, ErrorMode::Fail);
+        assert!(wf.steps[0].depends_on.is_empty());
     }
 
     #[test]

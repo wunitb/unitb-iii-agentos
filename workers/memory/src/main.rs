@@ -95,17 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "memory::session::list",
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_ref.clone();
-            async move {
-                let agent_id = input["agentId"].as_str().unwrap_or("default");
-                iii.trigger(TriggerRequest {
-                    function_id: "state::list".to_string(),
-                    payload: json!({ "scope": format!("sessions:{}", agent_id) }),
-                    action: None,
-                    timeout_ms: None,
-                })
-                .await
-                .map_err(|e| Error::Handler(e.to_string()))
-            }
+            async move { list_sessions(&iii, input).await }
         })
         .description("List sessions for an agent"),
     );
@@ -130,6 +120,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("7-phase session validation and repair"),
     );
 
+    let iii_ref = iii.clone();
+    iii.register_function(
+        "memory::kv::get",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_ref.clone();
+            async move { memory_kv_get(&iii, input).await }
+        })
+        .description("Get an agent-scoped memory value"),
+    );
+
+    let iii_ref = iii.clone();
+    iii.register_function(
+        "memory::kv::set",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_ref.clone();
+            async move { memory_kv_set(&iii, input).await }
+        })
+        .description("Set an agent-scoped memory value"),
+    );
+
+    let iii_ref = iii.clone();
+    iii.register_function(
+        "memory::kv::delete",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_ref.clone();
+            async move { memory_kv_delete(&iii, input).await }
+        })
+        .description("Delete an agent-scoped memory value"),
+    );
+
+    let iii_ref = iii.clone();
+    iii.register_function(
+        "memory::kv::list",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_ref.clone();
+            async move { memory_kv_list(&iii, input).await }
+        })
+        .description("List agent-scoped memory values"),
+    );
+
+    let iii_ref = iii.clone();
+    iii.register_function(
+        "memory::list",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_ref.clone();
+            async move { list_memories(&iii, input).await }
+        })
+        .description("List semantic memories for an agent"),
+    );
+
+    let iii_ref = iii.clone();
+    iii.register_function(
+        "memory::session::delete",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_ref.clone();
+            async move { delete_session(&iii, input).await }
+        })
+        .description("Delete a persisted agent session"),
+    );
+
+    for (function_id, method, path) in [
+        ("memory::kv::get", "GET", "api/memory/:key"),
+        ("memory::kv::set", "POST", "api/memory"),
+        ("memory::kv::delete", "DELETE", "api/memory/:key"),
+        ("memory::kv::list", "GET", "api/memory"),
+        ("memory::list", "GET", "agentmemory/memories"),
+        ("memory::recall", "POST", "agentmemory/search"),
+        ("memory::store", "POST", "agentmemory/remember"),
+        ("memory::session::list", "GET", "api/sessions"),
+        ("memory::session::delete", "DELETE", "api/sessions/:id"),
+    ] {
+        agentos_http_adapter::register_http_trigger(
+            &iii,
+            function_id.to_string(),
+            json!({ "http_method": method, "api_path": path }),
+            None,
+        )?;
+    }
+
     agentos_http_adapter::register_cron_trigger(
         &iii,
         "memory::consolidate".to_string(),
@@ -142,6 +211,209 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     iii.shutdown_async().await;
     Ok(())
+}
+
+fn memory_agent(input: &Value) -> &str {
+    input
+        .get("agent")
+        .or_else(|| input.get("agentId"))
+        .and_then(Value::as_str)
+        .filter(|agent| !agent.is_empty())
+        .unwrap_or("default")
+}
+
+fn memory_key(input: &Value) -> Result<&str, Error> {
+    input
+        .get("key")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| Error::Handler("key is required".to_string()))
+}
+
+async fn call_state(iii: &IIIClient, function_id: &str, payload: Value) -> Result<Value, Error> {
+    iii.trigger(TriggerRequest {
+        function_id: function_id.to_string(),
+        payload,
+        action: None,
+        timeout_ms: None,
+    })
+    .await
+    .map_err(|error| Error::Handler(error.to_string()))
+}
+
+async fn memory_kv_get(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    call_state(
+        iii,
+        "state::get",
+        json!({ "scope": format!("agent-memory:{}", memory_agent(&input)), "key": memory_key(&input)? }),
+    )
+    .await
+}
+
+async fn memory_kv_set(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    let value = input
+        .get("value")
+        .cloned()
+        .ok_or_else(|| Error::Handler("value is required".to_string()))?;
+    let key = memory_key(&input)?;
+    call_state(
+        iii,
+        "state::set",
+        json!({ "scope": format!("agent-memory:{}", memory_agent(&input)), "key": key, "value": value }),
+    )
+    .await?;
+    Ok(json!({ "stored": true, "key": key }))
+}
+
+async fn memory_kv_delete(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    let key = memory_key(&input)?;
+    call_state(
+        iii,
+        "state::delete",
+        json!({ "scope": format!("agent-memory:{}", memory_agent(&input)), "key": key }),
+    )
+    .await?;
+    Ok(json!({ "deleted": true, "key": key }))
+}
+
+async fn memory_kv_list(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    call_state(
+        iii,
+        "state::list",
+        json!({ "scope": format!("agent-memory:{}", memory_agent(&input)) }),
+    )
+    .await
+}
+
+async fn list_memories(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    let entries = call_state(
+        iii,
+        "state::list",
+        json!({ "scope": format!("memory:{}", memory_agent(&input)) }),
+    )
+    .await?;
+    let memories = entries
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("value"))
+        .filter(|value| value.get("content").is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(json!({ "memories": memories }))
+}
+
+async fn session_agents(iii: &IIIClient, input: &Value) -> Result<Vec<String>, Error> {
+    if let Some(agent) = input
+        .get("agent")
+        .or_else(|| input.get("agentId"))
+        .and_then(Value::as_str)
+        .filter(|agent| !agent.is_empty())
+    {
+        return Ok(vec![agent.to_string()]);
+    }
+
+    let agents = call_state(iii, "state::list", json!({ "scope": "agents" })).await?;
+    let mut agent_ids = agents
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .get("key")
+                .or_else(|| entry.get("id"))
+                .or_else(|| entry.get("value").and_then(|value| value.get("id")))
+                .and_then(Value::as_str)
+        })
+        .filter(|agent| !agent.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    agent_ids.sort();
+    agent_ids.dedup();
+    if agent_ids.is_empty() {
+        agent_ids.push("default".to_string());
+    }
+    Ok(agent_ids)
+}
+
+async fn list_sessions(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    let mut sessions = Vec::new();
+    for agent in session_agents(iii, &input).await? {
+        let entries = call_state(
+            iii,
+            "state::list",
+            json!({ "scope": format!("sessions:{agent}") }),
+        )
+        .await?;
+        for entry in entries.as_array().into_iter().flatten() {
+            let Some(id) = entry.get("key").and_then(Value::as_str) else {
+                continue;
+            };
+            let mut session = entry.get("value").cloned().unwrap_or_else(|| json!({}));
+            if !session.is_object() {
+                session = json!({ "value": session });
+            }
+            if let Some(object) = session.as_object_mut() {
+                object.entry("id".to_string()).or_insert_with(|| json!(id));
+                object
+                    .entry("agent".to_string())
+                    .or_insert_with(|| json!(agent));
+                object
+                    .entry("status".to_string())
+                    .or_insert_with(|| json!("active"));
+                if !object.contains_key("startedAt") {
+                    let started_at = object
+                        .get("createdAt")
+                        .or_else(|| object.get("updatedAt"))
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| value.to_string())
+                        })
+                        .unwrap_or_default();
+                    object.insert("startedAt".to_string(), json!(started_at));
+                }
+            }
+            sessions.push(session);
+        }
+    }
+    Ok(json!(sessions))
+}
+
+async fn delete_session(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    let id = input
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Error::Handler("id is required".to_string()))?;
+    let mut deleted = false;
+    for agent in session_agents(iii, &input).await? {
+        let entries = call_state(
+            iii,
+            "state::list",
+            json!({ "scope": format!("sessions:{agent}") }),
+        )
+        .await?;
+        if entries
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|entry| entry.get("key").and_then(Value::as_str) == Some(id))
+        {
+            call_state(
+                iii,
+                "state::delete",
+                json!({ "scope": format!("sessions:{agent}"), "key": id }),
+            )
+            .await?;
+            deleted = true;
+        }
+    }
+    if !deleted {
+        return Err(Error::Handler(format!("session not found: {id}")));
+    }
+    Ok(json!({ "deleted": true, "id": id }))
 }
 
 async fn store_memory(iii: &IIIClient, input: Value) -> Result<Value, Error> {

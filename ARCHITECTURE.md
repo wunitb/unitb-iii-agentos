@@ -118,6 +118,10 @@ These are **declarative config**, not workers:
 
 None ship as registered functions; they configure workers that do.
 
+The `workflow` worker auto-loads every `.yaml`/`.yml` definition from `AGENTOS_WORKFLOWS_DIR` or the bundled `workflows/` directory. Loading rejects invalid IDs, duplicate or missing dependencies, undeclared agent references, unbounded timeout/retry/loop controls, and incompatible consecutive fanout policies. Execution resolves the dependency graph, checks the selected agent's capability before every function call, and supports `sequential`, concurrently joined `parallel`, grouped `fanout`, and bounded `loop` modes with `fail`, `skip`, or retry behavior.
+
+Workflow definitions live under the `workflows` state scope. Runs live under `workflow_runs`; each checkpoint records `status`, `results`, interpolated `vars`, and `nextStep`, so HTTP and CLI clients can inspect the last durable step boundary through `GET /api/workflow-runs/:id`. Routes also expose workflow CRUD, `POST /api/workflows/:id/run`, and paginated run history at `GET /api/workflows/:id/runs`.
+
 ## Development control plane
 
 UNITB DELIVERY coordinates repository changes from a global installation outside this repository. The managed Planner is the read-only interactive entry point, each Worker is the single writer for an explicit path contract in an isolated worktree, and the Reviewer inspects the exact submitted commit independently.

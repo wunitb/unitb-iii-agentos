@@ -140,6 +140,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Each worker ships `iii.worker.yaml` declaring its registry shape. CI validates conformance on every PR.
 
+The `workflow` worker auto-loads `workflows/*.yaml` at startup, validates step and agent references, executes dependency-ordered `sequential`, `parallel`, `fanout`, and bounded `loop` steps, and checkpoints run state after every step. Use `AGENTOS_WORKFLOWS_DIR` to override the bundled directory. The CLI exposes the complete lifecycle:
+
+```bash
+agentos workflow list
+agentos workflow show feature-build
+agentos workflow run feature-build --input '{"feature_description":"add caching"}'
+agentos workflow runs feature-build --limit 20
+agentos workflow status <run-id>
+agentos workflow create workflows/feature-build.yaml
+```
+
 ## § 07 · Sandbox surfaces
 
 Two distinct namespaces, never overlap:

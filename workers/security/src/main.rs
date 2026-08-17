@@ -148,6 +148,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("Scan text for prompt injection patterns"),
     );
 
+    let iii_ref = iii.clone();
+    iii.register_function(
+        "security::list_capabilities",
+        RegisterFunction::new_async(move |_: Value| {
+            let iii = iii_ref.clone();
+            async move {
+                iii.trigger(TriggerRequest {
+                    function_id: "state::list".to_string(),
+                    payload: json!({ "scope": "capabilities" }),
+                    action: None,
+                    timeout_ms: None,
+                })
+                .await
+                .map_err(|error| Error::Handler(error.to_string()))
+            }
+        })
+        .description("List configured agent capabilities"),
+    );
+
     iii.register_trigger(RegisterTriggerInput {
         trigger_type: "subscribe".to_string(),
         function_id: "security::audit".to_string(),
@@ -161,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &iii,
         "security::verify_audit".to_string(),
         json!({
-            "api_path": "security/audit/verify",
+            "api_path": "/api/security/audit/verify",
             "http_method": "GET",
         }),
         None,
@@ -171,11 +190,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &iii,
         "security::scan_injection".to_string(),
         json!({
-            "api_path": "security/scan",
+            "api_path": "/api/security/scan",
             "http_method": "POST",
         }),
         None,
     )?;
+
+    let security_routes = [("security::list_capabilities", "GET", "/api/security")];
+    for (function_id, method, path) in security_routes {
+        agentos_http_adapter::register_http_trigger(
+            &iii,
+            function_id,
+            json!({ "api_path": path, "http_method": method }),
+            None,
+        )?;
+    }
 
     taint::register(&iii);
     signing::register(&iii);

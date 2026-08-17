@@ -13,6 +13,115 @@ use types::{AgentConfig, ChatRequest, FunctionCall};
 
 const MAX_ITERATIONS: u32 = 50;
 
+const CHANNELS: [&str; 14] = [
+    "bluesky", "discord", "email", "linkedin", "mastodon", "matrix", "reddit", "signal", "slack",
+    "teams", "telegram", "twitch", "webex", "whatsapp",
+];
+
+fn channel_secrets(channel: &str) -> Option<&'static [&'static str]> {
+    match channel {
+        "bluesky" => Some(&["BLUESKY_HANDLE", "BLUESKY_PASSWORD"]),
+        "discord" => Some(&["DISCORD_BOT_TOKEN"]),
+        "email" => Some(&["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS"]),
+        "linkedin" => Some(&["LINKEDIN_TOKEN"]),
+        "mastodon" => Some(&["MASTODON_INSTANCE", "MASTODON_TOKEN"]),
+        "matrix" => Some(&["MATRIX_HOMESERVER", "MATRIX_TOKEN"]),
+        "reddit" => Some(&["REDDIT_CLIENT_ID", "REDDIT_SECRET", "REDDIT_REFRESH_TOKEN"]),
+        "signal" => Some(&["SIGNAL_API_URL", "SIGNAL_PHONE"]),
+        "slack" => Some(&["SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET"]),
+        "teams" => Some(&["TEAMS_APP_ID", "TEAMS_APP_PASSWORD"]),
+        "telegram" => Some(&["TELEGRAM_BOT_TOKEN"]),
+        "twitch" => Some(&["TWITCH_CLIENT_ID", "TWITCH_TOKEN", "TWITCH_BOT_USER_ID"]),
+        "webex" => Some(&["WEBEX_TOKEN"]),
+        "whatsapp" => Some(&["WHATSAPP_PHONE_ID", "WHATSAPP_TOKEN"]),
+        _ => None,
+    }
+}
+
+async fn missing_channel_secrets(
+    iii: &IIIClient,
+    channel: &str,
+) -> Result<Vec<&'static str>, Error> {
+    let required = channel_secrets(channel)
+        .ok_or_else(|| Error::Handler(format!("Unsupported channel: {channel}")))?;
+    let mut missing = Vec::new();
+    for key in required {
+        let secret = iii
+            .trigger(TriggerRequest {
+                function_id: "vault::get".to_string(),
+                payload: json!({ "key": key }),
+                action: None,
+                timeout_ms: None,
+            })
+            .await
+            .ok()
+            .and_then(|value| value["value"].as_str().map(str::to_owned))
+            .or_else(|| std::env::var(key).ok());
+        if secret.as_deref().is_none_or(str::is_empty) {
+            missing.push(*key);
+        }
+    }
+    Ok(missing)
+}
+
+async fn channel_statuses(iii: &IIIClient) -> Result<Value, Error> {
+    let workers = iii
+        .trigger(TriggerRequest {
+            function_id: "engine::workers::list".to_string(),
+            payload: json!({}),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|error| Error::Handler(error.to_string()))?;
+    let connected = workers["workers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|worker| worker["status"] == "connected")
+        .filter_map(|worker| worker["name"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    Ok(Value::Array(
+        CHANNELS
+            .iter()
+            .map(|channel| {
+                let enabled = connected.contains(format!("channel-{channel}").as_str());
+                json!({
+                    "id": channel,
+                    "type": channel,
+                    "enabled": enabled,
+                    "config": "vault/env",
+                })
+            })
+            .collect(),
+    ))
+}
+
+async fn channel_readiness(iii: &IIIClient, channel: &str) -> Result<Value, Error> {
+    let missing = missing_channel_secrets(iii, channel).await?;
+    let statuses = channel_statuses(iii).await?;
+    let connected = statuses
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|status| status["id"] == channel && status["enabled"] == true);
+    let success = connected && missing.is_empty();
+    let error = if !connected {
+        Some(format!("channel-{channel} worker is not connected"))
+    } else if missing.is_empty() {
+        None
+    } else {
+        Some(format!("missing secrets: {}", missing.join(", ")))
+    };
+    Ok(json!({
+        "id": channel,
+        "success": success,
+        "connected": connected,
+        "missingSecrets": missing,
+        "error": error,
+    }))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -60,9 +169,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     agentos_http_adapter::register_http_trigger(
         &iii,
         "health::check",
-        json!({ "api_path": "/api/health", "http_method": "GET" }),
+        json!({ "api_path": "/api/health", "http_method": "GET", "auth": false }),
         None,
     )?;
+
+    let iii_clone = iii.clone();
+    iii.register_function(
+        "channel::list",
+        RegisterFunction::new_async(move |_: Value| {
+            let iii = iii_clone.clone();
+            async move { channel_statuses(&iii).await }
+        })
+        .description("List channel adapter status"),
+    );
+    let iii_clone = iii.clone();
+    iii.register_function(
+        "channel::setup",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_clone.clone();
+            async move {
+                let channel = input["channel"].as_str().unwrap_or_default();
+                channel_readiness(&iii, channel).await
+            }
+        })
+        .description("Validate channel adapter configuration"),
+    );
+    let iii_clone = iii.clone();
+    iii.register_function(
+        "channel::test",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_clone.clone();
+            async move {
+                let channel = input["channel"].as_str().unwrap_or_default();
+                channel_readiness(&iii, channel).await
+            }
+        })
+        .description("Test channel adapter readiness"),
+    );
+    for (function_id, method, path) in [
+        ("channel::list", "GET", "/api/channels"),
+        ("channel::setup", "POST", "/api/channels"),
+        ("channel::test", "POST", "/api/channels/:channel/test"),
+    ] {
+        agentos_http_adapter::register_http_trigger(
+            &iii,
+            function_id,
+            json!({ "api_path": path, "http_method": method }),
+            None,
+        )?;
+    }
 
     let iii_clone = iii.clone();
     iii.register_function(
@@ -161,6 +316,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .description("Remove an agent"),
     );
+
+    let agent_routes = [
+        ("agent::list", "GET", "/api/agents"),
+        ("agent::create", "POST", "/api/agents"),
+        ("agent::chat", "POST", "/api/agents/:agentId/message"),
+        ("agent::delete", "DELETE", "/api/agents/:agentId"),
+    ];
+    for (function_id, method, path) in agent_routes {
+        agentos_http_adapter::register_http_trigger(
+            &iii,
+            function_id,
+            json!({ "api_path": path, "http_method": method }),
+            None,
+        )?;
+    }
 
     iii.register_trigger(RegisterTriggerInput {
         trigger_type: "queue".to_string(),

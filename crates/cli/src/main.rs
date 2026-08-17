@@ -18,6 +18,15 @@ fn validate_id(id: &str) -> Result<&str> {
     }
 }
 
+fn parse_workflow_document(content: &str) -> Result<Value> {
+    match serde_json::from_str(content) {
+        Ok(value) => Ok(value),
+        Err(json_error) => serde_yaml::from_str(content).map_err(|yaml_error| {
+            anyhow::anyhow!("workflow is neither valid JSON ({json_error}) nor YAML ({yaml_error})")
+        }),
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "agentos", version, about = "Agent Operating System")]
 struct Cli {
@@ -131,8 +140,31 @@ enum AgentCmd {
 #[derive(Subcommand)]
 enum WorkflowCmd {
     List,
-    Create { file: String },
-    Run { id: String },
+    Show {
+        id: String,
+    },
+    Create {
+        file: String,
+    },
+    Run {
+        id: String,
+        #[arg(long, conflicts_with = "input_file")]
+        input: Option<String>,
+        #[arg(long, conflicts_with = "input")]
+        input_file: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    Runs {
+        id: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    Status {
+        run_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -150,7 +182,7 @@ enum TriggerCmd {
 #[derive(Subcommand)]
 enum SkillCmd {
     List,
-    Install { path: String },
+    Install { id: String },
     Remove { id: String },
     Search { query: String },
     Create { name: String },
@@ -161,8 +193,6 @@ enum ChannelCmd {
     List,
     Setup { channel: String },
     Test { channel: String },
-    Enable { channel: String },
-    Disable { channel: String },
 }
 
 #[derive(Subcommand)]
@@ -665,18 +695,31 @@ async fn main() -> Result<()> {
                     .get(format!("{}/api/workflows", api_base))
                     .send()
                     .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            }
+            WorkflowCmd::Show { id } => {
+                let id = validate_id(&id)?;
+                let resp: Value = client
+                    .get(format!("{}/api/workflows/{}", api_base, id))
+                    .send()
+                    .await?
+                    .error_for_status()?
                     .json()
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             }
             WorkflowCmd::Create { file } => {
                 let content = std::fs::read_to_string(&file)?;
-                let workflow: Value = serde_json::from_str(&content)?;
+                let workflow = parse_workflow_document(&content)?;
                 let resp: Value = client
                     .post(format!("{}/api/workflows", api_base))
                     .json(&workflow)
                     .send()
                     .await?
+                    .error_for_status()?
                     .json()
                     .await?;
                 println!(
@@ -685,12 +728,56 @@ async fn main() -> Result<()> {
                     resp["id"].as_str().unwrap_or("unknown")
                 );
             }
-            WorkflowCmd::Run { id } => {
+            WorkflowCmd::Run {
+                id,
+                input,
+                input_file,
+                agent,
+            } => {
+                let id = validate_id(&id)?;
+                let raw_input = match input_file {
+                    Some(path) => Some(std::fs::read_to_string(path)?),
+                    None => input,
+                };
+                let workflow_input = raw_input
+                    .map(|raw| serde_json::from_str(&raw).unwrap_or_else(|_| Value::String(raw)))
+                    .unwrap_or(Value::Null);
+                let mut body = json!({ "workflowId": id, "input": workflow_input });
+                if let Some(agent) = agent {
+                    let agent = validate_id(&agent)?;
+                    body["agentId"] = Value::String(agent.to_string());
+                }
                 let resp: Value = client
-                    .post(format!("{}/api/workflows/run", api_base))
-                    .json(&json!({ "workflowId": id }))
+                    .post(format!("{}/api/workflows/{}/run", api_base, id))
+                    .json(&body)
                     .send()
                     .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            }
+            WorkflowCmd::Runs { id, limit, offset } => {
+                let id = validate_id(&id)?;
+                let resp: Value = client
+                    .get(format!(
+                        "{}/api/workflows/{}/runs?limit={}&offset={}",
+                        api_base, id, limit, offset
+                    ))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            }
+            WorkflowCmd::Status { run_id } => {
+                let run_id = validate_id(&run_id)?;
+                let resp: Value = client
+                    .get(format!("{}/api/workflow-runs/{}", api_base, run_id))
+                    .send()
+                    .await?
+                    .error_for_status()?
                     .json()
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -700,12 +787,13 @@ async fn main() -> Result<()> {
         Commands::Skill(cmd) => match cmd {
             SkillCmd::List => {
                 let resp: Value = client
-                    .get(format!("{}/api/skills", api_base))
+                    .get(format!("{}/api/skillkit/list", api_base))
                     .send()
                     .await?
                     .json()
                     .await?;
-                if let Some(skills) = resp.as_array() {
+                let skills = resp.as_array().or_else(|| resp["skills"].as_array());
+                if let Some(skills) = skills {
                     println!(
                         "{:<20} {:<15} {:<40}",
                         "ID".bold(),
@@ -722,33 +810,43 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            SkillCmd::Install { path } => {
-                let content = std::fs::read_to_string(&path)?;
+            SkillCmd::Install { id } => {
                 let resp: Value = client
-                    .post(format!("{}/api/skills", api_base))
-                    .json(&json!({ "content": content }))
+                    .post(format!("{}/api/skillkit/install", api_base))
+                    .json(&json!({ "id": id }))
                     .send()
                     .await?
                     .json()
                     .await?;
-                println!(
-                    "{} Installed skill: {}",
-                    "✓".green(),
-                    resp["id"].as_str().unwrap_or("unknown")
-                );
+                if resp["installed"].as_bool() != Some(true) {
+                    anyhow::bail!(
+                        "Skill install failed: {}",
+                        resp["error"].as_str().unwrap_or("unknown error")
+                    );
+                }
+                println!("{} Installed skill: {}", "✓".green(), id);
             }
             SkillCmd::Remove { id } => {
                 let id = validate_id(&id)?;
-                client
-                    .delete(format!("{}/api/skills/{}", api_base, id))
+                let resp: Value = client
+                    .post(format!("{}/api/skillkit/uninstall", api_base))
+                    .json(&json!({ "id": id }))
                     .send()
+                    .await?
+                    .json()
                     .await?;
+                if resp["removed"].as_bool() != Some(true) {
+                    anyhow::bail!(
+                        "Skill removal failed: {}",
+                        resp["error"].as_str().unwrap_or("unknown error")
+                    );
+                }
                 println!("{} Removed skill: {}", "✓".green(), id);
             }
             SkillCmd::Search { query } => {
                 let resp: Value = client
                     .get(format!(
-                        "{}/api/skills/search?query={}",
+                        "{}/api/skillkit/search?query={}",
                         api_base,
                         urlencoding::encode(&query)
                     ))
@@ -908,20 +1006,36 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             }
             ApprovalsCmd::Approve { id } => {
-                client
+                let resp: Value = client
                     .post(format!("{}/api/approvals/decide", api_base))
                     .json(&json!({ "requestId": id, "decision": "approve" }))
                     .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
                     .await?;
-                println!("{} Approved: {}", "✓".green(), id);
+                println!(
+                    "{} Approval {}: {}",
+                    "✓".green(),
+                    id,
+                    resp["status"].as_str().unwrap_or("approved")
+                );
             }
             ApprovalsCmd::Reject { id } => {
-                client
+                let resp: Value = client
                     .post(format!("{}/api/approvals/decide", api_base))
                     .json(&json!({ "requestId": id, "decision": "deny" }))
                     .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
                     .await?;
-                println!("{} Rejected: {}", "✓".green(), id);
+                println!(
+                    "{} Approval {}: {}",
+                    "✓".green(),
+                    id,
+                    resp["status"].as_str().unwrap_or("denied")
+                );
             }
         },
 
@@ -1147,12 +1261,14 @@ async fn main() -> Result<()> {
                     .await?
                     .json()
                     .await?;
-                println!(
-                    "{} Channel {} configured: {}",
-                    "✓".green(),
-                    channel,
-                    resp["id"].as_str().unwrap_or("ok")
-                );
+                if resp["success"].as_bool() != Some(true) {
+                    anyhow::bail!(
+                        "Channel {} is not ready: {}",
+                        channel,
+                        resp["error"].as_str().unwrap_or("unknown error")
+                    );
+                }
+                println!("{} Channel {} is ready", "✓".green(), channel);
             }
             ChannelCmd::Test { channel } => {
                 let channel = validate_id(&channel)?;
@@ -1173,24 +1289,6 @@ async fn main() -> Result<()> {
                         resp["error"].as_str().unwrap_or("unknown error")
                     );
                 }
-            }
-            ChannelCmd::Enable { channel } => {
-                let channel = validate_id(&channel)?;
-                client
-                    .patch(format!("{}/api/channels/{}", get_api_url(), channel))
-                    .json(&json!({ "enabled": true }))
-                    .send()
-                    .await?;
-                println!("{} Channel {} enabled", "✓".green(), channel);
-            }
-            ChannelCmd::Disable { channel } => {
-                let channel = validate_id(&channel)?;
-                client
-                    .patch(format!("{}/api/channels/{}", get_api_url(), channel))
-                    .json(&json!({ "enabled": false }))
-                    .send()
-                    .await?;
-                println!("{} Channel {} disabled", "✓".green(), channel);
             }
         },
 
@@ -2600,5 +2698,37 @@ mod tests {
     #[test]
     fn test_api_base_port() {
         assert!(API_BASE.contains("3111"));
+    }
+
+    #[test]
+    fn test_workflow_run_accepts_json_input_and_agent() {
+        let cli = Cli::try_parse_from([
+            "agentos",
+            "workflow",
+            "run",
+            "feature-build",
+            "--input",
+            r#"{"feature_description":"cache"}"#,
+            "--agent",
+            "architect",
+        ])
+        .unwrap();
+        let Commands::Workflow(WorkflowCmd::Run {
+            id, input, agent, ..
+        }) = cli.command
+        else {
+            panic!("expected workflow run");
+        };
+        assert_eq!(id, "feature-build");
+        assert_eq!(input.as_deref(), Some(r#"{"feature_description":"cache"}"#));
+        assert_eq!(agent.as_deref(), Some("architect"));
+    }
+
+    #[test]
+    fn test_workflow_document_accepts_yaml() {
+        let workflow =
+            parse_workflow_document("id: test\nname: Test\ndescription: test\nsteps: []\n")
+                .unwrap();
+        assert_eq!(workflow["id"], "test");
     }
 }

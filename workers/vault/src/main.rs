@@ -178,7 +178,15 @@ fn require_auth(input: &Value) -> Result<(), Error> {
 }
 
 fn body_or_self(input: &Value) -> Value {
-    input.get("body").cloned().unwrap_or_else(|| input.clone())
+    let Some(mut body) = input.get("body").cloned() else {
+        return input.clone();
+    };
+
+    if let (Some(body), Some(key)) = (body.as_object_mut(), input.get("key")) {
+        body.entry("key".to_string()).or_insert_with(|| key.clone());
+    }
+
+    body
 }
 
 async fn state_get(iii: &IIIClient, scope: &str, key: &str) -> Option<Value> {
@@ -877,6 +885,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("vault::rotate", "api/vault/rotate", "POST"),
         ("vault::backup", "api/vault/backup", "POST"),
         ("vault::restore", "api/vault/restore", "POST"),
+        // Canonical CLI and TUI routes. The legacy function-shaped routes above
+        // remain for direct API consumers.
+        ("vault::set", "api/vault/:key", "POST"),
+        ("vault::list", "api/vault", "GET"),
+        ("vault::delete", "api/vault/:key", "DELETE"),
     ] {
         agentos_http_adapter::register_http_trigger(
             &iii,
@@ -1105,6 +1118,14 @@ mod tests {
         let req = json!({ "headers": {}, "body": { "key": "value" } });
         let body = body_or_self(&req);
         assert_eq!(body["key"], "value");
+    }
+
+    #[test]
+    fn test_body_or_self_merges_path_key() {
+        let req = json!({ "headers": {}, "body": { "value": "secret" }, "key": "API_KEY" });
+        let body = body_or_self(&req);
+        assert_eq!(body["key"], "API_KEY");
+        assert_eq!(body["value"], "secret");
     }
 
     #[test]

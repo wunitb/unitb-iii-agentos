@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum SwarmStatus {
     Active,
+    Completed,
+    Failed,
     Dissolved,
 }
 
@@ -13,6 +15,7 @@ pub enum MessageType {
     Observation,
     Proposal,
     Vote,
+    Error,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -35,6 +38,12 @@ pub struct SwarmConfig {
     #[serde(rename = "createdAt")]
     pub created_at: i64,
     pub status: SwarmStatus,
+    #[serde(
+        rename = "completedAt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub completed_at: Option<i64>,
     #[serde(rename = "dissolvedAt", skip_serializing_if = "Option::is_none")]
     pub dissolved_at: Option<i64>,
 }
@@ -121,6 +130,14 @@ mod tests {
             "\"active\""
         );
         assert_eq!(
+            serde_json::to_string(&SwarmStatus::Completed).unwrap(),
+            "\"completed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SwarmStatus::Failed).unwrap(),
+            "\"failed\""
+        );
+        assert_eq!(
             serde_json::to_string(&SwarmStatus::Dissolved).unwrap(),
             "\"dissolved\""
         );
@@ -140,6 +157,10 @@ mod tests {
             serde_json::to_string(&MessageType::Vote).unwrap(),
             "\"vote\""
         );
+        assert_eq!(
+            serde_json::to_string(&MessageType::Error).unwrap(),
+            "\"error\""
+        );
     }
 
     #[test]
@@ -152,6 +173,7 @@ mod tests {
             consensus_threshold: 0.66,
             created_at: 1_700_000_000_000,
             status: SwarmStatus::Active,
+            completed_at: None,
             dissolved_at: None,
         };
         let val = serde_json::to_value(&cfg).unwrap();
