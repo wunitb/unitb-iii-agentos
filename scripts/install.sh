@@ -50,6 +50,25 @@ get_latest_release() {
   fi
 }
 
+# Operator-owned paths inside the runtime tree. Everything else is release
+# payload and is replaced wholesale by an upgrade.
+RUNTIME_STATE_PATHS=(config config.yaml data .env)
+
+# Move operator-owned state from one runtime tree into another, replacing the
+# release defaults. Renames keep live engine state intact and never copy it.
+adopt_runtime_state() {
+  local from="$1"
+  local to="$2"
+  local state
+
+  for state in "${RUNTIME_STATE_PATHS[@]}"; do
+    if [ -e "$from/$state" ]; then
+      rm -rf "${to:?}/$state"
+      mv "$from/$state" "$to/$state"
+    fi
+  done
+}
+
 download_and_install() {
   local repo="$1"
   local version="$2"
@@ -59,7 +78,7 @@ download_and_install() {
   local tag="${version#v}"
   local asset="${binary_name}-${tag}-${arch}-${os}.tar.gz"
   local base_url="https://github.com/${repo}/releases/download/${version}"
-  local tmp_dir archive_path runtime_stage
+  local tmp_dir archive_path runtime_dir runtime_stage runtime_retired
 
   info "Downloading ${binary_name} ${version} for ${os}/${arch}..."
   tmp_dir="$(mktemp -d)"
@@ -98,18 +117,35 @@ download_and_install() {
     chmod +x "$INSTALL_DIR/agentos-tui"
   fi
 
+  runtime_dir="$AGENTOS_HOME/runtime"
   runtime_stage="$AGENTOS_HOME/runtime.new"
+  runtime_retired="$AGENTOS_HOME/runtime.old"
+
+  # Finish an upgrade that was interrupted mid-swap, so operator state is never
+  # stranded in the retired tree.
+  if [ -d "$runtime_retired" ]; then
+    if [ -d "$runtime_dir" ]; then
+      adopt_runtime_state "$runtime_retired" "$runtime_dir"
+      rm -rf "$runtime_retired"
+    else
+      mv "$runtime_retired" "$runtime_dir"
+    fi
+  fi
+
+  # The stage only ever holds release payload, so a stage left over by an
+  # interrupted run is always safe to discard.
   rm -rf "$runtime_stage"
   cp -R "$tmp_dir/runtime" "$runtime_stage"
-  if [ -d "$AGENTOS_HOME/runtime/config" ]; then
-    rm -rf "$runtime_stage/config"
-    cp -R "$AGENTOS_HOME/runtime/config" "$runtime_stage/config"
+
+  if [ -d "$runtime_dir" ]; then
+    mv "$runtime_dir" "$runtime_retired"
   fi
-  if [ -f "$AGENTOS_HOME/runtime/config.yaml" ]; then
-    cp "$AGENTOS_HOME/runtime/config.yaml" "$runtime_stage/config.yaml"
+  mv "$runtime_stage" "$runtime_dir"
+
+  if [ -d "$runtime_retired" ]; then
+    adopt_runtime_state "$runtime_retired" "$runtime_dir"
+    rm -rf "$runtime_retired"
   fi
-  rm -rf "$AGENTOS_HOME/runtime"
-  mv "$runtime_stage" "$AGENTOS_HOME/runtime"
 
   ok "${binary_name} ${version} installed to ${INSTALL_DIR}/${binary_name}"
   ok "Runtime installed to ${AGENTOS_HOME}/runtime"
