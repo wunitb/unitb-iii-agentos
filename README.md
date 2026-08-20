@@ -61,15 +61,31 @@ $EDITOR .env   # set ANTHROPIC_API_KEY=sk-ant-…
 # 4. build the workspace
 cargo build --workspace --release
 
-# 5. boot engine + workers (in two terminals, or one with `&`)
-iii --config config.yaml &
-bash scripts/dev-up.sh
-
-# 6. open the chat
-cargo run --release -p agentos-tui
+# 5. bring the stack up: engine, workers, then the chat TUI
+./target/release/agentos up
 ```
 
-Engine boots on port 49134. The development launcher starts the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source declares 267 literal function registrations. The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
+`agentos up` runs one ordered policy and never builds or installs anything: it
+resolves the config, verifies the iii binary (missing → `bash scripts/install-iii.sh`),
+reuses an engine already healthy on port 49134 or boots `iii --config config.yaml`
+detached and waits for health with a bounded timeout, verifies every Rust worker
+release binary (missing → `cargo build --workspace --release`), starts the workers
+unless the required set is already connected, waits for them to register on the
+bus, and only then hands the terminal to `agentos-tui`. Each stage reports its own
+failure and stops before the next one; `--timeout` (default 30s) bounds the engine
+wait and then the worker wait.
+
+```bash
+agentos up --no-tui   # engine + workers only; leaves them running, no TUI
+agentos doctor        # readiness report; diagnostic only, changes nothing
+```
+
+`agentos doctor` prints the iii binary path and version, engine health, how many
+of the required workers are connected, worker and TUI binary readiness, and which
+config discovery mode is in effect. `scripts/dev-up.sh` still starts only the
+workers against an engine you booted yourself.
+
+Engine boots on port 49134. `agentos up` starts the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source declares 267 literal function registrations. The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
 
 Prefer driving by HTTP? Same thing without the TUI:
 
@@ -93,7 +109,7 @@ The release installer supports Linux `x86_64` and `aarch64`, and macOS
 ```bash
 curl -fsSL https://raw.githubusercontent.com/wunitb/unitb-iii-agentos/main/scripts/install.sh | bash
 agentos init --quick
-agentos start
+agentos up
 ```
 
 The installer needs network access, `curl`, `tar`, and `sha256sum` or `shasum`.
@@ -104,13 +120,15 @@ relative `AGENTOS_HOME` is resolved against the directory from which `agentos`
 was invoked, before any engine or worker changes directory; an empty override
 uses the platform home plus `.agentos`.
 
-`agentos init`, `agentos onboard`, `agentos doctor`, `agentos start`,
-`agentos reset`, and `agentos config ...` all use the same resolved
-`AGENTOS_HOME`. `AGENTOS_CONFIG` has precedence over runtime discovery. A
-non-empty relative value is resolved against the caller's current directory;
-an empty value is ignored. Without it, a checkout `config.yaml` is used only
-when the checkout also contains `workers/`; otherwise
-`$AGENTOS_HOME/runtime/config.yaml` is used. This lets an installed release
+`agentos init`, `agentos onboard`, `agentos doctor`, `agentos up`,
+`agentos start`, `agentos reset`, and `agentos config ...` all use the same
+resolved `AGENTOS_HOME`. `AGENTOS_CONFIG` has precedence over runtime
+discovery. A non-empty relative value is resolved against the caller's current
+directory; an empty value is ignored. Without it, a checkout `config.yaml` is
+used only when the checkout also contains `workers/` — setting `AGENTOS_HOME`
+alone does not disable that checkout discovery; otherwise
+`$AGENTOS_HOME/runtime/config.yaml` is used. `agentos doctor` names the mode
+and the resolved path. This lets an installed release
 start from any working directory without a checkout. Upgrades replace release
 payload while retaining operator configuration and `$AGENTOS_HOME/runtime/data/**`.
 
