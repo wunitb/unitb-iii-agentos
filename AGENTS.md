@@ -38,6 +38,34 @@ Run every command from the stated directory. A command below is offline only whe
 
 From root, `bash scripts/install-iii.sh` downloads and checksum-verifies the pinned iii v0.22.1 release; it is connected setup, never an offline command. From root, starting a development stack also needs a built release workspace, `iii --config config.yaml`, and usually `.env` credentials (mode 600) before `bash scripts/dev-up.sh`.
 
+## Portability and release boundaries
+
+Released bundles are built for Linux `x86_64`/`aarch64` and macOS
+`x86_64`/`aarch64`. The bundle contains the CLI, TUI, runtime configuration,
+Rust worker binaries, and embedding-worker source; it must not require the
+source checkout at runtime. The installer keeps the operator-owned
+`$AGENTOS_HOME/runtime/config`, `config.yaml`, `.env`, and
+`runtime/data/**` paths across upgrades. Logs and transient process state stay
+under `$AGENTOS_HOME` and are not source.
+
+`AGENTOS_HOME` is the shared state root for init, onboarding, doctor, start,
+reset, and config commands. A non-empty relative override is resolved against
+the caller's current directory before a child process changes directory; an
+empty override falls back to the platform home plus `.agentos`. A non-empty
+relative `AGENTOS_CONFIG` is resolved the same way and takes precedence over
+checkout or installed-runtime discovery. `scripts/dev-up.sh` resolves a
+relative `CARGO_TARGET_DIR` against the repository root, so it is safe to
+invoke from another directory.
+
+The pinned iii installer and release installer are connected operations.
+Offline Rust/Python checks require their toolchains and cached dependencies;
+website npm, Bun, and live-engine/E2E checks have their own dependency,
+network, service, or credential prerequisites. The embedding worker requires
+Python >=3.11 with `venv` and `ensurepip`; SentenceTransformers is optional
+for its hash fallback when the package is unavailable. Local builds validate
+only the host architecture; the release CI matrix is the evidence for all
+four supported targets.
+
 ## Conventions
 
 - Rust uses edition 2024 and workspace dependency versions. Format with `cargo fmt`; treat the clippy command above, including `-D warnings`, as the lint bar. Target a workspace package with `-p`; preserve the worker-per-process/function-registration design and the reserved `sandbox::*` namespace.
