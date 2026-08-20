@@ -1,7 +1,12 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+use std::path::{Component, Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 
 const API_BASE: &str = "http://localhost:3111";
 
@@ -309,6 +314,493 @@ enum MigrateCmd {
     Report,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerRuntime {
+    Rust,
+    Python,
+}
+
+#[derive(Debug)]
+struct WorkerSpec {
+    name: String,
+    runtime: WorkerRuntime,
+    binary: Option<PathBuf>,
+}
+
+struct RunningWorker {
+    name: String,
+    child: Child,
+}
+
+struct ProcessGroup {
+    engine: Child,
+    workers: Vec<RunningWorker>,
+    terminated: bool,
+}
+
+impl ProcessGroup {
+    fn terminate(&mut self) {
+        if self.terminated {
+            return;
+        }
+
+        for worker in &mut self.workers {
+            let _ = worker.child.kill();
+        }
+        let _ = self.engine.kill();
+        for worker in &mut self.workers {
+            let _ = worker.child.wait();
+        }
+        let _ = self.engine.wait();
+        self.terminated = true;
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+fn normalize_path(path: PathBuf, caller_dir: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        caller_dir.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    normalized
+}
+
+fn resolve_agentos_home(
+    caller_dir: &Path,
+    configured_home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    if let Some(configured_home) = configured_home.filter(|value| !value.is_empty()) {
+        return Ok(normalize_path(PathBuf::from(configured_home), caller_dir));
+    }
+
+    dirs::home_dir()
+        .map(|home| home.join(".agentos"))
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))
+}
+
+fn agentos_home_dir() -> Result<PathBuf> {
+    let caller_dir = std::env::current_dir().context("Cannot determine current directory")?;
+    resolve_agentos_home(&caller_dir, std::env::var_os("AGENTOS_HOME").as_deref())
+}
+
+fn resolve_config_path(
+    caller_dir: &Path,
+    agentos_home: &Path,
+    allow_checkout_config: bool,
+) -> PathBuf {
+    if let Some(config) = std::env::var_os("AGENTOS_CONFIG").filter(|value| !value.is_empty()) {
+        return normalize_path(PathBuf::from(config), caller_dir);
+    }
+
+    let project_config = caller_dir.join("config.yaml");
+    if allow_checkout_config && project_config.is_file() && caller_dir.join("workers").is_dir() {
+        project_config
+    } else {
+        agentos_home.join("runtime/config.yaml")
+    }
+}
+
+fn runtime_paths() -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let caller_dir = std::env::current_dir().context("Cannot determine current directory")?;
+    let configured_home = std::env::var_os("AGENTOS_HOME").filter(|value| !value.is_empty());
+    let agentos_home = resolve_agentos_home(&caller_dir, configured_home.as_deref())?;
+    let config_path = resolve_config_path(&caller_dir, &agentos_home, configured_home.is_none());
+    let runtime_dir = config_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Invalid AgentOS config path"))?
+        .to_path_buf();
+    Ok((agentos_home, config_path, runtime_dir))
+}
+
+fn ensure_agentos_dirs(agentos_home: &Path) -> Result<()> {
+    for directory in ["data", "skills", "agents", "logs", "state"] {
+        std::fs::create_dir_all(agentos_home.join(directory))?;
+    }
+    Ok(())
+}
+
+fn strip_yaml_comment(value: &str) -> &str {
+    let mut quote = None;
+    let mut previous = '\0';
+    for (index, character) in value.char_indices() {
+        match character {
+            '\'' | '"' if quote.is_none() => quote = Some(character),
+            character if Some(character) == quote => quote = None,
+            '#' if quote.is_none() && (index == 0 || previous.is_whitespace()) => {
+                return &value[..index];
+            }
+            _ => {}
+        }
+        previous = character;
+    }
+    value
+}
+
+fn yaml_mapping_line(line: &str) -> Option<(usize, &str, &str)> {
+    let without_comment = strip_yaml_comment(line);
+    let trimmed = without_comment.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let indentation = without_comment.len() - without_comment.trim_start().len();
+    let (key, value) = trimmed.split_once(':')?;
+    let key = key.trim();
+    if key.is_empty() || key.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((indentation, key, value.trim()))
+}
+
+fn yaml_scalar(value: &str) -> &str {
+    let value = strip_yaml_comment(value).trim();
+    if value.len() >= 2
+        && ((value.starts_with('\'') && value.ends_with('\''))
+            || (value.starts_with('"') && value.ends_with('"')))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+fn parse_runtime_kind(value: &str) -> Result<WorkerRuntime> {
+    match yaml_scalar(value) {
+        "rust" => Ok(WorkerRuntime::Rust),
+        "python" => Ok(WorkerRuntime::Python),
+        other => anyhow::bail!("runtime.kind must be rust or python, got {other:?}"),
+    }
+}
+
+fn split_flow_items(value: &str) -> Result<Vec<&str>> {
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut nesting = 0i32;
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (index, character) in value.char_indices() {
+        if let Some(delimiter) = quote {
+            if character == delimiter && !escaped {
+                quote = None;
+            }
+            escaped = character == '\\' && !escaped;
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '{' | '[' => nesting += 1,
+            '}' | ']' => {
+                nesting -= 1;
+                if nesting < 0 {
+                    anyhow::bail!("Malformed inline runtime mapping");
+                }
+            }
+            ',' if nesting == 0 => {
+                items.push(value[start..index].trim());
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() || nesting != 0 {
+        anyhow::bail!("Malformed inline runtime mapping");
+    }
+    let last = value[start..].trim();
+    if !last.is_empty() {
+        items.push(last);
+    }
+    Ok(items)
+}
+
+fn split_flow_pair(value: &str) -> Result<(&str, &str)> {
+    let mut nesting = 0i32;
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (index, character) in value.char_indices() {
+        if let Some(delimiter) = quote {
+            if character == delimiter && !escaped {
+                quote = None;
+            }
+            escaped = character == '\\' && !escaped;
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '{' | '[' => nesting += 1,
+            '}' | ']' => {
+                nesting -= 1;
+                if nesting < 0 {
+                    anyhow::bail!("Malformed inline runtime mapping");
+                }
+            }
+            ':' if nesting == 0 => {
+                return Ok((value[..index].trim(), value[index + 1..].trim()));
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("Malformed inline runtime mapping")
+}
+
+fn parse_inline_runtime(value: &str) -> Result<WorkerRuntime> {
+    let value = yaml_scalar(value);
+    if !value.starts_with('{') || !value.ends_with('}') {
+        return parse_runtime_kind(value);
+    }
+
+    let inner = &value[1..value.len() - 1];
+    let mut kind = None;
+    for item in split_flow_items(inner)? {
+        let (key, value) = split_flow_pair(item)?;
+        if yaml_scalar(key) == "kind" {
+            if kind.is_some() {
+                anyhow::bail!("Duplicate runtime.kind");
+            }
+            kind = Some(value);
+        }
+    }
+    parse_runtime_kind(kind.ok_or_else(|| anyhow::anyhow!("Missing direct runtime.kind"))?)
+}
+
+fn parse_worker_runtime(manifest: &str) -> Result<WorkerRuntime> {
+    let lines = manifest.lines().collect::<Vec<_>>();
+    for (line_number, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if yaml_mapping_line(line).is_none() {
+            anyhow::bail!("Malformed worker manifest at line {}", line_number + 1);
+        }
+    }
+
+    let runtime_lines = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            yaml_mapping_line(line)
+                .filter(|(indentation, key, _)| *indentation == 0 && *key == "runtime")
+                .map(|(indentation, _, value)| (index, indentation, value))
+        })
+        .collect::<Vec<_>>();
+    if runtime_lines.len() != 1 {
+        anyhow::bail!("Worker manifest must contain exactly one direct runtime mapping");
+    }
+
+    let (runtime_line, runtime_indentation, inline_value) = runtime_lines[0];
+    if !inline_value.is_empty() {
+        return parse_inline_runtime(inline_value);
+    }
+
+    let mut child_indentation = None;
+    let mut direct_kind = None;
+    for (line_number, line) in lines.iter().enumerate().skip(runtime_line + 1) {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let (indentation, key, value) = yaml_mapping_line(line).ok_or_else(|| {
+            anyhow::anyhow!("Malformed runtime mapping at line {}", line_number + 1)
+        })?;
+        if indentation <= runtime_indentation {
+            break;
+        }
+        let child_indentation = *child_indentation.get_or_insert(indentation);
+        if indentation == child_indentation && key == "kind" {
+            if direct_kind.is_some() {
+                anyhow::bail!("Duplicate direct runtime.kind");
+            }
+            direct_kind = Some(value);
+        }
+    }
+
+    parse_runtime_kind(direct_kind.ok_or_else(|| anyhow::anyhow!("Missing direct runtime.kind"))?)
+}
+
+fn worker_package_name(worker_dir: &Path) -> Option<String> {
+    let source = std::fs::read_to_string(worker_dir.join("Cargo.toml")).ok()?;
+    let document = source.parse::<toml::Value>().ok()?;
+    document
+        .get("package")?
+        .get("name")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn discover_workers(runtime_dir: &Path) -> Result<Vec<WorkerSpec>> {
+    let workers_dir = runtime_dir.join("workers");
+    if !path_has_any_read_permission(&workers_dir, true) {
+        anyhow::bail!(
+            "AgentOS workers directory is missing or unreadable: {}",
+            workers_dir.display()
+        );
+    }
+    let entries = std::fs::read_dir(&workers_dir).with_context(|| {
+        format!(
+            "AgentOS workers directory is missing or unreadable: {}",
+            workers_dir.display()
+        )
+    })?;
+    let binary_dir = runtime_dir.join("target/release");
+    let mut workers = Vec::new();
+
+    for entry in entries {
+        let entry = entry.with_context(|| format!("Cannot read {}", workers_dir.display()))?;
+        let worker_dir = entry.path();
+        if !worker_dir.is_dir() {
+            continue;
+        }
+        if !path_has_any_read_permission(&worker_dir, true) {
+            anyhow::bail!("Worker directory is unreadable: {}", worker_dir.display());
+        }
+        let worker_name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("Worker directory name is not valid UTF-8"))?;
+        let manifest_path = worker_dir.join("iii.worker.yaml");
+        if !path_has_any_read_permission(&manifest_path, false) {
+            anyhow::bail!("Worker manifest is unreadable: {}", manifest_path.display());
+        }
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("Cannot read worker manifest {}", manifest_path.display()))?;
+        let runtime = parse_worker_runtime(&manifest)
+            .with_context(|| format!("Invalid worker manifest {}", manifest_path.display()))?;
+        let binary = if runtime == WorkerRuntime::Rust {
+            let packaged_name = format!("agentos-{worker_name}");
+            let packaged_binary = binary_dir.join(&packaged_name);
+            if packaged_binary.is_file() {
+                Some(packaged_binary)
+            } else if let Some(package_name) = worker_package_name(&worker_dir) {
+                let package_binary = binary_dir.join(package_name);
+                package_binary.is_file().then_some(package_binary)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        workers.push(WorkerSpec {
+            name: worker_name,
+            runtime,
+            binary,
+        });
+    }
+
+    if workers.is_empty() {
+        anyhow::bail!("No worker manifests found in {}", workers_dir.display());
+    }
+
+    workers.sort_by(|left, right| left.name.cmp(&right.name));
+    let missing = workers
+        .iter()
+        .filter(|worker| worker.runtime == WorkerRuntime::Rust && worker.binary.is_none())
+        .map(|worker| format!("agentos-{}", worker.name))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Missing compiled workers in {}: {}",
+            binary_dir.display(),
+            missing.join(", ")
+        );
+    }
+    Ok(workers)
+}
+
+fn path_has_any_read_permission(path: &Path, directory: bool) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        let mode = metadata.permissions().mode();
+        if mode & 0o444 == 0 || (directory && mode & 0o111 == 0) {
+            return false;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, directory);
+    true
+}
+
+fn workers_directory_is_usable(runtime_dir: &Path) -> bool {
+    let workers_dir = runtime_dir.join("workers");
+    if !path_has_any_read_permission(&workers_dir, true) {
+        return false;
+    }
+    let entries = match std::fs::read_dir(&workers_dir) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    let mut found_worker = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return false,
+        };
+        if !entry.path().is_dir() {
+            continue;
+        }
+        found_worker = true;
+        if !path_has_any_read_permission(&entry.path(), true) {
+            return false;
+        }
+        let manifest_path = entry.path().join("iii.worker.yaml");
+        if !path_has_any_read_permission(&manifest_path, false) {
+            return false;
+        }
+        let manifest = match std::fs::read_to_string(&manifest_path) {
+            Ok(manifest) => manifest,
+            Err(_) => return false,
+        };
+        if parse_worker_runtime(&manifest).is_err() {
+            return false;
+        }
+    }
+    found_worker
+}
+
+fn initialize_agentos_home(agentos_home: &Path) -> Result<()> {
+    if !agentos_home.exists() {
+        std::fs::create_dir_all(agentos_home)?;
+    }
+    ensure_agentos_dirs(agentos_home)
+}
+fn find_iii_binary(agentos_home: &Path) -> Result<PathBuf> {
+    if let Ok(path) = which::which("iii") {
+        return Ok(path);
+    }
+
+    let mut candidates = vec![agentos_home.join(".local/bin/iii")];
+    if let Some(platform_home) = dirs::home_dir() {
+        candidates.push(platform_home.join(".local/bin/iii"));
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "iii-engine v0.22.1 is required; run scripts/install-iii.sh or reinstall AgentOS"
+            )
+        })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -317,15 +809,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init { quick } => {
-            let home = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-            let config_dir = home.join(".agentos");
-            std::fs::create_dir_all(&config_dir)?;
-            std::fs::create_dir_all(config_dir.join("data"))?;
-            std::fs::create_dir_all(config_dir.join("skills"))?;
-            std::fs::create_dir_all(config_dir.join("agents"))?;
-            std::fs::create_dir_all(config_dir.join("logs"))?;
-            println!("{} Initialized ~/.agentos/", "✓".green());
+            let config_dir = agentos_home_dir()?;
+            initialize_agentos_home(&config_dir)?;
+            println!("{} Initialized {}", "✓".green(), config_dir.display());
 
             if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
                 let config_path = config_dir.join("config.toml");
@@ -358,162 +844,117 @@ async fn main() -> Result<()> {
         }
 
         Commands::Start => {
-            let home = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-            let config_dir = home.join(".agentos");
-
-            if !config_dir.exists() {
+            let (agentos_home, config_yaml, runtime_dir) = runtime_paths()?;
+            let first_run = !agentos_home.exists();
+            initialize_agentos_home(&agentos_home)?;
+            if first_run {
                 println!("{} First run detected. Initializing...", "→".blue());
-                std::fs::create_dir_all(&config_dir)?;
-                std::fs::create_dir_all(config_dir.join("data"))?;
-                std::fs::create_dir_all(config_dir.join("skills"))?;
-                std::fs::create_dir_all(config_dir.join("agents"))?;
-                std::fs::create_dir_all(config_dir.join("logs"))?;
-                println!("{} Created ~/.agentos/", "✓".green());
+                println!("{} Created {}", "✓".green(), agentos_home.display());
             }
 
-            let iii_path = which::which("iii")
-                .or_else(|_| {
-                    let candidate = home.join(".local/bin/iii");
-                    candidate
-                        .exists()
-                        .then_some(candidate)
-                        .ok_or(which::Error::CannotFindBinaryPath)
-                })
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "iii-engine v0.22.1 is required; run scripts/install-iii.sh or reinstall AgentOS"
-                    )
-                })?;
-
-            let current_dir = std::env::current_dir()?;
-            let installed_runtime = config_dir.join("runtime");
-            let config_yaml = std::env::var_os("AGENTOS_CONFIG")
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    let project_config = current_dir.join("config.yaml");
-                    (project_config.is_file() && current_dir.join("workers").is_dir())
-                        .then_some(project_config)
-                })
-                .unwrap_or_else(|| installed_runtime.join("config.yaml"));
             if !config_yaml.is_file() {
                 anyhow::bail!(
                     "AgentOS runtime not found at {}. Run the installer or set AGENTOS_CONFIG",
                     config_yaml.display()
                 );
             }
-            let runtime_dir = config_yaml
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("Invalid AgentOS config path"))?;
+            let worker_specs = discover_workers(&runtime_dir)?;
+            let iii_path = find_iii_binary(&agentos_home)?;
+            let engine_log_path = agentos_home.join("logs/engine.log");
+            let worker_log_path = agentos_home.join("logs/workers.log");
 
             println!("\n{}", "AgentOS".bold().cyan());
             println!("{}", "─".repeat(40).dimmed());
-
             println!("{} Starting iii-engine...", "→".blue());
-            let log_file = std::fs::File::create(config_dir.join("logs/engine.log"))?;
+
+            let log_file = std::fs::File::create(&engine_log_path)?;
             let log_err = log_file.try_clone()?;
-            let mut engine = std::process::Command::new(&iii_path)
+            let engine = Command::new(&iii_path)
                 .arg("--config")
                 .arg(&config_yaml)
-                .current_dir(runtime_dir)
-                .stdout(std::process::Stdio::from(log_file))
-                .stderr(std::process::Stdio::from(log_err))
+                .current_dir(&runtime_dir)
+                .stdout(Stdio::from(log_file))
+                .stderr(Stdio::from(log_err))
                 .spawn()
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to start iii-engine: {}. Is it installed?", e)
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to start iii-engine: {error}. Is it installed?")
                 })?;
+            let mut processes = ProcessGroup {
+                engine,
+                workers: Vec::new(),
+                terminated: false,
+            };
 
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-            if let Ok(Some(status)) = engine.try_wait() {
-                println!("{} iii-engine exited with: {}", "✗".red(), status);
-                println!("  Check logs: ~/.agentos/logs/engine.log");
-                return Ok(());
+            if let Some(status) = processes.engine.try_wait()? {
+                processes.terminate();
+                anyhow::bail!(
+                    "iii-engine exited with {status}; check {}",
+                    engine_log_path.display()
+                );
             }
-            println!("{} iii-engine running (pid {})", "✓".green(), engine.id());
+            println!(
+                "{} iii-engine running (pid {})",
+                "✓".green(),
+                processes.engine.id()
+            );
 
             println!("{} Starting workers...", "→".blue());
-            let worker_log = std::fs::File::create(config_dir.join("logs/workers.log"))?;
-            let worker_binary_dir = runtime_dir.join("target/release");
-            let mut worker_names = std::fs::read_dir(runtime_dir.join("workers"))?
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.path().join("iii.worker.yaml").is_file())
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .collect::<Vec<_>>();
-            worker_names.sort();
-
-            let mut workers = Vec::new();
-            let mut missing_workers = Vec::new();
-            for worker_name in worker_names {
-                let worker_dir = runtime_dir.join("workers").join(&worker_name);
-                let manifest = std::fs::read_to_string(worker_dir.join("iii.worker.yaml"))?;
-                if manifest.contains("kind: python") {
+            let worker_log = std::fs::File::create(&worker_log_path)?;
+            for worker in &worker_specs {
+                let Some(binary) = worker.binary.as_ref() else {
                     continue;
-                }
-
-                let packaged_name = format!("agentos-{worker_name}");
-                let mut binary = worker_binary_dir.join(&packaged_name);
-                if !binary.is_file() {
-                    let package_name = std::fs::read_to_string(worker_dir.join("Cargo.toml"))
-                        .ok()
-                        .and_then(|source| source.parse::<toml::Value>().ok())
-                        .and_then(|document| {
-                            document["package"]["name"].as_str().map(str::to_owned)
-                        });
-                    if let Some(package_name) = package_name {
-                        binary = worker_binary_dir.join(package_name);
-                    }
-                }
-                if !binary.is_file() {
-                    missing_workers.push(packaged_name);
-                    continue;
-                }
-
-                let child = std::process::Command::new(&binary)
-                    .current_dir(runtime_dir)
-                    .stdout(std::process::Stdio::from(worker_log.try_clone()?))
-                    .stderr(std::process::Stdio::from(worker_log.try_clone()?))
+                };
+                let child = Command::new(binary)
+                    .current_dir(&runtime_dir)
+                    .stdout(Stdio::from(worker_log.try_clone()?))
+                    .stderr(Stdio::from(worker_log.try_clone()?))
                     .spawn()
                     .map_err(|error| {
-                        anyhow::anyhow!("Failed to start {}: {}", binary.display(), error)
+                        anyhow::anyhow!("Failed to start {}: {error}", binary.display())
                     })?;
-                workers.push((worker_name, child));
-            }
-            if !missing_workers.is_empty() {
-                for (_, worker) in &mut workers {
-                    let _ = worker.kill();
-                }
-                let _ = engine.kill();
-                anyhow::bail!(
-                    "Missing compiled workers in {}: {}",
-                    worker_binary_dir.display(),
-                    missing_workers.join(", ")
-                );
+                processes.workers.push(RunningWorker {
+                    name: worker.name.clone(),
+                    child,
+                });
             }
 
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            if let Some(status) = processes.engine.try_wait()? {
+                processes.terminate();
+                anyhow::bail!(
+                    "iii-engine exited with {status}; check {}",
+                    engine_log_path.display()
+                );
+            }
             let mut failed_worker = None;
-            for (name, worker) in &mut workers {
-                if let Some(status) = worker.try_wait()? {
-                    failed_worker = Some((name.clone(), status));
+            for worker in &mut processes.workers {
+                if let Some(status) = worker.child.try_wait()? {
+                    failed_worker = Some((worker.name.clone(), status));
                     break;
                 }
             }
-            if let Some((name, status)) = failed_worker {
-                for (_, running) in &mut workers {
-                    let _ = running.kill();
-                }
-                let _ = engine.kill();
+            if let Some((worker_name, status)) = failed_worker {
+                processes.terminate();
                 anyhow::bail!(
-                    "Worker {name} exited with {status}; check ~/.agentos/logs/workers.log"
+                    "Worker {worker_name} exited with {status}; check {}",
+                    worker_log_path.display()
                 );
             }
 
-            println!("{} {} workers running", "✓".green(), workers.len());
+            let rust_worker_count = worker_specs
+                .iter()
+                .filter(|worker| worker.runtime == WorkerRuntime::Rust)
+                .count();
+            println!("{} {} workers running", "✓".green(), rust_worker_count);
             println!("{}", "─".repeat(40).dimmed());
             println!("  Engine   {}  ws://localhost:49134", "●".green());
             println!("  API      {}  http://localhost:3111", "●".green());
-            println!("  Workers  {}  {} Rust workers", "●".green(), workers.len());
+            println!(
+                "  Workers  {}  {} Rust workers",
+                "●".green(),
+                rust_worker_count
+            );
             println!("{}", "─".repeat(40).dimmed());
             println!(
                 "\n  {} agentos chat          Interactive chat",
@@ -528,14 +969,7 @@ async fn main() -> Result<()> {
 
             tokio::signal::ctrl_c().await?;
             println!("\n{} Shutting down...", "→".blue());
-            for (_, worker) in &mut workers {
-                let _ = worker.kill();
-            }
-            let _ = engine.kill();
-            for (_, worker) in &mut workers {
-                let _ = worker.wait();
-            }
-            let _ = engine.wait();
+            processes.terminate();
             println!("{} Stopped.", "✓".green());
         }
 
@@ -1111,6 +1545,18 @@ async fn main() -> Result<()> {
             json: is_json,
             repair,
         } => {
+            let runtime = runtime_paths().ok();
+            let config_dir = agentos_home_dir().ok();
+            let workers_ok = runtime
+                .as_ref()
+                .map(|(_, config, runtime_dir)| {
+                    config.is_file() && workers_directory_is_usable(runtime_dir)
+                })
+                .unwrap_or(false);
+            let config_ok = config_dir
+                .as_ref()
+                .map(|path| path.is_dir())
+                .unwrap_or(false);
             let checks = vec![
                 (
                     "Engine",
@@ -1120,14 +1566,9 @@ async fn main() -> Result<()> {
                         .await
                         .is_ok(),
                 ),
-                ("Workers", true),
+                ("Workers", workers_ok),
                 ("State", true),
-                (
-                    "Config",
-                    dirs::home_dir()
-                        .map(|h| h.join(".agentos").exists())
-                        .unwrap_or(false),
-                ),
+                ("Config", config_ok),
             ];
 
             if is_json {
@@ -1943,16 +2384,13 @@ async fn main() -> Result<()> {
 
             println!("\n{} Welcome to AgentOS Setup\n", "→".blue().bold());
 
-            let home = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-            let config_dir = home.join(".agentos");
-            std::fs::create_dir_all(&config_dir)?;
-            std::fs::create_dir_all(config_dir.join("data"))?;
-            std::fs::create_dir_all(config_dir.join("skills"))?;
-            std::fs::create_dir_all(config_dir.join("agents"))?;
-            std::fs::create_dir_all(config_dir.join("logs"))?;
-            std::fs::create_dir_all(config_dir.join("state"))?;
-            println!("  {} Created ~/.agentos/ directories", "✓".green());
+            let config_dir = agentos_home_dir()?;
+            initialize_agentos_home(&config_dir)?;
+            println!(
+                "  {} Created {} directories",
+                "✓".green(),
+                config_dir.display()
+            );
 
             let api_key: String = if quick {
                 std::env::var("AGENTOS_API_KEY").unwrap_or_default()
@@ -1995,7 +2433,11 @@ async fn main() -> Result<()> {
 
             let config_path = config_dir.join("config.toml");
             std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
-            println!("  {} Config written to ~/.agentos/config.toml", "✓".green());
+            println!(
+                "  {} Config written to {}",
+                "✓".green(),
+                config_path.display()
+            );
             println!("  {} Default model: {}", "✓".green(), default_model.cyan());
 
             println!(
@@ -2026,13 +2468,16 @@ async fn main() -> Result<()> {
                 ),
             }
 
-            let home = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-            let state_dir = home.join(".agentos/state");
+            let config_dir = agentos_home_dir()?;
+            let state_dir = config_dir.join("state");
             if state_dir.exists() {
                 std::fs::remove_dir_all(&state_dir)?;
                 std::fs::create_dir_all(&state_dir)?;
-                println!("  {} Local state cleared (~/.agentos/state/)", "✓".green());
+                println!(
+                    "  {} Local state cleared ({})",
+                    "✓".green(),
+                    state_dir.display()
+                );
             }
 
             println!("{} Reset complete.", "✓".green());
@@ -2106,10 +2551,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn agentos_config_path() -> Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
-        .join(".agentos/config.toml"))
+fn agentos_config_path() -> Result<PathBuf> {
+    Ok(agentos_home_dir()?.join("config.toml"))
 }
 
 fn get_api_url() -> String {
@@ -2229,36 +2672,29 @@ mod tests {
 
     #[test]
     fn test_get_api_url_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("AGENTOS_API_URL").ok();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("AGENTOS_API_URL");
         unsafe {
             std::env::remove_var("AGENTOS_API_URL");
         }
         let result = get_api_url();
-        if let Some(val) = prev {
-            unsafe {
-                std::env::set_var("AGENTOS_API_URL", val);
-            }
-        }
+        restore_test_env("AGENTOS_API_URL", previous);
         assert_eq!(result, "http://localhost:3111");
     }
 
     #[test]
     fn test_get_api_url_custom() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("AGENTOS_API_URL").ok();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("AGENTOS_API_URL");
         unsafe {
             std::env::set_var("AGENTOS_API_URL", "http://custom:8080");
         }
         let url = get_api_url();
-        match prev {
-            Some(val) => unsafe {
-                std::env::set_var("AGENTOS_API_URL", val);
-            },
-            None => unsafe {
-                std::env::remove_var("AGENTOS_API_URL");
-            },
-        }
+        restore_test_env("AGENTOS_API_URL", previous);
         assert_eq!(url, "http://custom:8080");
     }
 
@@ -2562,7 +2998,15 @@ mod tests {
 
     #[test]
     fn test_agentos_config_path_ends_with_config() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("AGENTOS_HOME");
+        unsafe {
+            std::env::remove_var("AGENTOS_HOME");
+        }
         let path = agentos_config_path().unwrap();
+        restore_test_env("AGENTOS_HOME", previous);
         assert!(path.ends_with(".agentos/config.toml"));
     }
 
@@ -2730,5 +3174,191 @@ mod tests {
             parse_workflow_document("id: test\nname: Test\ndescription: test\nsteps: []\n")
                 .unwrap();
         assert_eq!(workflow["id"], "test");
+    }
+
+    #[test]
+    fn test_relative_agentos_home_is_normalized_from_caller() {
+        let caller = Path::new("/tmp/agentos-caller");
+        assert_eq!(
+            resolve_agentos_home(caller, Some(std::ffi::OsStr::new("state"))).unwrap(),
+            PathBuf::from("/tmp/agentos-caller/state")
+        );
+        assert_eq!(
+            resolve_agentos_home(caller, Some(std::ffi::OsStr::new("nested/state"))).unwrap(),
+            PathBuf::from("/tmp/agentos-caller/nested/state")
+        );
+    }
+
+    #[test]
+    fn test_empty_agentos_home_uses_platform_fallback() {
+        let fallback =
+            resolve_agentos_home(Path::new("/tmp/caller"), Some(std::ffi::OsStr::new(""))).unwrap();
+        assert!(fallback.ends_with(".agentos"));
+    }
+
+    #[test]
+    fn test_relative_agentos_config_one_component_is_caller_relative() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("AGENTOS_CONFIG");
+        unsafe {
+            std::env::set_var("AGENTOS_CONFIG", "runtime.yaml");
+        }
+        let path = resolve_config_path(Path::new("/tmp/caller"), Path::new("/tmp/home"), true);
+        restore_test_env("AGENTOS_CONFIG", previous);
+        assert_eq!(path, PathBuf::from("/tmp/caller/runtime.yaml"));
+    }
+
+    #[test]
+    fn test_relative_agentos_config_nested_is_caller_relative() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("AGENTOS_CONFIG");
+        unsafe {
+            std::env::set_var("AGENTOS_CONFIG", "nested/runtime.yaml");
+        }
+        let path = resolve_config_path(Path::new("/tmp/caller"), Path::new("/tmp/home"), true);
+        restore_test_env("AGENTOS_CONFIG", previous);
+        assert_eq!(path, PathBuf::from("/tmp/caller/nested/runtime.yaml"));
+    }
+
+    #[test]
+    fn test_empty_agentos_config_uses_project_before_installed_runtime() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("AGENTOS_CONFIG");
+        unsafe {
+            std::env::set_var("AGENTOS_CONFIG", "");
+        }
+        let path = resolve_config_path(Path::new("/tmp/caller"), Path::new("/tmp/home"), true);
+        restore_test_env("AGENTOS_CONFIG", previous);
+        assert_eq!(path, PathBuf::from("/tmp/home/runtime/config.yaml"));
+    }
+
+    #[test]
+    fn test_worker_runtime_block_and_inline_forms() {
+        assert_eq!(
+            parse_worker_runtime("name: block\nruntime:\n  kind: rust\n").unwrap(),
+            WorkerRuntime::Rust
+        );
+        assert_eq!(
+            parse_worker_runtime("name: inline\nruntime: rust\n").unwrap(),
+            WorkerRuntime::Rust
+        );
+        assert_eq!(
+            parse_worker_runtime("name: map\nruntime: { kind: python }\n").unwrap(),
+            WorkerRuntime::Python
+        );
+    }
+
+    #[test]
+    fn test_worker_runtime_inline_nested_values_keep_direct_kind() {
+        assert_eq!(
+            parse_worker_runtime(
+                "name: inline\nruntime: { kind: rust, settings: { tags: [a, b] } }\n"
+            )
+            .unwrap(),
+            WorkerRuntime::Rust
+        );
+    }
+
+    #[test]
+    fn test_worker_runtime_nested_kind_fails_closed() {
+        let result = parse_worker_runtime("name: nested\nruntime:\n  settings:\n    kind: rust\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_worker_runtime_missing_unknown_and_misspelled_kinds_fail_closed() {
+        assert!(parse_worker_runtime("name: missing\nruntime:\n  settings: {}\n").is_err());
+        assert!(parse_worker_runtime("name: unknown\nruntime:\n  kind: ruby\n").is_err());
+        assert!(parse_worker_runtime("name: typo\nruntime:\n  knd: rust\n").is_err());
+    }
+
+    #[test]
+    fn test_workers_directory_missing_or_unreadable_is_not_usable() {
+        assert!(!workers_directory_is_usable(Path::new(
+            "/tmp/does-not-exist"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_workers_directory_unreadable_is_not_usable() {
+        let root =
+            std::env::temp_dir().join(format!("agentos-workers-unreadable-{}", std::process::id()));
+        let workers_dir = root.join("workers");
+        std::fs::create_dir_all(&workers_dir).expect("create workers directory");
+        let mut permissions = std::fs::metadata(&workers_dir)
+            .expect("read workers directory metadata")
+            .permissions();
+        permissions.set_mode(0o0);
+        std::fs::set_permissions(&workers_dir, permissions).expect("make workers unreadable");
+        assert!(!workers_directory_is_usable(&root));
+        let mut permissions = std::fs::metadata(&workers_dir)
+            .expect("read workers directory metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&workers_dir, permissions).expect("restore workers permissions");
+        std::fs::remove_dir_all(root).expect("remove temporary workers directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_workers_rejects_unreadable_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "agentos-discover-unreadable-{}",
+            std::process::id()
+        ));
+        let workers_dir = root.join("workers");
+        std::fs::create_dir_all(&workers_dir).expect("create workers directory");
+        let mut permissions = std::fs::metadata(&workers_dir)
+            .expect("read workers directory metadata")
+            .permissions();
+        permissions.set_mode(0o0);
+        std::fs::set_permissions(&workers_dir, permissions).expect("make workers unreadable");
+        assert!(discover_workers(&root).is_err());
+        let mut permissions = std::fs::metadata(&workers_dir)
+            .expect("read workers directory metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&workers_dir, permissions).expect("restore workers permissions");
+        std::fs::remove_dir_all(root).expect("remove temporary workers directory");
+    }
+
+    fn restore_test_env(name: &str, previous: Option<std::ffi::OsString>) {
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[test]
+    fn test_repository_worker_manifests_parse_fail_closed() {
+        let workers_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workers");
+        let mut count = 0;
+        for entry in std::fs::read_dir(workers_dir).expect("read repository workers") {
+            let entry = entry.expect("read worker entry");
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let manifest_path = entry.path().join("iii.worker.yaml");
+            if !manifest_path.is_file() {
+                continue;
+            }
+            let manifest = std::fs::read_to_string(&manifest_path).expect("read worker manifest");
+            assert!(
+                parse_worker_runtime(&manifest).is_ok(),
+                "invalid worker manifest {}",
+                manifest_path.display()
+            );
+            count += 1;
+        }
+        assert!(count > 0);
     }
 }

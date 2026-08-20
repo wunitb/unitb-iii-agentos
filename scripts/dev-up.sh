@@ -16,7 +16,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIDFILE="$ROOT/.agentos-dev.pids"
-RELEASE_DIR="$ROOT/target/release"
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+if [[ "$TARGET_DIR" != /* ]]; then
+    TARGET_DIR="$ROOT/$TARGET_DIR"
+fi
+RELEASE_DIR="$TARGET_DIR/release"
 
 export III_URL="${III_URL:-ws://localhost:49134}"
 
