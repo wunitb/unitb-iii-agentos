@@ -17,7 +17,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIDFILE="$ROOT/.agentos-dev.pids"
-RELEASE_DIR="$ROOT/target/release"
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+if [[ "$TARGET_DIR" != /* ]]; then
+    TARGET_DIR="$ROOT/$TARGET_DIR"
+fi
+RELEASE_DIR="$TARGET_DIR/release"
 
 env_file="$ROOT/.env"
 if [[ -e "$env_file" || -L "$env_file" ]]; then

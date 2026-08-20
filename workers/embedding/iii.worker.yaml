@@ -3,7 +3,7 @@ name: embedding
 runtime:
   kind: python
 scripts:
-  setup: 'command -v python3 >/dev/null || (apt-get update && apt-get install -y python3-venv python3-pip)'
-  install: 'python3 -m venv .venv && .venv/bin/pip install -e .'
+  setup: 'command -v python3 >/dev/null 2>&1 || { echo "embedding worker requires Python 3.11+ (python3)" >&2; exit 1; }; python3 -c "import sys; sys.exit(1 if sys.version_info < (3, 11) else 0)" || { echo "embedding worker requires Python 3.11 or newer" >&2; exit 1; }; python3 -c "import ensurepip" >/dev/null 2>&1 || { echo "embedding worker requires ensurepip; install the python3-venv/python3-pip package" >&2; exit 1; }; python3 -m venv .venv || { echo "embedding worker could not create .venv; install python3-venv and retry" >&2; exit 1; }'
+  install: '.venv/bin/python -m pip install --no-deps -e . && .venv/bin/python -m pip install iii-sdk==0.22.1 || { echo "embedding worker dependency installation failed; install iii-sdk==0.22.1 and check network access or the local package cache" >&2; exit 1; }'
   start: '.venv/bin/python -m main'
 description: "Text embedding generation via SentenceTransformers (fallback: hash-based)"
