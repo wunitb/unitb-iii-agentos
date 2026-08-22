@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { registerWorker, type IIIClient } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 
 const shouldRunE2E = process.env.AGENTOS_E2E === "1";
 const suite = shouldRunE2E ? describe : describe.skip;
@@ -27,7 +27,8 @@ async function call<T = unknown>(
 }
 
 suite("AgentOS full-stack E2E", () => {
-  beforeAll(() => {
+  beforeAll(async () => {
+    const { registerWorker } = await import("iii-sdk");
     sdk = registerWorker(wsUrl, { workerName: "e2e-test-client" });
   });
 
