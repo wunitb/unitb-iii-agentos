@@ -48,7 +48,10 @@ async function waitForQueueProvider(binary: string): Promise<string> {
       "1000",
     ]);
     lastOutput = `${result.stdout}\n${result.stderr}`;
-    if (result.exitCode === 0 && lastOutput.includes("engine::queue::enqueue")) {
+    if (
+      result.exitCode === 0 &&
+      lastOutput.includes('"worker_name": "queue-engine"')
+    ) {
       return lastOutput;
     }
     await Bun.sleep(100);

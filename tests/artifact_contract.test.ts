@@ -1,5 +1,17 @@
-import { describe, expect, it } from "bun:test";
-import { lstat, readdir } from "node:fs/promises";
+import { afterEach, describe, expect, it } from "bun:test";
+import {
+  lstat,
+  mkdtemp,
+  mkdir,
+  readdir,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const artifactDirectory = new URL(
   "../docs/builds/10000-salvage-the-five-surviving-agentos-work-items-fr/",
@@ -10,36 +22,222 @@ const requiredArtifacts = [
   "DECISIONS.md",
   "INVARIANTS.md",
   "TRACES.md",
-];
+] as const;
+const requiredIdentifiers = [
+  "ISC-000",
+  "ISC-001",
+  "ISC-002",
+  "ISC-003",
+  "ISC-004",
+] as const;
+const minimumArtifactBytes = 200;
+const headingPattern = /^#{1,6} +\S/m;
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+const utf8Encoder = new TextEncoder();
+
+type ArtifactFailure =
+  | "ARTIFACT_DIRECTORY_INVALID"
+  | "ARTIFACT_FILE_MISSING"
+  | "ARTIFACT_FILE_NOT_REGULAR"
+  | "ARTIFACT_FILE_INVALID_UTF8"
+  | "ARTIFACT_FILE_TOO_SHORT"
+  | "ARTIFACT_FILE_HEADING_MISSING"
+  | "TRACES_ISC_MISSING";
+
+interface Failure {
+  code: ArtifactFailure;
+  path: string;
+}
+
+function inspectArtifactBytes(filename: string, bytes: Uint8Array): Failure[] {
+  const failures: Failure[] = [];
+  if (bytes.byteLength < minimumArtifactBytes) {
+    failures.push({ code: "ARTIFACT_FILE_TOO_SHORT", path: filename });
+  }
+
+  let text: string;
+  try {
+    text = utf8Decoder.decode(bytes);
+  } catch {
+    failures.push({ code: "ARTIFACT_FILE_INVALID_UTF8", path: filename });
+    return failures;
+  }
+
+  if (!headingPattern.test(text)) {
+    failures.push({ code: "ARTIFACT_FILE_HEADING_MISSING", path: filename });
+  }
+
+  if (filename === "TRACES.md") {
+    for (const identifier of requiredIdentifiers) {
+      if (!new RegExp(`\\b${identifier}\\b`).test(text)) {
+        failures.push({ code: "TRACES_ISC_MISSING", path: identifier });
+      }
+    }
+  }
+  return failures;
+}
+
+async function inspectArtifactDirectory(directory: URL): Promise<Failure[]> {
+  const directoryPath = fileURLToPath(directory);
+  let metadata;
+  try {
+    metadata = await lstat(directory);
+  } catch {
+    return [{ code: "ARTIFACT_DIRECTORY_INVALID", path: directoryPath }];
+  }
+
+  if (
+    !metadata.isDirectory() ||
+    metadata.isSymbolicLink() ||
+    (await realpath(directory)) !== resolve(directoryPath)
+  ) {
+    return [{ code: "ARTIFACT_DIRECTORY_INVALID", path: directoryPath }];
+  }
+
+  const entries = await readdir(directory);
+  const failures: Failure[] = [];
+  for (const filename of requiredArtifacts) {
+    if (!entries.includes(filename)) {
+      failures.push({ code: "ARTIFACT_FILE_MISSING", path: filename });
+      continue;
+    }
+
+    const file = new URL(filename, directory);
+    const fileMetadata = await lstat(file);
+    if (!fileMetadata.isFile() || fileMetadata.isSymbolicLink()) {
+      failures.push({ code: "ARTIFACT_FILE_NOT_REGULAR", path: filename });
+      continue;
+    }
+    failures.push(...inspectArtifactBytes(filename, await Bun.file(file).bytes()));
+  }
+  return failures;
+}
+
+const temporaryDirectories: string[] = [];
+
+async function temporaryDirectory(): Promise<URL> {
+  const path = await mkdtemp(join(tmpdir(), "agentos-artifact-contract-"));
+  temporaryDirectories.push(path);
+  return pathToFileURL(`${path}/`);
+}
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
+  );
+});
 
 describe("build 10000 governed artifact contract", () => {
-  it("uses a real directory containing the exact regular UTF-8 artifacts", async () => {
-    const directory = await lstat(artifactDirectory);
-    expect(directory.isDirectory()).toBe(true);
-    expect(directory.isSymbolicLink()).toBe(false);
+  it("uses the canonical real directory with exactly the governed files", async () => {
+    expect(await realpath(artifactDirectory)).toBe(resolve(fileURLToPath(artifactDirectory)));
     expect((await readdir(artifactDirectory)).sort()).toEqual(
       [...requiredArtifacts].sort(),
     );
+  });
 
-    const decoder = new TextDecoder("utf-8", { fatal: true });
-    for (const filename of requiredArtifacts) {
-      const url = new URL(filename, artifactDirectory);
-      const metadata = await lstat(url);
-      expect(metadata.isFile(), `${filename} must be a regular file`).toBe(true);
-      expect(metadata.isSymbolicLink()).toBe(false);
+  it("accepts every required regular UTF-8 artifact and ISC trace token", async () => {
+    expect(await inspectArtifactDirectory(artifactDirectory)).toEqual([]);
+  });
+});
 
-      const bytes = await Bun.file(url).bytes();
-      expect(bytes.byteLength, `${filename} must contain at least 200 bytes`).toBeGreaterThanOrEqual(200);
-      expect(decoder.decode(bytes), `${filename} must contain a Markdown heading`).toMatch(
-        /^#{1,6} +\S/m,
-      );
+describe("artifact contract edge cases", () => {
+  it("rejects missing, non-directory, and symlinked artifact directories", async () => {
+    const parent = await temporaryDirectory();
+    const missing = new URL("missing/", parent);
+    expect(await inspectArtifactDirectory(missing)).toEqual([
+      { code: "ARTIFACT_DIRECTORY_INVALID", path: fileURLToPath(missing) },
+    ]);
+
+    const regularFile = new URL("not-a-directory", parent);
+    await writeFile(regularFile, "not a directory");
+    expect((await inspectArtifactDirectory(regularFile))[0]?.code).toBe(
+      "ARTIFACT_DIRECTORY_INVALID",
+    );
+
+    const realDirectory = new URL("real/", parent);
+    const linkedDirectoryPath = join(fileURLToPath(parent), "linked");
+    const linkedDirectory = pathToFileURL(`${linkedDirectoryPath}/`);
+    await mkdir(realDirectory);
+    await symlink(fileURLToPath(realDirectory), linkedDirectoryPath);
+    expect((await inspectArtifactDirectory(linkedDirectory))[0]?.code).toBe(
+      "ARTIFACT_DIRECTORY_INVALID",
+    );
+  });
+
+  it("reports every absent artifact for an empty directory", async () => {
+    const empty = await temporaryDirectory();
+    expect(await inspectArtifactDirectory(empty)).toEqual(
+      requiredArtifacts.map((path) => ({ code: "ARTIFACT_FILE_MISSING", path })),
+    );
+  });
+
+  it("rejects directories and symbolic links in place of regular artifacts", async () => {
+    const directory = await temporaryDirectory();
+    await mkdir(new URL("ATTACK_SURFACE.md/", directory));
+    await writeFile(new URL("target.md", directory), "# Target\n");
+    await symlink("target.md", fileURLToPath(new URL("DECISIONS.md", directory)));
+
+    const failures = await inspectArtifactDirectory(directory);
+    expect(failures).toContainEqual({
+      code: "ARTIFACT_FILE_NOT_REGULAR",
+      path: "ATTACK_SURFACE.md",
+    });
+    expect(failures).toContainEqual({
+      code: "ARTIFACT_FILE_NOT_REGULAR",
+      path: "DECISIONS.md",
+    });
+  });
+
+  it("enforces the 200-byte boundary and handles empty content", () => {
+    const exactlyMinimum = utf8Encoder.encode(`# Heading\n${"x".repeat(190)}`);
+    expect(exactlyMinimum.byteLength).toBe(minimumArtifactBytes);
+    expect(inspectArtifactBytes("ATTACK_SURFACE.md", exactlyMinimum)).toEqual([]);
+
+    const oneByteShort = utf8Encoder.encode(`# Heading\n${"x".repeat(189)}`);
+    expect(inspectArtifactBytes("ATTACK_SURFACE.md", oneByteShort)).toContainEqual({
+      code: "ARTIFACT_FILE_TOO_SHORT",
+      path: "ATTACK_SURFACE.md",
+    });
+    expect(inspectArtifactBytes("ATTACK_SURFACE.md", new Uint8Array())).toEqual([
+      { code: "ARTIFACT_FILE_TOO_SHORT", path: "ATTACK_SURFACE.md" },
+      { code: "ARTIFACT_FILE_HEADING_MISSING", path: "ATTACK_SURFACE.md" },
+    ]);
+  });
+
+  it("rejects malformed UTF-8 without attempting text checks", () => {
+    const invalidUtf8 = new Uint8Array(minimumArtifactBytes).fill(0x78);
+    invalidUtf8[0] = 0xff;
+    expect(inspectArtifactBytes("ATTACK_SURFACE.md", invalidUtf8)).toEqual([
+      { code: "ARTIFACT_FILE_INVALID_UTF8", path: "ATTACK_SURFACE.md" },
+    ]);
+  });
+
+  it("accepts heading levels one through six and rejects missing or level-seven headings", () => {
+    for (let level = 1; level <= 6; level += 1) {
+      const content = utf8Encoder.encode(`${"#".repeat(level)} Heading\n${"x".repeat(200)}`);
+      expect(inspectArtifactBytes("DECISIONS.md", content)).toEqual([]);
+    }
+
+    for (const content of ["plain text", "####### Heading", "#    "]) {
+      const padded = utf8Encoder.encode(`${content}\n${"x".repeat(200)}`);
+      expect(inspectArtifactBytes("DECISIONS.md", padded)).toContainEqual({
+        code: "ARTIFACT_FILE_HEADING_MISSING",
+        path: "DECISIONS.md",
+      });
     }
   });
 
-  it("traces every required ISC identifier as a whole token", async () => {
-    const traces = await Bun.file(new URL("TRACES.md", artifactDirectory)).text();
-    for (const identifier of ["ISC-000", "ISC-001", "ISC-002", "ISC-003", "ISC-004"]) {
-      expect(traces.match(new RegExp(`\\b${identifier}\\b`, "g"))?.length).toBeGreaterThanOrEqual(1);
-    }
+  it("requires ISC-000 through ISC-004 as whole tokens", () => {
+    const validTokens = utf8Encoder.encode(
+      `# Traces\n${requiredIdentifiers.join(", ")}\n${"x".repeat(200)}`,
+    );
+    expect(inspectArtifactBytes("TRACES.md", validTokens)).toEqual([]);
+
+    const partialTokens = utf8Encoder.encode(
+      `# Traces\n${requiredIdentifiers.map((id) => `x${id}x`).join(" ")}\n${"x".repeat(200)}`,
+    );
+    expect(inspectArtifactBytes("TRACES.md", partialTokens)).toEqual(
+      requiredIdentifiers.map((path) => ({ code: "TRACES_ISC_MISSING", path })),
+    );
   });
 });
