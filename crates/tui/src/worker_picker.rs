@@ -65,7 +65,7 @@ pub fn builtin_catalog() -> Vec<WorkerCard> {
         (
             "llm-router",
             "LLM provider routing + retries",
-            &["llm::route"],
+            &["agentos::llm::route"],
         ),
         (
             "agent-core",

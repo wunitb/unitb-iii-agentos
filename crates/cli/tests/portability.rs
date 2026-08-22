@@ -129,17 +129,18 @@ fn run_start_with_relative_config(config_override: &str) {
 
     wait_for_file(&engine_cwd);
     wait_for_file(&worker_cwd);
+    let expected_runtime = fs::canonicalize(&runtime).expect("canonicalize runtime directory");
     assert_eq!(
         fs::read_to_string(&engine_cwd)
             .expect("read engine cwd")
             .trim(),
-        runtime.to_string_lossy()
+        expected_runtime.to_string_lossy()
     );
     assert_eq!(
         fs::read_to_string(&worker_cwd)
             .expect("read worker cwd")
             .trim(),
-        runtime.to_string_lossy()
+        expected_runtime.to_string_lossy()
     );
     assert!(state.is_dir(), "relative AGENTOS_HOME was not created");
     thread::sleep(Duration::from_secs(4));
@@ -214,17 +215,18 @@ fn start_uses_relative_home_for_installed_runtime() {
 
     wait_for_file(&engine_cwd);
     wait_for_file(&worker_cwd);
+    let expected_runtime = fs::canonicalize(&runtime).expect("canonicalize runtime directory");
     assert_eq!(
         fs::read_to_string(&engine_cwd)
             .expect("read engine cwd")
             .trim(),
-        runtime.to_string_lossy()
+        expected_runtime.to_string_lossy()
     );
     assert_eq!(
         fs::read_to_string(&worker_cwd)
             .expect("read worker cwd")
             .trim(),
-        runtime.to_string_lossy()
+        expected_runtime.to_string_lossy()
     );
     assert!(
         home.join("logs").is_dir(),

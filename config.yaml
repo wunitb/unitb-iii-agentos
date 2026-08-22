@@ -16,9 +16,9 @@ workers:
       ttl_seconds: 0
 
   - name: iii-http
-  - name: iii-state
+  - name: state
   - name: iii-stream
-  - name: iii-queue
+  - name: queue
   - name: iii-pubsub
-  - name: iii-cron
+  - name: cron
   - name: iii-observability

@@ -24,6 +24,16 @@ const API_BASE: &str = "http://localhost:3111";
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS: u64 = 80;
 
+fn unavailable_provider(screen: Screen) -> Option<&'static str> {
+    match screen {
+        Screen::Dashboard | Screen::Agents | Screen::Skills => Some("GET /api/dashboard/stats"),
+        Screen::Logs => Some("GET /api/dashboard/logs"),
+        Screen::Audit => Some("GET /api/dashboard/events"),
+        Screen::Settings => Some("GET /api/settings"),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Screen {
     Dashboard,
@@ -397,30 +407,7 @@ impl App {
         let client = Self::client();
         match self.screen {
             Screen::Dashboard => self.refresh_health().await,
-            Screen::Agents => {
-                if let Ok(resp) = client
-                    .get(format!("{}/api/dashboard/stats", API_BASE))
-                    .send()
-                    .await
-                    && let Ok(data) = resp.json::<Value>().await
-                {
-                    if let Some(arr) = data["agentList"].as_array() {
-                        self.agents = arr.clone();
-                    }
-                }
-            }
-            Screen::Skills => {
-                if let Ok(resp) = client
-                    .get(format!("{}/api/dashboard/stats", API_BASE))
-                    .send()
-                    .await
-                    && let Ok(data) = resp.json::<Value>().await
-                {
-                    if let Some(arr) = data["skillList"].as_array() {
-                        self.skills = arr.clone();
-                    }
-                }
-            }
+            Screen::Agents | Screen::Skills => {}
             Screen::Channels => {
                 if let Ok(resp) = client
                     .get(format!("{}/api/coord/channels", API_BASE))
@@ -477,16 +464,7 @@ impl App {
                         .unwrap_or_default();
                 }
             }
-            Screen::Logs => {
-                if let Ok(resp) = client
-                    .get(format!("{}/api/dashboard/logs", API_BASE))
-                    .send()
-                    .await
-                    && let Ok(data) = resp.json::<Value>().await
-                {
-                    self.logs = data["logs"].as_array().cloned().unwrap_or_default();
-                }
-            }
+            Screen::Logs => {}
             Screen::Memory => {
                 if let Ok(resp) = client
                     .get(format!("{}/agentmemory/memories", API_BASE))
@@ -501,20 +479,7 @@ impl App {
                         .unwrap_or_default();
                 }
             }
-            Screen::Audit => {
-                if let Ok(resp) = client
-                    .get(format!("{}/api/dashboard/events", API_BASE))
-                    .send()
-                    .await
-                    && let Ok(data) = resp.json::<Value>().await
-                {
-                    self.audit_entries = data["events"]
-                        .as_array()
-                        .cloned()
-                        .or_else(|| data.as_array().cloned())
-                        .unwrap_or_default();
-                }
-            }
+            Screen::Audit => {}
             Screen::Security => {
                 if let Ok(resp) = client
                     .get(format!("{}/api/security", API_BASE))
@@ -581,37 +546,7 @@ impl App {
                     self.usage_data = data;
                 }
             }
-            Screen::Settings => {
-                if let Ok(resp) = client
-                    .get(format!("{}/api/settings", API_BASE))
-                    .send()
-                    .await
-                    && let Ok(data) = resp.json::<Value>().await
-                {
-                    if let Some(obj) = data.as_object() {
-                        self.settings = obj
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.to_string().trim_matches('"').to_string()))
-                            .collect();
-                    }
-                } else if let Ok(content) = std::fs::read_to_string("config.yaml") {
-                    self.settings = content
-                        .lines()
-                        .filter(|l| l.contains(':') && !l.trim().starts_with('#'))
-                        .filter_map(|l| {
-                            let parts: Vec<&str> = l.splitn(2, ':').collect();
-                            if parts.len() == 2 {
-                                Some((
-                                    parts[0].trim().to_string(),
-                                    parts[1].trim().trim_matches('"').to_string(),
-                                ))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                }
-            }
+            Screen::Settings => {}
             Screen::Lifecycle => {
                 let agent_ids: Vec<String> = self
                     .agents
@@ -1714,32 +1649,36 @@ fn draw(f: &mut Frame, app: &App) {
         .borders(Borders::ALL)
         .title(format!(" {} ", app.screen.label()));
 
-    match app.screen {
-        Screen::Dashboard => draw_dashboard(f, app, content_block, body_chunks[1]),
-        Screen::Agents => draw_agents(f, app, content_block, body_chunks[1]),
-        Screen::Chat => draw_chat(f, app, body_chunks[1]),
-        Screen::Channels => draw_channels(f, app, content_block, body_chunks[1]),
-        Screen::Skills => draw_skills(f, app, content_block, body_chunks[1]),
-        Screen::Hands => draw_hands(f, app, content_block, body_chunks[1]),
-        Screen::Workflows => draw_workflows(f, app, content_block, body_chunks[1]),
-        Screen::Sessions => draw_sessions(f, app, content_block, body_chunks[1]),
-        Screen::Approvals => draw_approvals(f, app, body_chunks[1]),
-        Screen::Logs => draw_logs(f, app, content_block, body_chunks[1]),
-        Screen::Memory => draw_memory(f, app, content_block, body_chunks[1]),
-        Screen::Audit => draw_audit(f, app, content_block, body_chunks[1]),
-        Screen::Security => draw_security(f, app, content_block, body_chunks[1]),
-        Screen::Peers => draw_peers(f, app, content_block, body_chunks[1]),
-        Screen::Extensions => draw_extensions(f, app, content_block, body_chunks[1]),
-        Screen::Triggers => draw_triggers(f, app, content_block, body_chunks[1]),
-        Screen::Templates => draw_templates(f, app, content_block, body_chunks[1]),
-        Screen::Usage => draw_usage(f, app, content_block, body_chunks[1]),
-        Screen::Settings => draw_settings(f, app, content_block, body_chunks[1]),
-        Screen::Wizard => draw_wizard(f, app, body_chunks[1]),
-        Screen::WorkflowBuilder => draw_workflow_builder(f, app, content_block, body_chunks[1]),
-        Screen::Lifecycle => draw_lifecycle(f, app, content_block, body_chunks[1]),
-        Screen::Tasks => draw_tasks(f, app, content_block, body_chunks[1]),
-        Screen::Recovery => draw_recovery(f, app, content_block, body_chunks[1]),
-        Screen::Orchestrator => draw_orchestrator(f, app, content_block, body_chunks[1]),
+    if let Some(route) = unavailable_provider(app.screen) {
+        draw_no_provider(f, app, content_block, body_chunks[1], route);
+    } else {
+        match app.screen {
+            Screen::Dashboard
+            | Screen::Agents
+            | Screen::Skills
+            | Screen::Logs
+            | Screen::Audit
+            | Screen::Settings => unreachable!("handled as unavailable provider surfaces"),
+            Screen::Chat => draw_chat(f, app, body_chunks[1]),
+            Screen::Channels => draw_channels(f, app, content_block, body_chunks[1]),
+            Screen::Hands => draw_hands(f, app, content_block, body_chunks[1]),
+            Screen::Workflows => draw_workflows(f, app, content_block, body_chunks[1]),
+            Screen::Sessions => draw_sessions(f, app, content_block, body_chunks[1]),
+            Screen::Approvals => draw_approvals(f, app, body_chunks[1]),
+            Screen::Memory => draw_memory(f, app, content_block, body_chunks[1]),
+            Screen::Security => draw_security(f, app, content_block, body_chunks[1]),
+            Screen::Peers => draw_peers(f, app, content_block, body_chunks[1]),
+            Screen::Extensions => draw_extensions(f, app, content_block, body_chunks[1]),
+            Screen::Triggers => draw_triggers(f, app, content_block, body_chunks[1]),
+            Screen::Templates => draw_templates(f, app, content_block, body_chunks[1]),
+            Screen::Usage => draw_usage(f, app, content_block, body_chunks[1]),
+            Screen::Wizard => draw_wizard(f, app, body_chunks[1]),
+            Screen::WorkflowBuilder => draw_workflow_builder(f, app, content_block, body_chunks[1]),
+            Screen::Lifecycle => draw_lifecycle(f, app, content_block, body_chunks[1]),
+            Screen::Tasks => draw_tasks(f, app, content_block, body_chunks[1]),
+            Screen::Recovery => draw_recovery(f, app, content_block, body_chunks[1]),
+            Screen::Orchestrator => draw_orchestrator(f, app, content_block, body_chunks[1]),
+        }
     }
 
     let footer = Block::default().borders(Borders::ALL);
@@ -1849,6 +1788,32 @@ fn draw_slash_completions(f: &mut Frame, app: &App, area: Rect) {
         .border_style(theme::dim())
         .title(Span::styled(" Tab to complete ", theme::eyebrow()));
     f.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn draw_no_provider(f: &mut Frame, app: &App, block: Block, area: Rect, route: &str) {
+    let engine = if app.healthy {
+        "The engine is reachable, but"
+    } else {
+        "The engine is currently unreachable, and"
+    };
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled("  No provider", theme::warn())),
+        Line::from(""),
+        Line::from(format!("  {engine} no AgentOS worker registers:")),
+        Line::from(Span::styled(format!("    {route}"), theme::accent())),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  This screen is unavailable in this release; empty data would be misleading.",
+            theme::dim(),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn draw_worker_picker(f: &mut Frame, app: &App, area: Rect) {
@@ -3846,6 +3811,22 @@ mod tests {
     #[test]
     fn test_screen_security_key() {
         assert_eq!(Screen::Security.key(), "s");
+    }
+
+    #[test]
+    fn test_dead_surfaces_report_their_missing_provider() {
+        for (screen, route) in [
+            (Screen::Dashboard, "GET /api/dashboard/stats"),
+            (Screen::Agents, "GET /api/dashboard/stats"),
+            (Screen::Skills, "GET /api/dashboard/stats"),
+            (Screen::Logs, "GET /api/dashboard/logs"),
+            (Screen::Audit, "GET /api/dashboard/events"),
+            (Screen::Settings, "GET /api/settings"),
+        ] {
+            assert_eq!(unavailable_provider(screen), Some(route));
+        }
+        assert_eq!(unavailable_provider(Screen::Sessions), None);
+        assert_eq!(unavailable_provider(Screen::Security), None);
     }
 
     #[test]

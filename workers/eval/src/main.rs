@@ -107,7 +107,7 @@ async fn score_llm_judge(iii: &IIIClient, output: &Value, expected: &Value, inpu
         "systemPrompt": "You are an eval judge. Score the output 0.0-1.0 for correctness. Respond with ONLY a number.",
         "messages": [{ "role": "user", "content": prompt }],
     });
-    let result = safe_trigger(iii, "llm::complete", payload).await;
+    let result = safe_trigger(iii, "agentos::llm::complete", payload).await;
     let content = match result {
         Some(v) => v
             .get("content")

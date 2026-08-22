@@ -408,7 +408,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
 
     let model: Value = iii
         .trigger(TriggerRequest {
-            function_id: "llm::route".to_string(),
+            function_id: "agentos::llm::route".to_string(),
             payload: json!({
                 "message": &req.message,
                 "functionCount": functions.as_array().map(|a| a.len()).unwrap_or(0),
@@ -445,7 +445,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
 
     let mut response: Value = iii
         .trigger(TriggerRequest {
-            function_id: "llm::complete".to_string(),
+            function_id: "agentos::llm::complete".to_string(),
             payload: json!({
                 "model": model,
                 "systemPrompt": system_prompt,
@@ -525,7 +525,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
 
         response = iii
             .trigger(TriggerRequest {
-                function_id: "llm::complete".to_string(),
+                function_id: "agentos::llm::complete".to_string(),
                 payload: json!({
                     "model": model,
                     "systemPrompt": system_prompt,

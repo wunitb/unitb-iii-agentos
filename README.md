@@ -40,7 +40,7 @@ AgentOS isn't another agent framework. It's *what's left* when the runtime becom
 | Primitive | What it does | Examples |
 |---|---|---|
 | **Worker** | One Rust binary per domain. Connects to the engine over WebSocket. | `agent-core`, `llm-router`, `realm` |
-| **Function** | A named handler registered by a Worker. | `agent::chat`, `llm::route`, `memory::search` |
+| **Function** | A named handler registered by a Worker. | `agent::chat`, `agentos::llm::route`, `memory::search` |
 | **Trigger** | Binds a Function to HTTP, cron, or pub/sub. | `POST /v1/chat/completions → stream::completion` |
 
 That's the whole protocol. Workers stay narrow; everything else lives in the engine.
