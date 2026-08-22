@@ -17,6 +17,10 @@ const artifactDirectory = new URL(
   "../docs/builds/10000-salvage-the-five-surviving-agentos-work-items-fr/",
   import.meta.url,
 );
+const build10003ArtifactDirectory = new URL(
+  "../docs/builds/10003-salvage-the-five-surviving-agentos-work-items-fr/",
+  import.meta.url,
+);
 const requiredArtifacts = [
   "ATTACK_SURFACE.md",
   "DECISIONS.md",
@@ -29,6 +33,10 @@ const requiredIdentifiers = [
   "ISC-002",
   "ISC-003",
   "ISC-004",
+] as const;
+const build10003RequiredIdentifiers = [
+  ...requiredIdentifiers,
+  "ISC-005",
 ] as const;
 const minimumArtifactBytes = 200;
 const headingPattern = /^#{1,6} +\S/m;
@@ -49,7 +57,11 @@ interface Failure {
   path: string;
 }
 
-function inspectArtifactBytes(filename: string, bytes: Uint8Array): Failure[] {
+function inspectArtifactBytes(
+  filename: string,
+  bytes: Uint8Array,
+  identifiers: readonly string[] = requiredIdentifiers,
+): Failure[] {
   const failures: Failure[] = [];
   if (bytes.byteLength < minimumArtifactBytes) {
     failures.push({ code: "ARTIFACT_FILE_TOO_SHORT", path: filename });
@@ -68,7 +80,7 @@ function inspectArtifactBytes(filename: string, bytes: Uint8Array): Failure[] {
   }
 
   if (filename === "TRACES.md") {
-    for (const identifier of requiredIdentifiers) {
+    for (const identifier of identifiers) {
       if (!new RegExp(`\\b${identifier}\\b`).test(text)) {
         failures.push({ code: "TRACES_ISC_MISSING", path: identifier });
       }
@@ -77,7 +89,10 @@ function inspectArtifactBytes(filename: string, bytes: Uint8Array): Failure[] {
   return failures;
 }
 
-async function inspectArtifactDirectory(directory: URL): Promise<Failure[]> {
+async function inspectArtifactDirectory(
+  directory: URL,
+  identifiers: readonly string[] = requiredIdentifiers,
+): Promise<Failure[]> {
   const directoryPath = fileURLToPath(directory);
   let metadata;
   try {
@@ -108,7 +123,9 @@ async function inspectArtifactDirectory(directory: URL): Promise<Failure[]> {
       failures.push({ code: "ARTIFACT_FILE_NOT_REGULAR", path: filename });
       continue;
     }
-    failures.push(...inspectArtifactBytes(filename, await Bun.file(file).bytes()));
+    failures.push(
+      ...inspectArtifactBytes(filename, await Bun.file(file).bytes(), identifiers),
+    );
   }
   return failures;
 }
@@ -137,6 +154,26 @@ describe("build 10000 governed artifact contract", () => {
 
   it("accepts every required regular UTF-8 artifact and ISC trace token", async () => {
     expect(await inspectArtifactDirectory(artifactDirectory)).toEqual([]);
+  });
+});
+
+describe("build 10003 governed artifact contract", () => {
+  it("uses the canonical real directory with exactly the governed files", async () => {
+    expect(await realpath(build10003ArtifactDirectory)).toBe(
+      resolve(fileURLToPath(build10003ArtifactDirectory)),
+    );
+    expect((await readdir(build10003ArtifactDirectory)).sort()).toEqual(
+      [...requiredArtifacts].sort(),
+    );
+  });
+
+  it("accepts every required regular UTF-8 artifact and ISC-000 through ISC-005", async () => {
+    expect(
+      await inspectArtifactDirectory(
+        build10003ArtifactDirectory,
+        build10003RequiredIdentifiers,
+      ),
+    ).toEqual([]);
   });
 });
 
@@ -239,5 +276,16 @@ describe("artifact contract edge cases", () => {
     expect(inspectArtifactBytes("TRACES.md", partialTokens)).toEqual(
       requiredIdentifiers.map((path) => ({ code: "TRACES_ISC_MISSING", path })),
     );
+
+    const missingBuild10003Boundary = utf8Encoder.encode(
+      `# Traces\n${requiredIdentifiers.join(", ")}\n${"x".repeat(200)}`,
+    );
+    expect(
+      inspectArtifactBytes(
+        "TRACES.md",
+        missingBuild10003Boundary,
+        build10003RequiredIdentifiers,
+      ),
+    ).toEqual([{ code: "TRACES_ISC_MISSING", path: "ISC-005" }]);
   });
 });
