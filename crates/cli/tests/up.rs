@@ -5,7 +5,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -55,35 +54,6 @@ fn wait_for_file(path: &Path) -> bool {
     false
 }
 
-/// A minimal stand-in for the engine API. It reports one connected worker once
-/// the fake worker has written its pid file, so `up` can observe the same
-/// "spawned, then actually on the bus" transition a real stack goes through.
-fn serve_worker_health(worker_pid: PathBuf) -> String {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake engine api");
-    let port = listener
-        .local_addr()
-        .expect("fake engine api address")
-        .port();
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut request = [0u8; 1024];
-            let _ = stream.read(&mut request);
-            let workers = u8::from(worker_pid.is_file());
-            let body = format!("{{\"workers\":{workers}}}");
-            let _ = stream.write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            );
-            let _ = stream.flush();
-        }
-    });
-    format!("http://127.0.0.1:{port}")
-}
-
 /// A fresh-clone-equivalent layout: runtime config, one worker manifest with a
 /// release binary, a fake engine, and a fake TUI.
 struct Fixture {
@@ -93,9 +63,10 @@ struct Fixture {
     bin: PathBuf,
     engine_marker: PathBuf,
     worker_pid: PathBuf,
+    worker_env: PathBuf,
     release: PathBuf,
-    api_base: String,
     tui_marker: PathBuf,
+    tui_env: PathBuf,
 }
 
 impl Fixture {
@@ -111,6 +82,11 @@ impl Fixture {
         fs::create_dir_all(&home).expect("create home directory");
         fs::write(runtime.join("config.yaml"), "workers: []\n").expect("write runtime config");
         fs::write(
+            runtime.join(".env"),
+            "DOTENV_ONLY=from-dotenv\nEXPLICIT_WINS=from-dotenv\nAGENTOS_API_KEY=fresh-clone-key\n",
+        )
+        .expect("write dotenv file");
+        fs::write(
             runtime.join("workers/echo/iii.worker.yaml"),
             "iii: v1\nname: echo\nruntime: rust\nscripts:\n  start: echo\n",
         )
@@ -118,23 +94,25 @@ impl Fixture {
 
         let engine_marker = root.join("engine.started");
         let worker_pid = root.join("worker.pid");
+        let worker_env = root.join("worker.env");
         let tui_marker = root.join("tui.started");
+        let tui_env = root.join("tui.env");
         write_executable(
             &bin.join("iii"),
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'iii 0.22.1'; exit 0; fi\necho started > {}\nexec sleep 60\n",
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'iii 0.22.1'; exit 0; fi\nif [ \"$1\" = \"trigger\" ]; then if [ -f '{}' ]; then printf '%s\\n' '{{\"workers\":[{{\"name\":\"echo\",\"runtime\":\"rust\",\"status\":\"connected\"}}]}}'; else printf '%s\\n' '{{\"workers\":[]}}'; fi; exit 0; fi\necho started > '{}'\nexec sleep 60\n",
+                worker_pid.display(),
                 engine_marker.display()
             ),
         );
         write_executable(
             &release.join("agentos-echo"),
             &format!(
-                "#!/bin/sh\necho $$ > {}\nexec sleep 60\n",
-                worker_pid.display()
+                "#!/bin/sh\necho $$ > '{}'\nprintf '%s|%s|%s\\n' \"$DOTENV_ONLY\" \"$EXPLICIT_WINS\" \"$III_WORKER_NAME\" > '{}'\nexec sleep 60\n",
+                worker_pid.display(),
+                worker_env.display()
             ),
         );
-
-        let api_base = serve_worker_health(worker_pid.clone());
 
         Self {
             root,
@@ -143,9 +121,10 @@ impl Fixture {
             bin,
             engine_marker,
             worker_pid,
+            worker_env,
             release,
-            api_base,
             tui_marker,
+            tui_env,
         }
     }
 
@@ -160,8 +139,9 @@ impl Fixture {
         write_executable(
             &self.bin.join("agentos-tui"),
             &format!(
-                "#!/bin/sh\necho started > {}\nexit {exit_code}\n",
-                self.tui_marker.display()
+                "#!/bin/sh\necho started > '{}'\nprintf '%s|%s|%s\\n' \"$DOTENV_ONLY\" \"$EXPLICIT_WINS\" \"$AGENTOS_API_KEY\" > '{}'\nexit {exit_code}\n",
+                self.tui_marker.display(),
+                self.tui_env.display()
             ),
         );
         cli
@@ -180,7 +160,7 @@ impl Fixture {
             .env("HOME", &self.home)
             .env("AGENTOS_HOME", &self.home)
             .env("AGENTOS_CONFIG", self.runtime.join("config.yaml"))
-            .env("AGENTOS_API_URL", &self.api_base)
+            .env("EXPLICIT_WINS", "from-shell")
             .current_dir(&self.root)
             .output()
             .expect("run agentos up")
@@ -244,6 +224,10 @@ fn up_reuses_a_healthy_engine_and_starts_workers_without_the_tui() {
     assert!(stdout.contains("1 started"), "{stdout}");
     assert!(stdout.contains("1 connected"), "{stdout}");
     assert!(wait_for_file(&fixture.worker_pid), "worker never started");
+    assert_eq!(
+        fs::read_to_string(&fixture.worker_env).expect("read worker environment"),
+        "from-dotenv|from-shell|echo\n"
+    );
     let first_pid = fs::read_to_string(&fixture.worker_pid).expect("read worker pid");
     assert!(
         !fixture.engine_marker.exists(),
@@ -301,6 +285,10 @@ fn up_runs_the_tui_in_the_foreground_and_propagates_its_exit_code() {
     assert_eq!(output.status.code(), Some(7));
     assert!(fixture.tui_marker.is_file(), "the TUI never ran");
     assert!(wait_for_file(&fixture.worker_pid), "worker never started");
+    assert_eq!(
+        fs::read_to_string(&fixture.tui_env).expect("read TUI environment"),
+        "from-dotenv|from-shell|fresh-clone-key\n"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Starting agentos-tui"), "{stdout}");
 

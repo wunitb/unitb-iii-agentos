@@ -41,4 +41,23 @@ describe("iii 0.22.1 engine config", () => {
       );
     }
   });
+
+  it("has no deprecated worker references outside this regression test", async () => {
+    const glob = new Bun.Glob("**/*.{yaml,yml,rs,ts,tsx,js,jsx,md,sh}");
+    for await (const path of glob.scan({ cwd: repository.pathname })) {
+      if (
+        path === "tests/config.test.ts" ||
+        path.startsWith("target/") ||
+        path.startsWith("node_modules/")
+      ) {
+        continue;
+      }
+      const source = await Bun.file(new URL(path, repository)).text();
+      for (const deprecated of deprecatedAliases.keys()) {
+        expect(source, `${path} still references ${deprecated}`).not.toContain(
+          deprecated,
+        );
+      }
+    }
+  });
 });

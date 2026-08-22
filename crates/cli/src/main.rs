@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -332,7 +333,7 @@ pub(crate) enum WorkerRuntime {
     Python,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct WorkerSpec {
     pub(crate) name: String,
     pub(crate) runtime: WorkerRuntime,
@@ -878,6 +879,9 @@ fn detach_process(command: &mut Command) {
 pub(crate) struct WorkerLaunch<'a> {
     pub(crate) runtime_dir: &'a Path,
     pub(crate) log_path: &'a Path,
+    /// Values loaded from the runtime `.env`. Explicit shell exports are not
+    /// included here and continue to be inherited normally.
+    pub(crate) env: &'a BTreeMap<String, String>,
     /// Keep the workers running after this process exits.
     pub(crate) detached: bool,
 }
@@ -899,6 +903,10 @@ pub(crate) fn launch_workers(
         let mut command = Command::new(binary);
         command
             .current_dir(launch.runtime_dir)
+            .envs(launch.env)
+            // iii-sdk 0.22.1 otherwise falls back to hostname:pid, which is
+            // not stable enough for readiness or duplicate suppression.
+            .env("III_WORKER_NAME", &worker.name)
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log.try_clone()?));
         if launch.detached {
@@ -921,6 +929,7 @@ pub(crate) fn spawn_engine(
     config_path: &Path,
     runtime_dir: &Path,
     log_path: &Path,
+    env: &BTreeMap<String, String>,
     detached: bool,
 ) -> Result<Child> {
     let log_file = std::fs::File::create(log_path)
@@ -931,6 +940,7 @@ pub(crate) fn spawn_engine(
         .arg("--config")
         .arg(config_path)
         .current_dir(runtime_dir)
+        .envs(env)
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err));
     if detached {
@@ -1007,12 +1017,20 @@ async fn main() -> Result<()> {
             let iii_path = find_iii_binary(&agentos_home)?;
             let engine_log = engine_log_path(&agentos_home);
             let worker_log = worker_log_path(&agentos_home);
+            let launch_env = BTreeMap::new();
 
             println!("\n{}", "AgentOS".bold().cyan());
             println!("{}", "─".repeat(40).dimmed());
             println!("{} Starting iii-engine...", "→".blue());
 
-            let engine = spawn_engine(&iii_path, &config_yaml, &runtime_dir, &engine_log, false)?;
+            let engine = spawn_engine(
+                &iii_path,
+                &config_yaml,
+                &runtime_dir,
+                &engine_log,
+                &launch_env,
+                false,
+            )?;
             let mut processes = ProcessGroup {
                 engine,
                 workers: Vec::new(),
@@ -1039,6 +1057,7 @@ async fn main() -> Result<()> {
                 &WorkerLaunch {
                     runtime_dir: &runtime_dir,
                     log_path: &worker_log,
+                    env: &launch_env,
                     detached: false,
                 },
                 &mut processes.workers,
@@ -1671,8 +1690,8 @@ async fn main() -> Result<()> {
 
             let paths = runtime_paths()?;
             initialize_agentos_home(&paths.agentos_home)?;
-            let mut effects =
-                bootstrap::SystemEffects::new(&paths, api_base.clone(), client.clone());
+            let launch_env = bootstrap::load_dotenv(&paths.runtime_dir)?;
+            let mut effects = bootstrap::SystemEffects::new(&paths, launch_env);
             let options = bootstrap::UpOptions {
                 launch_tui: !no_tui,
                 stage_timeout: Duration::from_secs(timeout),
@@ -1692,7 +1711,7 @@ async fn main() -> Result<()> {
 
         Commands::Doctor { json: is_json } => {
             let paths = runtime_paths()?;
-            let probes = bootstrap::SystemEffects::new(&paths, api_base.clone(), client.clone());
+            let probes = bootstrap::SystemEffects::new(&paths, BTreeMap::new());
             let report =
                 tokio::task::spawn_blocking(move || bootstrap::readiness(&probes, &paths)).await?;
 

@@ -15,6 +15,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{prelude::*, widgets::*};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::io::stdout;
 
@@ -345,16 +346,30 @@ impl App {
             .collect()
     }
 
+    fn api_headers(api_key: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(api_key) = api_key.filter(|key| !key.is_empty())
+            && let Ok(value) = HeaderValue::from_str(&format!("Bearer {api_key}"))
+        {
+            headers.insert(AUTHORIZATION, value);
+        }
+        headers
+    }
+
     fn client() -> reqwest::Client {
+        let api_key = std::env::var("AGENTOS_API_KEY").ok();
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
+            .default_headers(Self::api_headers(api_key.as_deref()))
             .build()
             .unwrap_or_default()
     }
 
     fn action_client() -> reqwest::Client {
+        let api_key = std::env::var("AGENTOS_API_KEY").ok();
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3_600))
+            .default_headers(Self::api_headers(api_key.as_deref()))
             .build()
             .unwrap_or_default()
     }
@@ -3762,10 +3777,24 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn test_screen_all_count() {
         assert_eq!(Screen::all().len(), 25);
+    }
+
+    #[test]
+    fn test_api_key_becomes_a_bearer_header() {
+        let headers = App::api_headers(Some("fresh-clone-secret"));
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer fresh-clone-secret")
+        );
+        assert!(App::api_headers(None).get(AUTHORIZATION).is_none());
+        assert!(App::api_headers(Some("")).get(AUTHORIZATION).is_none());
     }
 
     #[test]
@@ -3827,6 +3856,50 @@ mod tests {
         }
         assert_eq!(unavailable_provider(Screen::Sessions), None);
         assert_eq!(unavailable_provider(Screen::Security), None);
+        assert_eq!(
+            Screen::all()
+                .iter()
+                .filter(|screen| unavailable_provider(**screen).is_some())
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn test_dead_surfaces_render_explicit_no_provider_state() {
+        for screen in [
+            Screen::Dashboard,
+            Screen::Agents,
+            Screen::Skills,
+            Screen::Logs,
+            Screen::Audit,
+            Screen::Settings,
+        ] {
+            let mut app = App::new();
+            app.screen = screen;
+            app.show_first_run = false;
+            let backend = TestBackend::new(100, 30);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+            terminal
+                .draw(|frame| draw(frame, &app))
+                .expect("draw unavailable surface");
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("No provider"), "{screen:?}: {rendered}");
+            assert!(
+                rendered.contains(unavailable_provider(screen).expect("route")),
+                "{screen:?}: {rendered}"
+            );
+            assert!(
+                rendered.contains("empty data would be"),
+                "{screen:?}: {rendered}"
+            );
+        }
     }
 
     #[test]

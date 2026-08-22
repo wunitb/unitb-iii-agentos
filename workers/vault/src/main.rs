@@ -908,6 +908,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static AUTH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_api_key<T>(value: Option<&str>, test: impl FnOnce() -> T) -> T {
+        let _guard = AUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("AGENTOS_API_KEY");
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var("AGENTOS_API_KEY", value),
+                None => std::env::remove_var("AGENTOS_API_KEY"),
+            }
+        }
+        let result = test();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("AGENTOS_API_KEY", value),
+                None => std::env::remove_var("AGENTOS_API_KEY"),
+            }
+        }
+        result
+    }
 
     #[test]
     fn test_random_bytes_returns_requested_length() {
@@ -1137,50 +1161,41 @@ mod tests {
 
     #[test]
     fn test_require_auth_missing_env_fails() {
-        unsafe { std::env::remove_var("AGENTOS_API_KEY") };
         let req = json!({});
-        assert!(require_auth(&req).is_err());
+        assert!(with_api_key(None, || require_auth(&req)).is_err());
     }
 
     #[test]
     fn test_require_auth_with_correct_token_passes() {
-        unsafe { std::env::set_var("AGENTOS_API_KEY", "test-key-passes") };
         let req = json!({
             "headers": { "authorization": "Bearer test-key-passes" }
         });
-        let result = require_auth(&req);
-        unsafe { std::env::remove_var("AGENTOS_API_KEY") };
+        let result = with_api_key(Some("test-key-passes"), || require_auth(&req));
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_require_auth_with_wrong_token_fails() {
-        unsafe { std::env::set_var("AGENTOS_API_KEY", "expected-wrong") };
         let req = json!({
             "headers": { "authorization": "Bearer wrong-token" }
         });
-        let result = require_auth(&req);
-        unsafe { std::env::remove_var("AGENTOS_API_KEY") };
+        let result = with_api_key(Some("expected-wrong"), || require_auth(&req));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_require_auth_missing_header_fails() {
-        unsafe { std::env::set_var("AGENTOS_API_KEY", "expected-mh") };
         let req = json!({});
-        let result = require_auth(&req);
-        unsafe { std::env::remove_var("AGENTOS_API_KEY") };
+        let result = with_api_key(Some("expected-mh"), || require_auth(&req));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_require_auth_empty_token_fails() {
-        unsafe { std::env::set_var("AGENTOS_API_KEY", "expected-et") };
         let req = json!({
             "headers": { "authorization": "Bearer " }
         });
-        let result = require_auth(&req);
-        unsafe { std::env::remove_var("AGENTOS_API_KEY") };
+        let result = with_api_key(Some("expected-et"), || require_auth(&req));
         assert!(result.is_err());
     }
 

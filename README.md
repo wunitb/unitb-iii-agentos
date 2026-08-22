@@ -70,20 +70,24 @@ resolves the config, verifies the iii binary (missing → `bash scripts/install-
 reuses an engine already healthy on port 49134 or boots `iii --config config.yaml`
 detached and waits for health with a bounded timeout, verifies every Rust worker
 release binary (missing → `cargo build --workspace --release`), starts the workers
-unless the required set is already connected, waits for them to register on the
-bus, and only then hands the terminal to `agentos-tui`. Each stage reports its own
-failure and stops before the next one; `--timeout` (default 30s) bounds the engine
-wait and then the worker wait.
+unless their canonical identities are already connected, waits for the complete
+identity set to register on the bus, and only then hands the terminal to
+`agentos-tui`. A partial stack starts only its missing workers. `up` loads the
+active runtime's `.env` without overriding explicit shell exports and passes those
+values to the engine, workers, and TUI; the TUI sends `AGENTOS_API_KEY` as a bearer
+token on protected routes. Each stage reports its own failure and stops before the
+next one; `--timeout` (default 30s) bounds the engine wait and then the worker wait.
 
 ```bash
 agentos up --no-tui   # engine + workers only; leaves them running, no TUI
 agentos doctor        # readiness report; diagnostic only, changes nothing
 ```
 
-`agentos doctor` prints the iii binary path and version, engine health, how many
-of the required workers are connected, worker and TUI binary readiness, and which
-config discovery mode is in effect. `scripts/dev-up.sh` still starts only the
-workers against an engine you booted yourself.
+`agentos doctor` prints the iii binary path and version, engine health, the
+connected worker count and any missing canonical identities, worker and TUI
+binary readiness, and which config discovery mode is in effect.
+`scripts/dev-up.sh` still starts only the workers against an engine you booted
+yourself.
 
 Engine boots on port 49134. `agentos up` starts the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source declares 267 literal function registrations. The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
 
