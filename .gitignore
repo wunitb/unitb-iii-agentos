@@ -20,6 +20,5 @@ yarn.lock
 
 .agentos-*.log
 .agentos-dev.pids
-.agentfield-out-*/
 .upstream-iii/
 runtime/

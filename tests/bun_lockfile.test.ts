@@ -44,25 +44,14 @@ describe("root Bun dependency state", () => {
     }
   });
 
-  it("ignores generated AgentField directories without hiding near misses", () => {
-    const generated = git(
+  it("does not hide AgentField runner output in repository policy", () => {
+    const runnerOutput = git(
       "check-ignore",
       "--no-index",
       "--",
       ".agentfield-out-test/result.json",
     );
-    expect(generated.exitCode).toBe(0);
-    expect(generated.stdout.toString().trim()).toBe(
-      ".agentfield-out-test/result.json",
-    );
-
-    const nearMiss = git(
-      "check-ignore",
-      "--no-index",
-      "--",
-      ".agentfield-output/result.json",
-    );
-    expect(nearMiss.exitCode).toBe(1);
-    expect(nearMiss.stdout.toString()).toBe("");
+    expect(runnerOutput.exitCode).toBe(1);
+    expect(runnerOutput.stdout.toString()).toBe("");
   });
 });
