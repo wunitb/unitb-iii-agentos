@@ -2828,8 +2828,45 @@ fn draw_audit(f: &mut Frame, app: &App, block: Block, area: Rect) {
     f.render_widget(table, area);
 }
 
-fn draw_security(f: &mut Frame, app: &App, block: Block, area: Rect) {
-    let mut lines: Vec<Line> = vec![
+fn security_scalar(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn append_security_details(lines: &mut Vec<Line<'static>>, value: &Value, indent: usize) {
+    let padding = " ".repeat(indent);
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if value.is_array() || value.is_object() {
+                    lines.push(Line::from(format!("{padding}{key}:")));
+                    append_security_details(lines, value, indent + 2);
+                } else {
+                    lines.push(Line::from(format!(
+                        "{padding}{key}: {}",
+                        security_scalar(value)
+                    )));
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                if value.is_array() || value.is_object() {
+                    lines.push(Line::from(format!("{padding}-")));
+                    append_security_details(lines, value, indent + 2);
+                } else {
+                    lines.push(Line::from(format!("{padding}- {}", security_scalar(value))));
+                }
+            }
+        }
+        _ => lines.push(Line::from(format!("{padding}{}", security_scalar(value)))),
+    }
+}
+
+fn security_lines(capabilities: &Value) -> Vec<Line<'static>> {
+    let mut lines = vec![
         Line::from(Span::styled(
             "Security Capabilities",
             Style::default()
@@ -2839,42 +2876,60 @@ fn draw_security(f: &mut Frame, app: &App, block: Block, area: Rect) {
         Line::from(""),
     ];
 
-    if let Some(obj) = app.security_caps.as_object() {
-        for (key, val) in obj {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", key),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            if let Some(arr) = val.as_array() {
-                for item in arr {
-                    if let Some(s) = item.as_str() {
-                        lines.push(Line::from(format!("    - {}", s)));
-                    } else if let Some(obj) = item.as_object() {
-                        for (k, v) in obj {
-                            lines.push(Line::from(format!("    {} = {}", k, v)));
-                        }
-                    }
-                }
-            } else if let Some(obj) = val.as_object() {
-                for (k, v) in obj {
-                    lines.push(Line::from(format!("    {}: {}", k, v)));
-                }
-            } else {
-                lines.push(Line::from(format!("    {}", val)));
+    match capabilities {
+        Value::Object(object) if !object.is_empty() => {
+            for (key, value) in object {
+                lines.push(Line::from(Span::styled(
+                    format!("  {key}"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                append_security_details(&mut lines, value, 4);
+                lines.push(Line::from(""));
             }
-            lines.push(Line::from(""));
         }
-    } else {
-        lines.push(Line::from(Span::styled(
-            "  No data — press r to refresh",
-            Style::default().fg(Color::DarkGray),
-        )));
+        Value::Array(entries) if !entries.is_empty() => {
+            for (index, entry) in entries.iter().enumerate() {
+                let title = entry
+                    .get("key")
+                    .or_else(|| entry.get("name"))
+                    .or_else(|| entry.get("agentId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("Capability {}", index + 1));
+                let details = entry.get("value").unwrap_or(entry);
+
+                lines.push(Line::from(Span::styled(
+                    format!("  {title}"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                append_security_details(&mut lines, details, 4);
+                lines.push(Line::from(""));
+            }
+        }
+        Value::Array(_) | Value::Object(_) => {
+            lines.push(Line::from(Span::styled(
+                "  No capabilities configured",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        _ => {
+            lines.push(Line::from(Span::styled(
+                "  No data — press r to refresh",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
 
+    lines
+}
+
+fn draw_security(f: &mut Frame, app: &App, block: Block, area: Rect) {
     f.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(security_lines(&app.security_caps))
             .block(block)
             .wrap(Wrap { trim: false }),
         area,
@@ -3900,6 +3955,40 @@ mod tests {
                 "{screen:?}: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn test_security_screen_renders_state_list_array_response() {
+        let mut app = App::new();
+        app.security_caps = serde_json::json!([
+            {
+                "key": "security-auditor",
+                "value": {
+                    "tools": ["file_read", "shell_exec"],
+                    "resources": ["workspace"]
+                }
+            }
+        ]);
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_security(frame, &app, Block::default(), area);
+            })
+            .expect("draw security surface");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("security-auditor"), "{rendered}");
+        assert!(rendered.contains("file_read"), "{rendered}");
+        assert!(rendered.contains("workspace"), "{rendered}");
+        assert!(!rendered.contains("No data"), "{rendered}");
     }
 
     #[test]
