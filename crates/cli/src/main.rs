@@ -3368,6 +3368,19 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_agentos_config_keeps_checkout_discovery_enabled() {
+        let checkout = checkout_directory("empty-config", true);
+        let (path, discovery) = resolve_config_path(
+            &checkout,
+            Path::new("/tmp/agentos-home"),
+            Some(std::ffi::OsStr::new("")),
+        );
+        assert_eq!(path, checkout.join("config.yaml"));
+        assert_eq!(discovery, ConfigDiscovery::Checkout);
+        std::fs::remove_dir_all(&checkout).expect("remove checkout directory");
+    }
+
+    #[test]
     fn test_checkout_config_stays_eligible_when_agentos_home_is_set() {
         // Regression: AGENTOS_HOME alone must not disable checkout discovery.
         let checkout = checkout_directory("home-set", true);

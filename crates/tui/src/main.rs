@@ -3850,6 +3850,11 @@ mod tests {
         );
         assert!(App::api_headers(None).get(AUTHORIZATION).is_none());
         assert!(App::api_headers(Some("")).get(AUTHORIZATION).is_none());
+        assert!(
+            App::api_headers(Some("line\nbreak"))
+                .get(AUTHORIZATION)
+                .is_none()
+        );
     }
 
     #[test]
@@ -3989,6 +3994,87 @@ mod tests {
         assert!(rendered.contains("file_read"), "{rendered}");
         assert!(rendered.contains("workspace"), "{rendered}");
         assert!(!rendered.contains("No data"), "{rendered}");
+    }
+
+    #[test]
+    fn test_security_screen_distinguishes_empty_and_absent_payloads() {
+        for (payload, expected, unexpected) in [
+            (
+                serde_json::json!([]),
+                "No capabilities configured",
+                "No data",
+            ),
+            (
+                serde_json::json!({}),
+                "No capabilities configured",
+                "No data",
+            ),
+            (
+                Value::Null,
+                "No data — press r to refresh",
+                "No capabilities configured",
+            ),
+        ] {
+            let mut app = App::new();
+            app.security_caps = payload;
+            let backend = TestBackend::new(80, 10);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    draw_security(frame, &app, Block::default(), area);
+                })
+                .expect("draw empty security surface");
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(!rendered.contains(unexpected), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn test_security_screen_renders_unnamed_and_scalar_array_entries() {
+        let mut app = App::new();
+        app.security_caps = serde_json::json!([
+            {"name": "named", "enabled": false},
+            {"agentId": "agent-7", "limit": 0},
+            "raw-capability"
+        ]);
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_security(frame, &app, Block::default(), area);
+            })
+            .expect("draw mixed security surface");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        for expected in [
+            "named",
+            "false",
+            "agent-7",
+            "0",
+            "Capability 3",
+            "raw-capability",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}: {rendered}"
+            );
+        }
     }
 
     #[test]

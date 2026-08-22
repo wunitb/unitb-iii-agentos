@@ -1458,6 +1458,26 @@ mod tests {
     }
 
     #[test]
+    fn up_does_not_accept_an_unrelated_worker_count_as_readiness() {
+        let config = existing_config();
+        // This would have passed the old count-based readiness check: two
+        // workers are connected, but neither required identity is present.
+        let mut fake = Fake {
+            connected: RefCell::new(Some(ids(&["foreign-a", "foreign-b"]))),
+            connected_after_start: Some(ids(&["core", "memory", "foreign-a", "foreign-b"])),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert_eq!(outcome.expect("up succeeds"), UpOutcome::Ready);
+        assert_eq!(fake.events(), vec!["start_workers".to_string()]);
+        assert_eq!(&*fake.started_worker_names.borrow(), &["core", "memory"]);
+        assert!(
+            output.contains("Starting 2 missing workers (2 connected)"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn up_waits_for_the_started_workers_to_connect() {
         let config = existing_config();
         let mut fake = Fake {
@@ -1831,6 +1851,38 @@ mod tests {
     }
 
     #[test]
+    fn doctor_rejects_misleading_counts_and_silent_identity_reports() {
+        let config = existing_config();
+        let unrelated = Fake {
+            connected: RefCell::new(Some(ids(&["foreign-a", "foreign-b"]))),
+            ..Fake::default()
+        };
+        let (report, output) = diagnose(&unrelated, ConfigDiscovery::Checkout, &config);
+        let connected = report.item("Connected").expect("connected item");
+        assert!(!connected.passed);
+        assert!(
+            output.contains("2 connected; missing 2 of 2 required identities: core, memory"),
+            "{output}"
+        );
+
+        let silent = Fake {
+            connected: RefCell::new(None),
+            ..Fake::default()
+        };
+        let (report, output) = diagnose(&silent, ConfigDiscovery::Checkout, &config);
+        let connected = report.item("Connected").expect("connected item");
+        assert!(!connected.passed);
+        assert_eq!(
+            connected.hint.as_deref(),
+            Some("start the stack with `agentos up`, then re-run `agentos doctor`")
+        );
+        assert!(
+            output.contains("engine did not report connected worker identities"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn doctor_says_so_when_the_runtime_declares_no_rust_workers() {
         let config = existing_config();
         let fake = Fake {
@@ -1932,6 +1984,49 @@ mod tests {
     }
 
     #[test]
+    fn dotenv_parser_handles_empty_input_duplicates_and_blank_values() {
+        assert!(
+            parse_dotenv("", Path::new("/runtime/.env"))
+                .expect("empty dotenv is valid")
+                .is_empty()
+        );
+        let values = parse_dotenv(
+            "AGENTOS_TEST_DUPLICATE=first\nAGENTOS_TEST_DUPLICATE=second\nAGENTOS_TEST_EMPTY=\n",
+            Path::new("/runtime/.env"),
+        )
+        .expect("parse edge-case dotenv");
+        assert_eq!(
+            values.get("AGENTOS_TEST_DUPLICATE").map(String::as_str),
+            Some("first")
+        );
+        assert_eq!(
+            values.get("AGENTOS_TEST_EMPTY").map(String::as_str),
+            Some("")
+        );
+        assert!(
+            load_dotenv(Path::new("/agentos-test-path-that-does-not-exist"))
+                .expect("an absent dotenv is optional")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dotenv_parser_rejects_invalid_keys_and_unclosed_quotes() {
+        for (source, expected) in [
+            ("9INVALID=value", "Invalid dotenv key"),
+            ("BAD-KEY=value", "Invalid dotenv key"),
+            ("KEY='unterminated", "Unclosed single quote"),
+            ("KEY=\"unterminated", "Unclosed double quote"),
+        ] {
+            let error = parse_dotenv(source, Path::new("/runtime/.env"))
+                .expect_err("malformed dotenv must fail")
+                .to_string();
+            assert!(error.contains(expected), "{source:?}: {error}");
+            assert!(error.contains("/runtime/.env:1"), "{source:?}: {error}");
+        }
+    }
+
+    #[test]
     fn engine_worker_list_reports_only_stable_connected_non_engine_identities() {
         assert_eq!(
             reported_worker_ids(&json!({
@@ -1945,5 +2040,15 @@ mod tests {
         );
         assert_eq!(reported_worker_ids(&json!({ "workers": 62 })), None);
         assert_eq!(reported_worker_ids(&json!({ "status": "ok" })), None);
+    }
+
+    #[test]
+    fn engine_worker_list_parser_handles_wrapped_empty_and_malformed_output() {
+        let wrapped = b"iii 0.22.1 diagnostics\n{\"workers\":[{\"name\":\"core\",\"runtime\":\"rust\",\"status\":\"connected\"}]}\n";
+        let parsed = parse_worker_list_output(wrapped).expect("parse wrapped JSON output");
+        assert_eq!(reported_worker_ids(&parsed), Some(ids(&["core"])));
+        assert_eq!(parse_worker_list_output(b""), None);
+        assert_eq!(parse_worker_list_output(b"diagnostic only"), None);
+        assert_eq!(parse_worker_list_output(b"prefix {not-json} suffix"), None);
     }
 }
