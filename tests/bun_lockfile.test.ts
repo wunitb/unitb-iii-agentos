@@ -1,14 +1,21 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const repository = new URL("../", import.meta.url);
 
-function git(...args: string[]) {
+function gitAt(cwd: string, ...args: string[]) {
   return Bun.spawnSync({
     cmd: ["git", ...args],
-    cwd: repository.pathname,
+    cwd,
     stdout: "pipe",
     stderr: "pipe",
   });
+}
+
+function git(...args: string[]) {
+  return gitAt(repository.pathname, ...args);
 }
 
 describe("root Bun dependency state", () => {
@@ -44,14 +51,28 @@ describe("root Bun dependency state", () => {
     }
   });
 
-  it("does not hide AgentField runner output in repository policy", () => {
-    const runnerOutput = git(
-      "check-ignore",
-      "--no-index",
-      "--",
-      ".agentfield-out-test/result.json",
-    );
-    expect(runnerOutput.exitCode).toBe(1);
-    expect(runnerOutput.stdout.toString()).toBe("");
+  it("does not hide AgentField runner output in repository policy", async () => {
+    const temporaryRepository = await mkdtemp(join(tmpdir(), "agentos-ignore-policy-"));
+    try {
+      expect(gitAt(temporaryRepository, "init", "--quiet").exitCode).toBe(0);
+      await writeFile(
+        join(temporaryRepository, ".gitignore"),
+        await Bun.file(new URL(".gitignore", repository)).text(),
+      );
+
+      const runnerOutput = gitAt(
+        temporaryRepository,
+        "-c",
+        "core.excludesFile=/dev/null",
+        "check-ignore",
+        "--no-index",
+        "--",
+        ".agentfield-out-test/result.json",
+      );
+      expect(runnerOutput.exitCode).toBe(1);
+      expect(runnerOutput.stdout.toString()).toBe("");
+    } finally {
+      await rm(temporaryRepository, { recursive: true, force: true });
+    }
   });
 });

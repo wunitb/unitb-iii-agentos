@@ -21,6 +21,10 @@ const build10003ArtifactDirectory = new URL(
   "../docs/builds/10003-salvage-the-five-surviving-agentos-work-items-fr/",
   import.meta.url,
 );
+const build10005ArtifactDirectory = new URL(
+  "../docs/builds/10005-salvage-the-five-surviving-agentos-work-items-fr/",
+  import.meta.url,
+);
 const requiredArtifacts = [
   "ATTACK_SURFACE.md",
   "DECISIONS.md",
@@ -34,7 +38,7 @@ const requiredIdentifiers = [
   "ISC-003",
   "ISC-004",
 ] as const;
-const build10003RequiredIdentifiers = [
+const salvageBatchRequiredIdentifiers = [
   ...requiredIdentifiers,
   "ISC-005",
 ] as const;
@@ -171,7 +175,27 @@ describe("build 10003 governed artifact contract", () => {
     expect(
       await inspectArtifactDirectory(
         build10003ArtifactDirectory,
-        build10003RequiredIdentifiers,
+        salvageBatchRequiredIdentifiers,
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe("build 10005 governed artifact contract", () => {
+  it("uses the canonical real directory with exactly the governed files", async () => {
+    expect(await realpath(build10005ArtifactDirectory)).toBe(
+      resolve(fileURLToPath(build10005ArtifactDirectory)),
+    );
+    expect((await readdir(build10005ArtifactDirectory)).sort()).toEqual(
+      [...requiredArtifacts].sort(),
+    );
+  });
+
+  it("accepts every required regular UTF-8 artifact and ISC-000 through ISC-005", async () => {
+    expect(
+      await inspectArtifactDirectory(
+        build10005ArtifactDirectory,
+        salvageBatchRequiredIdentifiers,
       ),
     ).toEqual([]);
   });
@@ -284,7 +308,7 @@ describe("artifact contract edge cases", () => {
       inspectArtifactBytes(
         "TRACES.md",
         missingBuild10003Boundary,
-        build10003RequiredIdentifiers,
+        salvageBatchRequiredIdentifiers,
       ),
     ).toEqual([{ code: "TRACES_ISC_MISSING", path: "ISC-005" }]);
   });
