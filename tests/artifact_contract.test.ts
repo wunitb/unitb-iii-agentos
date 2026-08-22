@@ -47,6 +47,16 @@ const headingPattern = /^#{1,6} +\S/m;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 const utf8Encoder = new TextEncoder();
 
+function markdownHeadings(source: string): string[] {
+  return source.match(/^#{1,6} +\S.*$/gm) ?? [];
+}
+
+function normalizedBuildHeadings(source: string): string[] {
+  return markdownHeadings(source).map((heading) =>
+    heading.replace(/^# Build \d+ /, "# Build <number> "),
+  );
+}
+
 type ArtifactFailure =
   | "ARTIFACT_DIRECTORY_INVALID"
   | "ARTIFACT_FILE_MISSING"
@@ -199,6 +209,36 @@ describe("build 10005 governed artifact contract", () => {
       ),
     ).toEqual([]);
   });
+
+  it("preserves build 10000's heading topology in every governed artifact", async () => {
+    for (const filename of requiredArtifacts) {
+      const build10000 = await Bun.file(new URL(filename, artifactDirectory)).text();
+      const build10005 = await Bun.file(
+        new URL(filename, build10005ArtifactDirectory),
+      ).text();
+
+      expect(normalizedBuildHeadings(build10005), filename).toEqual(
+        normalizedBuildHeadings(build10000),
+      );
+    }
+  });
+
+  it("records every trace identifier exactly once and the frozen install decision", async () => {
+    const traces = await Bun.file(
+      new URL("TRACES.md", build10005ArtifactDirectory),
+    ).text();
+    for (const identifier of salvageBatchRequiredIdentifiers) {
+      expect(
+        traces.match(new RegExp(`\\b${identifier}\\b`, "g"))?.length ?? 0,
+        identifier,
+      ).toBe(1);
+    }
+
+    const decisions = await Bun.file(
+      new URL("DECISIONS.md", build10005ArtifactDirectory),
+    ).text();
+    expect(decisions).toContain("bun install --frozen-lockfile");
+  });
 });
 
 describe("artifact contract edge cases", () => {
@@ -286,6 +326,22 @@ describe("artifact contract edge cases", () => {
         path: "DECISIONS.md",
       });
     }
+  });
+
+  it("extracts headings in document order and normalizes only the build title", () => {
+    const source = [
+      "# Build 10005 Decisions",
+      "body # not a heading",
+      "### Later",
+      "## Earlier level",
+    ].join("\n");
+
+    expect(normalizedBuildHeadings(source)).toEqual([
+      "# Build <number> Decisions",
+      "### Later",
+      "## Earlier level",
+    ]);
+    expect(normalizedBuildHeadings("plain text")).toEqual([]);
   });
 
   it("requires ISC-000 through ISC-004 as whole tokens", () => {
