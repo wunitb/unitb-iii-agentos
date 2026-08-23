@@ -188,8 +188,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("memory::list", "GET", "agentmemory/memories"),
         ("memory::recall", "POST", "agentmemory/search"),
         ("memory::store", "POST", "agentmemory/remember"),
-        ("memory::session::list", "GET", "api/sessions"),
-        ("memory::session::delete", "DELETE", "api/sessions/:id"),
+        ("memory::session::list", "GET", "/api/sessions"),
+        ("memory::session::delete", "DELETE", "/api/sessions/:id"),
     ] {
         agentos_http_adapter::register_http_trigger(
             &iii,
@@ -1003,7 +1003,7 @@ async fn compact_session(iii: &IIIClient, input: Value) -> Result<Value, Error> 
 
     for chunk in &chunks {
         let summary = iii.trigger(TriggerRequest {
-            function_id: "llm::complete".to_string(),
+            function_id: "agentos::llm::complete".to_string(),
             payload: json!({
             "model": { "provider": "anthropic", "model": "claude-haiku-4-5", "maxTokens": 1024 },
             "systemPrompt": "Summarize this conversation concisely. Preserve key facts, decisions, and context. Be brief.",

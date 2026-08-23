@@ -304,7 +304,7 @@ async fn compress(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
     let llm_result = iii
         .trigger(TriggerRequest {
-            function_id: "llm::complete".into(),
+            function_id: "agentos::llm::complete".into(),
             payload: json!({
                 "model": {
                     "provider": "anthropic",

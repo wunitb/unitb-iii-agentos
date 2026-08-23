@@ -1,8 +1,9 @@
 use iii_sdk::errors::Error;
 use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, Trigger,
+    IIIClient, InitOptions, RegisterFunction,
     protocol::{RegisterTriggerInput, TriggerRequest},
     register_worker,
+    trigger::Trigger,
 };
 use serde_json::{Map, Value, json};
 use std::{

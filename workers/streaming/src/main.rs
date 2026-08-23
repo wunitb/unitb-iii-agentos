@@ -62,7 +62,7 @@ async fn stream_chat(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
     let model = iii
         .trigger(TriggerRequest {
-            function_id: "llm::route".into(),
+            function_id: "agentos::llm::route".into(),
             payload: json!({ "message": &message, "toolCount": 0, "config": model_config }),
             action: None,
             timeout_ms: None,
@@ -81,7 +81,7 @@ async fn stream_chat(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
     let response = iii
         .trigger(TriggerRequest {
-            function_id: "llm::complete".into(),
+            function_id: "agentos::llm::complete".into(),
             payload: json!({
                 "model": model,
                 "systemPrompt": system_prompt,

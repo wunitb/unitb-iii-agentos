@@ -1047,7 +1047,7 @@ mod tests {
             let manifest = parse_integration(&path).unwrap();
             assert_eq!(
                 path.file_stem().and_then(|stem| stem.to_str()),
-                Some(&manifest.id)
+                Some(manifest.id.as_str())
             );
             assert!(ids.insert(manifest.id));
             count += 1;

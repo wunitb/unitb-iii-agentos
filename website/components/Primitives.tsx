@@ -12,7 +12,7 @@ const primitives = [
     Icon: IconFunction,
     name: "Function",
     desc: "A named handler registered by a worker. Returns Value or IIIError.",
-    example: "agent::chat · llm::route · memory::search",
+    example: "agent::chat · agentos::llm::route · memory::search",
   },
   {
     Icon: IconTrigger,

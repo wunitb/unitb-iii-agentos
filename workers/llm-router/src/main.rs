@@ -461,7 +461,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let state = state.clone();
         iii.register_function(
-            "llm::route",
+            "agentos::llm::route",
             RegisterFunction::new_async(move |input: Value| {
                 let state = state.clone();
                 async move { route_handler(state, input).await }
@@ -474,7 +474,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = state.clone();
         let client = shared_client.clone();
         iii.register_function(
-            "llm::complete",
+            "agentos::llm::complete",
             RegisterFunction::new_async(move |input: Value| {
                 let state = state.clone();
                 let client = client.clone();
@@ -487,7 +487,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let state = state.clone();
         iii.register_function(
-            "llm::usage",
+            "agentos::llm::usage",
             RegisterFunction::new_async(move |input: Value| {
                 let state = state.clone();
                 async move { usage_handler(state, input).await }
@@ -499,7 +499,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let state = state.clone();
         iii.register_function(
-            "llm::providers",
+            "agentos::llm::providers",
             RegisterFunction::new_async(move |input: Value| {
                 let state = state.clone();
                 async move { providers_handler(state, input).await }
@@ -511,7 +511,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let state = state.clone();
         iii.register_function(
-            "llm::models",
+            "agentos::llm::models",
             RegisterFunction::new_async(move |_: Value| {
                 let state = state.clone();
                 async move { Ok::<Value, Error>(models_catalog(&state)) }
@@ -522,7 +522,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let state = state.clone();
         iii.register_function(
-            "llm::provider_catalog",
+            "agentos::llm::provider_catalog",
             RegisterFunction::new_async(move |_: Value| {
                 let state = state.clone();
                 async move { Ok::<Value, Error>(provider_catalog(&state)) }
@@ -531,7 +531,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     iii.register_function(
-        "llm::aliases",
+        "agentos::llm::aliases",
         RegisterFunction::new_async(
             move |_: Value| async move { Ok::<Value, Error>(model_aliases()) },
         )
@@ -539,9 +539,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let catalog_routes = [
-        ("llm::models", "/api/models"),
-        ("llm::aliases", "/api/models/aliases"),
-        ("llm::provider_catalog", "/api/providers"),
+        ("agentos::llm::models", "/api/models"),
+        ("agentos::llm::aliases", "/api/models/aliases"),
+        ("agentos::llm::provider_catalog", "/api/providers"),
     ];
     for (function_id, path) in catalog_routes {
         agentos_http_adapter::register_http_trigger(

@@ -28,7 +28,7 @@ export default function Agents() {
             <div className="eyebrow mb-4">What an agent sees</div>
             <ul className="space-y-3 text-[13.5px] font-mono text-fg-2">
               <li><span className="text-fg-3">fn </span>agent::chat(message)</li>
-              <li><span className="text-fg-3">fn </span>llm::route(prompt, tier)</li>
+              <li><span className="text-fg-3">fn </span>agentos::llm::route(prompt, tier)</li>
               <li><span className="text-fg-3">fn </span>memory::search(query)</li>
               <li><span className="text-fg-3">fn </span>realm::create(name)</li>
               <li><span className="text-fg-3">fn </span>wasm::execute(module, args)</li>
