@@ -5,6 +5,15 @@ const legacyFunctions = ["complete", "route", "providers", "usage"].map(
   (name) => `llm::${name}`,
 );
 
+function legacyLlmCalls(source: string): string[] {
+  const namespace = ["llm", "::"].join("");
+  const quotedFunctionId = new RegExp(
+    `["'\\x60](${namespace}[A-Za-z0-9_-]+)["'\\x60]`,
+    "g",
+  );
+  return [...source.matchAll(quotedFunctionId)].map((match) => match[1]);
+}
+
 describe("AgentOS LLM namespace", () => {
   it("registers its router functions below agentos::llm", async () => {
     const router = await Bun.file(
@@ -34,6 +43,36 @@ describe("AgentOS LLM namespace", () => {
         );
       }
     }
+  });
+
+  it("has no consumers in any legacy llm namespace", async () => {
+    const failures: string[] = [];
+    const glob = new Bun.Glob("**/*.{rs,ts,tsx,js,jsx}");
+    for await (const path of glob.scan({ cwd: repository.pathname })) {
+      if (
+        path === "tests/llm_namespace.test.ts" ||
+        path.startsWith("target/") ||
+        path.startsWith("node_modules/")
+      ) {
+        continue;
+      }
+      const calls = legacyLlmCalls(
+        await Bun.file(new URL(path, repository)).text(),
+      );
+      if (calls.length > 0) failures.push(`${path}: ${calls.join(", ")}`);
+    }
+
+    expect(failures).toEqual([]);
+  });
+
+  it("legacy namespace detection handles empty, near-miss, and boundary input", () => {
+    expect(legacyLlmCalls("")).toEqual([]);
+    expect(legacyLlmCalls("llm::chat and agentos::llm::chat")).toEqual([]);
+    expect(legacyLlmCalls("call(\"llm::chat\")\n'llm::route'\n`llm::complete`")).toEqual([
+      "llm::chat",
+      "llm::route",
+      "llm::complete",
+    ]);
   });
 
   it("records the complementary collision-error proposal as upstream-only", async () => {
