@@ -27,6 +27,24 @@ struct FunctionCall {
     arguments: Value,
 }
 
+impl FunctionCall {
+    fn normalized(call_id: String, id: String, arguments: Value) -> Option<Self> {
+        if call_id.is_empty() || id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            call_id,
+            id,
+            arguments,
+        })
+    }
+
+    fn from_normalized_value(value: Value) -> Option<Self> {
+        let call: Self = serde_json::from_value(value).ok()?;
+        Self::normalized(call.call_id, call.id, call.arguments)
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ToolAliases {
     by_function_id: BTreeMap<String, String>,
@@ -50,7 +68,7 @@ impl ToolAliases {
     fn from_function_ids(function_ids: impl IntoIterator<Item = String>) -> Self {
         let mut aliases = Self::default();
         for function_id in function_ids {
-            if aliases.by_function_id.contains_key(&function_id) {
+            if function_id.is_empty() || aliases.by_function_id.contains_key(&function_id) {
                 continue;
             }
             let base = provider_tool_name(&function_id);
@@ -573,7 +591,7 @@ fn message_function_calls(message: &Value) -> Vec<FunctionCall> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|call| serde_json::from_value(call.clone()).ok())
+        .filter_map(|call| FunctionCall::from_normalized_value(call.clone()))
         .collect()
 }
 
@@ -964,11 +982,11 @@ fn function_calls(driver: Driver, result: &Value, aliases: &ToolAliases) -> Vec<
             .flatten()
             .filter(|block| block["type"].as_str() == Some("tool_use"))
             .filter_map(|block| {
-                Some(FunctionCall {
-                    call_id: block["id"].as_str()?.to_string(),
-                    id: aliases.function_id(block["name"].as_str()?)?.to_string(),
-                    arguments: function_arguments(block.get("input")),
-                })
+                FunctionCall::normalized(
+                    block["id"].as_str()?.to_string(),
+                    aliases.function_id(block["name"].as_str()?)?.to_string(),
+                    function_arguments(block.get("input")),
+                )
             })
             .collect(),
         Driver::OpenAiCompat | Driver::Bedrock => result["choices"]
@@ -978,13 +996,13 @@ fn function_calls(driver: Driver, result: &Value, aliases: &ToolAliases) -> Vec<
             .into_iter()
             .flatten()
             .filter_map(|call| {
-                Some(FunctionCall {
-                    call_id: call["id"].as_str()?.to_string(),
-                    id: aliases
+                FunctionCall::normalized(
+                    call["id"].as_str()?.to_string(),
+                    aliases
                         .function_id(call["function"]["name"].as_str()?)?
                         .to_string(),
-                    arguments: function_arguments(call["function"].get("arguments")),
-                })
+                    function_arguments(call["function"].get("arguments")),
+                )
             })
             .collect(),
         Driver::Gemini => result["candidates"]
@@ -1001,15 +1019,11 @@ fn function_calls(driver: Driver, result: &Value, aliases: &ToolAliases) -> Vec<
                     .filter_map(move |(part_index, part)| {
                         let call = part.get("functionCall")?;
                         let id = aliases.function_id(call["name"].as_str()?)?.to_string();
-                        let call_id = call["id"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| format!("gemini-{candidate_index}-{part_index}"));
-                        Some(FunctionCall {
-                            call_id,
-                            id,
-                            arguments: function_arguments(call.get("args")),
-                        })
+                        let call_id = match call.get("id") {
+                            Some(id) => id.as_str()?.to_string(),
+                            None => format!("gemini-{candidate_index}-{part_index}"),
+                        };
+                        FunctionCall::normalized(call_id, id, function_arguments(call.get("args")))
                     })
             })
             .collect(),
@@ -1802,6 +1816,10 @@ mod tests {
     #[test]
     fn provider_tool_aliases_handle_empty_exact_boundary_and_unicode_ids() {
         assert_eq!(ToolAliases::from_function_ids([]), ToolAliases::default());
+        assert_eq!(
+            ToolAliases::from_function_ids([String::new()]),
+            ToolAliases::default()
+        );
 
         let exact = "a".repeat(64);
         let over = "b".repeat(65);
@@ -2063,11 +2081,12 @@ mod tests {
     }
 
     #[test]
-    fn gemini_function_call_normalization_replaces_empty_ids_and_rejects_unknown_aliases() {
+    fn gemini_function_call_normalization_rejects_empty_ids_and_unknown_aliases() {
         let aliases = aliases(&["state::get"]);
         let gemini = json!({
             "candidates": [{ "content": { "parts": [
                 { "functionCall": { "id": "", "name": "state__get", "args": null } },
+                { "functionCall": { "name": "state__get", "args": null } },
                 { "functionCall": { "id": "call-1", "name": "" } },
                 { "functionCall": { "id": "call-2", "name": "unknown" } },
             ] } }],
@@ -2075,7 +2094,7 @@ mod tests {
         assert_eq!(
             function_calls(Driver::Gemini, &gemini, &aliases),
             vec![FunctionCall {
-                call_id: "gemini-0-0".into(),
+                call_id: "gemini-0-1".into(),
                 id: "state::get".into(),
                 arguments: Value::Null,
             }]

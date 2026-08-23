@@ -427,6 +427,12 @@ fn completion_payload(
     })
 }
 
+fn parse_function_call(value: &Value) -> Option<FunctionCall> {
+    serde_json::from_value(value.clone())
+        .ok()
+        .filter(|call: &FunctionCall| !call.call_id.is_empty() && !call.id.is_empty())
+}
+
 fn route_fields(route: &Value) -> Result<(String, String), Error> {
     let provider = route["provider"]
         .as_str()
@@ -546,10 +552,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
         }
         iterations += 1;
 
-        let calls: Vec<FunctionCall> = tool_calls
-            .iter()
-            .filter_map(|tc| serde_json::from_value(tc.clone()).ok())
-            .collect();
+        let calls: Vec<FunctionCall> = tool_calls.iter().filter_map(parse_function_call).collect();
 
         let mut tool_results = Vec::new();
         for tc in &calls {
@@ -1614,15 +1617,14 @@ mod tests {
 
     #[test]
     fn test_tool_call_filter_map_ignores_invalid() {
-        let tool_calls = vec![
+        let tool_calls = [
             json!({"callId": "1", "id": "valid::tool", "arguments": {}}),
             json!({"missing": "fields"}),
+            json!({"callId": "", "id": "empty-call-id", "arguments": {}}),
+            json!({"callId": "empty-function-id", "id": "", "arguments": {}}),
             json!({"callId": "3", "id": "another::tool", "arguments": {"k": "v"}}),
         ];
-        let calls: Vec<FunctionCall> = tool_calls
-            .iter()
-            .filter_map(|tc| serde_json::from_value(tc.clone()).ok())
-            .collect();
+        let calls: Vec<FunctionCall> = tool_calls.iter().filter_map(parse_function_call).collect();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "valid::tool");
         assert_eq!(calls[1].id, "another::tool");
@@ -1630,11 +1632,14 @@ mod tests {
 
     #[test]
     fn test_tool_call_filter_map_all_invalid() {
-        let tool_calls = vec![json!({"bad": "data"}), json!(42), json!(null)];
-        let calls: Vec<FunctionCall> = tool_calls
-            .iter()
-            .filter_map(|tc| serde_json::from_value(tc.clone()).ok())
-            .collect();
+        let tool_calls = [
+            json!({"bad": "data"}),
+            json!(42),
+            json!(null),
+            json!({"callId": "", "id": "state::get", "arguments": {}}),
+            json!({"callId": "call-1", "id": "", "arguments": {}}),
+        ];
+        let calls: Vec<FunctionCall> = tool_calls.iter().filter_map(parse_function_call).collect();
         assert_eq!(calls.len(), 0);
     }
 
