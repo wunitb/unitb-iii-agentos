@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { registerWorker, type III } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 
 const shouldRunE2E = process.env.AGENTOS_E2E === "1";
 const suite = shouldRunE2E ? describe : describe.skip;
@@ -8,7 +8,7 @@ const wsUrl = process.env.III_URL || "ws://localhost:49134";
 const realmName = `e2e-${Date.now()}`;
 const owner = "alice-e2e";
 
-let sdk: III;
+let sdk: IIIClient;
 let realmId = "";
 let missionId = "";
 let proposalId = "";
@@ -21,13 +21,14 @@ async function call<T = unknown>(
   const result = await sdk.trigger({
     function_id: fn,
     payload,
-    timeout_ms: timeoutMs,
+    timeoutMs,
   });
   return result as T;
 }
 
 suite("AgentOS full-stack E2E", () => {
-  beforeAll(() => {
+  beforeAll(async () => {
+    const { registerWorker } = await import("iii-sdk");
     sdk = registerWorker(wsUrl, { workerName: "e2e-test-client" });
   });
 
@@ -183,33 +184,61 @@ suite("AgentOS full-stack E2E", () => {
     expect(stored.id || stored.deduplicated !== undefined).toBeTruthy();
   });
 
-  it("llm::providers — 10 providers registered", async () => {
+  it("agentos::llm::providers — secure Codex provider registered", async () => {
     const r = await call<{
-      providers: { name: string; configured: boolean }[];
-    }>("llm::providers", {});
-    expect(r.providers.length).toBeGreaterThanOrEqual(10);
+      providers: {
+        name: string;
+        base_url: string;
+        models: string[];
+      }[];
+    }>("agentos::llm::providers", {});
+    expect(r.providers.length).toBeGreaterThanOrEqual(11);
     const names = r.providers.map((p) => p.name);
     for (const expected of ["anthropic", "openai", "google", "ollama"]) {
       expect(names).toContain(expected);
     }
+    const codex = r.providers.find((p) => p.name === "codex");
+    expect(codex).toBeDefined();
+    const codexUrl = new URL(codex?.base_url ?? "");
+    const codexHost = codexUrl.hostname.replace(/^\[|\]$/g, "");
+    expect(["http:", "https:"]).toContain(codexUrl.protocol);
+    expect(
+      codexHost === "::1" || /^127(?:\.\d{1,3}){3}$/.test(codexHost),
+    ).toBe(true);
+    expect(codexUrl.username).toBe("");
+    expect(codexUrl.password).toBe("");
+    expect(codexUrl.search).toBe("");
+    expect(codexUrl.hash).toBe("");
+    expect(codex?.models).toContain("gpt-5.6-sol");
   });
 
-  it("llm::route — complexity-based model selection", async () => {
-    const easy = await call<{ provider: string; model: string }>("llm::route", {
-      messages: [{ role: "user", content: "hi" }],
-      tools: [],
-    });
-    expect(easy.provider).toBe("anthropic");
-    expect(easy.model).toMatch(/haiku/);
+  it("agentos::llm::route — resolves default and explicit model contracts", async () => {
+    const automatic = await call<{ provider: string; model: string }>(
+      "agentos::llm::route",
+      {
+        messages: [{ role: "user", content: "hi" }],
+        tools: [],
+      },
+    );
+    expect(automatic.provider.length).toBeGreaterThan(0);
+    expect(automatic.model.length).toBeGreaterThan(0);
 
-    const forced = await call<{ model: string }>("llm::route", {
+    const haiku = await call<{ provider: string; model: string }>("agentos::llm::route", {
       messages: [{ role: "user", content: "x" }],
       model: "haiku",
     });
-    expect(forced.model).toMatch(/haiku/);
+    expect(haiku.provider).toBe("anthropic");
+    expect(haiku.model).toMatch(/haiku/);
+
+    const codex = await call<{ provider: string; model: string }>("agentos::llm::route", {
+      messages: [{ role: "user", content: "x" }],
+      model: "gpt-5.6-sol",
+    });
+    expect(codex.provider).toBe("codex");
+    expect(codex.model).toBe("gpt-5.6-sol");
   });
 
-  it("llm::complete — real Anthropic call", async () => {
+  it("agentos::llm::complete — real Anthropic call", async () => {
     if (!process.env.ANTHROPIC_API_KEY) {
       console.warn("ANTHROPIC_API_KEY not set; skipping live call assertion");
       return;
@@ -219,7 +248,7 @@ suite("AgentOS full-stack E2E", () => {
       model: string;
       usage: { input: number; output: number; total: number };
     }>(
-      "llm::complete",
+      "agentos::llm::complete",
       {
         provider: "anthropic",
         model: "claude-haiku-4-5-20251001",
@@ -255,13 +284,13 @@ suite("AgentOS full-stack E2E", () => {
     expect(r.durationMs).toBeGreaterThan(0);
   }, 120_000);
 
-  it("llm::usage — tracks tokens across calls", async () => {
+  it("agentos::llm::usage — tracks tokens across calls", async () => {
     if (!process.env.ANTHROPIC_API_KEY) {
       return;
     }
     const r = await call<{
       stats: { provider: string; requests: number }[];
-    }>("llm::usage", {});
+    }>("agentos::llm::usage", {});
     expect(r.stats.length).toBeGreaterThan(0);
     const anthropic = r.stats.find((s) => s.provider === "anthropic");
     expect(anthropic?.requests).toBeGreaterThanOrEqual(2);

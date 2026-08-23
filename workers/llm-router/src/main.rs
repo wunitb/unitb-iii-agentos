@@ -1,13 +1,16 @@
 use dashmap::DashMap;
 use iii_sdk::errors::Error;
 use iii_sdk::{InitOptions, RegisterFunction, register_worker};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 struct RouterState {
     usage: DashMap<String, Usage>,
     providers: DashMap<String, ProviderConfig>,
+    default_route: Option<Route>,
 }
 
 struct Usage {
@@ -16,11 +19,167 @@ struct Usage {
     requests: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct FunctionCall {
+    #[serde(rename = "callId")]
+    call_id: String,
+    id: String,
+    arguments: Value,
+}
+
+impl FunctionCall {
+    fn normalized(call_id: String, id: String, arguments: Value) -> Option<Self> {
+        if call_id.is_empty() || id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            call_id,
+            id,
+            arguments,
+        })
+    }
+
+    fn from_normalized_value(value: Value) -> Option<Self> {
+        let call: Self = serde_json::from_value(value).ok()?;
+        Self::normalized(call.call_id, call.id, call.arguments)
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ToolAliases {
+    by_function_id: BTreeMap<String, String>,
+    by_provider_name: BTreeMap<String, String>,
+}
+
+impl ToolAliases {
+    fn for_request(tools: &[Value], messages: &[Value]) -> Self {
+        let mut function_ids = BTreeSet::new();
+        function_ids.extend(tools.iter().filter_map(agent_tool_id).map(str::to_owned));
+        for message in messages {
+            function_ids.extend(
+                message_function_calls(message)
+                    .into_iter()
+                    .map(|call| call.id),
+            );
+        }
+        Self::from_function_ids(function_ids)
+    }
+
+    fn from_function_ids(function_ids: impl IntoIterator<Item = String>) -> Self {
+        let mut aliases = Self::default();
+        for function_id in function_ids {
+            if function_id.is_empty() || aliases.by_function_id.contains_key(&function_id) {
+                continue;
+            }
+            let base = provider_tool_name(&function_id);
+            let mut provider_name = base.clone();
+            let mut discriminator = 2_u64;
+            while aliases.by_provider_name.contains_key(&provider_name) {
+                let suffix = format!("_{discriminator}");
+                provider_name = format!("{}{}", &base[..base.len().min(64 - suffix.len())], suffix);
+                discriminator += 1;
+            }
+            aliases
+                .by_function_id
+                .insert(function_id.clone(), provider_name.clone());
+            aliases.by_provider_name.insert(provider_name, function_id);
+        }
+        aliases
+    }
+
+    fn provider_name(&self, function_id: &str) -> Option<&str> {
+        self.by_function_id.get(function_id).map(String::as_str)
+    }
+
+    fn function_id(&self, provider_name: &str) -> Option<&str> {
+        self.by_provider_name.get(provider_name).map(String::as_str)
+    }
+}
+
+fn provider_tool_name(function_id: &str) -> String {
+    let bytes = function_id.as_bytes();
+    let mut encoded = String::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' => encoded.push(byte as char),
+            b'_' => encoded.push_str("_u"),
+            b':' if bytes.get(index + 1) == Some(&b':') => {
+                encoded.push_str("__");
+                index += 1;
+            }
+            b':' => encoded.push_str("_c"),
+            _ => encoded.push_str(&format!("_x{byte:02x}")),
+        }
+        index += 1;
+    }
+
+    if encoded.len() <= 64 {
+        return encoded;
+    }
+
+    // Provider names are capped at 64 characters. The full mapping remains in
+    // ToolAliases; the hash only keeps long aliases stable and readable.
+    let hash = function_id
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    format!("{}_h{hash:016x}", &encoded[..46])
+}
+
 struct ProviderConfig {
     base_url: String,
     env_key: String,
     driver: Driver,
     models: Vec<String>,
+}
+
+const CODEX_PROVIDER: &str = "codex";
+const DEFAULT_CODEX_BASE_URL: &str = "http://127.0.0.1:8317/v1";
+const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
+
+fn resolve_codex_base_url(override_value: Option<&str>) -> String {
+    let Some(raw) = override_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return DEFAULT_CODEX_BASE_URL.to_string();
+    };
+
+    let Some(url) = reqwest::Url::parse(raw).ok() else {
+        return DEFAULT_CODEX_BASE_URL.to_string();
+    };
+    let is_loopback_literal = url
+        .host_str()
+        .and_then(|host| {
+            let host = host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(host);
+            host.parse::<std::net::IpAddr>().ok()
+        })
+        .is_some_and(|host| host.is_loopback());
+    let is_safe = matches!(url.scheme(), "http" | "https")
+        && is_loopback_literal
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none();
+
+    if !is_safe {
+        return DEFAULT_CODEX_BASE_URL.to_string();
+    }
+
+    url.to_string().trim_end_matches('/').to_string()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Route {
+    provider: String,
+    model: String,
 }
 
 #[derive(Clone, Copy)]
@@ -49,6 +208,8 @@ fn default_providers() -> Vec<(
                 "claude-opus-4-20250514",
                 "claude-sonnet-4-20250514",
                 "claude-haiku-4-5-20251001",
+                "claude-opus-4-6",
+                "claude-sonnet-4-6",
             ],
         ),
         (
@@ -120,7 +281,45 @@ fn default_providers() -> Vec<(
             Driver::OpenAiCompat,
             &["llama3.3", "qwen2.5", "deepseek-r1"],
         ),
+        (
+            CODEX_PROVIDER,
+            DEFAULT_CODEX_BASE_URL,
+            "CODEX_PROXY_API_KEY",
+            Driver::OpenAiCompat,
+            &["gpt-5.4", "gpt-5.4-mini", "gpt-5.6-sol"],
+        ),
     ]
+}
+
+struct RuntimeDefaultResolution {
+    route: Option<Route>,
+    disabled_provider: Option<String>,
+}
+
+fn resolve_runtime_default<F>(get_env: F) -> RuntimeDefaultResolution
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let configured = |name: &str| get_env(name).filter(|value| !value.trim().is_empty());
+    let provider = configured("AGENTOS_DEFAULT_PROVIDER");
+    let model = configured("AGENTOS_DEFAULT_MODEL");
+
+    if configured("CODEX_PROXY_API_KEY").is_none() {
+        let default_requested = provider.is_some() || model.is_some();
+        return RuntimeDefaultResolution {
+            route: None,
+            disabled_provider: default_requested
+                .then(|| provider.unwrap_or_else(|| CODEX_PROVIDER.to_string())),
+        };
+    }
+
+    RuntimeDefaultResolution {
+        route: Some(Route {
+            provider: provider.unwrap_or_else(|| CODEX_PROVIDER.to_string()),
+            model: model.unwrap_or_else(|| DEFAULT_CODEX_MODEL.to_string()),
+        }),
+        disabled_provider: None,
+    }
 }
 
 fn score_complexity(messages: &[Value], tools: &[Value]) -> u32 {
@@ -143,16 +342,31 @@ fn score_complexity(messages: &[Value], tools: &[Value]) -> u32 {
     score
 }
 
+fn route_field<'a>(input: &'a Value, name: &str) -> Result<Option<&'a str>, Error> {
+    match input.get(name) {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
+        Some(Value::String(_)) => Ok(None),
+        Some(_) => Err(Error::Handler(format!("{name} must be a string"))),
+    }
+}
+
+fn model_alias(model: &str) -> Option<(&'static str, &'static str)> {
+    match model {
+        "opus" | "claude-opus" => Some(("anthropic", "claude-opus-4-20250514")),
+        "sonnet" | "claude-sonnet" => Some(("anthropic", "claude-sonnet-4-20250514")),
+        "haiku" | "claude-haiku" => Some(("anthropic", "claude-haiku-4-5-20251001")),
+        "gpt-4o" => Some(("openai", "gpt-4o")),
+        "gemini" => Some(("google", "gemini-2.0-flash")),
+        _ => None,
+    }
+}
+
 fn select_model(complexity: u32, preferred: Option<&str>) -> (&'static str, &'static str) {
-    if let Some(p) = preferred {
-        match p {
-            "opus" | "claude-opus" => return ("anthropic", "claude-opus-4-20250514"),
-            "sonnet" | "claude-sonnet" => return ("anthropic", "claude-sonnet-4-20250514"),
-            "haiku" | "claude-haiku" => return ("anthropic", "claude-haiku-4-5-20251001"),
-            "gpt-4o" => return ("openai", "gpt-4o"),
-            "gemini" => return ("google", "gemini-2.0-flash"),
-            _ => {}
-        }
+    if let Some(preferred) = preferred
+        && let Some(route) = model_alias(preferred)
+    {
+        return route;
     }
     match complexity {
         0..=10 => ("anthropic", "claude-haiku-4-5-20251001"),
@@ -161,22 +375,516 @@ fn select_model(complexity: u32, preferred: Option<&str>) -> (&'static str, &'st
     }
 }
 
+fn resolve_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
+    let explicit_provider = route_field(input, "provider")?;
+    let requested_model = route_field(input, "model")?;
+    let explicit_model = requested_model
+        .filter(|value| *value != "agentos-default")
+        .map(|model| {
+            model_alias(model)
+                .map(|(_, canonical)| canonical)
+                .unwrap_or(model)
+        });
+
+    if let (Some(provider), Some(model)) = (explicit_provider, explicit_model) {
+        let config = state
+            .providers
+            .get(provider)
+            .ok_or_else(|| Error::Handler(format!("unknown provider: {provider}")))?;
+        if !config.models.iter().any(|candidate| candidate == model) {
+            return Err(Error::Handler(format!(
+                "model {model} is not registered for provider {provider}"
+            )));
+        }
+        return Ok(Route {
+            provider: provider.into(),
+            model: model.into(),
+        });
+    }
+
+    if let Some(model) = explicit_model {
+        let owners: Vec<String> = state
+            .providers
+            .iter()
+            .filter(|entry| entry.models.iter().any(|candidate| candidate == model))
+            .map(|entry| entry.key().clone())
+            .collect();
+        return match owners.as_slice() {
+            [provider] => Ok(Route {
+                provider: provider.clone(),
+                model: model.into(),
+            }),
+            [] => Err(Error::Handler(format!("unknown model: {model}"))),
+            _ => Err(Error::Handler(format!("ambiguous model: {model}"))),
+        };
+    }
+
+    if explicit_provider.is_some() {
+        return Err(Error::Handler("provider requires model".into()));
+    }
+
+    if let Some(route) = &state.default_route {
+        let config = state.providers.get(&route.provider).ok_or_else(|| {
+            Error::Handler(format!("unknown default provider: {}", route.provider))
+        })?;
+        let model = model_alias(&route.model)
+            .map(|(_, canonical)| canonical)
+            .unwrap_or(route.model.as_str());
+        if !config.models.iter().any(|candidate| candidate == model) {
+            return Err(Error::Handler(format!(
+                "model {} is not registered for provider {}",
+                route.model, route.provider
+            )));
+        }
+        return Ok(Route {
+            provider: route.provider.clone(),
+            model: model.into(),
+        });
+    }
+
+    let messages = input["messages"].as_array().cloned().unwrap_or_default();
+    let tools = input["tools"].as_array().cloned().unwrap_or_default();
+    let complexity = score_complexity(&messages, &tools);
+    let (provider, model) = select_model(complexity, None);
+    Ok(Route {
+        provider: provider.into(),
+        model: model.into(),
+    })
+}
+
+fn has_explicit_route(input: &Value) -> bool {
+    let provider_explicit = match input.get("provider") {
+        None => false,
+        Some(Value::String(value)) => !value.is_empty(),
+        Some(_) => true,
+    };
+    let model_explicit = match input.get("model") {
+        None => false,
+        Some(Value::String(value)) => !value.is_empty() && value != "agentos-default",
+        Some(_) => true,
+    };
+    provider_explicit || model_explicit
+}
+
+fn resolve_complete_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
+    if state.default_route.is_none() && !has_explicit_route(input) {
+        return resolve_route(
+            state,
+            &json!({
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-20250514",
+            }),
+        );
+    }
+    resolve_route(state, input)
+}
+
+fn client_for_provider<'a>(
+    provider: &str,
+    shared_client: &'a reqwest::Client,
+    direct_client: &'a reqwest::Client,
+) -> &'a reqwest::Client {
+    if provider == CODEX_PROVIDER {
+        direct_client
+    } else {
+        shared_client
+    }
+}
+
+fn completion_tools(input: &Value) -> Vec<Value> {
+    input["tools"]
+        .as_array()
+        .or_else(|| input["functions"].as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn tool_field<'a>(tool: &'a Value, names: &[&str]) -> Option<&'a Value> {
+    names.iter().find_map(|name| tool.get(*name))
+}
+
+fn agent_tool_id(tool: &Value) -> Option<&str> {
+    tool_field(tool, &["id", "function_id", "functionId", "name"])
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+fn agent_tool_schema(tool: &Value) -> Value {
+    tool_field(
+        tool,
+        &[
+            "request_format",
+            "requestFormat",
+            "input_schema",
+            "inputSchema",
+            "parameters",
+        ],
+    )
+    .filter(|schema| !schema.is_null())
+    .cloned()
+    .unwrap_or_else(|| json!({ "type": "object", "properties": {} }))
+}
+
+fn anthropic_tools(tools: &[Value], aliases: &ToolAliases) -> Vec<Value> {
+    tools
+        .iter()
+        .filter_map(|tool| {
+            let mut native = serde_json::Map::new();
+            native.insert(
+                "name".into(),
+                json!(aliases.provider_name(agent_tool_id(tool)?)?),
+            );
+            if let Some(description) = tool.get("description").and_then(Value::as_str) {
+                native.insert("description".into(), json!(description));
+            }
+            native.insert("input_schema".into(), agent_tool_schema(tool));
+            Some(Value::Object(native))
+        })
+        .collect()
+}
+
+fn openai_tools(tools: &[Value], aliases: &ToolAliases) -> Vec<Value> {
+    tools
+        .iter()
+        .filter_map(|tool| {
+            let mut function = serde_json::Map::new();
+            function.insert(
+                "name".into(),
+                json!(aliases.provider_name(agent_tool_id(tool)?)?),
+            );
+            if let Some(description) = tool.get("description").and_then(Value::as_str) {
+                function.insert("description".into(), json!(description));
+            }
+            function.insert("parameters".into(), agent_tool_schema(tool));
+            Some(json!({ "type": "function", "function": function }))
+        })
+        .collect()
+}
+
+fn gemini_tools(tools: &[Value], aliases: &ToolAliases) -> Vec<Value> {
+    let declarations: Vec<Value> = tools
+        .iter()
+        .filter_map(|tool| {
+            let mut declaration = serde_json::Map::new();
+            declaration.insert(
+                "name".into(),
+                json!(aliases.provider_name(agent_tool_id(tool)?)?),
+            );
+            if let Some(description) = tool.get("description").and_then(Value::as_str) {
+                declaration.insert("description".into(), json!(description));
+            }
+            declaration.insert("parameters".into(), agent_tool_schema(tool));
+            Some(Value::Object(declaration))
+        })
+        .collect();
+    if declarations.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({ "functionDeclarations": declarations })]
+    }
+}
+
+fn message_function_calls(message: &Value) -> Vec<FunctionCall> {
+    message
+        .get("tool_calls")
+        .or_else(|| message.get("toolCalls"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|call| FunctionCall::from_normalized_value(call.clone()))
+        .collect()
+}
+
+fn message_tool_call_id(message: &Value) -> Option<&str> {
+    message
+        .get("tool_call_id")
+        .or_else(|| message.get("toolCallId"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+fn anthropic_messages(messages: &[Value], aliases: &ToolAliases) -> Vec<Value> {
+    let mut provider_messages: Vec<Value> = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                let calls = message_function_calls(message);
+                if calls.is_empty() {
+                    provider_messages.push(message.clone());
+                    continue;
+                }
+
+                let mut content = Vec::new();
+                if let Some(text) = message.get("content").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    content.push(json!({ "type": "text", "text": text }));
+                }
+                content.extend(calls.into_iter().filter_map(|call| {
+                    Some(json!({
+                        "type": "tool_use",
+                        "id": call.call_id,
+                        "name": aliases.provider_name(&call.id)?,
+                        "input": call.arguments,
+                    }))
+                }));
+                provider_messages.push(json!({ "role": "assistant", "content": content }));
+            }
+            Some("tool") => {
+                let Some(call_id) = message_tool_call_id(message) else {
+                    continue;
+                };
+                let block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": message.get("content").cloned().unwrap_or(Value::Null),
+                });
+
+                let appended = provider_messages.last_mut().is_some_and(|previous| {
+                    if previous.get("role").and_then(Value::as_str) != Some("user") {
+                        return false;
+                    }
+                    let Some(content) = previous.get_mut("content").and_then(Value::as_array_mut)
+                    else {
+                        return false;
+                    };
+                    if !content
+                        .iter()
+                        .all(|item| item.get("type").and_then(Value::as_str) == Some("tool_result"))
+                    {
+                        return false;
+                    }
+                    content.push(block.clone());
+                    true
+                });
+                if !appended {
+                    provider_messages.push(json!({ "role": "user", "content": [block] }));
+                }
+            }
+            _ => provider_messages.push(message.clone()),
+        }
+    }
+
+    provider_messages
+}
+
+fn openai_messages(messages: &[Value], aliases: &ToolAliases) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut native = message.clone();
+            let calls = message_function_calls(message);
+            if !calls.is_empty() {
+                native["tool_calls"] = Value::Array(
+                    calls
+                        .into_iter()
+                        .filter_map(|call| {
+                            Some(json!({
+                                "id": call.call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": aliases.provider_name(&call.id)?,
+                                    "arguments": serde_json::to_string(&call.arguments)
+                                        .unwrap_or_else(|_| "null".to_string()),
+                                },
+                            }))
+                        })
+                        .collect(),
+                );
+                if let Some(object) = native.as_object_mut() {
+                    object.remove("toolCalls");
+                }
+            }
+            if message.get("role").and_then(Value::as_str) == Some("tool")
+                && let Some(call_id) = message_tool_call_id(message)
+            {
+                native["tool_call_id"] = json!(call_id);
+                if let Some(object) = native.as_object_mut() {
+                    object.remove("toolCallId");
+                }
+            }
+            native
+        })
+        .collect()
+}
+
+fn gemini_function_response(content: Option<&Value>) -> Value {
+    let response = match content {
+        Some(Value::String(content)) => {
+            serde_json::from_str(content).unwrap_or_else(|_| json!(content))
+        }
+        Some(content) => content.clone(),
+        None => Value::Null,
+    };
+    if response.is_object() {
+        response
+    } else {
+        json!({ "result": response })
+    }
+}
+
+fn gemini_messages(messages: &[Value], aliases: &ToolAliases) -> Vec<Value> {
+    let mut call_names = BTreeMap::new();
+    let mut contents: Vec<Value> = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        let calls = message_function_calls(message);
+        for call in &calls {
+            if let Some(provider_name) = aliases.provider_name(&call.id) {
+                call_names.insert(call.call_id.clone(), provider_name.to_string());
+            }
+        }
+
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") if !calls.is_empty() => {
+                let mut parts = Vec::new();
+                if let Some(text) = message.get("content").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    parts.push(json!({ "text": text }));
+                }
+                parts.extend(calls.into_iter().filter_map(|call| {
+                    Some(json!({
+                        "functionCall": {
+                            "id": call.call_id,
+                            "name": aliases.provider_name(&call.id)?,
+                            "args": call.arguments,
+                        },
+                    }))
+                }));
+                contents.push(json!({ "role": "model", "parts": parts }));
+            }
+            Some("tool") => {
+                let Some(call_id) = message_tool_call_id(message) else {
+                    continue;
+                };
+                let Some(name) = call_names.get(call_id) else {
+                    continue;
+                };
+                let part = json!({
+                    "functionResponse": {
+                        "id": call_id,
+                        "name": name,
+                        "response": gemini_function_response(message.get("content")),
+                    },
+                });
+                let appended = contents.last_mut().is_some_and(|previous| {
+                    if previous.get("role").and_then(Value::as_str) != Some("user") {
+                        return false;
+                    }
+                    let Some(parts) = previous.get_mut("parts").and_then(Value::as_array_mut)
+                    else {
+                        return false;
+                    };
+                    if !parts
+                        .iter()
+                        .all(|item| item.get("functionResponse").is_some())
+                    {
+                        return false;
+                    }
+                    parts.push(part.clone());
+                    true
+                });
+                if !appended {
+                    contents.push(json!({ "role": "user", "parts": [part] }));
+                }
+            }
+            Some(role) => {
+                let Some(text) = message.get("content").and_then(Value::as_str) else {
+                    continue;
+                };
+                let role = if role == "assistant" { "model" } else { "user" };
+                contents.push(json!({ "role": role, "parts": [{ "text": text }] }));
+            }
+            None => {}
+        }
+    }
+
+    contents
+}
+
+fn anthropic_request_body(
+    model: &str,
+    system_prompt: Option<&str>,
+    messages: &[Value],
+    tools: &[Value],
+    max_tokens: u64,
+) -> Value {
+    let aliases = ToolAliases::for_request(tools, messages);
+    let mut body = json!({
+        "model": model,
+        "messages": anthropic_messages(messages, &aliases),
+        "max_tokens": max_tokens,
+    });
+    if let Some(system_prompt) = system_prompt.filter(|prompt| !prompt.is_empty()) {
+        body["system"] = json!(system_prompt);
+    }
+    let tools = anthropic_tools(tools, &aliases);
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+    }
+    body
+}
+
+fn openai_request_body(
+    model: &str,
+    system_prompt: Option<&str>,
+    messages: &[Value],
+    tools: &[Value],
+    max_tokens: u64,
+) -> Value {
+    let aliases = ToolAliases::for_request(tools, messages);
+    let mut provider_messages = Vec::with_capacity(messages.len() + 1);
+    if let Some(system_prompt) = system_prompt.filter(|prompt| !prompt.is_empty()) {
+        provider_messages.push(json!({ "role": "system", "content": system_prompt }));
+    }
+    provider_messages.extend(openai_messages(messages, &aliases));
+
+    let mut body = json!({
+        "model": model,
+        "messages": provider_messages,
+        "max_tokens": max_tokens,
+    });
+    let tools = openai_tools(tools, &aliases);
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+    }
+    body
+}
+
+fn gemini_request_body(
+    system_prompt: Option<&str>,
+    messages: &[Value],
+    tools: &[Value],
+    max_tokens: u64,
+) -> Value {
+    let aliases = ToolAliases::for_request(tools, messages);
+    let contents = gemini_messages(messages, &aliases);
+    let mut body = json!({
+        "contents": contents,
+        "generationConfig": { "maxOutputTokens": max_tokens },
+    });
+    if let Some(system_prompt) = system_prompt.filter(|prompt| !prompt.is_empty()) {
+        body["systemInstruction"] = json!({ "parts": [{ "text": system_prompt }] });
+    }
+    let tools = gemini_tools(tools, &aliases);
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+    }
+    body
+}
+
 async fn call_anthropic(
     client: &reqwest::Client,
     api_key: &str,
     model: &str,
+    system_prompt: Option<&str>,
     messages: &[Value],
     tools: &[Value],
     max_tokens: u64,
 ) -> Result<Value, Error> {
-    let mut body = json!({
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-    });
-    if !tools.is_empty() {
-        body["tools"] = json!(tools);
-    }
+    let body = anthropic_request_body(model, system_prompt, messages, tools, max_tokens);
 
     let resp = client
         .post("https://api.anthropic.com/v1/messages")
@@ -201,18 +909,12 @@ async fn call_openai_compat(
     base_url: &str,
     api_key: &str,
     model: &str,
+    system_prompt: Option<&str>,
     messages: &[Value],
     tools: &[Value],
     max_tokens: u64,
 ) -> Result<Value, Error> {
-    let mut body = json!({
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-    });
-    if !tools.is_empty() {
-        body["tools"] = json!(tools);
-    }
+    let body = openai_request_body(model, system_prompt, messages, tools, max_tokens);
 
     let mut req = client
         .post(format!("{}/chat/completions", base_url))
@@ -235,36 +937,132 @@ async fn call_openai_compat(
     Ok(resp)
 }
 
-async fn route_handler(_state: Arc<RouterState>, input: Value) -> Result<Value, Error> {
+async fn call_gemini(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    system_prompt: Option<&str>,
+    messages: &[Value],
+    tools: &[Value],
+    max_tokens: u64,
+) -> Result<Value, Error> {
+    let body = gemini_request_body(system_prompt, messages, tools, max_tokens);
+    let resp = client
+        .post(format!("{base_url}/models/{model}:generateContent"))
+        .query(&[("key", api_key)])
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| Error::Handler(e.to_string()))?
+        .error_for_status()
+        .map_err(|e| Error::Handler(e.to_string()))?
+        .json::<Value>()
+        .await
+        .map_err(|e| Error::Handler(e.to_string()))?;
+    Ok(resp)
+}
+
+fn function_arguments(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(arguments)) => {
+            serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.clone()))
+        }
+        Some(arguments) => arguments.clone(),
+        None => json!({}),
+    }
+}
+
+fn function_calls(driver: Driver, result: &Value, aliases: &ToolAliases) -> Vec<FunctionCall> {
+    match driver {
+        Driver::Anthropic => result["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|block| block["type"].as_str() == Some("tool_use"))
+            .filter_map(|block| {
+                FunctionCall::normalized(
+                    block["id"].as_str()?.to_string(),
+                    aliases.function_id(block["name"].as_str()?)?.to_string(),
+                    function_arguments(block.get("input")),
+                )
+            })
+            .collect(),
+        Driver::OpenAiCompat | Driver::Bedrock => result["choices"]
+            .as_array()
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice["message"]["tool_calls"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|call| {
+                FunctionCall::normalized(
+                    call["id"].as_str()?.to_string(),
+                    aliases
+                        .function_id(call["function"]["name"].as_str()?)?
+                        .to_string(),
+                    function_arguments(call["function"].get("arguments")),
+                )
+            })
+            .collect(),
+        Driver::Gemini => result["candidates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .flat_map(|(candidate_index, candidate)| {
+                candidate["content"]["parts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .filter_map(move |(part_index, part)| {
+                        let call = part.get("functionCall")?;
+                        let id = aliases.function_id(call["name"].as_str()?)?.to_string();
+                        let call_id = match call.get("id") {
+                            Some(Value::String(id)) if !id.is_empty() => id.clone(),
+                            Some(Value::String(_)) | None => {
+                                format!("gemini-{candidate_index}-{part_index}")
+                            }
+                            Some(_) => return None,
+                        };
+                        FunctionCall::normalized(call_id, id, function_arguments(call.get("args")))
+                    })
+            })
+            .collect(),
+    }
+}
+
+async fn route_handler(state: Arc<RouterState>, input: Value) -> Result<Value, Error> {
     let messages = input["messages"].as_array().cloned().unwrap_or_default();
     let tools = input["tools"].as_array().cloned().unwrap_or_default();
-    let preferred = input["model"].as_str();
     let complexity = score_complexity(&messages, &tools);
-    let (provider, model) = select_model(complexity, preferred);
+    let route = resolve_route(&state, &input)?;
     Ok(json!({
-        "provider": provider,
-        "model": model,
+        "provider": route.provider,
+        "model": route.model,
         "complexity": complexity,
     }))
 }
 
 async fn complete_handler(
     state: Arc<RouterState>,
-    client: reqwest::Client,
+    shared_client: reqwest::Client,
+    direct_client: reqwest::Client,
     input: Value,
 ) -> Result<Value, Error> {
-    let provider_name = input["provider"].as_str().unwrap_or("anthropic");
-    let model = input["model"]
-        .as_str()
-        .unwrap_or("claude-sonnet-4-20250514");
-    let messages = input["messages"].as_array().cloned().unwrap_or_default();
-    let tools = input["tools"].as_array().cloned().unwrap_or_default();
-    let max_tokens = input["max_tokens"].as_u64().unwrap_or(4096);
-
+    let route = resolve_complete_route(&state, &input)?;
     let provider = state
         .providers
-        .get(provider_name)
-        .ok_or_else(|| Error::Handler(format!("unknown provider: {}", provider_name)))?;
+        .get(&route.provider)
+        .ok_or_else(|| Error::Handler(format!("unknown provider: {}", route.provider)))?;
+    let model = route.model.as_str();
+    let client = client_for_provider(&route.provider, &shared_client, &direct_client);
+    let messages = input["messages"].as_array().cloned().unwrap_or_default();
+    let tools = completion_tools(&input);
+    let tool_aliases = ToolAliases::for_request(&tools, &messages);
+    let system_prompt = input["systemPrompt"].as_str();
+    let max_tokens = input["max_tokens"].as_u64().unwrap_or(4096);
 
     let api_key = if provider.env_key.is_empty() {
         String::new()
@@ -276,14 +1074,37 @@ async fn complete_handler(
 
     let result = match provider.driver {
         Driver::Anthropic => {
-            call_anthropic(&client, &api_key, model, &messages, &tools, max_tokens).await?
+            call_anthropic(
+                client,
+                &api_key,
+                model,
+                system_prompt,
+                &messages,
+                &tools,
+                max_tokens,
+            )
+            .await?
         }
-        Driver::OpenAiCompat | Driver::Gemini | Driver::Bedrock => {
+        Driver::OpenAiCompat | Driver::Bedrock => {
             call_openai_compat(
-                &client,
+                client,
                 &provider.base_url,
                 &api_key,
                 model,
+                system_prompt,
+                &messages,
+                &tools,
+                max_tokens,
+            )
+            .await?
+        }
+        Driver::Gemini => {
+            call_gemini(
+                client,
+                &provider.base_url,
+                &api_key,
+                model,
+                system_prompt,
                 &messages,
                 &tools,
                 max_tokens,
@@ -297,13 +1118,15 @@ async fn complete_handler(
     let input_tokens = result["usage"]["input_tokens"]
         .as_u64()
         .or(result["usage"]["prompt_tokens"].as_u64())
+        .or(result["usageMetadata"]["promptTokenCount"].as_u64())
         .unwrap_or(0);
     let output_tokens = result["usage"]["output_tokens"]
         .as_u64()
         .or(result["usage"]["completion_tokens"].as_u64())
+        .or(result["usageMetadata"]["candidatesTokenCount"].as_u64())
         .unwrap_or(0);
 
-    let key = format!("{}:{}", provider_name, model);
+    let key = format!("{}:{}", route.provider, model);
     let mut usage = state.usage.entry(key).or_insert(Usage {
         input_tokens: 0,
         output_tokens: 0,
@@ -323,24 +1146,16 @@ async fn complete_handler(
                 .and_then(|c| c.first())
                 .and_then(|c| c["message"]["content"].as_str())
         })
+        .or_else(|| {
+            result["candidates"]
+                .as_array()
+                .and_then(|candidates| candidates.first())
+                .and_then(|candidate| candidate["content"]["parts"].as_array())
+                .and_then(|parts| parts.iter().find_map(|part| part["text"].as_str()))
+        })
         .unwrap_or("");
 
-    let tool_calls = result["content"]
-        .as_array()
-        .map(|blocks| {
-            blocks
-                .iter()
-                .filter(|b| b["type"].as_str() == Some("tool_use"))
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .or_else(|| {
-            result["choices"]
-                .as_array()
-                .and_then(|c| c.first())
-                .and_then(|c| c["message"]["tool_calls"].as_array().cloned())
-        })
-        .unwrap_or_default();
+    let tool_calls = function_calls(provider.driver, &result, &tool_aliases);
 
     Ok(json!({
         "content": content,
@@ -370,17 +1185,25 @@ async fn usage_handler(state: Arc<RouterState>, _input: Value) -> Result<Value, 
 }
 
 async fn providers_handler(state: Arc<RouterState>, _input: Value) -> Result<Value, Error> {
-    let list: Vec<Value> = state.providers.iter().map(|entry| {
-        let name = entry.key();
-        let provider = entry.value();
-        json!({
-            "name": name,
-            "base_url": &provider.base_url,
-            "env_key": &provider.env_key,
-            "models": &provider.models,
-            "configured": if provider.env_key.is_empty() { true } else { std::env::var(&provider.env_key).is_ok() },
+    let list: Vec<Value> = state
+        .providers
+        .iter()
+        .map(|entry| {
+            let name = entry.key();
+            let provider = entry.value();
+            json!({
+                "name": name,
+                "base_url": &provider.base_url,
+                "env_key": &provider.env_key,
+                "models": &provider.models,
+                "configured": if provider.env_key.is_empty() { true } else {
+                    std::env::var(&provider.env_key)
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+                },
+            })
         })
-    }).collect();
+        .collect();
     Ok(json!({ "providers": list }))
 }
 
@@ -415,7 +1238,10 @@ fn provider_catalog(state: &RouterState) -> Value {
             let provider = entry.value();
             json!({
                 "name": entry.key(),
-                "available": provider.env_key.is_empty() || std::env::var(&provider.env_key).is_ok(),
+                "available": provider.env_key.is_empty()
+                    || std::env::var(&provider.env_key)
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false),
                 "modelCount": provider.models.len(),
             })
         })
@@ -439,16 +1265,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
     let iii = register_worker(&ws_url, InitOptions::default());
 
+    let default_resolution = resolve_runtime_default(|name| std::env::var(name).ok());
+    if let Some(provider) = &default_resolution.disabled_provider {
+        tracing::warn!(
+            provider,
+            "configured default provider disabled because CODEX_PROXY_API_KEY is empty; unqualified requests can fall back to the Anthropic cloud API"
+        );
+    }
     let state = Arc::new(RouterState {
         usage: DashMap::new(),
         providers: DashMap::new(),
+        default_route: default_resolution.route,
     });
 
     for (name, base_url, env_key, driver, models) in default_providers() {
         state.providers.insert(
             name.to_string(),
             ProviderConfig {
-                base_url: base_url.to_string(),
+                base_url: if name == CODEX_PROVIDER {
+                    resolve_codex_base_url(std::env::var("CODEX_PROXY_BASE_URL").ok().as_deref())
+                } else {
+                    base_url.to_string()
+                },
                 env_key: env_key.to_string(),
                 driver,
                 models: models.iter().map(|s| s.to_string()).collect(),
@@ -457,11 +1295,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let shared_client = reqwest::Client::new();
+    let direct_client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build direct HTTP client");
 
     {
         let state = state.clone();
         iii.register_function(
-            "llm::route",
+            "agentos::llm::route",
             RegisterFunction::new_async(move |input: Value| {
                 let state = state.clone();
                 async move { route_handler(state, input).await }
@@ -472,13 +1314,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     {
         let state = state.clone();
-        let client = shared_client.clone();
+        let shared_client = shared_client.clone();
+        let direct_client = direct_client.clone();
         iii.register_function(
-            "llm::complete",
+            "agentos::llm::complete",
             RegisterFunction::new_async(move |input: Value| {
                 let state = state.clone();
-                let client = client.clone();
-                async move { complete_handler(state, client, input).await }
+                let shared_client = shared_client.clone();
+                let direct_client = direct_client.clone();
+                async move { complete_handler(state, shared_client, direct_client, input).await }
             })
             .description("Send completion request to routed provider"),
         );
@@ -487,7 +1331,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let state = state.clone();
         iii.register_function(
-            "llm::usage",
+            "agentos::llm::usage",
             RegisterFunction::new_async(move |input: Value| {
                 let state = state.clone();
                 async move { usage_handler(state, input).await }
@@ -499,7 +1343,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let state = state.clone();
         iii.register_function(
-            "llm::providers",
+            "agentos::llm::providers",
             RegisterFunction::new_async(move |input: Value| {
                 let state = state.clone();
                 async move { providers_handler(state, input).await }
@@ -511,7 +1355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let state = state.clone();
         iii.register_function(
-            "llm::models",
+            "agentos::llm::models",
             RegisterFunction::new_async(move |_: Value| {
                 let state = state.clone();
                 async move { Ok::<Value, Error>(models_catalog(&state)) }
@@ -522,7 +1366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let state = state.clone();
         iii.register_function(
-            "llm::provider_catalog",
+            "agentos::llm::provider_catalog",
             RegisterFunction::new_async(move |_: Value| {
                 let state = state.clone();
                 async move { Ok::<Value, Error>(provider_catalog(&state)) }
@@ -531,7 +1375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     iii.register_function(
-        "llm::aliases",
+        "agentos::llm::aliases",
         RegisterFunction::new_async(
             move |_: Value| async move { Ok::<Value, Error>(model_aliases()) },
         )
@@ -539,9 +1383,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let catalog_routes = [
-        ("llm::models", "/api/models"),
-        ("llm::aliases", "/api/models/aliases"),
-        ("llm::provider_catalog", "/api/providers"),
+        ("agentos::llm::models", "/api/models"),
+        ("agentos::llm::aliases", "/api/models/aliases"),
+        ("agentos::llm::provider_catalog", "/api/providers"),
     ];
     for (function_id, path) in catalog_routes {
         agentos_http_adapter::register_http_trigger(
@@ -564,6 +1408,740 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn aliases(function_ids: &[&str]) -> ToolAliases {
+        ToolAliases::from_function_ids(function_ids.iter().map(|id| (*id).to_string()))
+    }
+
+    fn test_state(default_route: Option<Route>) -> RouterState {
+        let providers = DashMap::new();
+        for (name, base_url, env_key, driver, models) in default_providers() {
+            providers.insert(
+                name.to_string(),
+                ProviderConfig {
+                    base_url: base_url.to_string(),
+                    env_key: env_key.to_string(),
+                    driver,
+                    models: models.iter().map(|model| model.to_string()).collect(),
+                },
+            );
+        }
+        RouterState {
+            usage: DashMap::new(),
+            providers,
+            default_route,
+        }
+    }
+
+    #[test]
+    fn codex_provider_is_registered() {
+        let (_, base_url, env_key, driver, models) = default_providers()
+            .into_iter()
+            .find(|(name, ..)| *name == CODEX_PROVIDER)
+            .expect("codex provider");
+
+        assert_eq!(base_url, DEFAULT_CODEX_BASE_URL);
+        assert_eq!(env_key, "CODEX_PROXY_API_KEY");
+        assert!(matches!(driver, Driver::OpenAiCompat));
+        assert!(models.contains(&DEFAULT_CODEX_MODEL));
+    }
+
+    #[test]
+    fn codex_base_url_only_accepts_loopback_literals() {
+        assert_eq!(resolve_codex_base_url(None), DEFAULT_CODEX_BASE_URL);
+        assert_eq!(resolve_codex_base_url(Some("   ")), DEFAULT_CODEX_BASE_URL);
+        assert_eq!(
+            resolve_codex_base_url(Some("http://127.0.0.2:8317/v1/")),
+            "http://127.0.0.2:8317/v1"
+        );
+        assert_eq!(
+            resolve_codex_base_url(Some("https://[::1]:8317/v1/")),
+            "https://[::1]:8317/v1"
+        );
+        for unsafe_url in [
+            "not a url",
+            "ftp://127.0.0.1:8317/v1",
+            "http://localhost:8317/v1",
+            "http://192.168.1.10:8317/v1",
+            "http://user:password@127.0.0.1:8317/v1",
+            "http://127.0.0.1:8317/v1?target=https://example.com",
+            "http://127.0.0.1:8317/v1#fragment",
+        ] {
+            assert_eq!(
+                resolve_codex_base_url(Some(unsafe_url)),
+                DEFAULT_CODEX_BASE_URL,
+                "unsafe URL accepted: {unsafe_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_default_handles_absent_empty_enabled_and_disabled_values() {
+        let absent = resolve_runtime_default(|_| None);
+        assert!(absent.route.is_none());
+        assert!(absent.disabled_provider.is_none());
+
+        let whitespace = resolve_runtime_default(|name| match name {
+            "CODEX_PROXY_API_KEY" | "AGENTOS_DEFAULT_PROVIDER" | "AGENTOS_DEFAULT_MODEL" => {
+                Some("  ".into())
+            }
+            _ => None,
+        });
+        assert!(whitespace.route.is_none());
+        assert!(whitespace.disabled_provider.is_none());
+
+        let enabled = resolve_runtime_default(|name| match name {
+            "CODEX_PROXY_API_KEY" => Some("secret".into()),
+            _ => None,
+        });
+        assert_eq!(
+            enabled.route,
+            Some(Route {
+                provider: CODEX_PROVIDER.into(),
+                model: DEFAULT_CODEX_MODEL.into(),
+            })
+        );
+        assert!(enabled.disabled_provider.is_none());
+
+        let disabled = resolve_runtime_default(|name| match name {
+            "AGENTOS_DEFAULT_PROVIDER" => Some("codex".into()),
+            "AGENTOS_DEFAULT_MODEL" => Some(DEFAULT_CODEX_MODEL.into()),
+            _ => None,
+        });
+        assert!(disabled.route.is_none());
+        assert_eq!(disabled.disabled_provider.as_deref(), Some(CODEX_PROVIDER));
+    }
+
+    #[test]
+    fn route_contract_reports_missing_unknown_and_mismatched_fields() {
+        let state = test_state(None);
+        for (input, message) in [
+            (json!({ "provider": "codex" }), "provider requires model"),
+            (json!({ "model": "missing-model" }), "unknown model"),
+            (
+                json!({ "provider": "codex", "model": "gpt-4o" }),
+                "is not registered for provider codex",
+            ),
+            (
+                json!({ "provider": "missing", "model": DEFAULT_CODEX_MODEL }),
+                "unknown provider",
+            ),
+            (json!({ "provider": null }), "provider must be a string"),
+        ] {
+            let error = resolve_route(&state, &input).unwrap_err().to_string();
+            assert!(error.contains(message), "{error}");
+        }
+
+        let empty = resolve_route(
+            &state,
+            &json!({ "provider": "", "model": "agentos-default", "messages": [] }),
+        )
+        .expect("empty preferences fall back to automatic routing");
+        assert_eq!(empty.provider, "anthropic");
+        assert!(empty.model.contains("haiku"));
+    }
+
+    #[test]
+    fn configured_codex_default_and_explicit_models_resolve() {
+        let state = test_state(Some(Route {
+            provider: CODEX_PROVIDER.into(),
+            model: DEFAULT_CODEX_MODEL.into(),
+        }));
+        assert_eq!(
+            resolve_route(&state, &json!({})).unwrap().model,
+            DEFAULT_CODEX_MODEL
+        );
+
+        let explicit = resolve_route(&state, &json!({ "model": "gpt-5.4-mini" })).unwrap();
+        assert_eq!(explicit.provider, CODEX_PROVIDER);
+        assert_eq!(explicit.model, "gpt-5.4-mini");
+    }
+
+    #[test]
+    fn route_contract_rejects_nested_model_objects() {
+        let error = resolve_route(
+            &test_state(None),
+            &json!({ "model": { "provider": "codex", "model": DEFAULT_CODEX_MODEL } }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("model must be a string"));
+    }
+
+    #[test]
+    fn complete_without_explicit_or_runtime_route_preserves_legacy_sonnet() {
+        let route = resolve_complete_route(&test_state(None), &json!({})).unwrap();
+        assert_eq!(route.provider, "anthropic");
+        assert_eq!(route.model, "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn completion_contract_accepts_canonical_tools_and_legacy_functions() {
+        let tools = vec![json!({ "name": "memory::recall" })];
+        assert_eq!(completion_tools(&json!({ "tools": tools })), tools);
+        assert_eq!(completion_tools(&json!({ "functions": tools })), tools);
+        assert!(completion_tools(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn anthropic_body_preserves_system_prompt_and_agent_tools() {
+        let messages = vec![json!({ "role": "user", "content": "hello" })];
+        let tools = vec![json!({
+            "function_id": "memory::recall",
+            "description": "Recall matching memories",
+            "request_format": {
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"],
+            },
+        })];
+        let body = anthropic_request_body(
+            "claude-sonnet-4-20250514",
+            Some("Use memory when relevant"),
+            &messages,
+            &tools,
+            1024,
+        );
+
+        assert_eq!(body["system"], "Use memory when relevant");
+        assert_eq!(body["messages"], json!(messages));
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "name": "memory__recall",
+                "description": "Recall matching memories",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "query": { "type": "string" } },
+                    "required": ["query"],
+                },
+            }])
+        );
+    }
+
+    #[test]
+    fn openai_body_preserves_system_prompt_and_agent_tools() {
+        let messages = vec![json!({ "role": "user", "content": "hello" })];
+        let tools = vec![json!({
+            "id": "memory::recall",
+            "description": "Recall matching memories",
+            "inputSchema": { "type": "object", "properties": {} },
+        })];
+        let body = openai_request_body(
+            DEFAULT_CODEX_MODEL,
+            Some("Use memory when relevant"),
+            &messages,
+            &tools,
+            1024,
+        );
+
+        assert_eq!(
+            body["messages"],
+            json!([
+                { "role": "system", "content": "Use memory when relevant" },
+                { "role": "user", "content": "hello" },
+            ])
+        );
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "type": "function",
+                "function": {
+                    "name": "memory__recall",
+                    "description": "Recall matching memories",
+                    "parameters": { "type": "object", "properties": {} },
+                },
+            }])
+        );
+    }
+
+    #[test]
+    fn gemini_body_uses_function_declarations_and_native_message_shape() {
+        let body = gemini_request_body(
+            Some("Use memory"),
+            &[json!({ "role": "user", "content": "hello" })],
+            &[json!({ "functionId": "memory::recall" })],
+            512,
+        );
+        assert_eq!(
+            body["contents"],
+            json!([{ "role": "user", "parts": [{ "text": "hello" }] }])
+        );
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "functionDeclarations": [{
+                    "name": "memory__recall",
+                    "parameters": { "type": "object", "properties": {} },
+                }],
+            }])
+        );
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "Use memory");
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 512);
+    }
+
+    #[test]
+    fn provider_tool_calls_normalize_to_the_agent_function_call_contract() {
+        let aliases = aliases(&["memory::recall", "state::get", "queue::publish"]);
+        let anthropic = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu-1",
+                "name": "memory__recall",
+                "input": { "query": "rust" },
+            }],
+        });
+        assert_eq!(
+            function_calls(Driver::Anthropic, &anthropic, &aliases),
+            vec![FunctionCall {
+                call_id: "toolu-1".into(),
+                id: "memory::recall".into(),
+                arguments: json!({ "query": "rust" }),
+            }]
+        );
+
+        let openai = json!({
+            "choices": [{ "message": { "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "state__get",
+                    "arguments": "{\"scope\":\"agents\"}",
+                },
+            }] } }],
+        });
+        assert_eq!(
+            function_calls(Driver::OpenAiCompat, &openai, &aliases),
+            vec![FunctionCall {
+                call_id: "call-1".into(),
+                id: "state::get".into(),
+                arguments: json!({ "scope": "agents" }),
+            }]
+        );
+
+        let gemini = json!({
+            "candidates": [{ "content": { "parts": [{
+                "functionCall": { "name": "queue__publish", "args": { "topic": "work" } },
+            }] } }],
+        });
+        assert_eq!(
+            function_calls(Driver::Gemini, &gemini, &aliases),
+            vec![FunctionCall {
+                call_id: "gemini-0-0".into(),
+                id: "queue::publish".into(),
+                arguments: json!({ "topic": "work" }),
+            }]
+        );
+    }
+
+    #[test]
+    fn provider_bodies_omit_empty_or_malformed_tools_and_optional_prompts() {
+        let malformed_tools = vec![
+            Value::Null,
+            json!({}),
+            json!({ "id": "" }),
+            json!({ "function_id": 7 }),
+            json!({ "name": null }),
+        ];
+
+        let anthropic = anthropic_request_body("model", None, &[], &malformed_tools, 0);
+        assert!(anthropic.get("system").is_none());
+        assert!(anthropic.get("tools").is_none());
+        assert_eq!(anthropic["messages"], json!([]));
+        assert_eq!(anthropic["max_tokens"], 0);
+
+        let openai = openai_request_body("model", Some(""), &[], &malformed_tools, 0);
+        assert!(openai.get("tools").is_none());
+        assert_eq!(openai["messages"], json!([]));
+        assert_eq!(openai["max_tokens"], 0);
+
+        let gemini = gemini_request_body(Some(""), &[], &malformed_tools, 0);
+        assert!(gemini.get("systemInstruction").is_none());
+        assert!(gemini.get("tools").is_none());
+        assert_eq!(gemini["contents"], json!([]));
+        assert_eq!(gemini["generationConfig"]["maxOutputTokens"], 0);
+    }
+
+    #[test]
+    fn tool_schema_aliases_and_defaults_preserve_object_boundaries() {
+        let tools = vec![
+            json!({ "id": "a", "requestFormat": { "type": "object", "required": [] } }),
+            json!({ "function_id": "b", "input_schema": { "type": "object" } }),
+            json!({ "functionId": "c", "parameters": { "type": "object", "maxProperties": 0 } }),
+            json!({ "name": "d", "request_format": null }),
+        ];
+
+        let translated = openai_tools(&tools, &ToolAliases::for_request(&tools, &[]));
+        assert_eq!(
+            translated[0]["function"]["parameters"]["required"],
+            json!([])
+        );
+        assert_eq!(translated[1]["function"]["parameters"]["type"], "object");
+        assert_eq!(translated[2]["function"]["parameters"]["maxProperties"], 0);
+        assert_eq!(
+            translated[3]["function"]["parameters"],
+            json!({ "type": "object", "properties": {} })
+        );
+    }
+
+    #[test]
+    fn provider_tool_aliases_are_valid_bidirectional_and_collision_safe() {
+        let long_id = format!("worker::{}", "segment_".repeat(20));
+        let aliases = ToolAliases::from_function_ids([
+            "memory::recall".to_string(),
+            "memory__recall".to_string(),
+            long_id.clone(),
+        ]);
+
+        assert_eq!(
+            aliases.provider_name("memory::recall"),
+            Some("memory__recall")
+        );
+        assert_eq!(
+            aliases.provider_name("memory__recall"),
+            Some("memory_u_urecall")
+        );
+        for function_id in ["memory::recall", "memory__recall", long_id.as_str()] {
+            let provider_name = aliases.provider_name(function_id).unwrap();
+            assert!(provider_name.len() <= 64);
+            assert!(
+                provider_name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            );
+            assert_eq!(aliases.function_id(provider_name), Some(function_id));
+        }
+        assert_ne!(
+            aliases.provider_name("memory::recall"),
+            aliases.provider_name("memory__recall")
+        );
+    }
+
+    #[test]
+    fn provider_tool_aliases_handle_empty_exact_boundary_and_unicode_ids() {
+        assert_eq!(ToolAliases::from_function_ids([]), ToolAliases::default());
+        assert_eq!(
+            ToolAliases::from_function_ids([String::new()]),
+            ToolAliases::default()
+        );
+
+        let exact = "a".repeat(64);
+        let over = "b".repeat(65);
+        let unicode = "memory::récall".to_string();
+        let aliases =
+            ToolAliases::from_function_ids([exact.clone(), over.clone(), unicode.clone()]);
+
+        assert_eq!(aliases.provider_name(&exact), Some(exact.as_str()));
+        for function_id in [&exact, &over, &unicode] {
+            let provider_name = aliases.provider_name(function_id).unwrap();
+            assert!(!provider_name.is_empty());
+            assert!(provider_name.len() <= 64);
+            assert!(provider_name.is_ascii());
+            assert_eq!(
+                aliases.function_id(provider_name),
+                Some(function_id.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn function_call_output_serializes_exactly_the_agent_contract() {
+        let call = FunctionCall {
+            call_id: "call-1".into(),
+            id: "state::get".into(),
+            arguments: json!({ "scope": "agents" }),
+        };
+
+        assert_eq!(
+            serde_json::to_value(call).unwrap(),
+            json!({
+                "callId": "call-1",
+                "id": "state::get",
+                "arguments": { "scope": "agents" },
+            })
+        );
+    }
+
+    #[test]
+    fn normalized_tool_continuations_translate_to_each_provider_schema() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    { "callId": "call-1", "id": "state::get", "arguments": { "scope": "agents" } },
+                    { "callId": "call-2", "id": "queue::publish", "arguments": { "topic": "work" } },
+                ],
+            }),
+            json!({ "role": "tool", "tool_call_id": "call-1", "content": "{\"value\":1}" }),
+            json!({ "role": "tool", "tool_call_id": "call-2", "content": "published" }),
+        ];
+
+        let anthropic = anthropic_request_body("model", None, &messages, &[], 128);
+        assert_eq!(
+            anthropic["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "tool_use", "id": "call-1", "name": "state__get", "input": { "scope": "agents" } },
+                        { "type": "tool_use", "id": "call-2", "name": "queue__publish", "input": { "topic": "work" } },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "tool_result", "tool_use_id": "call-1", "content": "{\"value\":1}" },
+                        { "type": "tool_result", "tool_use_id": "call-2", "content": "published" },
+                    ],
+                },
+            ])
+        );
+
+        let openai = openai_request_body("model", None, &messages, &[], 128);
+        assert_eq!(
+            openai["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        { "id": "call-1", "type": "function", "function": { "name": "state__get", "arguments": "{\"scope\":\"agents\"}" } },
+                        { "id": "call-2", "type": "function", "function": { "name": "queue__publish", "arguments": "{\"topic\":\"work\"}" } },
+                    ],
+                },
+                { "role": "tool", "tool_call_id": "call-1", "content": "{\"value\":1}" },
+                { "role": "tool", "tool_call_id": "call-2", "content": "published" },
+            ])
+        );
+
+        let gemini = gemini_request_body(None, &messages, &[], 128);
+        assert_eq!(
+            gemini["contents"],
+            json!([
+                {
+                    "role": "model",
+                    "parts": [
+                        { "functionCall": { "id": "call-1", "name": "state__get", "args": { "scope": "agents" } } },
+                        { "functionCall": { "id": "call-2", "name": "queue__publish", "args": { "topic": "work" } } },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        { "functionResponse": { "id": "call-1", "name": "state__get", "response": { "value": 1 } } },
+                        { "functionResponse": { "id": "call-2", "name": "queue__publish", "response": { "result": "published" } } },
+                    ],
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn normalized_continuation_aliases_reject_missing_empty_and_malformed_ids() {
+        let aliased = json!({
+            "role": "assistant",
+            "toolCalls": [
+                { "callId": "call-1", "id": "state::get", "arguments": null },
+            ],
+        });
+        assert_eq!(
+            message_function_calls(&aliased),
+            vec![FunctionCall {
+                call_id: "call-1".into(),
+                id: "state::get".into(),
+                arguments: Value::Null,
+            }]
+        );
+
+        for malformed in [
+            json!({}),
+            json!({ "tool_calls": null }),
+            json!({ "tool_calls": {} }),
+            json!({ "tool_calls": [null, {}, { "callId": "call-1" }] }),
+            json!({
+                "tool_calls": [
+                    { "callId": "", "id": "state::get", "arguments": {} },
+                    { "callId": "call-1", "id": "", "arguments": {} },
+                ],
+            }),
+        ] {
+            assert!(message_function_calls(&malformed).is_empty());
+        }
+
+        assert_eq!(
+            message_tool_call_id(&json!({ "toolCallId": "call-1" })),
+            Some("call-1")
+        );
+        for malformed in [
+            json!({}),
+            json!({ "tool_call_id": null }),
+            json!({ "tool_call_id": 7 }),
+            json!({ "tool_call_id": "" }),
+        ] {
+            assert_eq!(message_tool_call_id(&malformed), None);
+        }
+
+        assert_eq!(gemini_function_response(None), json!({ "result": null }));
+        assert_eq!(
+            gemini_function_response(Some(&json!(""))),
+            json!({ "result": "" })
+        );
+    }
+
+    #[test]
+    fn normalized_function_call_rejects_empty_call_id() {
+        assert_eq!(
+            FunctionCall::normalized(String::new(), "state::get".into(), json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn normalized_function_call_rejects_empty_function_id() {
+        assert_eq!(
+            FunctionCall::normalized("call-1".into(), String::new(), json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn normalized_function_call_value_handles_boundaries_and_invalid_shapes() {
+        assert_eq!(
+            FunctionCall::from_normalized_value(
+                json!({ "callId": "c", "id": "x", "arguments": null }),
+            ),
+            Some(FunctionCall {
+                call_id: "c".into(),
+                id: "x".into(),
+                arguments: Value::Null,
+            })
+        );
+
+        for malformed in [
+            Value::Null,
+            json!({}),
+            json!({ "callId": null, "id": "state::get", "arguments": {} }),
+            json!({ "callId": "call-1", "id": null, "arguments": {} }),
+            json!({ "callId": 1, "id": "state::get", "arguments": {} }),
+        ] {
+            assert_eq!(FunctionCall::from_normalized_value(malformed), None);
+        }
+    }
+
+    #[test]
+    fn function_call_normalization_handles_empty_missing_and_malformed_fields() {
+        let aliases = aliases(&["state::get", "state::set", "queue::publish"]);
+        for driver in [
+            Driver::Anthropic,
+            Driver::OpenAiCompat,
+            Driver::Gemini,
+            Driver::Bedrock,
+        ] {
+            assert!(function_calls(driver, &json!({}), &aliases).is_empty());
+        }
+
+        let anthropic = json!({
+            "content": [
+                { "type": "text", "text": "not a call" },
+                { "type": "tool_use", "name": "missing-id", "input": {} },
+                { "type": "tool_use", "id": "missing-name", "input": {} },
+                { "type": "tool_use", "id": "valid", "name": "state__get" },
+            ],
+        });
+        assert_eq!(
+            function_calls(Driver::Anthropic, &anthropic, &aliases),
+            vec![FunctionCall {
+                call_id: "valid".into(),
+                id: "state::get".into(),
+                arguments: json!({}),
+            }]
+        );
+
+        let openai = json!({
+            "choices": [{ "message": { "tool_calls": [
+                { "id": "missing-name", "function": { "arguments": "{}" } },
+                { "function": { "name": "missing-id", "arguments": "{}" } },
+                {
+                    "id": "raw-arguments",
+                    "function": { "name": "state__set", "arguments": "not-json" },
+                },
+            ] } }],
+        });
+        let expected = vec![FunctionCall {
+            call_id: "raw-arguments".into(),
+            id: "state::set".into(),
+            arguments: json!("not-json"),
+        }];
+        assert_eq!(
+            function_calls(Driver::OpenAiCompat, &openai, &aliases),
+            expected
+        );
+        assert_eq!(function_calls(Driver::Bedrock, &openai, &aliases), expected);
+
+        let gemini = json!({
+            "candidates": [
+                { "content": { "parts": [{ "text": "not a call" }] } },
+                { "content": { "parts": [
+                    { "functionCall": { "args": {} } },
+                    { "functionCall": { "id": "provider-id", "name": "queue__publish" } },
+                ] } },
+            ],
+        });
+        assert_eq!(
+            function_calls(Driver::Gemini, &gemini, &aliases),
+            vec![FunctionCall {
+                call_id: "provider-id".into(),
+                id: "queue::publish".into(),
+                arguments: json!({}),
+            }]
+        );
+    }
+
+    #[test]
+    fn anthropic_function_call_normalization_rejects_empty_ids_and_unknown_aliases() {
+        let aliases = aliases(&["state::get"]);
+        let anthropic = json!({
+            "content": [
+                { "type": "tool_use", "id": "", "name": "state__get", "input": {} },
+                { "type": "tool_use", "id": "call-1", "name": "", "input": {} },
+                { "type": "tool_use", "id": "call-2", "name": "unknown", "input": {} },
+            ],
+        });
+        assert!(function_calls(Driver::Anthropic, &anthropic, &aliases).is_empty());
+    }
+
+    #[test]
+    fn openai_function_call_normalization_rejects_empty_ids_and_unknown_aliases() {
+        let aliases = aliases(&["state::get"]);
+        let openai = json!({
+            "choices": [{ "message": { "tool_calls": [
+                { "id": "", "function": { "name": "state__get", "arguments": null } },
+                { "id": "call-1", "function": { "name": "", "arguments": "{}" } },
+                { "id": "call-2", "function": { "name": "unknown", "arguments": "{}" } },
+            ] } }],
+        });
+        assert!(function_calls(Driver::OpenAiCompat, &openai, &aliases).is_empty());
+    }
+
+    #[test]
+    fn gemini_function_call_normalization_replaces_empty_ids_and_rejects_unknown_aliases() {
+        let aliases = aliases(&["state::get"]);
+        let gemini = json!({
+            "candidates": [{ "content": { "parts": [
+                { "functionCall": { "id": "", "name": "state__get", "args": null } },
+                { "functionCall": { "id": "call-1", "name": "" } },
+                { "functionCall": { "id": "call-2", "name": "unknown" } },
+            ] } }],
+        });
+        assert_eq!(
+            function_calls(Driver::Gemini, &gemini, &aliases),
+            vec![FunctionCall {
+                call_id: "gemini-0-0".into(),
+                id: "state::get".into(),
+                arguments: Value::Null,
+            }]
+        );
+    }
 
     #[test]
     fn test_score_complexity_empty_messages() {
@@ -746,7 +2324,7 @@ mod tests {
     #[test]
     fn test_default_providers_count() {
         let providers = default_providers();
-        assert_eq!(providers.len(), 10);
+        assert_eq!(providers.len(), 11);
     }
 
     #[test]
@@ -947,7 +2525,7 @@ mod tests {
             );
         }
         let anthropic = providers.iter().find(|p| p.0 == "anthropic").unwrap();
-        assert_eq!(anthropic.4.len(), 3);
+        assert_eq!(anthropic.4.len(), 5);
         let openai = providers.iter().find(|p| p.0 == "openai").unwrap();
         assert_eq!(openai.4.len(), 4);
     }

@@ -15,6 +15,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{prelude::*, widgets::*};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::io::stdout;
 
@@ -23,6 +24,16 @@ use crate::palette::PaletteItem;
 const API_BASE: &str = "http://localhost:3111";
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS: u64 = 80;
+
+fn unavailable_provider(screen: Screen) -> Option<&'static str> {
+    match screen {
+        Screen::Dashboard | Screen::Agents | Screen::Skills => Some("GET /api/dashboard/stats"),
+        Screen::Logs => Some("GET /api/dashboard/logs"),
+        Screen::Audit => Some("GET /api/dashboard/events"),
+        Screen::Settings => Some("GET /api/settings"),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Screen {
@@ -303,10 +314,7 @@ impl App {
 
     async fn refresh_registry(&mut self) {
         let client = Self::client();
-        if let Ok(resp) = client
-            .get(format!("{}/api/metrics/summary", API_BASE))
-            .send()
-            .await
+        if let Ok(resp) = client.get(format!("{}/api/health", API_BASE)).send().await
             && let Ok(data) = resp.json::<Value>().await
         {
             self.worker_count = data["workers"]
@@ -335,16 +343,30 @@ impl App {
             .collect()
     }
 
+    fn api_headers(api_key: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(api_key) = api_key.filter(|key| !key.is_empty())
+            && let Ok(value) = HeaderValue::from_str(&format!("Bearer {api_key}"))
+        {
+            headers.insert(AUTHORIZATION, value);
+        }
+        headers
+    }
+
     fn client() -> reqwest::Client {
+        let api_key = std::env::var("AGENTOS_API_KEY").ok();
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
+            .default_headers(Self::api_headers(api_key.as_deref()))
             .build()
             .unwrap_or_default()
     }
 
     fn action_client() -> reqwest::Client {
+        let api_key = std::env::var("AGENTOS_API_KEY").ok();
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3_600))
+            .default_headers(Self::api_headers(api_key.as_deref()))
             .build()
             .unwrap_or_default()
     }
@@ -397,30 +419,7 @@ impl App {
         let client = Self::client();
         match self.screen {
             Screen::Dashboard => self.refresh_health().await,
-            Screen::Agents => {
-                if let Ok(resp) = client
-                    .get(format!("{}/api/dashboard/stats", API_BASE))
-                    .send()
-                    .await
-                    && let Ok(data) = resp.json::<Value>().await
-                {
-                    if let Some(arr) = data["agentList"].as_array() {
-                        self.agents = arr.clone();
-                    }
-                }
-            }
-            Screen::Skills => {
-                if let Ok(resp) = client
-                    .get(format!("{}/api/dashboard/stats", API_BASE))
-                    .send()
-                    .await
-                    && let Ok(data) = resp.json::<Value>().await
-                {
-                    if let Some(arr) = data["skillList"].as_array() {
-                        self.skills = arr.clone();
-                    }
-                }
-            }
+            Screen::Agents | Screen::Skills => {}
             Screen::Channels => {
                 if let Ok(resp) = client
                     .get(format!("{}/api/coord/channels", API_BASE))
@@ -477,16 +476,7 @@ impl App {
                         .unwrap_or_default();
                 }
             }
-            Screen::Logs => {
-                if let Ok(resp) = client
-                    .get(format!("{}/api/dashboard/logs", API_BASE))
-                    .send()
-                    .await
-                    && let Ok(data) = resp.json::<Value>().await
-                {
-                    self.logs = data["logs"].as_array().cloned().unwrap_or_default();
-                }
-            }
+            Screen::Logs => {}
             Screen::Memory => {
                 if let Ok(resp) = client
                     .get(format!("{}/agentmemory/memories", API_BASE))
@@ -501,20 +491,7 @@ impl App {
                         .unwrap_or_default();
                 }
             }
-            Screen::Audit => {
-                if let Ok(resp) = client
-                    .get(format!("{}/api/dashboard/events", API_BASE))
-                    .send()
-                    .await
-                    && let Ok(data) = resp.json::<Value>().await
-                {
-                    self.audit_entries = data["events"]
-                        .as_array()
-                        .cloned()
-                        .or_else(|| data.as_array().cloned())
-                        .unwrap_or_default();
-                }
-            }
+            Screen::Audit => {}
             Screen::Security => {
                 if let Ok(resp) = client
                     .get(format!("{}/api/security", API_BASE))
@@ -581,37 +558,7 @@ impl App {
                     self.usage_data = data;
                 }
             }
-            Screen::Settings => {
-                if let Ok(resp) = client
-                    .get(format!("{}/api/settings", API_BASE))
-                    .send()
-                    .await
-                    && let Ok(data) = resp.json::<Value>().await
-                {
-                    if let Some(obj) = data.as_object() {
-                        self.settings = obj
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.to_string().trim_matches('"').to_string()))
-                            .collect();
-                    }
-                } else if let Ok(content) = std::fs::read_to_string("config.yaml") {
-                    self.settings = content
-                        .lines()
-                        .filter(|l| l.contains(':') && !l.trim().starts_with('#'))
-                        .filter_map(|l| {
-                            let parts: Vec<&str> = l.splitn(2, ':').collect();
-                            if parts.len() == 2 {
-                                Some((
-                                    parts[0].trim().to_string(),
-                                    parts[1].trim().trim_matches('"').to_string(),
-                                ))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                }
-            }
+            Screen::Settings => {}
             Screen::Lifecycle => {
                 let agent_ids: Vec<String> = self
                     .agents
@@ -950,11 +897,7 @@ impl App {
         };
 
         let client = Self::client();
-        let body = serde_json::json!({
-            "messages": [{"role": "user", "content": msg}],
-            "agentId": agent_id,
-            "realm": self.chat_realm,
-        });
+        let body = chat_request_body(&msg, &agent_id, &self.chat_realm);
 
         let send_result = client
             .post(format!("{}/api/chat/stream", API_BASE))
@@ -1096,6 +1039,14 @@ impl App {
             _ => 0,
         }
     }
+}
+
+fn chat_request_body(message: &str, agent_id: &str, realm: &str) -> Value {
+    serde_json::json!({
+        "message": message,
+        "agentId": agent_id,
+        "realm": realm,
+    })
 }
 
 fn parse_chat_response(body: &str) -> String {
@@ -1714,32 +1665,36 @@ fn draw(f: &mut Frame, app: &App) {
         .borders(Borders::ALL)
         .title(format!(" {} ", app.screen.label()));
 
-    match app.screen {
-        Screen::Dashboard => draw_dashboard(f, app, content_block, body_chunks[1]),
-        Screen::Agents => draw_agents(f, app, content_block, body_chunks[1]),
-        Screen::Chat => draw_chat(f, app, body_chunks[1]),
-        Screen::Channels => draw_channels(f, app, content_block, body_chunks[1]),
-        Screen::Skills => draw_skills(f, app, content_block, body_chunks[1]),
-        Screen::Hands => draw_hands(f, app, content_block, body_chunks[1]),
-        Screen::Workflows => draw_workflows(f, app, content_block, body_chunks[1]),
-        Screen::Sessions => draw_sessions(f, app, content_block, body_chunks[1]),
-        Screen::Approvals => draw_approvals(f, app, body_chunks[1]),
-        Screen::Logs => draw_logs(f, app, content_block, body_chunks[1]),
-        Screen::Memory => draw_memory(f, app, content_block, body_chunks[1]),
-        Screen::Audit => draw_audit(f, app, content_block, body_chunks[1]),
-        Screen::Security => draw_security(f, app, content_block, body_chunks[1]),
-        Screen::Peers => draw_peers(f, app, content_block, body_chunks[1]),
-        Screen::Extensions => draw_extensions(f, app, content_block, body_chunks[1]),
-        Screen::Triggers => draw_triggers(f, app, content_block, body_chunks[1]),
-        Screen::Templates => draw_templates(f, app, content_block, body_chunks[1]),
-        Screen::Usage => draw_usage(f, app, content_block, body_chunks[1]),
-        Screen::Settings => draw_settings(f, app, content_block, body_chunks[1]),
-        Screen::Wizard => draw_wizard(f, app, body_chunks[1]),
-        Screen::WorkflowBuilder => draw_workflow_builder(f, app, content_block, body_chunks[1]),
-        Screen::Lifecycle => draw_lifecycle(f, app, content_block, body_chunks[1]),
-        Screen::Tasks => draw_tasks(f, app, content_block, body_chunks[1]),
-        Screen::Recovery => draw_recovery(f, app, content_block, body_chunks[1]),
-        Screen::Orchestrator => draw_orchestrator(f, app, content_block, body_chunks[1]),
+    if let Some(route) = unavailable_provider(app.screen) {
+        draw_no_provider(f, app, content_block, body_chunks[1], route);
+    } else {
+        match app.screen {
+            Screen::Dashboard
+            | Screen::Agents
+            | Screen::Skills
+            | Screen::Logs
+            | Screen::Audit
+            | Screen::Settings => unreachable!("handled as unavailable provider surfaces"),
+            Screen::Chat => draw_chat(f, app, body_chunks[1]),
+            Screen::Channels => draw_channels(f, app, content_block, body_chunks[1]),
+            Screen::Hands => draw_hands(f, app, content_block, body_chunks[1]),
+            Screen::Workflows => draw_workflows(f, app, content_block, body_chunks[1]),
+            Screen::Sessions => draw_sessions(f, app, content_block, body_chunks[1]),
+            Screen::Approvals => draw_approvals(f, app, body_chunks[1]),
+            Screen::Memory => draw_memory(f, app, content_block, body_chunks[1]),
+            Screen::Security => draw_security(f, app, content_block, body_chunks[1]),
+            Screen::Peers => draw_peers(f, app, content_block, body_chunks[1]),
+            Screen::Extensions => draw_extensions(f, app, content_block, body_chunks[1]),
+            Screen::Triggers => draw_triggers(f, app, content_block, body_chunks[1]),
+            Screen::Templates => draw_templates(f, app, content_block, body_chunks[1]),
+            Screen::Usage => draw_usage(f, app, content_block, body_chunks[1]),
+            Screen::Wizard => draw_wizard(f, app, body_chunks[1]),
+            Screen::WorkflowBuilder => draw_workflow_builder(f, app, content_block, body_chunks[1]),
+            Screen::Lifecycle => draw_lifecycle(f, app, content_block, body_chunks[1]),
+            Screen::Tasks => draw_tasks(f, app, content_block, body_chunks[1]),
+            Screen::Recovery => draw_recovery(f, app, content_block, body_chunks[1]),
+            Screen::Orchestrator => draw_orchestrator(f, app, content_block, body_chunks[1]),
+        }
     }
 
     let footer = Block::default().borders(Borders::ALL);
@@ -1849,6 +1804,32 @@ fn draw_slash_completions(f: &mut Frame, app: &App, area: Rect) {
         .border_style(theme::dim())
         .title(Span::styled(" Tab to complete ", theme::eyebrow()));
     f.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn draw_no_provider(f: &mut Frame, app: &App, block: Block, area: Rect, route: &str) {
+    let engine = if app.healthy {
+        "The engine is reachable, but"
+    } else {
+        "The engine is currently unreachable, and"
+    };
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled("  No provider", theme::warn())),
+        Line::from(""),
+        Line::from(format!("  {engine} no AgentOS worker registers:")),
+        Line::from(Span::styled(format!("    {route}"), theme::accent())),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  This screen is unavailable in this release; empty data would be misleading.",
+            theme::dim(),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn draw_worker_picker(f: &mut Frame, app: &App, area: Rect) {
@@ -2848,8 +2829,45 @@ fn draw_audit(f: &mut Frame, app: &App, block: Block, area: Rect) {
     f.render_widget(table, area);
 }
 
-fn draw_security(f: &mut Frame, app: &App, block: Block, area: Rect) {
-    let mut lines: Vec<Line> = vec![
+fn security_scalar(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn append_security_details(lines: &mut Vec<Line<'static>>, value: &Value, indent: usize) {
+    let padding = " ".repeat(indent);
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if value.is_array() || value.is_object() {
+                    lines.push(Line::from(format!("{padding}{key}:")));
+                    append_security_details(lines, value, indent + 2);
+                } else {
+                    lines.push(Line::from(format!(
+                        "{padding}{key}: {}",
+                        security_scalar(value)
+                    )));
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                if value.is_array() || value.is_object() {
+                    lines.push(Line::from(format!("{padding}-")));
+                    append_security_details(lines, value, indent + 2);
+                } else {
+                    lines.push(Line::from(format!("{padding}- {}", security_scalar(value))));
+                }
+            }
+        }
+        _ => lines.push(Line::from(format!("{padding}{}", security_scalar(value)))),
+    }
+}
+
+fn security_lines(capabilities: &Value) -> Vec<Line<'static>> {
+    let mut lines = vec![
         Line::from(Span::styled(
             "Security Capabilities",
             Style::default()
@@ -2859,42 +2877,60 @@ fn draw_security(f: &mut Frame, app: &App, block: Block, area: Rect) {
         Line::from(""),
     ];
 
-    if let Some(obj) = app.security_caps.as_object() {
-        for (key, val) in obj {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", key),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            if let Some(arr) = val.as_array() {
-                for item in arr {
-                    if let Some(s) = item.as_str() {
-                        lines.push(Line::from(format!("    - {}", s)));
-                    } else if let Some(obj) = item.as_object() {
-                        for (k, v) in obj {
-                            lines.push(Line::from(format!("    {} = {}", k, v)));
-                        }
-                    }
-                }
-            } else if let Some(obj) = val.as_object() {
-                for (k, v) in obj {
-                    lines.push(Line::from(format!("    {}: {}", k, v)));
-                }
-            } else {
-                lines.push(Line::from(format!("    {}", val)));
+    match capabilities {
+        Value::Object(object) if !object.is_empty() => {
+            for (key, value) in object {
+                lines.push(Line::from(Span::styled(
+                    format!("  {key}"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                append_security_details(&mut lines, value, 4);
+                lines.push(Line::from(""));
             }
-            lines.push(Line::from(""));
         }
-    } else {
-        lines.push(Line::from(Span::styled(
-            "  No data — press r to refresh",
-            Style::default().fg(Color::DarkGray),
-        )));
+        Value::Array(entries) if !entries.is_empty() => {
+            for (index, entry) in entries.iter().enumerate() {
+                let title = entry
+                    .get("key")
+                    .or_else(|| entry.get("name"))
+                    .or_else(|| entry.get("agentId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("Capability {}", index + 1));
+                let details = entry.get("value").unwrap_or(entry);
+
+                lines.push(Line::from(Span::styled(
+                    format!("  {title}"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                append_security_details(&mut lines, details, 4);
+                lines.push(Line::from(""));
+            }
+        }
+        Value::Array(_) | Value::Object(_) => {
+            lines.push(Line::from(Span::styled(
+                "  No capabilities configured",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        _ => {
+            lines.push(Line::from(Span::styled(
+                "  No data — press r to refresh",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
 
+    lines
+}
+
+fn draw_security(f: &mut Frame, app: &App, block: Block, area: Rect) {
     f.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(security_lines(&app.security_caps))
             .block(block)
             .wrap(Wrap { trim: false }),
         area,
@@ -3797,10 +3833,29 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn test_screen_all_count() {
         assert_eq!(Screen::all().len(), 25);
+    }
+
+    #[test]
+    fn test_api_key_becomes_a_bearer_header() {
+        let headers = App::api_headers(Some("fresh-clone-secret"));
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer fresh-clone-secret")
+        );
+        assert!(App::api_headers(None).get(AUTHORIZATION).is_none());
+        assert!(App::api_headers(Some("")).get(AUTHORIZATION).is_none());
+        assert!(
+            App::api_headers(Some("line\nbreak"))
+                .get(AUTHORIZATION)
+                .is_none()
+        );
     }
 
     #[test]
@@ -3846,6 +3901,181 @@ mod tests {
     #[test]
     fn test_screen_security_key() {
         assert_eq!(Screen::Security.key(), "s");
+    }
+
+    #[test]
+    fn test_dead_surfaces_report_their_missing_provider() {
+        for (screen, route) in [
+            (Screen::Dashboard, "GET /api/dashboard/stats"),
+            (Screen::Agents, "GET /api/dashboard/stats"),
+            (Screen::Skills, "GET /api/dashboard/stats"),
+            (Screen::Logs, "GET /api/dashboard/logs"),
+            (Screen::Audit, "GET /api/dashboard/events"),
+            (Screen::Settings, "GET /api/settings"),
+        ] {
+            assert_eq!(unavailable_provider(screen), Some(route));
+        }
+        assert_eq!(unavailable_provider(Screen::Sessions), None);
+        assert_eq!(unavailable_provider(Screen::Security), None);
+        assert_eq!(
+            Screen::all()
+                .iter()
+                .filter(|screen| unavailable_provider(**screen).is_some())
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn test_dead_surfaces_render_explicit_no_provider_state() {
+        for screen in [
+            Screen::Dashboard,
+            Screen::Agents,
+            Screen::Skills,
+            Screen::Logs,
+            Screen::Audit,
+            Screen::Settings,
+        ] {
+            let mut app = App::new();
+            app.screen = screen;
+            app.show_first_run = false;
+            let backend = TestBackend::new(100, 30);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+            terminal
+                .draw(|frame| draw(frame, &app))
+                .expect("draw unavailable surface");
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("No provider"), "{screen:?}: {rendered}");
+            assert!(
+                rendered.contains(unavailable_provider(screen).expect("route")),
+                "{screen:?}: {rendered}"
+            );
+            assert!(
+                rendered.contains("empty data would be"),
+                "{screen:?}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_security_screen_renders_state_list_array_response() {
+        let mut app = App::new();
+        app.security_caps = serde_json::json!([
+            {
+                "key": "security-auditor",
+                "value": {
+                    "tools": ["file_read", "shell_exec"],
+                    "resources": ["workspace"]
+                }
+            }
+        ]);
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_security(frame, &app, Block::default(), area);
+            })
+            .expect("draw security surface");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("security-auditor"), "{rendered}");
+        assert!(rendered.contains("file_read"), "{rendered}");
+        assert!(rendered.contains("workspace"), "{rendered}");
+        assert!(!rendered.contains("No data"), "{rendered}");
+    }
+
+    #[test]
+    fn test_security_screen_distinguishes_empty_and_absent_payloads() {
+        for (payload, expected, unexpected) in [
+            (
+                serde_json::json!([]),
+                "No capabilities configured",
+                "No data",
+            ),
+            (
+                serde_json::json!({}),
+                "No capabilities configured",
+                "No data",
+            ),
+            (
+                Value::Null,
+                "No data — press r to refresh",
+                "No capabilities configured",
+            ),
+        ] {
+            let mut app = App::new();
+            app.security_caps = payload;
+            let backend = TestBackend::new(80, 10);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    draw_security(frame, &app, Block::default(), area);
+                })
+                .expect("draw empty security surface");
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(!rendered.contains(unexpected), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn test_security_screen_renders_unnamed_and_scalar_array_entries() {
+        let mut app = App::new();
+        app.security_caps = serde_json::json!([
+            {"name": "named", "enabled": false},
+            {"agentId": "agent-7", "limit": 0},
+            "raw-capability"
+        ]);
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_security(frame, &app, Block::default(), area);
+            })
+            .expect("draw mixed security surface");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        for expected in [
+            "named",
+            "false",
+            "agent-7",
+            "0",
+            "Capability 3",
+            "raw-capability",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -3919,6 +4149,16 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_request_body_matches_stream_chat_contract() {
+        let body = chat_request_body("Reply with READY only.", "agent-7", "realm-3");
+
+        assert_eq!(body["message"], "Reply with READY only.");
+        assert_eq!(body["agentId"], "agent-7");
+        assert_eq!(body["realm"], "realm-3");
+        assert!(body.get("messages").is_none());
+    }
+
+    #[test]
     fn test_palette_items_cover_all_screens() {
         let app = App::new();
         let items = app.palette_items();
@@ -3972,6 +4212,21 @@ mod tests {
         for required in ["memory", "browser", "llm-router", "agent-core", "approval"] {
             assert!(names.contains(required), "missing {}", required);
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live iii engine on :3111"]
+    async fn live_refresh_registry_counts_connected_workers() {
+        if std::env::var("AGENTOS_LIVE_TEST").is_err() {
+            return;
+        }
+        let mut app = App::new();
+        app.refresh_registry().await;
+        assert!(
+            app.worker_count > 1,
+            "refresh_registry reported {} connected workers; expected the live engine count",
+            app.worker_count
+        );
     }
 
     #[tokio::test]

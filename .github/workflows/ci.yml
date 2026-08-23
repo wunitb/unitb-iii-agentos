@@ -29,13 +29,98 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --release
 
-      - name: upload worker binaries
+      - name: upload portable binaries
         uses: actions/upload-artifact@v7
         with:
           name: worker-binaries
           path: |
+            target/release/agentos
+            target/release/agentos-tui
             target/release/agentos-*
           retention-days: 7
+
+  portable-bundles:
+    name: validate portable bundle ${{ matrix.arch }}-${{ matrix.os }}
+    needs: rust
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x86_64
+          - os: linux
+            arch: aarch64
+          - os: darwin
+            arch: x86_64
+          - os: darwin
+            arch: aarch64
+    env:
+      TARGET_OS: ${{ matrix.os }}
+      TARGET_ARCH: ${{ matrix.arch }}
+      HOME: ${{ runner.temp }}/agentos-portable-home
+      AGENTOS_HOME: ${{ runner.temp }}/agentos-portable-home/.agentos
+      BIN_DIR: ${{ runner.temp }}/agentos-portable-bin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: worker-binaries
+          path: target/release/
+      - name: stage and inspect isolated bundle
+        run: |
+          set -euo pipefail
+          version="0.1.0"
+          asset="agentos-${version}-${TARGET_ARCH}-${TARGET_OS}"
+          stage="$RUNNER_TEMP/$asset"
+          archive="$RUNNER_TEMP/$asset.tar.gz"
+          checksum="$archive.sha256"
+          mkdir -p "$stage/bin" "$stage/runtime/target/release" "$HOME" "$AGENTOS_HOME" "$BIN_DIR"
+          cp target/release/agentos "$stage/bin/agentos"
+          cp target/release/agentos-tui "$stage/bin/agentos-tui"
+          cp config.yaml "$stage/runtime/config.yaml"
+          cp -R config agents hands identity integrations plugin workflows "$stage/runtime/"
+          while IFS= read -r manifest; do
+            destination="$stage/runtime/$(dirname "$manifest")"
+            mkdir -p "$destination"
+            cp "$manifest" "$destination/iii.worker.yaml"
+            packaged_binary="agentos-$(basename "$(dirname "$manifest")")"
+            cargo_toml="$(dirname "$manifest")/Cargo.toml"
+            if [[ -f "$cargo_toml" ]]; then
+              source_binary="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^name *=/{gsub(/^name *= *"|"$/,"");print;exit}' "$cargo_toml")"
+              cp "target/release/$source_binary" "$stage/runtime/target/release/$packaged_binary"
+            elif [[ "$packaged_binary" == "agentos-embedding" ]]; then
+              cp workers/embedding/{main.py,pyproject.toml,uv.lock} "$destination/"
+            else
+              echo "worker has no package definition: $packaged_binary" >&2
+              exit 1
+            fi
+          done < <(find workers -name iii.worker.yaml -type f | sort)
+          tar -czf "$archive" -C "$stage" .
+          sha256sum "$archive" > "$checksum"
+          [[ "$(basename "$archive")" == "$asset.tar.gz" ]]
+          [[ "$(basename "$checksum")" == "$asset.tar.gz.sha256" ]]
+          for required in \
+            ./bin/agentos \
+            ./bin/agentos-tui \
+            ./runtime/config.yaml \
+            ./runtime/workers/agent-core/iii.worker.yaml \
+            ./runtime/target/release/agentos-agent-core \
+            ./runtime/workers/embedding/main.py \
+            ./runtime/workers/embedding/pyproject.toml \
+            ./runtime/workers/embedding/uv.lock; do
+            tar -tzf "$archive" | grep -Fx "$required" >/dev/null
+          done
+          extract="$RUNNER_TEMP/extract-$asset"
+          mkdir -p "$extract"
+          tar -xzf "$archive" -C "$extract"
+          [[ -x "$extract/bin/agentos" ]]
+          [[ -x "$extract/bin/agentos-tui" ]]
+          [[ -f "$extract/runtime/config.yaml" ]]
+          [[ ! -e "$extract/workers" ]]
+          echo "validated $asset without checkout-relative runtime paths"
 
   python:
     name: python worker tests
@@ -69,7 +154,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: shellcheck --severity=warning scripts/install.sh website/public/install.sh scripts/install-iii.sh
+      - run: shellcheck --severity=warning scripts/install.sh scripts/dev-up.sh website/public/install.sh scripts/install-iii.sh
 
   worker-yaml:
     name: validate iii.worker.yaml
@@ -141,18 +226,28 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
+      - uses: oven-sh/setup-bun@v2
 
       - name: install deps
-        run: npm ci --no-audit --no-fund
+        run: bun install --frozen-lockfile
 
       - name: typecheck Node examples
-        run: npm run typecheck:examples
+        run: bun run typecheck:examples
 
       - name: test Node example adapters
-        run: npm run test:examples
+        run: bun run test:examples
+
+      - name: typecheck startup configuration tests
+        run: bun run typecheck:scripts
+
+      - name: test startup configuration
+        run: bun run test:scripts
+
+      - name: typecheck startup configuration tests
+        run: npm run typecheck:scripts
+
+      - name: test startup configuration
+        run: npm run test:scripts
 
       - name: download worker binaries
         uses: actions/download-artifact@v8
@@ -250,12 +345,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
+      - uses: oven-sh/setup-bun@v2
 
       - name: install deps
-        run: npm ci --no-audit --no-fund
+        run: bun install --frozen-lockfile
 
       - name: download worker binaries
         uses: actions/download-artifact@v8
@@ -309,10 +402,11 @@ jobs:
         env:
           AGENTOS_E2E: "1"
           AGENTOS_BASE_URL: http://127.0.0.1:3111
+          AGENTOS_E2E_MODEL: claude-sonnet-4-20250514
           III_URL: ws://localhost:49134
           AGENTOS_API_KEY: ${{ secrets.AGENTOS_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: npm run test:e2e
+        run: bun run test:e2e
 
       - name: dump logs on failure
         if: failure()

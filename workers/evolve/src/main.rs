@@ -124,18 +124,19 @@ fn strip_code_fences(raw: &str) -> String {
     s.trim().to_string()
 }
 
+fn evolve_completion_payload(prompt: &str) -> Value {
+    json!({
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-20250514",
+        "systemPrompt": "You are a code generator. Output only a single JavaScript arrow function expression. No markdown, no explanation.",
+        "messages": [{ "role": "user", "content": prompt }],
+    })
+}
+
 async fn invoke_llm_complete(iii: &IIIClient, prompt: &str) -> Result<Value, Error> {
     iii.trigger(TriggerRequest {
-        function_id: "llm::complete".to_string(),
-        payload: json!({
-            "model": {
-                "provider": "anthropic",
-                "model": "claude-sonnet-4-20250514",
-                "maxTokens": 2048,
-            },
-            "systemPrompt": "You are a code generator. Output only a single JavaScript arrow function expression. No markdown, no explanation.",
-            "messages": [{ "role": "user", "content": prompt }],
-        }),
+        function_id: "agentos::llm::complete".to_string(),
+        payload: evolve_completion_payload(prompt),
         action: None,
         timeout_ms: None,
     })
@@ -175,7 +176,7 @@ async fn evolve_generate(iii: &IIIClient, input: Value) -> Result<Value, Error> 
     let function_id = format!("evolved::{safe_name}_v{next_version}");
 
     let prompt = format!(
-        "Write a JavaScript function that accomplishes the following goal. Return ONLY the function body as an arrow function expression. Do not include markdown, explanations, or code fences.\n\nGoal: {goal}\n{}\n\nThe function receives a single `input` parameter (any type) and must return a result.\nIt has access to: JSON, Math, Date, Array, Object, String, Number, Boolean, Map, Set, Promise, parseInt, parseFloat.\nIt can call `await trigger({{ function_id: fnId, payload: data }})` to invoke other functions (only evolved::, fn::, llm:: prefixes).\nIt CANNOT use: fetch, fs, process, require, setTimeout, eval, Function constructor.\n\nExample: async (input) => {{ return {{ result: input.value * 2 }}; }}",
+        "Write a JavaScript function that accomplishes the following goal. Return ONLY the function body as an arrow function expression. Do not include markdown, explanations, or code fences.\n\nGoal: {goal}\n{}\n\nThe function receives a single `input` parameter (any type) and must return a result.\nIt has access to: JSON, Math, Date, Array, Object, String, Number, Boolean, Map, Set, Promise, parseInt, parseFloat.\nIt can call `await trigger({{ function_id: fnId, payload: data }})` to invoke other functions (only evolved::, fn::, agentos::llm:: prefixes).\nIt CANNOT use: fetch, fs, process, require, setTimeout, eval, Function constructor.\n\nExample: async (input) => {{ return {{ result: input.value * 2 }}; }}",
         if spec.is_empty() {
             String::new()
         } else {
@@ -454,7 +455,7 @@ async fn evolve_fork(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let function_id = format!("evolved::{safe_name}_v{next_version}");
 
     let prompt = format!(
-        "Improve the following JavaScript function based on the goal below. Return ONLY the function body as an arrow function expression. Do not include markdown, explanations, or code fences.\n\nCurrent code:\n{}\n\nCurrent description: {}\n\nImprovement goal: {goal}\n\nThe function receives a single `input` parameter and must return a result.\nIt has access to: JSON, Math, Date, Array, Object, String, Number, Boolean, Map, Set, Promise.\nIt can call `await trigger({{ function_id: fnId, payload: data }})` for evolved::, fn::, llm:: prefixes.",
+        "Improve the following JavaScript function based on the goal below. Return ONLY the function body as an arrow function expression. Do not include markdown, explanations, or code fences.\n\nCurrent code:\n{}\n\nCurrent description: {}\n\nImprovement goal: {goal}\n\nThe function receives a single `input` parameter and must return a result.\nIt has access to: JSON, Math, Date, Array, Object, String, Number, Boolean, Map, Set, Promise.\nIt can call `await trigger({{ function_id: fnId, payload: data }})` for evolved::, fn::, agentos::llm:: prefixes.",
         source.code, source.description,
     );
     let llm_result = invoke_llm_complete(iii, &prompt).await?;
@@ -759,6 +760,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evolve_payload_uses_top_level_route_fields() {
+        let payload = evolve_completion_payload("write code");
+        assert_eq!(payload["provider"], "anthropic");
+        assert_eq!(payload["model"], "claude-sonnet-4-20250514");
+        assert!(payload["model"].is_string());
+    }
 
     #[test]
     fn test_sanitize_id_accepts_valid() {

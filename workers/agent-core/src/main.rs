@@ -9,7 +9,7 @@ use std::time::Instant;
 
 mod types;
 
-use types::{AgentConfig, ChatRequest, FunctionCall};
+use types::{AgentConfig, ChatRequest, FunctionCall, ModelConfig};
 
 const MAX_ITERATIONS: u32 = 50;
 
@@ -360,6 +360,91 @@ fn spawn_trigger(iii: &IIIClient, function_id: &'static str, payload: Value) {
     });
 }
 
+fn route_payload(
+    message: &str,
+    functions: &Value,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Value {
+    let mut payload = json!({
+        "messages": [{ "role": "user", "content": message }],
+        "tools": functions,
+    });
+    if let Some(provider) = provider {
+        payload["provider"] = json!(provider);
+    }
+    if let Some(model) = model {
+        payload["model"] = json!(model);
+    }
+    payload
+}
+
+fn valid_route_preference(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty() && *value != "agentos-default")
+}
+
+fn route_preferences(
+    request_provider: Option<&str>,
+    request_model: Option<&str>,
+    model_config: Option<&ModelConfig>,
+) -> (Option<String>, Option<String>) {
+    let request_provider = valid_route_preference(request_provider);
+    let request_model = valid_route_preference(request_model);
+    if request_provider.is_some() || request_model.is_some() {
+        return (
+            request_provider.map(str::to_owned),
+            request_model.map(str::to_owned),
+        );
+    }
+
+    let config_provider =
+        model_config.and_then(|model| valid_route_preference(model.provider.as_deref()));
+    let config_model =
+        model_config.and_then(|model| valid_route_preference(model.model.as_deref()));
+    if config_model.is_some() {
+        (
+            config_provider.map(str::to_owned),
+            config_model.map(str::to_owned),
+        )
+    } else {
+        (None, None)
+    }
+}
+
+fn completion_payload(
+    provider: &str,
+    model: &str,
+    system_prompt: &str,
+    messages: &[Value],
+    functions: &Value,
+) -> Value {
+    json!({
+        "provider": provider,
+        "model": model,
+        "systemPrompt": system_prompt,
+        "messages": messages,
+        "tools": functions,
+    })
+}
+
+fn parse_function_call(value: &Value) -> Option<FunctionCall> {
+    serde_json::from_value(value.clone())
+        .ok()
+        .filter(|call: &FunctionCall| !call.call_id.is_empty() && !call.id.is_empty())
+}
+
+fn route_fields(route: &Value) -> Result<(String, String), Error> {
+    let provider = route["provider"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Handler("agentos::llm::route omitted provider".into()))?;
+    let model = route["model"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Handler("agentos::llm::route omitted model".into()))?;
+    Ok((provider.into(), model.into()))
+}
+
 async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
     let start = Instant::now();
 
@@ -401,24 +486,30 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
         .await
         .unwrap_or(json!([]));
 
+    let model_config = config.as_ref().and_then(|agent| agent.model.as_ref());
+    let (preferred_provider, preferred_model) =
+        route_preferences(req.provider.as_deref(), req.model.as_deref(), model_config);
+
     let system_prompt = req
         .system_prompt
         .or_else(|| config.as_ref().and_then(|c| c.system_prompt.clone()))
         .unwrap_or_default();
 
-    let model: Value = iii
+    let route: Value = iii
         .trigger(TriggerRequest {
-            function_id: "llm::route".to_string(),
-            payload: json!({
-                "message": &req.message,
-                "functionCount": functions.as_array().map(|a| a.len()).unwrap_or(0),
-                "config": config.as_ref().and_then(|c| c.model.as_ref()),
-            }),
+            function_id: "agentos::llm::route".to_string(),
+            payload: route_payload(
+                &req.message,
+                &functions,
+                preferred_provider.as_deref(),
+                preferred_model.as_deref(),
+            ),
             action: None,
             timeout_ms: None,
         })
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
+    let (provider, model) = route_fields(&route)?;
 
     let scan_result = iii
         .trigger(TriggerRequest {
@@ -445,13 +536,8 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
 
     let mut response: Value = iii
         .trigger(TriggerRequest {
-            function_id: "llm::complete".to_string(),
-            payload: json!({
-                "model": model,
-                "systemPrompt": system_prompt,
-                "messages": messages,
-                "functions": functions,
-            }),
+            function_id: "agentos::llm::complete".to_string(),
+            payload: completion_payload(&provider, &model, &system_prompt, &messages, &functions),
             action: None,
             timeout_ms: None,
         })
@@ -466,10 +552,10 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
         }
         iterations += 1;
 
-        let calls: Vec<FunctionCall> = tool_calls
-            .iter()
-            .filter_map(|tc| serde_json::from_value(tc.clone()).ok())
-            .collect();
+        let calls: Vec<FunctionCall> = tool_calls.iter().filter_map(parse_function_call).collect();
+        if calls.is_empty() {
+            break;
+        }
 
         let mut tool_results = Vec::new();
         for tc in &calls {
@@ -525,13 +611,14 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
 
         response = iii
             .trigger(TriggerRequest {
-                function_id: "llm::complete".to_string(),
-                payload: json!({
-                    "model": model,
-                    "systemPrompt": system_prompt,
-                    "messages": messages,
-                    "functions": functions,
-                }),
+                function_id: "agentos::llm::complete".to_string(),
+                payload: completion_payload(
+                    &provider,
+                    &model,
+                    &system_prompt,
+                    &messages,
+                    &functions,
+                ),
                 action: None,
                 timeout_ms: None,
             })
@@ -618,7 +705,7 @@ async fn list_functions(iii: &IIIClient, agent_id: &str) -> Result<Value, Error>
         .map(|s| s.trim_end_matches('*').to_string())
         .collect();
 
-    let all_functions: Value = iii
+    let registry: Value = iii
         .trigger(TriggerRequest {
             function_id: "engine::functions::list".to_string(),
             payload: json!({}),
@@ -626,35 +713,123 @@ async fn list_functions(iii: &IIIClient, agent_id: &str) -> Result<Value, Error>
             timeout_ms: None,
         })
         .await
-        .unwrap_or(json!([]));
+        .unwrap_or_else(|_| json!({ "functions": [] }));
+
+    Ok(filter_functions(&registry, &allowed))
+}
+
+fn filter_functions(registry: &Value, allowed: &[String]) -> Value {
+    let functions = registry
+        .get("functions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
     if allowed.iter().any(|prefix| prefix.is_empty()) {
-        return Ok(all_functions);
+        return Value::Array(functions);
     }
 
     if allowed.is_empty() {
-        return Ok(json!([]));
+        return json!([]);
     }
 
-    let filtered: Vec<&Value> = all_functions
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter(|f| {
-                    let id = f["id"].as_str().unwrap_or("");
-                    allowed.iter().any(|a| id.starts_with(a.as_str()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(json!(filtered))
+    Value::Array(
+        functions
+            .into_iter()
+            .filter(|function| {
+                function
+                    .get("function_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| allowed.iter().any(|prefix| id.starts_with(prefix)))
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use types::{Capabilities, ModelConfig, Resources};
+
+    #[test]
+    fn llm_route_and_complete_payloads_use_top_level_strings() {
+        let functions = json!([{ "id": "memory::recall" }]);
+        let route = route_payload("hello", &functions, Some("codex"), Some("gpt-5.6-sol"));
+        assert_eq!(route["provider"], "codex");
+        assert_eq!(route["model"], "gpt-5.6-sol");
+        assert!(route["model"].is_string());
+
+        let complete = completion_payload(
+            "codex",
+            "gpt-5.6-sol",
+            "system",
+            &[json!({ "role": "user", "content": "hello" })],
+            &functions,
+        );
+        assert_eq!(complete["provider"], "codex");
+        assert_eq!(complete["model"], "gpt-5.6-sol");
+        assert!(complete["model"].is_string());
+        assert_eq!(complete["systemPrompt"], "system");
+        assert_eq!(complete["tools"], functions);
+        assert!(complete.get("functions").is_none());
+    }
+
+    #[test]
+    fn route_preferences_keep_request_pairs_and_complete_config_pairs() {
+        let config = ModelConfig {
+            provider: Some("anthropic".into()),
+            model: Some("sonnet".into()),
+            max_tokens: None,
+        };
+        assert_eq!(
+            route_preferences(Some("codex"), Some("gpt-5.6-sol"), Some(&config)),
+            (Some("codex".into()), Some("gpt-5.6-sol".into()))
+        );
+        assert_eq!(
+            route_preferences(None, None, Some(&config)),
+            (Some("anthropic".into()), Some("sonnet".into()))
+        );
+    }
+
+    #[test]
+    fn route_preferences_ignore_empty_none_and_incomplete_config_values() {
+        assert_eq!(route_preferences(None, None, None), (None, None));
+        assert_eq!(
+            route_preferences(Some(""), Some("agentos-default"), None),
+            (None, None)
+        );
+
+        let provider_only = ModelConfig {
+            provider: Some("codex".into()),
+            model: None,
+            max_tokens: None,
+        };
+        assert_eq!(
+            route_preferences(None, None, Some(&provider_only)),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn route_fields_reject_nested_model_responses() {
+        let error = route_fields(&json!({
+            "provider": "codex",
+            "model": { "provider": "codex", "model": "gpt-5.6-sol" },
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("omitted model"));
+    }
+
+    #[test]
+    fn route_fields_reject_missing_and_empty_strings() {
+        for route in [
+            json!({}),
+            json!({ "provider": "", "model": "gpt-5.6-sol" }),
+            json!({ "provider": "codex", "model": "" }),
+        ] {
+            assert!(route_fields(&route).is_err(), "accepted {route}");
+        }
+    }
 
     #[test]
     fn test_max_iterations_constant() {
@@ -1345,6 +1520,49 @@ mod tests {
     }
 
     #[test]
+    fn iii_0_22_1_function_registry_envelope_is_unwrapped_and_filtered_by_function_id() {
+        let registry = json!({
+            "functions": [
+                { "function_id": "memory::recall", "worker_name": "memory" },
+                { "function_id": "state::get", "worker_name": "state" },
+                { "id": "memory::legacy-wrong-key", "worker_name": "memory" },
+            ],
+        });
+
+        assert_eq!(
+            filter_functions(&registry, &["memory::".to_string()]),
+            json!([{
+                "function_id": "memory::recall",
+                "worker_name": "memory",
+            }])
+        );
+        assert_eq!(
+            filter_functions(&registry, &[String::new()]),
+            registry["functions"]
+        );
+        assert_eq!(filter_functions(&json!([]), &[String::new()]), json!([]));
+        assert_eq!(filter_functions(&registry, &[]), json!([]));
+        assert_eq!(
+            filter_functions(
+                &json!({
+                    "functions": [
+                        Value::Null,
+                        { "function_id": null },
+                        { "function_id": "" },
+                        { "function_id": 7 },
+                    ],
+                }),
+                &["memory::".to_string()],
+            ),
+            json!([]),
+            "malformed registry entries must not become callable tools"
+        );
+        for malformed in [Value::Null, json!({}), json!({ "functions": null })] {
+            assert_eq!(filter_functions(&malformed, &[String::new()]), json!([]));
+        }
+    }
+
+    #[test]
     fn test_tool_count_from_non_array() {
         let functions = json!("not an array");
         let count = functions.as_array().map(|a| a.len()).unwrap_or(0);
@@ -1402,15 +1620,14 @@ mod tests {
 
     #[test]
     fn test_tool_call_filter_map_ignores_invalid() {
-        let tool_calls = vec![
+        let tool_calls = [
             json!({"callId": "1", "id": "valid::tool", "arguments": {}}),
             json!({"missing": "fields"}),
+            json!({"callId": "", "id": "empty-call-id", "arguments": {}}),
+            json!({"callId": "empty-function-id", "id": "", "arguments": {}}),
             json!({"callId": "3", "id": "another::tool", "arguments": {"k": "v"}}),
         ];
-        let calls: Vec<FunctionCall> = tool_calls
-            .iter()
-            .filter_map(|tc| serde_json::from_value(tc.clone()).ok())
-            .collect();
+        let calls: Vec<FunctionCall> = tool_calls.iter().filter_map(parse_function_call).collect();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "valid::tool");
         assert_eq!(calls[1].id, "another::tool");
@@ -1418,12 +1635,50 @@ mod tests {
 
     #[test]
     fn test_tool_call_filter_map_all_invalid() {
-        let tool_calls = vec![json!({"bad": "data"}), json!(42), json!(null)];
-        let calls: Vec<FunctionCall> = tool_calls
-            .iter()
-            .filter_map(|tc| serde_json::from_value(tc.clone()).ok())
-            .collect();
+        let tool_calls = [
+            json!({"bad": "data"}),
+            json!(42),
+            json!(null),
+            json!({"callId": "", "id": "state::get", "arguments": {}}),
+            json!({"callId": "call-1", "id": "", "arguments": {}}),
+        ];
+        let calls: Vec<FunctionCall> = tool_calls.iter().filter_map(parse_function_call).collect();
         assert_eq!(calls.len(), 0);
+    }
+
+    #[test]
+    fn parse_function_call_rejects_empty_call_id() {
+        assert!(
+            parse_function_call(&json!({ "callId": "", "id": "state::get", "arguments": {} }),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_function_call_rejects_empty_function_id() {
+        assert!(
+            parse_function_call(&json!({ "callId": "call-1", "id": "", "arguments": {} }),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_function_call_handles_boundaries_and_invalid_shapes() {
+        let call = parse_function_call(&json!({ "callId": "c", "id": "x", "arguments": null }))
+            .expect("single-character identifiers are non-empty");
+        assert_eq!(call.call_id, "c");
+        assert_eq!(call.id, "x");
+        assert_eq!(call.arguments, Value::Null);
+
+        for malformed in [
+            Value::Null,
+            json!({}),
+            json!({ "callId": null, "id": "state::get", "arguments": {} }),
+            json!({ "callId": "call-1", "id": null, "arguments": {} }),
+            json!({ "callId": "call-1", "id": "state::get" }),
+        ] {
+            assert!(parse_function_call(&malformed).is_none());
+        }
     }
 
     #[test]

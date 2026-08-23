@@ -37,6 +37,15 @@ fn payload_body(input: &Value) -> Value {
     }
 }
 
+fn summary_completion_payload(user_msg: &str) -> Value {
+    json!({
+        "provider": "anthropic",
+        "model": "claude-haiku-4-5-20251001",
+        "systemPrompt": "Summarize this conversation into the structured template. Preserve key facts and decisions.",
+        "messages": [{ "role": "user", "content": user_msg }],
+    })
+}
+
 fn fire_void(iii: &IIIClient, function_id: &str, payload: Value) {
     let iii = iii.clone();
     let id = function_id.to_string();
@@ -304,18 +313,8 @@ async fn compress(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
     let llm_result = iii
         .trigger(TriggerRequest {
-            function_id: "llm::complete".into(),
-            payload: json!({
-                "model": {
-                    "provider": "anthropic",
-                    "model": "claude-haiku-4-5",
-                    "maxTokens": 1024
-                },
-                "systemPrompt": "Summarize this conversation into the structured template. Preserve key facts and decisions.",
-                "messages": [
-                    { "role": "user", "content": user_msg }
-                ]
-            }),
+            function_id: "agentos::llm::complete".into(),
+            payload: summary_completion_payload(&user_msg),
             action: None,
             timeout_ms: None,
         })
@@ -691,6 +690,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_payload_uses_top_level_route_fields() {
+        let payload = summary_completion_payload("conversation");
+        assert_eq!(payload["provider"], "anthropic");
+        assert_eq!(payload["model"], "claude-haiku-4-5-20251001");
+        assert!(payload["model"].is_string());
+    }
 
     fn msg(role: &str, content: &str) -> Message {
         Message {

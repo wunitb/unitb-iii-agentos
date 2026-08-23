@@ -10,7 +10,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-apache_2.0-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Apache 2.0"></a>
   <img src="https://img.shields.io/badge/workers-63-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Workers">
   <img src="https://img.shields.io/badge/functions-267-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Functions">
-  <img src="https://img.shields.io/badge/rust_tests-1330_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="1,330 Rust tests">
+  <img src="https://img.shields.io/badge/rust_tests-1413_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="1,413 Rust tests">
   <img src="https://img.shields.io/badge/iii--sdk-0.22.1-d96e2e?style=flat-square&labelColor=f2ede1" alt="iii-sdk 0.22.1">
 </p>
 
@@ -40,7 +40,7 @@ AgentOS isn't another agent framework. It's *what's left* when the runtime becom
 | Primitive | What it does | Examples |
 |---|---|---|
 | **Worker** | One Rust binary per domain. Connects to the engine over WebSocket. | `agent-core`, `llm-router`, `realm` |
-| **Function** | A named handler registered by a Worker. | `agent::chat`, `llm::route`, `memory::search` |
+| **Function** | A named handler registered by a Worker. | `agent::chat`, `agentos::llm::route`, `memory::search` |
 | **Trigger** | Binds a Function to HTTP, cron, or pub/sub. | `POST /v1/chat/completions → stream::completion` |
 
 That's the whole protocol. Workers stay narrow; everything else lives in the engine.
@@ -54,22 +54,46 @@ git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos
 # 2. install the pinned iii v0.22.1 release with checksum verification
 bash scripts/install-iii.sh
 
-# 3. add your model key
-cp .env.example .env
-$EDITOR .env   # set ANTHROPIC_API_KEY=sk-ant-…
+# 3. configure the local model proxy
+install -m 600 .env.example .env
+$EDITOR .env   # set CODEX_PROXY_API_KEY for http://127.0.0.1:8317/v1
 
 # 4. build the workspace
 cargo build --workspace --release
 
-# 5. boot engine + workers (in two terminals, or one with `&`)
-iii --config config.yaml &
-bash scripts/dev-up.sh
-
-# 6. open the chat
-cargo run --release -p agentos-tui
+# 5. bring the stack up: engine, workers, then the chat TUI
+./target/release/agentos up
 ```
 
-Engine boots on port 49134. 62 Rust workers and one Python worker connect. The source declares 267 literal function registrations. The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
+Quickstart uses the local Codex proxy at `http://127.0.0.1:8317/v1`.
+Anthropic is optional and selected only by an explicit provider/model or when
+no configured local default exists.
+
+`agentos up` runs one ordered policy and never builds or installs anything: it
+resolves the config, verifies the iii binary (missing → `bash scripts/install-iii.sh`),
+reuses an engine already healthy on port 49134 or boots `iii --config config.yaml`
+detached and waits for health with a bounded timeout, verifies every Rust worker
+release binary (missing → `cargo build --workspace --release`), starts the workers
+unless their canonical identities are already connected, waits for the complete
+identity set to register on the bus, and only then hands the terminal to
+`agentos-tui`. A partial stack starts only its missing workers. `up` loads the
+active runtime's `.env` without overriding explicit shell exports and passes those
+values to the engine, workers, and TUI; the TUI sends `AGENTOS_API_KEY` as a bearer
+token on protected routes. Each stage reports its own failure and stops before the
+next one; `--timeout` (default 30s) bounds the engine wait and then the worker wait.
+
+```bash
+agentos up --no-tui   # engine + workers only; leaves them running, no TUI
+agentos doctor        # readiness report; diagnostic only, changes nothing
+```
+
+`agentos doctor` prints the iii binary path and version, engine health, the
+connected worker count and any missing canonical identities, worker and TUI
+binary readiness, and which config discovery mode is in effect.
+`scripts/dev-up.sh` still starts only the workers against an engine you booted
+yourself.
+
+Engine boots on port 49134. `agentos up` starts the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source declares 267 literal function registrations. The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
 
 Prefer driving by HTTP? Same thing without the TUI:
 
@@ -78,6 +102,59 @@ curl -X POST http://127.0.0.1:3111/v1/realms \
   -H 'Content-Type: application/json' \
   -d '{"name":"prod","description":"production"}'
 ```
+
+The live chat E2E test defaults to `gpt-5.6-sol`. To target a non-Codex backend, override it for the test command:
+
+```bash
+AGENTOS_E2E_MODEL=claude-sonnet-4-20250514 bun run test:e2e
+```
+
+### Installed releases and portability
+
+The release installer supports Linux `x86_64` and `aarch64`, and macOS
+`x86_64` and `aarch64`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wunitb/unitb-iii-agentos/main/scripts/install.sh | bash
+agentos init --quick
+agentos up
+```
+
+The installer needs network access, `curl`, `tar`, and `sha256sum` or `shasum`.
+It installs the CLI in `$HOME/.local/bin` by default and places the replaceable
+runtime payload at `$HOME/.agentos/runtime`. Set `BIN_DIR` or `PREFIX` for the
+CLI destination and set `AGENTOS_HOME` for the runtime/state root. A non-empty
+relative `AGENTOS_HOME` is resolved against the directory from which `agentos`
+was invoked, before any engine or worker changes directory; an empty override
+uses the platform home plus `.agentos`.
+
+`agentos init`, `agentos onboard`, `agentos doctor`, `agentos up`,
+`agentos start`, `agentos reset`, and `agentos config ...` all use the same
+resolved `AGENTOS_HOME`. `AGENTOS_CONFIG` has precedence over runtime
+discovery. A non-empty relative value is resolved against the caller's current
+directory; an empty value is ignored. Without it, a checkout `config.yaml` is
+used only when the checkout also contains `workers/` — setting `AGENTOS_HOME`
+alone does not disable that checkout discovery; otherwise
+`$AGENTOS_HOME/runtime/config.yaml` is used. `agentos doctor` names the mode
+and the resolved path. This lets an installed release
+start from any working directory without a checkout. Upgrades replace release
+payload while retaining operator configuration, `$AGENTOS_HOME/runtime/data/**`,
+and the runtime `.env` file.
+
+The engine must be iii `v0.22.1`, installed in `PATH` or by
+`bash scripts/install-iii.sh` (which downloads and verifies it). The embedding
+worker needs Python `>=3.11`, a working `venv` module, and `ensurepip`.
+Its setup installs the core `iii-sdk` dependency without downloading the
+optional `sentence-transformers`/`torch` model stack; absent those packages,
+the worker deliberately uses its hash-based fallback. Install the optional
+model dependencies separately when model-quality embeddings are required.
+
+Rust format checks and cached Cargo builds/tests can run offline; Cargo still
+needs the locked registry and source artifacts in its cache. Installing iii,
+installing the release, installing Bun/npm/Python dependencies, and live
+engine or chat E2E checks are connected or credential-dependent operations.
+Local verification on one host does not prove the other three release targets;
+the release workflow builds and inspects all four target bundles.
 
 ## § 04 · Calling a function
 
@@ -183,17 +260,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full primitive flow and worker ma
 
 ## § 09 · Development control plane
 
-Repository development is coordinated by the globally installed UNITB DELIVERY control plane. Its configuration, SQLite ledger, credentials, agent sessions, and isolated worktrees live outside this repository under the user's UNITB DELIVERY config and data directories.
+Repository changes enter as **control-room directives** and are built by the **sweafax** factory; nothing in this repository launches an agent session itself.
 
-Use the managed Planner session rather than launching `omp` directly from this repository:
-
-```bash
-unitb-delivery up --project unitb-iii-agentos
-unitb-delivery health --project unitb-iii-agentos
-herdr session attach unitb-delivery-unitb-iii-agentos
-```
-
-The managed Planner is read-only. It creates durable Work Items, assigns a single Writer in an isolated worktree, obtains independent review of the exact submitted commit, and publishes or merges only through protected fleet operations.
+1. Intent: a directive records the verbatim request and its acceptance criteria (ISC) in `unitb-control-room` (`cr new --from-sweafax <intake.json>`).
+2. Execution: `cr dispatch <directive> --engine sweafax --spec <intake.json>` registers a sweafax build from the intake's `base_branch`; sweafax runs implementation, verification, the artifact gate (`docs/builds/<build>-<slug>/{INVARIANTS,TRACES,DECISIONS,ATTACK_SURFACE}.md`, `bunx tsc --noEmit`, `bun test`) and a cross-vendor audit. `cr sync` follows the build's state.
+3. Delivery: after audit approval the result branch (`issue/<id>-…`) is pushed by the maintainer and merged through a pull request. `main` is protected; there is no direct push path.
 
 ## § 10 · TUI
 
@@ -219,10 +290,16 @@ If the engine is offline or no workers are connected, the TUI shows a first-run 
 
 ```bash
 cargo build --workspace --release                                    # 62 Rust workers + CLI + TUI + HTTP adapter
-cargo test --workspace --release                                     # 1,330 Rust tests; 2 live-engine checks ignored by default
+cargo test --workspace --release                                     # 1,413 Rust tests; 3 live-engine checks ignored by default
 uv run --no-project --with pytest python -m pytest workers/embedding/test_main.py -q  # 161 Python tests
 npm ci && npm run test:e2e                                           # live engine + workers; model credentials required for chat
 ```
+
+The Rust commands are offline only when the Rust toolchain and all locked
+registry/source artifacts are already cached. `uv run` may download pytest and
+the Bun command requires an installed lockfile-matching dependency tree.
+The E2E command is not offline: it needs a running engine/workers stack and
+model credentials for chat assertions.
 
 ## § 12 · Versioning
 
