@@ -699,7 +699,7 @@ async fn list_functions(iii: &IIIClient, agent_id: &str) -> Result<Value, Error>
         .map(|s| s.trim_end_matches('*').to_string())
         .collect();
 
-    let all_functions: Value = iii
+    let registry: Value = iii
         .trigger(TriggerRequest {
             function_id: "engine::functions::list".to_string(),
             payload: json!({}),
@@ -707,29 +707,37 @@ async fn list_functions(iii: &IIIClient, agent_id: &str) -> Result<Value, Error>
             timeout_ms: None,
         })
         .await
-        .unwrap_or(json!([]));
+        .unwrap_or_else(|_| json!({ "functions": [] }));
+
+    Ok(filter_functions(&registry, &allowed))
+}
+
+fn filter_functions(registry: &Value, allowed: &[String]) -> Value {
+    let functions = registry
+        .get("functions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
     if allowed.iter().any(|prefix| prefix.is_empty()) {
-        return Ok(all_functions);
+        return Value::Array(functions);
     }
 
     if allowed.is_empty() {
-        return Ok(json!([]));
+        return json!([]);
     }
 
-    let filtered: Vec<&Value> = all_functions
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter(|f| {
-                    let id = f["id"].as_str().unwrap_or("");
-                    allowed.iter().any(|a| id.starts_with(a.as_str()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(json!(filtered))
+    Value::Array(
+        functions
+            .into_iter()
+            .filter(|function| {
+                function
+                    .get("function_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| allowed.iter().any(|prefix| id.starts_with(prefix)))
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -1503,6 +1511,30 @@ mod tests {
         let functions = json!([{"id": "a"}, {"id": "b"}, {"id": "c"}]);
         let count = functions.as_array().map(|a| a.len()).unwrap_or(0);
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn iii_0_22_1_function_registry_envelope_is_unwrapped_and_filtered_by_function_id() {
+        let registry = json!({
+            "functions": [
+                { "function_id": "memory::recall", "worker_name": "memory" },
+                { "function_id": "state::get", "worker_name": "state" },
+                { "id": "memory::legacy-wrong-key", "worker_name": "memory" },
+            ],
+        });
+
+        assert_eq!(
+            filter_functions(&registry, &["memory::".to_string()]),
+            json!([{
+                "function_id": "memory::recall",
+                "worker_name": "memory",
+            }])
+        );
+        assert_eq!(
+            filter_functions(&registry, &[String::new()]),
+            registry["functions"]
+        );
+        assert_eq!(filter_functions(&json!([]), &[String::new()]), json!([]));
     }
 
     #[test]

@@ -2181,6 +2181,22 @@ mod tests {
             })),
             Some(ids(&["core", "memory"]))
         );
+        assert_eq!(
+            reported_worker_ids(&json!({ "functions": [] })),
+            Some(BTreeSet::new()),
+            "an answered empty registry must remain distinct from no answer"
+        );
+        assert_eq!(
+            reported_worker_ids(&json!({
+                "functions": [
+                    {"function_id": "missing::identity"},
+                    {"function_id": "empty::identity", "worker_name": ""},
+                    {"function_id": "wrong::identity", "worker_name": 7},
+                    {"function_id": "core::run", "worker_name": "core"}
+                ]
+            })),
+            Some(ids(&["core"]))
+        );
         assert_eq!(reported_worker_ids(&json!({ "functions": 62 })), None);
     }
 
