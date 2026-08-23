@@ -387,6 +387,37 @@ mod tests {
     }
 
     #[test]
+    fn stream_route_preferences_handle_absent_empty_and_incomplete_values() {
+        assert_eq!(stream_route_preferences(&json!({}), None), (None, None));
+        assert_eq!(
+            stream_route_preferences(
+                &json!({ "provider": "", "model": "agentos-default" }),
+                Some(&json!({ "provider": "codex" })),
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            stream_route_preferences(
+                &json!({}),
+                Some(&json!({ "provider": "codex", "model": "gpt-5.6-sol" })),
+            ),
+            (Some("codex".into()), Some("gpt-5.6-sol".into()))
+        );
+    }
+
+    #[test]
+    fn stream_route_fields_reject_missing_empty_and_nested_values() {
+        for route in [
+            json!({}),
+            json!({ "provider": "", "model": "gpt-5.6-sol" }),
+            json!({ "provider": "codex", "model": "" }),
+            json!({ "provider": "codex", "model": { "name": "gpt-5.6-sol" } }),
+        ] {
+            assert!(stream_route_fields(&route).is_err(), "accepted {route}");
+        }
+    }
+
+    #[test]
     fn stream_chat_response_is_transport_neutral() {
         let response = stream_chat_response(&json!({
             "content": "ready",

@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -18,7 +19,14 @@ async function executable(path: string, source: string): Promise<void> {
   await chmod(path, 0o755);
 }
 
-async function upgradeFixture() {
+interface UpgradeFixturePaths {
+  agentosHome: string;
+  runtime: string;
+}
+
+async function upgradeFixture(
+  beforeInstall?: (paths: UpgradeFixturePaths) => Promise<void>,
+) {
   const root = await mkdtemp(join(tmpdir(), "agentos-install-upgrade-"));
   sandboxes.push(root);
   const home = join(root, "home");
@@ -86,6 +94,8 @@ esac
   });
   expect(packed.exitCode, packed.stderr.toString()).toBe(0);
 
+  await beforeInstall?.({ agentosHome, runtime });
+
   const process = Bun.spawn(["bash", new URL("scripts/install.sh", repository).pathname], {
     env: {
       ...Bun.env,
@@ -141,6 +151,71 @@ describe("installer upgrade portability", () => {
     expect(await readFile(join(runtime, ".env"), "utf8")).toBe(
       "ANTHROPIC_API_KEY=preserve-me\n",
     );
+  });
+
+  it("preserves empty operator-owned files and directories", async () => {
+    const { runtime } = await upgradeFixture(async ({ runtime }) => {
+      await Promise.all([
+        writeFile(join(runtime, "config.yaml"), ""),
+        writeFile(join(runtime, ".env"), ""),
+        rm(join(runtime, "config"), { recursive: true, force: true }),
+        rm(join(runtime, "data"), { recursive: true, force: true }),
+      ]);
+      await Promise.all([
+        mkdir(join(runtime, "config"), { recursive: true }),
+        mkdir(join(runtime, "data"), { recursive: true }),
+      ]);
+    });
+
+    expect(await readFile(join(runtime, "config.yaml"), "utf8")).toBe("");
+    expect(await readFile(join(runtime, ".env"), "utf8")).toBe("");
+    expect(await readdir(join(runtime, "config"))).toEqual([]);
+    expect(await readdir(join(runtime, "data"))).toEqual([]);
+  });
+
+  it("uses release defaults when no previous runtime exists", async () => {
+    const { runtime } = await upgradeFixture(async ({ runtime }) => {
+      await rm(runtime, { recursive: true, force: true });
+    });
+
+    expect(await readFile(join(runtime, "config.yaml"), "utf8")).toBe(
+      "release: default\n",
+    );
+    expect(await readFile(join(runtime, "config", "state.yaml"), "utf8")).toBe(
+      "release default\n",
+    );
+    expect(await readFile(join(runtime, "data", "default.db"), "utf8")).toBe(
+      "release default\n",
+    );
+    expect(await Bun.file(join(runtime, ".env")).exists()).toBe(false);
+  });
+
+  it("recovers operator state from an interrupted retired runtime", async () => {
+    const { runtime } = await upgradeFixture(async ({ agentosHome }) => {
+      const retired = join(agentosHome, "runtime.old");
+      await Promise.all([
+        mkdir(join(retired, "config"), { recursive: true }),
+        mkdir(join(retired, "data"), { recursive: true }),
+      ]);
+      await Promise.all([
+        writeFile(join(retired, "config.yaml"), "retired-operator: true\n"),
+        writeFile(join(retired, "config", "state.yaml"), "retired-state-config\n"),
+        writeFile(join(retired, "data", "state.db"), "retired-live-state\n"),
+        writeFile(join(retired, ".env"), "CODEX_PROXY_API_KEY=retired-secret\n"),
+      ]);
+    });
+
+    expect(await readFile(join(runtime, "config.yaml"), "utf8")).toBe(
+      "retired-operator: true\n",
+    );
+    expect(await readFile(join(runtime, "data", "state.db"), "utf8")).toBe(
+      "retired-live-state\n",
+    );
+    expect(await readFile(join(runtime, ".env"), "utf8")).toBe(
+      "CODEX_PROXY_API_KEY=retired-secret\n",
+    );
+    expect(await Bun.file(join(runtime, "..", "runtime.old")).exists()).toBe(false);
+    expect(await Bun.file(join(runtime, "..", "runtime.new")).exists()).toBe(false);
   });
 
   it("keeps the published installer byte-identical to the source installer", async () => {

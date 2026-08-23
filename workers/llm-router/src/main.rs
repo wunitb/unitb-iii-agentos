@@ -378,22 +378,69 @@ fn client_for_provider<'a>(
     }
 }
 
-async fn call_anthropic(
-    client: &reqwest::Client,
-    api_key: &str,
+fn completion_tools(input: &Value) -> Vec<Value> {
+    input["tools"]
+        .as_array()
+        .or_else(|| input["functions"].as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn anthropic_request_body(
     model: &str,
+    system_prompt: Option<&str>,
     messages: &[Value],
     tools: &[Value],
     max_tokens: u64,
-) -> Result<Value, Error> {
+) -> Value {
     let mut body = json!({
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
     });
+    if let Some(system_prompt) = system_prompt.filter(|prompt| !prompt.is_empty()) {
+        body["system"] = json!(system_prompt);
+    }
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
+    body
+}
+
+fn openai_request_body(
+    model: &str,
+    system_prompt: Option<&str>,
+    messages: &[Value],
+    tools: &[Value],
+    max_tokens: u64,
+) -> Value {
+    let mut provider_messages = Vec::with_capacity(messages.len() + 1);
+    if let Some(system_prompt) = system_prompt.filter(|prompt| !prompt.is_empty()) {
+        provider_messages.push(json!({ "role": "system", "content": system_prompt }));
+    }
+    provider_messages.extend_from_slice(messages);
+
+    let mut body = json!({
+        "model": model,
+        "messages": provider_messages,
+        "max_tokens": max_tokens,
+    });
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+    }
+    body
+}
+
+async fn call_anthropic(
+    client: &reqwest::Client,
+    api_key: &str,
+    model: &str,
+    system_prompt: Option<&str>,
+    messages: &[Value],
+    tools: &[Value],
+    max_tokens: u64,
+) -> Result<Value, Error> {
+    let body = anthropic_request_body(model, system_prompt, messages, tools, max_tokens);
 
     let resp = client
         .post("https://api.anthropic.com/v1/messages")
@@ -418,18 +465,12 @@ async fn call_openai_compat(
     base_url: &str,
     api_key: &str,
     model: &str,
+    system_prompt: Option<&str>,
     messages: &[Value],
     tools: &[Value],
     max_tokens: u64,
 ) -> Result<Value, Error> {
-    let mut body = json!({
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-    });
-    if !tools.is_empty() {
-        body["tools"] = json!(tools);
-    }
+    let body = openai_request_body(model, system_prompt, messages, tools, max_tokens);
 
     let mut req = client
         .post(format!("{}/chat/completions", base_url))
@@ -478,7 +519,8 @@ async fn complete_handler(
     let model = route.model.as_str();
     let client = client_for_provider(&route.provider, &shared_client, &direct_client);
     let messages = input["messages"].as_array().cloned().unwrap_or_default();
-    let tools = input["tools"].as_array().cloned().unwrap_or_default();
+    let tools = completion_tools(&input);
+    let system_prompt = input["systemPrompt"].as_str();
     let max_tokens = input["max_tokens"].as_u64().unwrap_or(4096);
 
     let api_key = if provider.env_key.is_empty() {
@@ -491,7 +533,16 @@ async fn complete_handler(
 
     let result = match provider.driver {
         Driver::Anthropic => {
-            call_anthropic(client, &api_key, model, &messages, &tools, max_tokens).await?
+            call_anthropic(
+                client,
+                &api_key,
+                model,
+                system_prompt,
+                &messages,
+                &tools,
+                max_tokens,
+            )
+            .await?
         }
         Driver::OpenAiCompat | Driver::Gemini | Driver::Bedrock => {
             call_openai_compat(
@@ -499,6 +550,7 @@ async fn complete_handler(
                 &provider.base_url,
                 &api_key,
                 model,
+                system_prompt,
                 &messages,
                 &tools,
                 max_tokens,
@@ -844,16 +896,24 @@ mod tests {
 
     #[test]
     fn codex_base_url_only_accepts_loopback_literals() {
+        assert_eq!(resolve_codex_base_url(None), DEFAULT_CODEX_BASE_URL);
+        assert_eq!(resolve_codex_base_url(Some("   ")), DEFAULT_CODEX_BASE_URL);
         assert_eq!(
             resolve_codex_base_url(Some("http://127.0.0.2:8317/v1/")),
             "http://127.0.0.2:8317/v1"
         );
+        assert_eq!(
+            resolve_codex_base_url(Some("https://[::1]:8317/v1/")),
+            "https://[::1]:8317/v1"
+        );
         for unsafe_url in [
             "not a url",
+            "ftp://127.0.0.1:8317/v1",
             "http://localhost:8317/v1",
             "http://192.168.1.10:8317/v1",
             "http://user:password@127.0.0.1:8317/v1",
             "http://127.0.0.1:8317/v1?target=https://example.com",
+            "http://127.0.0.1:8317/v1#fragment",
         ] {
             assert_eq!(
                 resolve_codex_base_url(Some(unsafe_url)),
@@ -861,6 +921,72 @@ mod tests {
                 "unsafe URL accepted: {unsafe_url}"
             );
         }
+    }
+
+    #[test]
+    fn runtime_default_handles_absent_empty_enabled_and_disabled_values() {
+        let absent = resolve_runtime_default(|_| None);
+        assert!(absent.route.is_none());
+        assert!(absent.disabled_provider.is_none());
+
+        let whitespace = resolve_runtime_default(|name| match name {
+            "CODEX_PROXY_API_KEY" | "AGENTOS_DEFAULT_PROVIDER" | "AGENTOS_DEFAULT_MODEL" => {
+                Some("  ".into())
+            }
+            _ => None,
+        });
+        assert!(whitespace.route.is_none());
+        assert!(whitespace.disabled_provider.is_none());
+
+        let enabled = resolve_runtime_default(|name| match name {
+            "CODEX_PROXY_API_KEY" => Some("secret".into()),
+            _ => None,
+        });
+        assert_eq!(
+            enabled.route,
+            Some(Route {
+                provider: CODEX_PROVIDER.into(),
+                model: DEFAULT_CODEX_MODEL.into(),
+            })
+        );
+        assert!(enabled.disabled_provider.is_none());
+
+        let disabled = resolve_runtime_default(|name| match name {
+            "AGENTOS_DEFAULT_PROVIDER" => Some("codex".into()),
+            "AGENTOS_DEFAULT_MODEL" => Some(DEFAULT_CODEX_MODEL.into()),
+            _ => None,
+        });
+        assert!(disabled.route.is_none());
+        assert_eq!(disabled.disabled_provider.as_deref(), Some(CODEX_PROVIDER));
+    }
+
+    #[test]
+    fn route_contract_reports_missing_unknown_and_mismatched_fields() {
+        let state = test_state(None);
+        for (input, message) in [
+            (json!({ "provider": "codex" }), "provider requires model"),
+            (json!({ "model": "missing-model" }), "unknown model"),
+            (
+                json!({ "provider": "codex", "model": "gpt-4o" }),
+                "is not registered for provider codex",
+            ),
+            (
+                json!({ "provider": "missing", "model": DEFAULT_CODEX_MODEL }),
+                "unknown provider",
+            ),
+            (json!({ "provider": null }), "provider must be a string"),
+        ] {
+            let error = resolve_route(&state, &input).unwrap_err().to_string();
+            assert!(error.contains(message), "{error}");
+        }
+
+        let empty = resolve_route(
+            &state,
+            &json!({ "provider": "", "model": "agentos-default", "messages": [] }),
+        )
+        .expect("empty preferences fall back to automatic routing");
+        assert_eq!(empty.provider, "anthropic");
+        assert!(empty.model.contains("haiku"));
     }
 
     #[test]
@@ -894,6 +1020,53 @@ mod tests {
         let route = resolve_complete_route(&test_state(None), &json!({})).unwrap();
         assert_eq!(route.provider, "anthropic");
         assert_eq!(route.model, "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn completion_contract_accepts_canonical_tools_and_legacy_functions() {
+        let tools = vec![json!({ "name": "memory::recall" })];
+        assert_eq!(completion_tools(&json!({ "tools": tools })), tools);
+        assert_eq!(completion_tools(&json!({ "functions": tools })), tools);
+        assert!(completion_tools(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn anthropic_body_preserves_system_prompt_and_agent_tools() {
+        let messages = vec![json!({ "role": "user", "content": "hello" })];
+        let tools = vec![json!({ "name": "memory::recall" })];
+        let body = anthropic_request_body(
+            "claude-sonnet-4-20250514",
+            Some("Use memory when relevant"),
+            &messages,
+            &tools,
+            1024,
+        );
+
+        assert_eq!(body["system"], "Use memory when relevant");
+        assert_eq!(body["messages"], json!(messages));
+        assert_eq!(body["tools"], json!(tools));
+    }
+
+    #[test]
+    fn openai_body_preserves_system_prompt_and_agent_tools() {
+        let messages = vec![json!({ "role": "user", "content": "hello" })];
+        let tools = vec![json!({ "name": "memory::recall" })];
+        let body = openai_request_body(
+            DEFAULT_CODEX_MODEL,
+            Some("Use memory when relevant"),
+            &messages,
+            &tools,
+            1024,
+        );
+
+        assert_eq!(
+            body["messages"],
+            json!([
+                { "role": "system", "content": "Use memory when relevant" },
+                { "role": "user", "content": "hello" },
+            ])
+        );
+        assert_eq!(body["tools"], json!(tools));
     }
 
     #[test]

@@ -82,6 +82,21 @@ function normalizedBuildHeadings(source: string): string[] {
   );
 }
 
+function reconciliationDecision(
+  source: string,
+  filename: string,
+): { side: string; reason: string } | null {
+  const prefix = `| \`${filename}\` |`;
+  const row = source.split(/\r?\n/).find((line) => line.startsWith(prefix));
+  if (!row) return null;
+
+  const columns = row.split("|").map((column) => column.trim());
+  if (columns.length !== 5) return null;
+  const side = columns[2] ?? "";
+  const reason = columns[3] ?? "";
+  return side && reason ? { side, reason } : null;
+}
+
 type ArtifactFailure =
   | "ARTIFACT_DIRECTORY_INVALID"
   | "ARTIFACT_FILE_MISSING"
@@ -295,17 +310,37 @@ describe("build 10010 reconciliation artifact contract", () => {
     }
   });
 
-  it("records a resolution decision for every conflicting file", async () => {
+  it("records the chosen side and reason for every conflicting file", async () => {
     const decisions = await Bun.file(
       new URL("DECISIONS.md", build10010ArtifactDirectory),
     ).text();
     for (const filename of reconciliationConflictFiles) {
-      expect(decisions, filename).toContain(`\`${filename}\``);
+      const decision = reconciliationDecision(decisions, filename);
+      expect(decision, filename).not.toBeNull();
+      expect(decision?.side.length, `${filename} has no chosen side`).toBeGreaterThan(0);
+      expect(decision?.reason.length, `${filename} has no reason`).toBeGreaterThan(0);
     }
   });
 });
 
 describe("artifact contract edge cases", () => {
+  it("rejects absent, malformed, and empty reconciliation decisions", () => {
+    expect(reconciliationDecision("", "README.md")).toBeNull();
+    expect(reconciliationDecision("| `README.md` |", "README.md")).toBeNull();
+    expect(
+      reconciliationDecision("| `README.md` |  | because |", "README.md"),
+    ).toBeNull();
+    expect(
+      reconciliationDecision("| `README.md` | Combined |  |", "README.md"),
+    ).toBeNull();
+    expect(
+      reconciliationDecision(
+        "| `README.md` | Combined | preserves both lines |",
+        "README.md",
+      ),
+    ).toEqual({ side: "Combined", reason: "preserves both lines" });
+  });
+
   it("rejects missing, non-directory, and symlinked artifact directories", async () => {
     const parent = await temporaryDirectory();
     const missing = new URL("missing/", parent);

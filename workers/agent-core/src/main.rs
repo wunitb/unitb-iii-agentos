@@ -423,7 +423,7 @@ fn completion_payload(
         "model": model,
         "systemPrompt": system_prompt,
         "messages": messages,
-        "functions": functions,
+        "tools": functions,
     })
 }
 
@@ -755,6 +755,9 @@ mod tests {
         assert_eq!(complete["provider"], "codex");
         assert_eq!(complete["model"], "gpt-5.6-sol");
         assert!(complete["model"].is_string());
+        assert_eq!(complete["systemPrompt"], "system");
+        assert_eq!(complete["tools"], functions);
+        assert!(complete.get("functions").is_none());
     }
 
     #[test]
@@ -775,6 +778,25 @@ mod tests {
     }
 
     #[test]
+    fn route_preferences_ignore_empty_none_and_incomplete_config_values() {
+        assert_eq!(route_preferences(None, None, None), (None, None));
+        assert_eq!(
+            route_preferences(Some(""), Some("agentos-default"), None),
+            (None, None)
+        );
+
+        let provider_only = ModelConfig {
+            provider: Some("codex".into()),
+            model: None,
+            max_tokens: None,
+        };
+        assert_eq!(
+            route_preferences(None, None, Some(&provider_only)),
+            (None, None)
+        );
+    }
+
+    #[test]
     fn route_fields_reject_nested_model_responses() {
         let error = route_fields(&json!({
             "provider": "codex",
@@ -782,6 +804,17 @@ mod tests {
         }))
         .unwrap_err();
         assert!(error.to_string().contains("omitted model"));
+    }
+
+    #[test]
+    fn route_fields_reject_missing_and_empty_strings() {
+        for route in [
+            json!({}),
+            json!({ "provider": "", "model": "gpt-5.6-sol" }),
+            json!({ "provider": "codex", "model": "" }),
+        ] {
+            assert!(route_fields(&route).is_err(), "accepted {route}");
+        }
     }
 
     #[test]
