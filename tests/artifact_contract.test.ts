@@ -29,6 +29,10 @@ const build10010ArtifactDirectory = new URL(
   "../docs/builds/10010-reconcile-feat-herdr-omp-fleet-with-main-so-that/",
   import.meta.url,
 );
+const build10008ArtifactDirectory = new URL(
+  "../docs/builds/10008-fix-agentos-up-so-a-failed-worker-identity-query/",
+  import.meta.url,
+);
 const requiredArtifacts = [
   "ATTACK_SURFACE.md",
   "DECISIONS.md",
@@ -319,6 +323,39 @@ describe("build 10010 reconciliation artifact contract", () => {
       expect(decision, filename).not.toBeNull();
       expect(decision?.side.length, `${filename} has no chosen side`).toBeGreaterThan(0);
       expect(decision?.reason.length, `${filename} has no reason`).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("build 10008 worker-identity hardening evidence", () => {
+  it("contains exactly the four governed artifacts", async () => {
+    expect((await readdir(build10008ArtifactDirectory)).sort()).toEqual(
+      [...requiredArtifacts].sort(),
+    );
+    expect(
+      await inspectArtifactDirectory(build10008ArtifactDirectory, [
+        "ISC-000",
+        "ISC-001",
+        "ISC-002",
+      ]),
+    ).toEqual([]);
+  });
+
+  it("records the duplicate-registration path and fail-closed behavior", async () => {
+    const attackSurface = await Bun.file(
+      new URL("ATTACK_SURFACE.md", build10008ArtifactDirectory),
+    ).text();
+    expect(attackSurface).toContain("Duplicate-registration path");
+    expect(attackSurface).toContain("fails closed");
+    expect(attackSurface).toContain("does not spawn any worker");
+  });
+
+  it("traces ISC-000 through ISC-002 as whole tokens", async () => {
+    const traces = await Bun.file(
+      new URL("TRACES.md", build10008ArtifactDirectory),
+    ).text();
+    for (const identifier of ["ISC-000", "ISC-001", "ISC-002"] as const) {
+      expect(new RegExp(`\\b${identifier}\\b`).test(traces), identifier).toBe(true);
     }
   });
 });

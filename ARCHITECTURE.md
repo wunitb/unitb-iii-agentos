@@ -124,9 +124,7 @@ Workflow definitions live under the `workflows` state scope. Runs live under `wo
 
 ## Development control plane
 
-UNITB DELIVERY coordinates repository changes from a global installation outside this repository. The managed Planner is the read-only interactive entry point, each Worker is the single writer for an explicit path contract in an isolated worktree, and the Reviewer inspects the exact submitted commit independently.
-
-Project routing configuration, the SQLite ledger, credentials, agent sessions, and worktrees live under the user's UNITB DELIVERY config and data directories. This repository intentionally contains no embedded fleet runtime or `.omp` fleet extensions. Launching `omp` directly from the repository does not create a managed Planner; operators attach to the registered Herdr session instead.
+Development is coordinated outside this repository: **unitb-control-room** owns the record of intent (directives with verbatim goals and acceptance criteria) and **sweafax** executes builds (implementation → verification → artifact gate → cross-vendor audit). Each build produces a result branch `issue/<id>-…` and a governed artifact directory under `docs/builds/`. Delivery is a pull request opened by the maintainer; `main` accepts no direct pushes. This repository holds no scheduler, ledger, credentials, or agent sessions of its own.
 
 ## Versioning
 

@@ -260,17 +260,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full primitive flow and worker ma
 
 ## § 09 · Development control plane
 
-Repository development is coordinated by the globally installed UNITB DELIVERY control plane. Its configuration, SQLite ledger, credentials, agent sessions, and isolated worktrees live outside this repository under the user's UNITB DELIVERY config and data directories.
+Repository changes enter as **control-room directives** and are built by the **sweafax** factory; nothing in this repository launches an agent session itself.
 
-Use the managed Planner session rather than launching `omp` directly from this repository:
-
-```bash
-unitb-delivery up --project unitb-iii-agentos
-unitb-delivery health --project unitb-iii-agentos
-herdr session attach unitb-delivery-unitb-iii-agentos
-```
-
-The managed Planner is read-only. It creates durable Work Items, assigns a single Writer in an isolated worktree, obtains independent review of the exact submitted commit, and publishes or merges only through protected fleet operations.
+1. Intent: a directive records the verbatim request and its acceptance criteria (ISC) in `unitb-control-room` (`cr new --from-sweafax <intake.json>`).
+2. Execution: `cr dispatch <directive> --engine sweafax --spec <intake.json>` registers a sweafax build from the intake's `base_branch`; sweafax runs implementation, verification, the artifact gate (`docs/builds/<build>-<slug>/{INVARIANTS,TRACES,DECISIONS,ATTACK_SURFACE}.md`, `bunx tsc --noEmit`, `bun test`) and a cross-vendor audit. `cr sync` follows the build's state.
+3. Delivery: after audit approval the result branch (`issue/<id>-…`) is pushed by the maintainer and merged through a pull request. `main` is protected; there is no direct push path.
 
 ## § 10 · TUI
 
