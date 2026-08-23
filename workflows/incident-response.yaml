@@ -13,6 +13,7 @@ agents:
 steps:
   - name: Detect
     functionId: "agent::chat"
+    agentId: ops
     promptTemplate: >
       Analyze the incident: {{input}}.
       Classify severity (P0-P3), identify affected systems,
@@ -24,6 +25,7 @@ steps:
 
   - name: Triage
     functionId: "agent::chat"
+    agentId: debugger
     promptTemplate: >
       Debug the incident from this report: {{incident_report}}.
       Analyze logs, traces, and metrics to identify root cause.
@@ -36,6 +38,7 @@ steps:
 
   - name: Fix
     functionId: "agent::chat"
+    agentId: coder
     promptTemplate: >
       Implement a fix for root cause: {{root_cause}}.
       Prefer minimal, targeted changes. Include rollback plan.
@@ -48,6 +51,7 @@ steps:
 
   - name: Verify
     functionId: "agent::chat"
+    agentId: test-engineer
     promptTemplate: >
       Verify the fix: {{fix_output}}.
       Run regression tests, confirm the original issue is resolved,

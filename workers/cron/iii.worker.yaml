@@ -5,4 +5,4 @@ scripts:
 name: cron
 runtime:
   kind: rust
-description: Scheduled function invocations on top of iii-cron — session cleanup, cost aggregation, rate limit reset
+description: Scheduled function invocations on top of the canonical cron worker — session cleanup, cost aggregation, rate limit reset

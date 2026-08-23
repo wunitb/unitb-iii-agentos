@@ -3,10 +3,16 @@ use iii_sdk::{
     IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
 };
 use serde_json::{Map, Value, json};
+use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 mod types;
 
 use types::{ErrorMode, StepMode, StepResult, Workflow, WorkflowStep, sanitize_id};
+
+const MAX_STEP_TIMEOUT_MS: u64 = 3_600_000;
+const MAX_STEP_RETRIES: u32 = 10;
+const MAX_LOOP_ITERATIONS: u32 = 100;
+const STATE_STARTUP_ATTEMPTS: usize = 5;
 
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
@@ -46,6 +52,235 @@ fn interpolate(template: &str, vars: &Map<String, Value>) -> String {
     out
 }
 
+fn validate_workflow(workflow: &Workflow) -> Result<(), String> {
+    if workflow.name.trim().is_empty() {
+        return Err("workflow name is required".to_string());
+    }
+    if workflow.steps.is_empty() {
+        return Err("workflow must contain at least one step".to_string());
+    }
+
+    let declared_agents = workflow.agents.iter().collect::<HashSet<_>>();
+    if declared_agents.len() != workflow.agents.len() {
+        return Err("workflow agent IDs must be unique".to_string());
+    }
+
+    let mut step_names = HashSet::new();
+    let mut concurrent_policy = None;
+    for step in &workflow.steps {
+        let step_name = step.name.trim();
+        if step_name.is_empty() {
+            return Err("workflow step name is required".to_string());
+        }
+        if step_name.len() != step.name.len() {
+            return Err(format!(
+                "workflow step name has surrounding whitespace: {}",
+                step.name
+            ));
+        }
+        if !step_names.insert(step_name) {
+            return Err(format!("duplicate workflow step name: {step_name}"));
+        }
+        if step.timeout_ms == 0 || step.timeout_ms > MAX_STEP_TIMEOUT_MS {
+            return Err(format!(
+                "step {step_name} timeoutMs must be between 1 and {MAX_STEP_TIMEOUT_MS}"
+            ));
+        }
+        if step.error_mode == ErrorMode::Retry {
+            let retries = step.max_retries.unwrap_or(3);
+            if retries == 0 || retries > MAX_STEP_RETRIES {
+                return Err(format!(
+                    "step {step_name} maxRetries must be between 1 and {MAX_STEP_RETRIES}"
+                ));
+            }
+        }
+        if step.mode == StepMode::Loop {
+            let iterations = step.max_iterations.unwrap_or(10);
+            if iterations == 0 || iterations > MAX_LOOP_ITERATIONS {
+                return Err(format!(
+                    "step {step_name} maxIterations must be between 1 and {MAX_LOOP_ITERATIONS}"
+                ));
+            }
+        }
+        if let Some(agent_id) = &step.agent_id
+            && !declared_agents.is_empty()
+            && !declared_agents.contains(agent_id)
+        {
+            return Err(format!(
+                "step {step_name} references undeclared agent {agent_id}"
+            ));
+        }
+        if let Some(output_var) = &step.output_var
+            && (output_var.is_empty()
+                || !output_var.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                }))
+        {
+            return Err(format!(
+                "step {step_name} has invalid outputVar {output_var}"
+            ));
+        }
+
+        if matches!(step.mode, StepMode::Parallel | StepMode::Fanout) {
+            let policy = (step.error_mode, step.max_retries);
+            if let Some(expected) = concurrent_policy
+                && expected != policy
+            {
+                return Err(
+                    "consecutive parallel or fanout steps must use the same error policy"
+                        .to_string(),
+                );
+            }
+            concurrent_policy = Some(policy);
+        } else {
+            concurrent_policy = None;
+        }
+    }
+
+    validate_step_dependencies(workflow, &step_names)?;
+    workflow_execution_order(workflow)?;
+    Ok(())
+}
+
+fn validate_step_dependencies(
+    workflow: &Workflow,
+    step_names: &HashSet<&str>,
+) -> Result<(), String> {
+    for step in &workflow.steps {
+        let mut dependencies = HashSet::new();
+        for dependency in &step.depends_on {
+            if dependency.trim() != dependency {
+                return Err(format!(
+                    "step {} dependency has surrounding whitespace: {dependency}",
+                    step.name
+                ));
+            }
+            if dependency.is_empty() {
+                return Err(format!("step {} has an empty dependency", step.name));
+            }
+            if dependency == &step.name {
+                return Err(format!("step {} cannot depend on itself", step.name));
+            }
+            if !step_names.contains(dependency.as_str()) {
+                return Err(format!(
+                    "step {} depends on missing step {dependency}",
+                    step.name
+                ));
+            }
+            if !dependencies.insert(dependency) {
+                return Err(format!(
+                    "step {} repeats dependency {dependency}",
+                    step.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn workflow_execution_order(workflow: &Workflow) -> Result<Vec<usize>, String> {
+    let mut scheduled = vec![false; workflow.steps.len()];
+    let mut completed = HashSet::with_capacity(workflow.steps.len());
+    let mut order = Vec::with_capacity(workflow.steps.len());
+
+    while order.len() < workflow.steps.len() {
+        let mut progressed = false;
+        for (index, step) in workflow.steps.iter().enumerate() {
+            if scheduled[index]
+                || !step
+                    .depends_on
+                    .iter()
+                    .all(|dependency| completed.contains(dependency.as_str()))
+            {
+                continue;
+            }
+            scheduled[index] = true;
+            completed.insert(step.name.as_str());
+            order.push(index);
+            progressed = true;
+        }
+        if !progressed {
+            return Err("workflow dependency graph contains a cycle".to_string());
+        }
+    }
+
+    Ok(order)
+}
+
+fn seed_vars(input: Value, agent_id: Option<&str>) -> Map<String, Value> {
+    let mut vars = input.as_object().cloned().unwrap_or_default();
+    vars.insert("input".to_string(), input);
+    if let Some(agent_id) = agent_id {
+        vars.insert("agentId".to_string(), Value::String(agent_id.to_string()));
+    }
+    vars
+}
+
+fn initial_step_states(workflow: &Workflow) -> Map<String, Value> {
+    workflow
+        .steps
+        .iter()
+        .map(|step| (step.name.clone(), json!({ "status": "pending" })))
+        .collect()
+}
+
+fn set_step_status(
+    states: &mut Map<String, Value>,
+    step: &WorkflowStep,
+    status: &str,
+    error: Option<&str>,
+) {
+    let mut value = json!({ "status": status, "updatedAt": now_ms() });
+    if let Some(error) = error {
+        value["error"] = Value::String(error.to_string());
+    }
+    states.insert(step.name.clone(), value);
+}
+
+fn step_payload(
+    step: &WorkflowStep,
+    vars: &Map<String, Value>,
+    fallback_agent_id: Option<&str>,
+) -> Result<Value, Error> {
+    let template = step.prompt_template.as_deref().unwrap_or("{{input}}");
+    let prompt = interpolate(template, vars);
+    let mut payload = vars.clone();
+    payload.insert("prompt".to_string(), Value::String(prompt.clone()));
+
+    if step.function_id == "agent::chat" {
+        let agent_id = step
+            .agent_id
+            .as_deref()
+            .or(fallback_agent_id)
+            .ok_or_else(|| {
+                Error::Handler(format!(
+                    "step {} requires agentId for agent::chat",
+                    step.name
+                ))
+            })?;
+        payload.insert("agentId".to_string(), Value::String(agent_id.to_string()));
+        payload.insert("message".to_string(), Value::String(prompt));
+    }
+
+    Ok(Value::Object(payload))
+}
+
+async fn trigger_step(
+    iii: &IIIClient,
+    step: &WorkflowStep,
+    vars: &Map<String, Value>,
+    fallback_agent_id: Option<&str>,
+) -> Result<Value, Error> {
+    iii.trigger(TriggerRequest {
+        function_id: step.function_id.clone(),
+        payload: step_payload(step, vars, fallback_agent_id)?,
+        action: None,
+        timeout_ms: Some(step.timeout_ms),
+    })
+    .await
+    .map_err(|error| Error::Handler(error.to_string()))
+}
+
 async fn state_get(iii: &IIIClient, scope: &str, key: &str) -> Result<Value, Error> {
     iii.trigger(TriggerRequest {
         function_id: "state::get".to_string(),
@@ -69,15 +304,10 @@ async fn state_set(iii: &IIIClient, scope: &str, key: &str, value: Value) -> Res
     Ok(())
 }
 
-async fn state_update(
-    iii: &IIIClient,
-    scope: &str,
-    key: &str,
-    operations: Value,
-) -> Result<(), Error> {
+async fn state_update(iii: &IIIClient, scope: &str, key: &str, ops: Value) -> Result<(), Error> {
     iii.trigger(TriggerRequest {
         function_id: "state::update".to_string(),
-        payload: json!({ "scope": scope, "key": key, "operations": operations }),
+        payload: json!({ "scope": scope, "key": key, "ops": ops }),
         action: None,
         timeout_ms: None,
     })
@@ -91,6 +321,9 @@ async fn mark_run_failed(
     run_id: &str,
     error: &str,
     results: &[StepResult],
+    vars: &Map<String, Value>,
+    step_states: &Map<String, Value>,
+    next_step: usize,
 ) -> Result<(), Error> {
     state_update(
         iii,
@@ -101,25 +334,83 @@ async fn mark_run_failed(
             { "type": "set", "path": "failedAt", "value": now_ms() },
             { "type": "set", "path": "error", "value": error },
             { "type": "set", "path": "results", "value": results },
+            { "type": "set", "path": "vars", "value": vars },
+            { "type": "set", "path": "nextStep", "value": next_step },
+            { "type": "set", "path": "stepStates", "value": step_states },
         ]),
     )
     .await
 }
 
 async fn create_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
-    let id = match input.get("id").and_then(Value::as_str) {
-        Some(s) if !s.is_empty() => sanitize_id(s).map_err(Error::Handler)?,
-        _ => uuid::Uuid::new_v4().to_string(),
-    };
-
-    let mut workflow_value = input.clone();
-    if let Some(obj) = workflow_value.as_object_mut() {
-        obj.insert("id".into(), Value::String(id.clone()));
-        obj.insert("createdAt".into(), json!(now_ms()));
+    let mut workflow_value = input;
+    let object = workflow_value
+        .as_object_mut()
+        .ok_or_else(|| Error::Handler("workflow definition must be an object".to_string()))?;
+    if object
+        .get("id")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        object.insert(
+            "id".to_string(),
+            Value::String(uuid::Uuid::new_v4().to_string()),
+        );
     }
 
-    state_set(iii, "workflows", &id, workflow_value).await?;
+    let workflow: Workflow = serde_json::from_value(workflow_value)
+        .map_err(|error| Error::Handler(format!("invalid workflow definition: {error}")))?;
+    validate_workflow(&workflow).map_err(Error::Handler)?;
+    let id = workflow.id.clone();
+    let mut stored =
+        serde_json::to_value(workflow).map_err(|error| Error::Handler(error.to_string()))?;
+    stored
+        .as_object_mut()
+        .expect("Workflow serializes as an object")
+        .insert("createdAt".to_string(), json!(now_ms()));
+
+    state_set(iii, "workflows", &id, stored).await?;
     Ok(json!({ "id": id }))
+}
+
+fn record_step_result(
+    step: &WorkflowStep,
+    output: Value,
+    vars: &mut Map<String, Value>,
+    results: &mut Vec<StepResult>,
+    start_ms: u128,
+) {
+    if let Some(var) = &step.output_var {
+        vars.insert(var.clone(), output.clone());
+    }
+    vars.insert("input".to_string(), output.clone());
+    results.push(StepResult {
+        step_name: step.name.clone(),
+        output,
+        duration_ms: now_ms().saturating_sub(start_ms),
+        error: None,
+    });
+}
+
+fn concurrent_group_end(workflow: &Workflow, index: usize, completed: &HashSet<String>) -> usize {
+    let mode = workflow.steps[index].mode;
+    if !matches!(mode, StepMode::Parallel | StepMode::Fanout) {
+        return index;
+    }
+
+    let mut end = index;
+    for candidate in workflow.steps.iter().skip(index + 1) {
+        if candidate.mode != mode
+            || !candidate
+                .depends_on
+                .iter()
+                .all(|dependency| completed.contains(dependency))
+        {
+            break;
+        }
+        end += 1;
+    }
+    end
 }
 
 async fn run_step(
@@ -130,200 +421,170 @@ async fn run_step(
     results: &mut Vec<StepResult>,
     start_ms: u128,
     i: &mut usize,
+    completed: &HashSet<String>,
+    fallback_agent_id: Option<&str>,
 ) -> Result<(), Error> {
     match step.mode {
         StepMode::Sequential => {
-            let template = step.prompt_template.as_deref().unwrap_or("{{input}}");
-            let prompt = interpolate(template, vars);
-            let mut payload = vars.clone();
-            payload.insert("prompt".into(), Value::String(prompt));
-            let output = iii
-                .trigger(TriggerRequest {
-                    function_id: step.function_id.clone(),
-                    payload: Value::Object(payload),
-                    action: None,
-                    timeout_ms: None,
-                })
-                .await
-                .map_err(|e| Error::Handler(e.to_string()))?;
-            if let Some(var) = &step.output_var {
-                vars.insert(var.clone(), output.clone());
-            }
-            vars.insert("input".into(), output.clone());
-            results.push(StepResult {
-                step_name: step.name.clone(),
-                output,
-                duration_ms: now_ms().saturating_sub(start_ms),
-                error: None,
-            });
+            let output = trigger_step(iii, step, vars, fallback_agent_id).await?;
+            record_step_result(step, output, vars, results, start_ms);
         }
-        StepMode::Fanout => {
-            let mut fanout_steps: Vec<&WorkflowStep> = Vec::new();
-            let mut j = *i;
-            while j < workflow.steps.len() && workflow.steps[j].mode == StepMode::Fanout {
-                fanout_steps.push(&workflow.steps[j]);
-                j += 1;
-            }
-
-            let mut handles = Vec::with_capacity(fanout_steps.len());
-            for fs in &fanout_steps {
-                let template = fs.prompt_template.as_deref().unwrap_or("{{input}}");
-                let prompt = interpolate(template, vars);
-                let mut payload = vars.clone();
-                payload.insert("prompt".into(), Value::String(prompt));
-                let iii_clone = iii.clone();
-                let function_id = fs.function_id.clone();
+        StepMode::Parallel | StepMode::Fanout => {
+            let group_end = concurrent_group_end(workflow, *i, completed);
+            let concurrent_steps = &workflow.steps[*i..=group_end];
+            let mut handles = Vec::with_capacity(concurrent_steps.len());
+            for concurrent_step in concurrent_steps {
+                let payload = step_payload(concurrent_step, vars, fallback_agent_id)?;
+                let iii = iii.clone();
+                let function_id = concurrent_step.function_id.clone();
+                let timeout_ms = concurrent_step.timeout_ms;
                 handles.push(tokio::spawn(async move {
-                    iii_clone
-                        .trigger(TriggerRequest {
-                            function_id,
-                            payload: Value::Object(payload),
-                            action: None,
-                            timeout_ms: None,
-                        })
-                        .await
-                        .map_err(|e| Error::Handler(e.to_string()))
+                    iii.trigger(TriggerRequest {
+                        function_id,
+                        payload,
+                        action: None,
+                        timeout_ms: Some(timeout_ms),
+                    })
+                    .await
+                    .map_err(|error| Error::Handler(error.to_string()))
                 }));
             }
 
-            let mut fanout_results: Vec<Value> = Vec::with_capacity(handles.len());
-            for h in handles {
-                let v = h.await.map_err(|e| Error::Handler(e.to_string()))??;
-                fanout_results.push(v);
+            let mut concurrent_results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                concurrent_results.push(
+                    handle
+                        .await
+                        .map_err(|error| Error::Handler(error.to_string()))??,
+                );
             }
 
-            vars.insert("__fanout".into(), Value::Array(fanout_results.clone()));
-            for (idx, fs) in fanout_steps.iter().enumerate() {
-                if let Some(var) = &fs.output_var {
-                    vars.insert(var.clone(), fanout_results[idx].clone());
+            let result_key = if step.mode == StepMode::Fanout {
+                "__fanout"
+            } else {
+                "__parallel"
+            };
+            vars.insert(
+                result_key.to_string(),
+                Value::Array(concurrent_results.clone()),
+            );
+            for (concurrent_step, output) in concurrent_steps.iter().zip(concurrent_results) {
+                if let Some(var) = &concurrent_step.output_var {
+                    vars.insert(var.clone(), output.clone());
                 }
                 results.push(StepResult {
-                    step_name: fs.name.clone(),
-                    output: fanout_results[idx].clone(),
+                    step_name: concurrent_step.name.clone(),
+                    output,
                     duration_ms: now_ms().saturating_sub(start_ms),
                     error: None,
                 });
             }
-
-            *i = j - 1;
+            *i = group_end;
         }
         StepMode::Collect => {
-            let template = step.prompt_template.as_deref().unwrap_or("{{__fanout}}");
-            let prompt = interpolate(template, vars);
-            let mut payload = vars.clone();
-            payload.insert(
-                "fanoutResults".into(),
+            let mut collect_vars = vars.clone();
+            collect_vars.insert(
+                "fanoutResults".to_string(),
                 vars.get("__fanout").cloned().unwrap_or(Value::Null),
             );
-            payload.insert("prompt".into(), Value::String(prompt));
-            let output = iii
-                .trigger(TriggerRequest {
-                    function_id: step.function_id.clone(),
-                    payload: Value::Object(payload),
-                    action: None,
-                    timeout_ms: None,
-                })
-                .await
-                .map_err(|e| Error::Handler(e.to_string()))?;
-            if let Some(var) = &step.output_var {
-                vars.insert(var.clone(), output.clone());
-            }
-            vars.insert("input".into(), output.clone());
-            results.push(StepResult {
-                step_name: step.name.clone(),
-                output,
-                duration_ms: now_ms().saturating_sub(start_ms),
-                error: None,
-            });
+            let output = trigger_step(iii, step, &collect_vars, fallback_agent_id).await?;
+            record_step_result(step, output, vars, results, start_ms);
         }
         StepMode::Conditional => {
-            let prev_output = vars
+            let previous = vars
                 .get("input")
-                .and_then(Value::as_str)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| vars.get("input").map(|v| v.to_string()).unwrap_or_default());
-            if let Some(cond) = &step.condition
-                && !prev_output.to_lowercase().contains(&cond.to_lowercase())
-            {
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string())
+                })
+                .unwrap_or_default();
+            if step.condition.as_ref().is_some_and(|condition| {
+                !previous.to_lowercase().contains(&condition.to_lowercase())
+            }) {
                 results.push(StepResult {
                     step_name: step.name.clone(),
-                    output: Value::String("skipped".into()),
+                    output: Value::String("skipped".to_string()),
                     duration_ms: now_ms().saturating_sub(start_ms),
                     error: None,
                 });
                 return Ok(());
             }
-            let template = step.prompt_template.as_deref().unwrap_or("{{input}}");
-            let prompt = interpolate(template, vars);
-            let mut payload = vars.clone();
-            payload.insert("prompt".into(), Value::String(prompt));
-            let output = iii
-                .trigger(TriggerRequest {
-                    function_id: step.function_id.clone(),
-                    payload: Value::Object(payload),
-                    action: None,
-                    timeout_ms: None,
-                })
-                .await
-                .map_err(|e| Error::Handler(e.to_string()))?;
-            if let Some(var) = &step.output_var {
-                vars.insert(var.clone(), output.clone());
-            }
-            vars.insert("input".into(), output.clone());
-            results.push(StepResult {
-                step_name: step.name.clone(),
-                output,
-                duration_ms: now_ms().saturating_sub(start_ms),
-                error: None,
-            });
+            let output = trigger_step(iii, step, vars, fallback_agent_id).await?;
+            record_step_result(step, output, vars, results, start_ms);
         }
         StepMode::Loop => {
-            let max = step.max_iterations.unwrap_or(10);
-            let mut loop_output: Value = Value::Null;
-            for iter in 0..max {
-                let template = step.prompt_template.as_deref().unwrap_or("{{input}}");
-                let prompt = interpolate(template, vars);
-                let mut payload = vars.clone();
-                payload.insert("prompt".into(), Value::String(prompt));
-                payload.insert("iteration".into(), json!(iter));
-                loop_output = iii
-                    .trigger(TriggerRequest {
-                        function_id: step.function_id.clone(),
-                        payload: Value::Object(payload),
-                        action: None,
-                        timeout_ms: None,
-                    })
-                    .await
-                    .map_err(|e| Error::Handler(e.to_string()))?;
+            let mut loop_output = Value::Null;
+            for iteration in 0..step.max_iterations.unwrap_or(10) {
+                let mut iteration_vars = vars.clone();
+                iteration_vars.insert("iteration".to_string(), json!(iteration));
+                loop_output = trigger_step(iii, step, &iteration_vars, fallback_agent_id).await?;
                 if let Some(var) = &step.output_var {
                     vars.insert(var.clone(), loop_output.clone());
                 }
-                vars.insert("input".into(), loop_output.clone());
+                vars.insert("input".to_string(), loop_output.clone());
 
-                if let Some(until) = &step.until {
-                    let s = match &loop_output {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    if s.to_lowercase().contains(&until.to_lowercase()) {
-                        break;
-                    }
+                if step.until.as_ref().is_some_and(|until| {
+                    let output = loop_output
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| loop_output.to_string());
+                    output.to_lowercase().contains(&until.to_lowercase())
+                }) {
+                    break;
                 }
             }
-            results.push(StepResult {
-                step_name: step.name.clone(),
-                output: loop_output,
-                duration_ms: now_ms().saturating_sub(start_ms),
-                error: None,
-            });
+            record_step_result(step, loop_output, vars, results, start_ms);
         }
     }
     Ok(())
 }
 
+async fn authorize_workflow(
+    iii: &IIIClient,
+    workflow: &Workflow,
+    fallback_agent_id: Option<&str>,
+) -> Result<(), Error> {
+    let mut checked = HashSet::new();
+    for step in &workflow.steps {
+        let agent_id = step.agent_id.as_deref().or(fallback_agent_id);
+        if step.function_id == "agent::chat" && agent_id.is_none() {
+            return Err(Error::Handler(format!(
+                "step {} requires agentId for agent::chat",
+                step.name
+            )));
+        }
+        let Some(agent_id) = agent_id else {
+            continue;
+        };
+        let capability = step
+            .function_id
+            .split("::")
+            .next()
+            .unwrap_or(&step.function_id);
+        if !checked.insert((agent_id, capability, step.function_id.as_str())) {
+            continue;
+        }
+        iii.trigger(TriggerRequest {
+            function_id: "security::check_capability".to_string(),
+            payload: json!({
+                "agentId": agent_id,
+                "capability": capability,
+                "resource": step.function_id,
+            }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|error| Error::Handler(error.to_string()))?;
+    }
+    Ok(())
+}
 async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let workflow_id = input
         .get("workflowId")
+        .or_else(|| input.get("id"))
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Handler("workflowId is required".into()))?;
     let safe_workflow_id = sanitize_id(workflow_id).map_err(Error::Handler)?;
@@ -341,38 +602,23 @@ async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
             "Workflow {safe_workflow_id} not found"
         )));
     }
-    let workflow: Workflow = serde_json::from_value(workflow_value)
-        .map_err(|e| Error::Handler(format!("invalid workflow definition: {e}")))?;
-
-    if let Some(agent_id) = &agent_id {
-        for step in &workflow.steps {
-            let cap = step
-                .function_id
-                .split("::")
-                .next()
-                .unwrap_or(&step.function_id);
-            iii.trigger(TriggerRequest {
-                function_id: "security::check_capability".to_string(),
-                payload: json!({
-                    "agentId": agent_id,
-                    "capability": cap,
-                    "resource": step.function_id,
-                }),
-                action: None,
-                timeout_ms: None,
-            })
-            .await
-            .map_err(|e| Error::Handler(e.to_string()))?;
-        }
-    }
+    let mut workflow: Workflow = serde_json::from_value(workflow_value)
+        .map_err(|error| Error::Handler(format!("invalid workflow definition: {error}")))?;
+    validate_workflow(&workflow).map_err(Error::Handler)?;
+    let execution_order = workflow_execution_order(&workflow).map_err(Error::Handler)?;
+    workflow.steps = execution_order
+        .into_iter()
+        .map(|index| workflow.steps[index].clone())
+        .collect();
+    authorize_workflow(iii, &workflow, agent_id.as_deref()).await?;
 
     let run_id = uuid::Uuid::new_v4().to_string();
     let safe_run_id = sanitize_id(&run_id).map_err(Error::Handler)?;
-
-    let mut vars: Map<String, Value> = Map::new();
-    vars.insert("input".into(), user_input);
+    let mut vars = seed_vars(user_input.clone(), agent_id.as_deref());
 
     let mut results: Vec<StepResult> = Vec::new();
+    let mut completed = HashSet::with_capacity(workflow.steps.len());
+    let mut step_states = initial_step_states(&workflow);
 
     state_set(
         iii,
@@ -381,6 +627,12 @@ async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         json!({
             "runId": safe_run_id,
             "workflowId": safe_workflow_id,
+            "agentId": agent_id,
+            "input": user_input,
+            "vars": vars,
+            "results": results,
+            "stepStates": step_states,
+            "nextStep": 0,
             "status": "running",
             "startedAt": now_ms(),
         }),
@@ -391,6 +643,21 @@ async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     while i < workflow.steps.len() {
         let step = workflow.steps[i].clone();
         let start_ms = now_ms();
+        let batch_start = i;
+        let batch_end = concurrent_group_end(&workflow, i, &completed);
+        for batch_step in &workflow.steps[i..=batch_end] {
+            set_step_status(&mut step_states, batch_step, "running", None);
+        }
+        state_update(
+            iii,
+            "workflow_runs",
+            &safe_run_id,
+            json!([
+                { "type": "set", "path": "stepStates", "value": step_states },
+                { "type": "set", "path": "nextStep", "value": i },
+            ]),
+        )
+        .await?;
 
         let step_outcome = run_step(
             iii,
@@ -400,6 +667,8 @@ async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
             &mut results,
             start_ms,
             &mut i,
+            &completed,
+            agent_id.as_deref(),
         )
         .await;
 
@@ -416,6 +685,7 @@ async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
                 }
                 ErrorMode::Retry => {
                     let max_retries = step.max_retries.unwrap_or(3);
+                    let mut last_error = err;
                     let mut retried = false;
                     for _ in 0..max_retries {
                         let vars_snapshot = vars.clone();
@@ -430,6 +700,8 @@ async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
                             &mut results,
                             retry_start_ms,
                             &mut i,
+                            &completed,
+                            agent_id.as_deref(),
                         )
                         .await
                         {
@@ -437,27 +709,74 @@ async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
                                 retried = true;
                                 break;
                             }
-                            Err(_) => {
+                            Err(error) => {
+                                last_error = error;
                                 vars = vars_snapshot;
                                 results.truncate(results_len);
                                 i = i_snapshot;
-                                continue;
                             }
                         }
                     }
                     if !retried {
-                        mark_run_failed(iii, &safe_run_id, &err_msg, &results).await?;
-                        return Err(err);
+                        let error = last_error.to_string();
+                        set_step_status(&mut step_states, &step, "failed", Some(&error));
+                        mark_run_failed(
+                            iii,
+                            &safe_run_id,
+                            &error,
+                            &results,
+                            &vars,
+                            &step_states,
+                            i,
+                        )
+                        .await?;
+                        return Err(last_error);
                     }
                 }
                 ErrorMode::Fail => {
-                    mark_run_failed(iii, &safe_run_id, &err_msg, &results).await?;
+                    set_step_status(&mut step_states, &step, "failed", Some(&err_msg));
+                    mark_run_failed(
+                        iii,
+                        &safe_run_id,
+                        &err_msg,
+                        &results,
+                        &vars,
+                        &step_states,
+                        i,
+                    )
+                    .await?;
                     return Err(err);
                 }
             }
         }
 
+        for completed_step in &workflow.steps[batch_start..=i] {
+            completed.insert(completed_step.name.clone());
+            let result = results
+                .iter()
+                .rev()
+                .find(|result| result.step_name == completed_step.name);
+            let status = if result.is_some_and(|result| result.error.is_some()) {
+                "skipped"
+            } else {
+                "completed"
+            };
+            set_step_status(&mut step_states, completed_step, status, None);
+        }
+
         i += 1;
+        state_update(
+            iii,
+            "workflow_runs",
+            &safe_run_id,
+            json!([
+                { "type": "set", "path": "results", "value": results },
+                { "type": "set", "path": "vars", "value": vars },
+                { "type": "set", "path": "nextStep", "value": i },
+                { "type": "set", "path": "stepStates", "value": step_states },
+            ]),
+        )
+        .await?;
     }
 
     state_update(
@@ -468,6 +787,9 @@ async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
             { "type": "set", "path": "status", "value": "completed" },
             { "type": "set", "path": "completedAt", "value": now_ms() },
             { "type": "set", "path": "results", "value": results },
+            { "type": "set", "path": "vars", "value": vars },
+            { "type": "set", "path": "nextStep", "value": workflow.steps.len() },
+            { "type": "set", "path": "stepStates", "value": step_states },
         ]),
     )
     .await?;
@@ -476,6 +798,7 @@ async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         "runId": safe_run_id,
         "results": results,
         "vars": vars,
+        "stepStates": step_states,
     }))
 }
 
@@ -490,23 +813,56 @@ async fn list_workflows(iii: &IIIClient) -> Result<Value, Error> {
     .map_err(|e| Error::Handler(e.to_string()))
 }
 
+async fn get_workflow(iii: &IIIClient, workflow_id: &str) -> Result<Value, Error> {
+    let safe_workflow_id = sanitize_id(workflow_id).map_err(Error::Handler)?;
+    let workflow = state_get(iii, "workflows", &safe_workflow_id).await?;
+    if workflow.is_null() {
+        return Err(Error::Handler(format!(
+            "Workflow {safe_workflow_id} not found"
+        )));
+    }
+    Ok(workflow)
+}
+
 fn safe_pagination(limit: Option<i64>, offset: Option<i64>) -> (usize, usize) {
     let limit = limit.unwrap_or(50).clamp(1, 500) as usize;
     let offset = offset.unwrap_or(0).max(0) as usize;
     (limit, offset)
 }
 
+fn input_i64(input: &Value, key: &str) -> Option<i64> {
+    input
+        .get(key)
+        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+fn workflow_run_page(
+    all: Value,
+    workflow_id: &str,
+    limit: usize,
+    offset: usize,
+) -> (Vec<Value>, usize) {
+    let matching: Vec<Value> = all
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|run| run.get("workflowId").and_then(Value::as_str) == Some(workflow_id))
+        .collect();
+    let total = matching.len();
+    let page = matching.into_iter().skip(offset).take(limit).collect();
+    (page, total)
+}
+
 async fn list_runs(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let workflow_id = input
         .get("workflowId")
+        .or_else(|| input.get("id"))
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Handler("workflowId is required".into()))?;
     let safe_workflow_id = sanitize_id(workflow_id).map_err(Error::Handler)?;
 
-    let (limit, offset) = safe_pagination(
-        input.get("limit").and_then(Value::as_i64),
-        input.get("offset").and_then(Value::as_i64),
-    );
+    let (limit, offset) = safe_pagination(input_i64(&input, "limit"), input_i64(&input, "offset"));
 
     let all = iii
         .trigger(TriggerRequest {
@@ -518,19 +874,7 @@ async fn list_runs(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
 
-    let arr = all.as_array().cloned().unwrap_or_default();
-    let matching: Vec<Value> = arr
-        .into_iter()
-        .filter(|r| {
-            r.get("value")
-                .and_then(|v| v.get("workflowId"))
-                .and_then(Value::as_str)
-                .map(|w| w == safe_workflow_id)
-                .unwrap_or(false)
-        })
-        .collect();
-    let total = matching.len();
-    let filtered: Vec<Value> = matching.into_iter().skip(offset).take(limit).collect();
+    let (filtered, total) = workflow_run_page(all, &safe_workflow_id, limit, offset);
 
     Ok::<Value, Error>(json!({
         "runs": filtered,
@@ -542,9 +886,110 @@ async fn list_runs(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
 async fn get_run_state(iii: &IIIClient, run_id: &str) -> Result<Value, Error> {
     let safe_run_id = sanitize_id(run_id).map_err(Error::Handler)?;
-    state_get(iii, "workflow_runs", &safe_run_id).await
+    let run = state_get(iii, "workflow_runs", &safe_run_id).await?;
+    if run.is_null() {
+        return Err(Error::Handler(format!(
+            "Workflow run {safe_run_id} not found"
+        )));
+    }
+    Ok(run)
 }
 
+fn workflow_directory() -> Result<PathBuf, Error> {
+    if let Some(path) = std::env::var_os("AGENTOS_WORKFLOWS_DIR") {
+        let path = PathBuf::from(path);
+        if path.is_dir() {
+            return Ok(path);
+        }
+        return Err(Error::Handler(format!(
+            "AGENTOS_WORKFLOWS_DIR is not a directory: {}",
+            path.display()
+        )));
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir.join("workflows"));
+        candidates.push(current_dir.join("runtime/workflows"));
+        candidates.push(current_dir.join("../workflows"));
+    }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(bin_dir) = executable.parent()
+    {
+        candidates.push(bin_dir.join("../workflows"));
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../workflows"));
+
+    candidates
+        .into_iter()
+        .find(|path| path.is_dir())
+        .ok_or_else(|| Error::Handler("bundled workflows directory not found".to_string()))
+}
+
+fn read_workflow_definitions(directory: &std::path::Path) -> Result<Vec<Workflow>, Error> {
+    let mut paths = std::fs::read_dir(directory)
+        .map_err(|error| Error::Handler(format!("{}: {error}", directory.display())))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "yaml" | "yml"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    paths
+        .into_iter()
+        .map(|path| {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|error| Error::Handler(format!("{}: {error}", path.display())))?;
+            let workflow: Workflow = serde_yaml::from_str(&content)
+                .map_err(|error| Error::Handler(format!("{}: {error}", path.display())))?;
+            validate_workflow(&workflow)
+                .map_err(|error| Error::Handler(format!("{}: {error}", path.display())))?;
+            Ok(workflow)
+        })
+        .collect()
+}
+
+async fn load_workflows_from_directory(
+    iii: &IIIClient,
+    directory: &std::path::Path,
+) -> Result<usize, Error> {
+    let workflows = read_workflow_definitions(directory)?;
+    if workflows.is_empty() {
+        return Err(Error::Handler(format!(
+            "no workflow definitions found in {}",
+            directory.display()
+        )));
+    }
+
+    let mut last_error = None;
+    for attempt in 0..STATE_STARTUP_ATTEMPTS {
+        let mut loaded = 0;
+        for workflow in &workflows {
+            let input = serde_json::to_value(workflow)
+                .map_err(|error| Error::Handler(error.to_string()))?;
+            match create_workflow(iii, input).await {
+                Ok(_) => loaded += 1,
+                Err(error) => {
+                    last_error = Some(error);
+                    break;
+                }
+            }
+        }
+        if loaded == workflows.len() {
+            return Ok(loaded);
+        }
+        if attempt + 1 < STATE_STARTUP_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(250 * (attempt as u64 + 1))).await;
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| Error::Handler("workflow state unavailable during startup".to_string())))
+}
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -584,6 +1029,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let iii_clone = iii.clone();
     iii.register_function(
+        "workflow::get",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_clone.clone();
+            async move {
+                let workflow_id = input
+                    .get("workflowId")
+                    .or_else(|| input.get("id"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::Handler("workflowId is required".into()))?;
+                get_workflow(&iii, workflow_id).await
+            }
+        })
+        .description("Read a workflow by ID"),
+    );
+
+    let iii_clone = iii.clone();
+    iii.register_function(
         "workflow::runs",
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_clone.clone();
@@ -600,6 +1062,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             async move {
                 let run_id = input
                     .get("runId")
+                    .or_else(|| input.get("id"))
                     .and_then(Value::as_str)
                     .ok_or_else(|| Error::Handler("runId is required".into()))?;
                 get_run_state(&iii, run_id).await
@@ -611,7 +1074,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     agentos_http_adapter::register_http_trigger(
         &iii,
         "workflow::run".to_string(),
-        json!({ "http_method": "POST", "api_path": "api/workflows/run" }),
+        json!({ "http_method": "POST", "api_path": "api/workflows/:id/run" }),
         None,
     )?;
     agentos_http_adapter::register_http_trigger(
@@ -626,6 +1089,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         json!({ "http_method": "GET", "api_path": "api/workflows" }),
         None,
     )?;
+    agentos_http_adapter::register_http_trigger(
+        &iii,
+        "workflow::get".to_string(),
+        json!({ "http_method": "GET", "api_path": "api/workflows/:id" }),
+        None,
+    )?;
+    agentos_http_adapter::register_http_trigger(
+        &iii,
+        "workflow::runs".to_string(),
+        json!({ "http_method": "GET", "api_path": "api/workflows/:id/runs" }),
+        None,
+    )?;
+    agentos_http_adapter::register_http_trigger(
+        &iii,
+        "workflow::get_run_state".to_string(),
+        json!({ "http_method": "GET", "api_path": "api/workflow-runs/:id" }),
+        None,
+    )?;
+
+    let workflow_dir = workflow_directory()?;
+    let loaded_workflows = load_workflows_from_directory(&iii, &workflow_dir).await?;
+    tracing::info!(
+        count = loaded_workflows,
+        directory = %workflow_dir.display(),
+        "bundled workflows loaded"
+    );
 
     tracing::info!("workflow worker started");
     tokio::signal::ctrl_c().await?;
@@ -662,5 +1151,174 @@ mod tests {
         assert_eq!(safe_pagination(Some(0), Some(-5)), (1, 0));
         assert_eq!(safe_pagination(Some(10000), Some(20)), (500, 20));
         assert_eq!(safe_pagination(None, None), (50, 0));
+    }
+
+    #[test]
+    fn input_i64_accepts_http_query_strings() {
+        let input = json!({ "limit": "5", "offset": 2, "invalid": "x" });
+        assert_eq!(input_i64(&input, "limit"), Some(5));
+        assert_eq!(input_i64(&input, "offset"), Some(2));
+        assert_eq!(input_i64(&input, "invalid"), None);
+    }
+
+    #[test]
+    fn workflow_run_page_filters_raw_state_values() {
+        let all = json!([
+            { "runId": "a-1", "workflowId": "a" },
+            { "runId": "b-1", "workflowId": "b" },
+            { "runId": "a-2", "workflowId": "a" },
+        ]);
+        let (page, total) = workflow_run_page(all, "a", 1, 1);
+        assert_eq!(total, 2);
+        assert_eq!(page, vec![json!({ "runId": "a-2", "workflowId": "a" })]);
+    }
+
+    #[test]
+    fn bundled_workflows_parse_and_bind_every_agent_step() {
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../workflows");
+        let workflows = read_workflow_definitions(&directory).unwrap();
+        assert_eq!(workflows.len(), 3);
+        for workflow in workflows {
+            for step in workflow
+                .steps
+                .iter()
+                .filter(|step| step.function_id == "agent::chat")
+            {
+                let agent_id = step
+                    .agent_id
+                    .as_ref()
+                    .expect("agent step must bind agentId");
+                assert!(workflow.agents.contains(agent_id));
+            }
+        }
+    }
+
+    #[test]
+    fn agent_step_payload_uses_interpolated_message_and_step_agent() {
+        let workflow: Workflow = serde_json::from_value(json!({
+            "id": "wf",
+            "name": "workflow",
+            "description": "test",
+            "agents": ["architect"],
+            "steps": [{
+                "name": "spec",
+                "functionId": "agent::chat",
+                "agentId": "architect",
+                "promptTemplate": "Design {{goal}}",
+                "mode": "sequential",
+                "errorMode": "fail",
+                "timeoutMs": 1000
+            }]
+        }))
+        .unwrap();
+        let vars = seed_vars(json!({ "goal": "a cache" }), Some("fallback"));
+        let payload = step_payload(&workflow.steps[0], &vars, Some("fallback")).unwrap();
+        assert_eq!(payload["agentId"], "architect");
+        assert_eq!(payload["message"], "Design a cache");
+        assert_eq!(payload["prompt"], "Design a cache");
+    }
+
+    #[test]
+    fn validation_rejects_unbounded_step_controls() {
+        let workflow: Workflow = serde_json::from_value(json!({
+            "id": "wf",
+            "name": "workflow",
+            "description": "test",
+            "steps": [{
+                "name": "loop",
+                "functionId": "echo::run",
+                "mode": "loop",
+                "errorMode": "fail",
+                "timeoutMs": 3600001,
+                "maxIterations": 101
+            }]
+        }))
+        .unwrap();
+        assert!(validate_workflow(&workflow).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_missing_dependency() {
+        let workflow: Workflow = serde_json::from_value(json!({
+            "id": "wf",
+            "name": "workflow",
+            "description": "test",
+            "steps": [{
+                "name": "deploy",
+                "functionId": "echo::run",
+                "dependsOn": ["build"],
+                "mode": "sequential",
+                "errorMode": "fail",
+                "timeoutMs": 1000
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            validate_workflow(&workflow).unwrap_err(),
+            "step deploy depends on missing step build"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_dependency_cycle() {
+        let workflow: Workflow = serde_json::from_value(json!({
+            "id": "wf",
+            "name": "workflow",
+            "description": "test",
+            "steps": [
+                {
+                    "name": "build",
+                    "functionId": "echo::run",
+                    "dependsOn": ["test"],
+                    "mode": "sequential",
+                    "errorMode": "fail",
+                    "timeoutMs": 1000
+                },
+                {
+                    "name": "test",
+                    "functionId": "echo::run",
+                    "dependsOn": ["build"],
+                    "mode": "sequential",
+                    "errorMode": "fail",
+                    "timeoutMs": 1000
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            validate_workflow(&workflow).unwrap_err(),
+            "workflow dependency graph contains a cycle"
+        );
+    }
+
+    #[test]
+    fn dependency_order_moves_prerequisites_before_dependents() {
+        let workflow: Workflow = serde_json::from_value(json!({
+            "id": "wf",
+            "name": "workflow",
+            "description": "test",
+            "steps": [
+                {
+                    "name": "deploy",
+                    "functionId": "echo::run",
+                    "dependsOn": ["build"],
+                    "mode": "sequential",
+                    "errorMode": "fail",
+                    "timeoutMs": 1000
+                },
+                {
+                    "name": "build",
+                    "functionId": "echo::run",
+                    "mode": "sequential",
+                    "errorMode": "fail",
+                    "timeoutMs": 1000
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(workflow_execution_order(&workflow).unwrap(), vec![1, 0]);
     }
 }

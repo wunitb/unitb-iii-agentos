@@ -1,0 +1,2228 @@
+//! One-command bootstrap (`agentos up`) and readiness diagnosis (`agentos doctor`).
+//!
+//! Every operating-system effect the policies need sits behind two traits:
+//! [`Diagnostics`] for read-only probes and [`Bootstrap`] for process control.
+//! `agentos doctor` is handed a [`Diagnostics`] only, so "doctor never installs,
+//! builds, starts, repairs, or kills anything" is enforced by the type system,
+//! and `agentos up` can be unit tested without spawning a single process.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use colored::Colorize;
+use serde_json::{Value, json};
+
+use crate::{RunningWorker, RuntimePaths, WorkerLaunch, WorkerRuntime, WorkerSpec};
+
+/// The engine accepts worker connections here; `config.yaml` pins the port.
+pub(crate) const ENGINE_HOST: Ipv4Addr = Ipv4Addr::LOCALHOST;
+pub(crate) const ENGINE_PORT: u16 = 49134;
+
+pub(crate) const ENGINE_INSTALL_HINT: &str =
+    "install it with `bash scripts/install-iii.sh` (or reinstall AgentOS) and keep `iii` on PATH";
+pub(crate) const WORKSPACE_BUILD_HINT: &str = "run `cargo build --workspace --release`";
+
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+const WORKER_IDENTITIES_UNREPORTED: &str = "the engine did not report connected worker identities";
+
+/// Reads `<runtime>/.env` for `agentos up` without mutating this process. Keys
+/// already exported by the invoking shell are deliberately omitted so child
+/// process inheritance keeps the explicit value. The returned values are
+/// applied to the engine, workers, and TUI at spawn time.
+pub(crate) fn load_dotenv(runtime_dir: &Path) -> Result<BTreeMap<String, String>> {
+    let path = runtime_dir.join(".env");
+    if !path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let source = std::fs::read_to_string(&path)
+        .with_context(|| format!("Cannot read dotenv file {}", path.display()))?;
+    parse_dotenv(&source, &path)
+}
+
+fn parse_dotenv(source: &str, path: &Path) -> Result<BTreeMap<String, String>> {
+    let mut values = BTreeMap::new();
+    for (index, raw_line) in source.lines().enumerate() {
+        let mut line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("export ") {
+            line = rest.trim_start();
+        }
+        let Some((key, raw_value)) = line.split_once('=') else {
+            anyhow::bail!(
+                "Invalid dotenv assignment at {}:{}",
+                path.display(),
+                index + 1
+            );
+        };
+        let key = key.trim();
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|character| character == '_' || character.is_ascii_alphanumeric())
+            || key.as_bytes()[0].is_ascii_digit()
+        {
+            anyhow::bail!(
+                "Invalid dotenv key at {}:{}: {key}",
+                path.display(),
+                index + 1
+            );
+        }
+        // Explicit shell exports win. First assignment wins within `.env`,
+        // matching common dotenv behavior and avoiding surprising overrides.
+        if std::env::var_os(key).is_some() || values.contains_key(key) {
+            continue;
+        }
+        let value = parse_dotenv_value(raw_value.trim(), path, index + 1)?;
+        values.insert(key.to_string(), value);
+    }
+    Ok(values)
+}
+
+fn parse_dotenv_value(value: &str, path: &Path, line: usize) -> Result<String> {
+    if let Some(quoted) = value.strip_prefix('"') {
+        let Some(quoted) = quoted.strip_suffix('"') else {
+            anyhow::bail!("Unclosed double quote at {}:{line}", path.display());
+        };
+        let mut parsed = String::new();
+        let mut escaped = false;
+        for character in quoted.chars() {
+            if escaped {
+                parsed.push(match character {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    other => other,
+                });
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else {
+                parsed.push(character);
+            }
+        }
+        if escaped {
+            parsed.push('\\');
+        }
+        return Ok(parsed);
+    }
+    if let Some(quoted) = value.strip_prefix('\'') {
+        let Some(quoted) = quoted.strip_suffix('\'') else {
+            anyhow::bail!("Unclosed single quote at {}:{line}", path.display());
+        };
+        return Ok(quoted.to_string());
+    }
+    let value = value.find(" #").map_or(value, |comment| &value[..comment]);
+    Ok(value.trim_end().to_string())
+}
+
+fn engine_endpoint() -> SocketAddr {
+    SocketAddr::from((ENGINE_HOST, ENGINE_PORT))
+}
+
+/// Read-only probes. Nothing here changes machine state.
+pub(crate) trait Diagnostics {
+    /// The resolved `iii` binary, or why it could not be found.
+    fn engine_binary(&self) -> Result<PathBuf>;
+    /// `iii --version` output, when the binary answers.
+    fn engine_version(&self, binary: &Path) -> Option<String>;
+    /// Whether the engine accepts connections on its worker port.
+    fn engine_healthy(&self) -> bool;
+    /// Stable names of connected non-engine workers, `None` when the engine
+    /// cannot answer `engine::functions::list`.
+    fn connected_worker_ids(&self) -> Option<BTreeSet<String>>;
+    /// Worker manifests plus the release binary resolved for each of them.
+    fn worker_specs(&self) -> Result<Vec<WorkerSpec>>;
+    /// The `agentos-tui` binary, when it is installed or built.
+    fn tui_binary(&self) -> Option<PathBuf>;
+    /// Where the engine writes its log; used in failure guidance.
+    fn engine_log(&self) -> PathBuf;
+    /// Where the workers write their log; used in failure guidance.
+    fn worker_log(&self) -> PathBuf;
+}
+
+/// Process control used by `agentos up` only.
+pub(crate) trait Bootstrap: Diagnostics {
+    /// Starts the engine detached and returns its pid.
+    fn start_engine(&mut self, binary: &Path) -> Result<u32>;
+    /// The exit status of an engine started by this process, if it died.
+    fn engine_stopped(&mut self) -> Option<String>;
+    /// Workers started by this process that have already exited, named with
+    /// their exit status. Spawning a worker is not the same as it staying up.
+    fn stopped_workers(&mut self) -> Vec<String>;
+    /// Starts every Rust worker and returns how many were started.
+    fn start_workers(&mut self, workers: &[WorkerSpec]) -> Result<usize>;
+    /// Terminates whatever this process started; used on failure paths.
+    fn shutdown_started(&mut self);
+    /// Runs the TUI in the foreground and returns its exit code.
+    fn run_tui(&mut self, binary: &Path) -> Result<i32>;
+    /// Monotonic time. Fakes advance this when `sleep` is called.
+    fn now(&self) -> Instant;
+    fn sleep(&mut self, duration: Duration);
+}
+
+// ---------------------------------------------------------------------------
+// readiness report (`agentos doctor`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReadinessItem {
+    pub(crate) name: &'static str,
+    pub(crate) passed: bool,
+    pub(crate) detail: String,
+    /// What to do about it, present only when the item failed.
+    pub(crate) hint: Option<String>,
+}
+
+impl ReadinessItem {
+    fn ok(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            name,
+            passed: true,
+            detail: detail.into(),
+            hint: None,
+        }
+    }
+
+    fn failed(name: &'static str, detail: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
+            name,
+            passed: false,
+            detail: detail.into(),
+            hint: Some(hint.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Readiness {
+    pub(crate) items: Vec<ReadinessItem>,
+}
+
+impl Readiness {
+    pub(crate) fn passed(&self) -> bool {
+        self.items.iter().all(|item| item.passed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn item(&self, name: &str) -> Option<&ReadinessItem> {
+        self.items.iter().find(|item| item.name == name)
+    }
+
+    pub(crate) fn to_json(&self) -> Value {
+        let checks = self
+            .items
+            .iter()
+            .map(|item| {
+                json!({
+                    "check": item.name,
+                    "passed": item.passed,
+                    "detail": item.detail,
+                    "hint": item.hint,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({ "checks": checks, "passed": self.passed() })
+    }
+
+    pub(crate) fn render(&self, out: &mut dyn Write) -> Result<()> {
+        writeln!(out, "\n{} AgentOS readiness\n", "→".blue())?;
+        let width = self
+            .items
+            .iter()
+            .map(|item| item.name.len())
+            .max()
+            .unwrap_or(0);
+        for item in &self.items {
+            let icon = if item.passed {
+                "✓".green()
+            } else {
+                "✗".red()
+            };
+            writeln!(
+                out,
+                "  {icon} {:<width$}  {}",
+                item.name,
+                item.detail,
+                width = width
+            )?;
+            if let Some(hint) = &item.hint {
+                writeln!(out, "    {:<width$}  {hint}", "", width = width)?;
+            }
+        }
+
+        let failed = self.items.iter().filter(|item| !item.passed).count();
+        if failed == 0 {
+            writeln!(
+                out,
+                "\n{} Everything is ready. Run `agentos up`.\n",
+                "✓".green()
+            )?;
+        } else {
+            writeln!(out, "\n{} {failed} check(s) need attention.\n", "✗".red())?;
+        }
+        Ok(())
+    }
+}
+
+/// Builds the readiness report. Pure aggregation over read-only probes.
+pub(crate) fn readiness(probes: &dyn Diagnostics, paths: &RuntimePaths) -> Readiness {
+    let mut items = Vec::new();
+
+    let engine_binary = probes.engine_binary();
+    match &engine_binary {
+        Ok(binary) => {
+            let version = probes
+                .engine_version(binary)
+                .unwrap_or_else(|| "version unknown".to_string());
+            items.push(ReadinessItem::ok(
+                "Engine binary",
+                format!("{version} ({})", binary.display()),
+            ));
+        }
+        Err(error) => items.push(ReadinessItem::failed(
+            "Engine binary",
+            error.to_string(),
+            ENGINE_INSTALL_HINT,
+        )),
+    }
+
+    let endpoint = engine_endpoint();
+    let healthy = probes.engine_healthy();
+    items.push(if healthy {
+        ReadinessItem::ok("Engine", format!("accepting connections on {endpoint}"))
+    } else {
+        ReadinessItem::failed(
+            "Engine",
+            format!("no listener on {endpoint}"),
+            "start the stack with `agentos up`",
+        )
+    });
+
+    let binary_dir = crate::worker_binary_dir(&paths.runtime_dir);
+    let specs = probes.worker_specs();
+    let required = specs
+        .as_ref()
+        .ok()
+        .map(|workers| required_worker_ids(workers));
+    match &specs {
+        Ok(workers) => {
+            let missing = crate::missing_worker_binaries(workers);
+            let rust_workers = required.as_ref().map_or(0, BTreeSet::len);
+            if missing.is_empty() {
+                items.push(ReadinessItem::ok(
+                    "Workers",
+                    format!(
+                        "{rust_workers} release binaries in {}",
+                        binary_dir.display()
+                    ),
+                ));
+            } else {
+                items.push(ReadinessItem::failed(
+                    "Workers",
+                    format!(
+                        "{} of {rust_workers} release binaries missing in {}: {}",
+                        missing.len(),
+                        binary_dir.display(),
+                        missing.join(", ")
+                    ),
+                    WORKSPACE_BUILD_HINT,
+                ));
+            }
+        }
+        Err(error) => items.push(ReadinessItem::failed(
+            "Workers",
+            error.to_string(),
+            "check the runtime `workers/` directory named by the config below",
+        )),
+    }
+
+    // Counts can be satisfied by unrelated or duplicate workers. Readiness is
+    // the complete set of canonical manifest identities.
+    items.push(match (probes.connected_worker_ids(), required) {
+        (Some(connected), Some(required)) => {
+            if required.is_empty() {
+                ReadinessItem::failed(
+                    "Connected",
+                    format!(
+                        "the runtime declares no Rust workers in {}",
+                        binary_dir.display()
+                    ),
+                    "point the config at a runtime with `workers/`, or reinstall AgentOS",
+                )
+            } else {
+                let missing = missing_worker_ids(&required, &connected);
+                if missing.is_empty() {
+                    ReadinessItem::ok(
+                        "Connected",
+                        format!(
+                            "{} connected; all {} required worker identities present",
+                            connected.len(),
+                            required.len()
+                        ),
+                    )
+                } else {
+                    ReadinessItem::failed(
+                        "Connected",
+                        format!(
+                            "{} connected; missing {} of {} required identities: {}",
+                            connected.len(),
+                            missing.len(),
+                            required.len(),
+                            missing.join(", ")
+                        ),
+                        "start them with `agentos up --no-tui`",
+                    )
+                }
+            }
+        }
+        (Some(connected), None) => ReadinessItem::failed(
+            "Connected",
+            format!(
+                "{} workers connected, but the required set is unknown",
+                connected.len()
+            ),
+            "fix the `workers/` directory above, then re-run `agentos doctor`",
+        ),
+        (None, _) => ReadinessItem::failed(
+            "Connected",
+            WORKER_IDENTITIES_UNREPORTED,
+            "start the stack with `agentos up`, then re-run `agentos doctor`",
+        ),
+    });
+
+    items.push(match probes.tui_binary() {
+        Some(path) => ReadinessItem::ok("TUI", path.display().to_string()),
+        None => ReadinessItem::failed(
+            "TUI",
+            format!("{} not found", crate::TUI_BINARY),
+            format!("{WORKSPACE_BUILD_HINT}, or reinstall AgentOS"),
+        ),
+    });
+
+    let config_detail = format!(
+        "{} — {}",
+        paths.discovery.label(),
+        paths.config_path.display()
+    );
+    items.push(if paths.config_path.is_file() {
+        ReadinessItem::ok("Config", config_detail)
+    } else {
+        ReadinessItem::failed(
+            "Config",
+            format!("{config_detail} (missing)"),
+            "run the installer, or point AGENTOS_CONFIG at a config.yaml",
+        )
+    });
+
+    items.push(if paths.agentos_home.is_dir() {
+        ReadinessItem::ok("State", paths.agentos_home.display().to_string())
+    } else {
+        ReadinessItem::failed(
+            "State",
+            format!("{} is missing", paths.agentos_home.display()),
+            "create it with `agentos init`",
+        )
+    });
+
+    Readiness { items }
+}
+
+/// Workers `up` launches and therefore expects to see on the bus: every Rust
+/// worker in the runtime. Python workers are started by their own tooling.
+fn required_worker_ids(workers: &[WorkerSpec]) -> BTreeSet<String> {
+    workers
+        .iter()
+        .filter(|worker| worker.runtime == WorkerRuntime::Rust)
+        .map(|worker| worker.name.clone())
+        .collect()
+}
+
+fn missing_worker_ids(required: &BTreeSet<String>, connected: &BTreeSet<String>) -> Vec<String> {
+    required.difference(connected).cloned().collect()
+}
+
+// ---------------------------------------------------------------------------
+// bootstrap policy (`agentos up`)
+// ---------------------------------------------------------------------------
+
+pub(crate) struct UpOptions {
+    pub(crate) launch_tui: bool,
+    /// Upper bound on each readiness wait: engine health, then worker
+    /// connections.
+    pub(crate) stage_timeout: Duration,
+    pub(crate) poll_interval: Duration,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UpOutcome {
+    /// `--no-tui`: engine and workers are ready and keep running.
+    Ready,
+    /// The TUI ran in the foreground and exited with this code.
+    Tui(i32),
+}
+
+/// Brings the stack up in order: config, engine binary, TUI binary, engine
+/// health, worker binaries, workers, TUI. A failed stage stops the sequence and
+/// tears down whatever this invocation started.
+pub(crate) fn run_up(
+    effects: &mut dyn Bootstrap,
+    paths: &RuntimePaths,
+    options: &UpOptions,
+    out: &mut dyn Write,
+) -> Result<UpOutcome> {
+    let outcome = up_stages(effects, paths, options, out);
+    if outcome.is_err() {
+        effects.shutdown_started();
+    }
+    outcome
+}
+
+fn stage_ok(out: &mut dyn Write, name: &str, detail: &str) -> Result<()> {
+    writeln!(out, "  {} {:<9} {detail}", "✓".green(), name)?;
+    Ok(())
+}
+
+fn stage_run(out: &mut dyn Write, detail: &str) -> Result<()> {
+    writeln!(out, "  {} {detail}", "→".blue())?;
+    Ok(())
+}
+
+fn up_stages(
+    effects: &mut dyn Bootstrap,
+    paths: &RuntimePaths,
+    options: &UpOptions,
+    out: &mut dyn Write,
+) -> Result<UpOutcome> {
+    writeln!(out, "\n{}", "AgentOS".bold().cyan())?;
+    writeln!(out, "{}", "─".repeat(46).dimmed())?;
+
+    // 1. configuration
+    if !paths.config_path.is_file() {
+        anyhow::bail!(
+            "AgentOS config not found at {} ({}). Run the installer, or point AGENTOS_CONFIG at a config.yaml",
+            paths.config_path.display(),
+            paths.discovery.label()
+        );
+    }
+    stage_ok(
+        out,
+        "Config",
+        &format!(
+            "{} — {}",
+            paths.discovery.label(),
+            paths.config_path.display()
+        ),
+    )?;
+
+    // 2. engine binary
+    let engine_binary = effects
+        .engine_binary()
+        .map_err(|error| anyhow::anyhow!("{error}; {ENGINE_INSTALL_HINT}"))?;
+    let version = effects
+        .engine_version(&engine_binary)
+        .unwrap_or_else(|| "version unknown".to_string());
+    stage_ok(
+        out,
+        "Engine",
+        &format!("{version} ({})", engine_binary.display()),
+    )?;
+
+    // 3. the TUI binary is a precondition, so a missing TUI never leaves a
+    //    half-started stack behind.
+    let tui_binary = if options.launch_tui {
+        let Some(path) = effects.tui_binary() else {
+            anyhow::bail!(
+                "{} not found beside the agentos binary or in {}: {WORKSPACE_BUILD_HINT}, or start without it using `agentos up --no-tui`",
+                crate::TUI_BINARY,
+                crate::worker_binary_dir(&paths.runtime_dir).display()
+            );
+        };
+        stage_ok(out, "TUI", &path.display().to_string())?;
+        Some(path)
+    } else {
+        None
+    };
+
+    // 4. engine: reuse a healthy one, otherwise start it detached and wait.
+    let endpoint = engine_endpoint();
+    let reused_engine = effects.engine_healthy();
+    if reused_engine {
+        stage_ok(out, "Bus", &format!("already healthy on {endpoint}"))?;
+    } else {
+        stage_run(out, &format!("Starting iii-engine on {endpoint}..."))?;
+        let pid = effects.start_engine(&engine_binary)?;
+        await_engine(effects, options)?;
+        stage_ok(out, "Bus", &format!("healthy on {endpoint} (pid {pid})"))?;
+    }
+
+    // 5. worker binaries
+    let workers = effects.worker_specs()?;
+    let missing = crate::missing_worker_binaries(&workers);
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Missing compiled workers in {}: {}. {WORKSPACE_BUILD_HINT}",
+            crate::worker_binary_dir(&paths.runtime_dir).display(),
+            missing.join(", ")
+        );
+    }
+    let required = required_worker_ids(&workers);
+    if required.is_empty() {
+        anyhow::bail!(
+            "No Rust workers found in {}; {WORKSPACE_BUILD_HINT} in a checkout, or reinstall AgentOS",
+            paths.runtime_dir.join("workers").display()
+        );
+    }
+    stage_ok(
+        out,
+        "Workers",
+        &format!("{} release binaries", required.len()),
+    )?;
+
+    // 6. workers: compare canonical identities, never aggregate counts. On a
+    //    partial stack only missing workers are launched, preserving the
+    //    already-connected processes and avoiding duplicate registrations.
+    let already_connected = await_worker_identity_report(effects, options)?;
+    let missing = missing_worker_ids(&required, &already_connected);
+    let connected = if missing.is_empty() {
+        stage_ok(
+            out,
+            "Workers",
+            &format!(
+                "all {} required identities already connected; not starting duplicates",
+                required.len()
+            ),
+        )?;
+        already_connected
+    } else {
+        if !already_connected.is_empty() {
+            stage_run(
+                out,
+                &format!(
+                    "Starting {} missing workers ({} connected)...",
+                    missing.len(),
+                    already_connected.len()
+                ),
+            )?;
+        } else {
+            stage_run(out, "Starting workers...")?;
+        }
+        let workers_to_start = workers
+            .iter()
+            .filter(|worker| missing.binary_search(&worker.name).is_ok())
+            .cloned()
+            .collect::<Vec<_>>();
+        let started = effects.start_workers(&workers_to_start)?;
+        stage_ok(out, "Workers", &format!("{started} started"))?;
+        let connected = await_workers(effects, options, &required)?;
+        stage_ok(
+            out,
+            "Workers",
+            &format!(
+                "{} connected; all {} required identities present",
+                connected.len(),
+                required.len()
+            ),
+        )?;
+        connected
+    };
+
+    // The engine can accept one connection and then die; nothing later may
+    // report success against a dead bus.
+    ensure_engine_alive(effects)?;
+
+    // 7. TUI in the foreground.
+    match tui_binary {
+        Some(path) => {
+            stage_run(out, "Starting agentos-tui...")?;
+            let code = effects.run_tui(&path)?;
+            Ok(UpOutcome::Tui(code))
+        }
+        None => {
+            writeln!(out, "{}", "─".repeat(46).dimmed())?;
+            writeln!(out, "  Engine   {}  ws://{endpoint}", "●".green())?;
+            writeln!(
+                out,
+                "  Workers  {}  {} connected; {} required identities present",
+                "●".green(),
+                connected.len(),
+                required.len()
+            )?;
+            writeln!(out, "{}", "─".repeat(46).dimmed())?;
+            writeln!(
+                out,
+                "\n  {} agentos tui           Terminal dashboard",
+                "▸".dimmed()
+            )?;
+            writeln!(
+                out,
+                "  {} agentos doctor        Readiness report\n",
+                "▸".dimmed()
+            )?;
+            Ok(UpOutcome::Ready)
+        }
+    }
+}
+
+/// Builds a wall-clock polling budget for each readiness wait. A deadline caps
+/// slow probes too; deriving only an attempt count can exceed the timeout by
+/// the cumulative duration of those probes.
+fn poll_plan(options: &UpOptions) -> (Duration, Instant) {
+    let poll = options.poll_interval.max(Duration::from_millis(1));
+    let now = Instant::now();
+    let deadline = now.checked_add(options.stage_timeout).unwrap_or(now);
+    (poll, deadline)
+}
+
+/// Polls engine health within a bounded number of attempts, and fails fast when
+/// the engine we started has already exited.
+fn await_engine(effects: &mut dyn Bootstrap, options: &UpOptions) -> Result<()> {
+    let (poll, deadline) = poll_plan(options);
+    loop {
+        if let Some(status) = effects.engine_stopped() {
+            anyhow::bail!(
+                "iii-engine exited with {status} before it became healthy; check {}",
+                effects.engine_log().display()
+            );
+        }
+        if effects.engine_healthy() {
+            return Ok(());
+        }
+        let now = effects.now();
+        if now >= deadline {
+            break;
+        }
+        effects.sleep(poll.min(deadline.saturating_duration_since(now)));
+    }
+    anyhow::bail!(
+        "iii-engine did not accept connections on {} within {}s; check {}",
+        engine_endpoint(),
+        options.stage_timeout.as_secs_f32(),
+        effects.engine_log().display()
+    )
+}
+
+/// Waits for the engine to answer the worker-identity query before deciding
+/// what to launch. `None` is an unknown state, while `Some(empty)` is a valid
+/// report that means every required worker still needs to be started.
+fn await_worker_identity_report(
+    effects: &mut dyn Bootstrap,
+    options: &UpOptions,
+) -> Result<BTreeSet<String>> {
+    let (poll, deadline) = poll_plan(options);
+    loop {
+        ensure_engine_alive(effects)?;
+        if let Some(connected) = effects.connected_worker_ids() {
+            return Ok(connected);
+        }
+        let now = effects.now();
+        if now >= deadline {
+            break;
+        }
+        effects.sleep(poll.min(deadline.saturating_duration_since(now)));
+    }
+    anyhow::bail!(WORKER_IDENTITIES_UNREPORTED)
+}
+
+/// Waits for the required workers to be on the bus within the same bounded
+/// budget. Spawning is not readiness: a worker that exits, or an engine that
+/// dies underneath them, fails here instead of being reported as ready.
+fn await_workers(
+    effects: &mut dyn Bootstrap,
+    options: &UpOptions,
+    required: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let (poll, deadline) = poll_plan(options);
+    let mut reported: Option<BTreeSet<String>> = None;
+    loop {
+        ensure_engine_alive(effects)?;
+        let stopped = effects.stopped_workers();
+        if !stopped.is_empty() {
+            anyhow::bail!(
+                "worker(s) exited right after starting: {}; check {}",
+                stopped.join(", "),
+                effects.worker_log().display()
+            );
+        }
+        if let Some(connected) = effects.connected_worker_ids() {
+            if missing_worker_ids(required, &connected).is_empty() {
+                return Ok(connected);
+            }
+            reported = Some(connected);
+        }
+        let now = effects.now();
+        if now >= deadline {
+            break;
+        }
+        effects.sleep(poll.min(deadline.saturating_duration_since(now)));
+    }
+    let seconds = options.stage_timeout.as_secs_f32();
+    match reported {
+        Some(connected) => {
+            let missing = missing_worker_ids(required, &connected);
+            anyhow::bail!(
+                "{} worker identities are still missing within {seconds}s: {}; check {}",
+                missing.len(),
+                missing.join(", "),
+                effects.worker_log().display()
+            )
+        }
+        None => anyhow::bail!(
+            "the engine did not report connected worker identities within {seconds}s; check {}",
+            effects.worker_log().display()
+        ),
+    }
+}
+
+/// The engine must still be up. Health can succeed once and the process can die
+/// straight after, so every stage past the first probe re-checks it.
+fn ensure_engine_alive(effects: &mut dyn Bootstrap) -> Result<()> {
+    if let Some(status) = effects.engine_stopped() {
+        anyhow::bail!(
+            "iii-engine exited with {status} after it became healthy; check {}",
+            effects.engine_log().display()
+        );
+    }
+    if !effects.engine_healthy() {
+        anyhow::bail!(
+            "iii-engine stopped accepting connections on {}; check {}",
+            engine_endpoint(),
+            effects.engine_log().display()
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// the real machine
+// ---------------------------------------------------------------------------
+
+/// [`Diagnostics`] and [`Bootstrap`] against this machine.
+pub(crate) struct SystemEffects {
+    agentos_home: PathBuf,
+    config_path: PathBuf,
+    runtime_dir: PathBuf,
+    launch_env: BTreeMap<String, String>,
+    engine: Option<std::process::Child>,
+    workers: Vec<RunningWorker>,
+}
+
+impl SystemEffects {
+    pub(crate) fn new(paths: &RuntimePaths, launch_env: BTreeMap<String, String>) -> Self {
+        Self {
+            agentos_home: paths.agentos_home.clone(),
+            config_path: paths.config_path.clone(),
+            runtime_dir: paths.runtime_dir.clone(),
+            launch_env,
+            engine: None,
+            workers: Vec::new(),
+        }
+    }
+}
+
+fn reported_worker_ids(registry: &Value) -> Option<BTreeSet<String>> {
+    if let Some(functions) = registry.get("functions").and_then(Value::as_array) {
+        return Some(
+            functions
+                .iter()
+                .filter_map(|function| function["worker_name"].as_str())
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        );
+    }
+
+    // Keep accepting the richer worker registry used by newer iii builds and
+    // by older AgentOS test fakes. iii 0.22.1 readiness uses the function
+    // registry above because its stable wire identity is `worker_name`.
+    let workers = registry.get("workers")?.as_array()?;
+    Some(
+        workers
+            .iter()
+            .filter(|worker| worker["status"].as_str() == Some("connected"))
+            .filter(|worker| worker["runtime"].as_str() != Some("engine"))
+            .filter_map(|worker| worker["name"].as_str())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+fn parse_registry_output(output: &[u8]) -> Option<Value> {
+    serde_json::from_slice(output).ok().or_else(|| {
+        let text = String::from_utf8_lossy(output);
+        let start = text.find('{')?;
+        let end = text.rfind('}')?;
+        serde_json::from_str(&text[start..=end]).ok()
+    })
+}
+
+impl Diagnostics for SystemEffects {
+    fn engine_binary(&self) -> Result<PathBuf> {
+        crate::find_iii_binary(&self.agentos_home)
+    }
+
+    fn engine_version(&self, binary: &Path) -> Option<String> {
+        let output = std::process::Command::new(binary)
+            .arg("--version")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.lines().next().map(|line| line.trim().to_string())
+    }
+
+    fn engine_healthy(&self) -> bool {
+        TcpStream::connect_timeout(&engine_endpoint(), HEALTH_PROBE_TIMEOUT).is_ok()
+    }
+
+    fn connected_worker_ids(&self) -> Option<BTreeSet<String>> {
+        let binary = self.engine_binary().ok()?;
+        let output = std::process::Command::new(binary)
+            .args([
+                "trigger",
+                "engine::functions::list",
+                "--json",
+                "{}",
+                "--timeout-ms",
+                "1000",
+            ])
+            .envs(&self.launch_env)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        reported_worker_ids(&parse_registry_output(&output.stdout)?)
+    }
+
+    fn worker_specs(&self) -> Result<Vec<WorkerSpec>> {
+        crate::collect_worker_specs(&self.runtime_dir)
+    }
+
+    fn tui_binary(&self) -> Option<PathBuf> {
+        crate::find_tui_binary(Some(&self.runtime_dir))
+    }
+
+    fn engine_log(&self) -> PathBuf {
+        crate::engine_log_path(&self.agentos_home)
+    }
+
+    fn worker_log(&self) -> PathBuf {
+        crate::worker_log_path(&self.agentos_home)
+    }
+}
+
+impl Bootstrap for SystemEffects {
+    fn start_engine(&mut self, binary: &Path) -> Result<u32> {
+        let engine = crate::spawn_engine(
+            binary,
+            &self.config_path,
+            &self.runtime_dir,
+            &self.engine_log(),
+            &self.launch_env,
+            true,
+        )?;
+        let pid = engine.id();
+        self.engine = Some(engine);
+        Ok(pid)
+    }
+
+    fn engine_stopped(&mut self) -> Option<String> {
+        let engine = self.engine.as_mut()?;
+        engine
+            .try_wait()
+            .ok()
+            .flatten()
+            .map(|status| status.to_string())
+    }
+
+    fn stopped_workers(&mut self) -> Vec<String> {
+        self.workers
+            .iter_mut()
+            .filter_map(|worker| {
+                let status = worker.child.try_wait().ok().flatten()?;
+                Some(format!("{} ({status})", worker.name))
+            })
+            .collect()
+    }
+
+    fn start_workers(&mut self, workers: &[WorkerSpec]) -> Result<usize> {
+        let log_path = self.worker_log();
+        let launch = WorkerLaunch {
+            runtime_dir: &self.runtime_dir,
+            log_path: &log_path,
+            env: &self.launch_env,
+            detached: true,
+        };
+        let before = self.workers.len();
+        crate::launch_workers(workers, &launch, &mut self.workers)?;
+        Ok(self.workers.len() - before)
+    }
+
+    fn shutdown_started(&mut self) {
+        for worker in &mut self.workers {
+            let _ = worker.child.kill();
+            let _ = worker.child.wait();
+        }
+        self.workers.clear();
+        if let Some(engine) = self.engine.as_mut() {
+            let _ = engine.kill();
+            let _ = engine.wait();
+        }
+        self.engine = None;
+    }
+
+    fn run_tui(&mut self, binary: &Path) -> Result<i32> {
+        // Inherited stdio: the TUI owns the terminal until the user quits.
+        let status = std::process::Command::new(binary)
+            .current_dir(&self.runtime_dir)
+            .envs(&self.launch_env)
+            .status()
+            .with_context(|| format!("Failed to start {}", binary.display()))?;
+        Ok(status.code().unwrap_or(1))
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ConfigDiscovery;
+    use std::cell::{Cell, RefCell};
+
+    fn spec(name: &str, runtime: WorkerRuntime, built: bool) -> WorkerSpec {
+        WorkerSpec {
+            name: name.to_string(),
+            runtime,
+            binary: built.then(|| PathBuf::from(format!("/release/agentos-{name}"))),
+        }
+    }
+
+    fn ids(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    fn paths(config_path: &Path, discovery: ConfigDiscovery) -> RuntimePaths {
+        RuntimePaths {
+            agentos_home: PathBuf::from("/home/user/.agentos"),
+            config_path: config_path.to_path_buf(),
+            runtime_dir: config_path
+                .parent()
+                .unwrap_or(Path::new("/runtime"))
+                .to_path_buf(),
+            discovery,
+        }
+    }
+
+    /// A path that really is a file, so the up policy passes stage 1. The test
+    /// binary itself qualifies and leaves nothing behind in the temp directory;
+    /// the policy only checks existence and hands the path to the engine.
+    fn existing_config() -> PathBuf {
+        std::env::current_exe().expect("test binary path")
+    }
+
+    struct Fake {
+        engine_binary: Option<PathBuf>,
+        engine_version: Option<String>,
+        /// Healthy from this probe onwards; `None` never becomes healthy.
+        healthy_from: Option<usize>,
+        /// Stops being healthy again from this probe onwards.
+        unhealthy_from: Option<usize>,
+        probes: Cell<usize>,
+        /// The engine this invocation started reports exited from this liveness
+        /// check onwards.
+        engine_exits_after: Option<usize>,
+        stop_checks: Cell<usize>,
+        engine_start_error: Option<String>,
+        /// Stable worker identities the engine reports; `None` when silent.
+        connected: RefCell<Option<BTreeSet<String>>>,
+        identity_probes: Cell<usize>,
+        /// Overrides `connected` from this zero-based identity probe onwards.
+        connected_from_probe: Option<(usize, BTreeSet<String>)>,
+        /// What the engine reports once this invocation started the workers.
+        connected_after_start: Option<BTreeSet<String>>,
+        workers: Result<Vec<WorkerSpec>, String>,
+        worker_start_error: Option<String>,
+        /// Workers that exit right after being started.
+        worker_exits: Vec<String>,
+        started_workers: Cell<bool>,
+        started_worker_names: RefCell<Vec<String>>,
+        tui: Option<PathBuf>,
+        tui_code: i32,
+        events: RefCell<Vec<String>>,
+        sleeps: Cell<usize>,
+        clock_elapsed: Cell<Duration>,
+    }
+
+    impl Default for Fake {
+        fn default() -> Self {
+            Self {
+                engine_binary: Some(PathBuf::from("/usr/local/bin/iii")),
+                engine_version: Some("iii 0.22.1".to_string()),
+                healthy_from: Some(0),
+                unhealthy_from: None,
+                probes: Cell::new(0),
+                engine_exits_after: None,
+                stop_checks: Cell::new(0),
+                engine_start_error: None,
+                connected: RefCell::new(Some(ids(&["core", "memory"]))),
+                identity_probes: Cell::new(0),
+                connected_from_probe: None,
+                connected_after_start: Some(ids(&["core", "memory"])),
+                workers: Ok(vec![
+                    spec("core", WorkerRuntime::Rust, true),
+                    spec("memory", WorkerRuntime::Rust, true),
+                    spec("embedding", WorkerRuntime::Python, false),
+                ]),
+                worker_start_error: None,
+                worker_exits: Vec::new(),
+                started_workers: Cell::new(false),
+                started_worker_names: RefCell::new(Vec::new()),
+                tui: Some(PathBuf::from("/usr/local/bin/agentos-tui")),
+                tui_code: 0,
+                events: RefCell::new(Vec::new()),
+                sleeps: Cell::new(0),
+                clock_elapsed: Cell::new(Duration::ZERO),
+            }
+        }
+    }
+
+    impl Fake {
+        fn record(&self, event: &str) {
+            self.events.borrow_mut().push(event.to_string());
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.borrow().clone()
+        }
+    }
+
+    impl Diagnostics for Fake {
+        fn engine_binary(&self) -> Result<PathBuf> {
+            self.engine_binary.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "iii-engine v0.22.1 is required and was not found on PATH; {ENGINE_INSTALL_HINT}"
+                )
+            })
+        }
+
+        fn engine_version(&self, _binary: &Path) -> Option<String> {
+            self.engine_version.clone()
+        }
+
+        fn engine_healthy(&self) -> bool {
+            let probe = self.probes.get();
+            self.probes.set(probe + 1);
+            let started = self
+                .healthy_from
+                .map(|threshold| probe >= threshold)
+                .unwrap_or(false);
+            let stopped = self
+                .unhealthy_from
+                .map(|threshold| probe >= threshold)
+                .unwrap_or(false);
+            started && !stopped
+        }
+
+        fn connected_worker_ids(&self) -> Option<BTreeSet<String>> {
+            let probe = self.identity_probes.get();
+            self.identity_probes.set(probe + 1);
+            let connected = self.connected.borrow().clone();
+            if connected.is_some() {
+                return connected;
+            }
+            if let Some((threshold, connected)) = &self.connected_from_probe {
+                if probe >= *threshold {
+                    return Some(connected.clone());
+                }
+            }
+            None
+        }
+
+        fn worker_specs(&self) -> Result<Vec<WorkerSpec>> {
+            match &self.workers {
+                Ok(workers) => Ok(workers
+                    .iter()
+                    .map(|worker| spec(&worker.name, worker.runtime, worker.binary.is_some()))
+                    .collect()),
+                Err(error) => anyhow::bail!("{error}"),
+            }
+        }
+
+        fn tui_binary(&self) -> Option<PathBuf> {
+            self.tui.clone()
+        }
+
+        fn engine_log(&self) -> PathBuf {
+            PathBuf::from("/home/user/.agentos/logs/engine.log")
+        }
+
+        fn worker_log(&self) -> PathBuf {
+            PathBuf::from("/home/user/.agentos/logs/workers.log")
+        }
+    }
+
+    impl Bootstrap for Fake {
+        fn start_engine(&mut self, _binary: &Path) -> Result<u32> {
+            self.record("start_engine");
+            match &self.engine_start_error {
+                Some(error) => anyhow::bail!("{error}"),
+                None => Ok(4242),
+            }
+        }
+
+        fn engine_stopped(&mut self) -> Option<String> {
+            let check = self.stop_checks.get();
+            self.stop_checks.set(check + 1);
+            let exits_after = self.engine_exits_after?;
+            (check >= exits_after).then(|| "exit status: 1".to_string())
+        }
+
+        fn stopped_workers(&mut self) -> Vec<String> {
+            if self.started_workers.get() {
+                self.worker_exits.clone()
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn start_workers(&mut self, workers: &[WorkerSpec]) -> Result<usize> {
+            self.record("start_workers");
+            match &self.worker_start_error {
+                Some(error) => anyhow::bail!("{error}"),
+                None => {
+                    self.started_workers.set(true);
+                    *self.connected.borrow_mut() = self.connected_after_start.clone();
+                    *self.started_worker_names.borrow_mut() =
+                        workers.iter().map(|worker| worker.name.clone()).collect();
+                    Ok(workers
+                        .iter()
+                        .filter(|worker| worker.binary.is_some())
+                        .count())
+                }
+            }
+        }
+
+        fn shutdown_started(&mut self) {
+            self.record("shutdown_started");
+        }
+
+        fn run_tui(&mut self, _binary: &Path) -> Result<i32> {
+            self.record("run_tui");
+            Ok(self.tui_code)
+        }
+
+        fn now(&self) -> Instant {
+            Instant::now() + self.clock_elapsed.get()
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.sleeps.set(self.sleeps.get() + 1);
+            self.clock_elapsed.set(self.clock_elapsed.get() + duration);
+        }
+    }
+
+    fn options(launch_tui: bool) -> UpOptions {
+        UpOptions {
+            launch_tui,
+            stage_timeout: Duration::from_secs(3),
+            poll_interval: Duration::from_millis(500),
+        }
+    }
+
+    fn up(fake: &mut Fake, options: &UpOptions, config: &Path) -> (Result<UpOutcome>, String) {
+        colored::control::set_override(false);
+        let mut out = Vec::new();
+        let outcome = run_up(
+            fake,
+            &paths(config, ConfigDiscovery::Checkout),
+            options,
+            &mut out,
+        );
+        (outcome, String::from_utf8(out).expect("utf-8 output"))
+    }
+
+    #[test]
+    fn up_reports_install_hint_when_engine_binary_is_missing() {
+        let config = existing_config();
+        let mut fake = Fake {
+            engine_binary: None,
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(true), &config);
+        let error = outcome.expect_err("missing engine must fail").to_string();
+        assert!(error.contains("install-iii.sh"), "{error}");
+        assert!(!fake.events().contains(&"start_engine".to_string()));
+        assert!(!fake.events().contains(&"start_workers".to_string()));
+    }
+
+    #[test]
+    fn up_stops_at_an_engine_spawn_error_and_cleans_up() {
+        let config = existing_config();
+        let mut fake = Fake {
+            healthy_from: None,
+            engine_start_error: Some("permission denied while starting iii".to_string()),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome
+            .expect_err("engine spawn error must fail")
+            .to_string();
+        assert!(error.contains("permission denied"), "{error}");
+        assert_eq!(
+            fake.events(),
+            vec!["start_engine".to_string(), "shutdown_started".to_string()]
+        );
+        assert!(!fake.events().contains(&"start_workers".to_string()));
+    }
+
+    #[test]
+    fn up_fails_closed_when_the_initial_worker_identity_query_is_unanswered() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(None),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        assert!(!matches!(&outcome, Ok(UpOutcome::Ready)));
+        let error = outcome
+            .expect_err("an unanswered identity query must fail")
+            .to_string();
+        assert_eq!(error, WORKER_IDENTITIES_UNREPORTED);
+        assert!(
+            fake.identity_probes.get() > 1,
+            "identity query was not retried"
+        );
+        assert_eq!(fake.sleeps.get(), 6);
+        assert_eq!(fake.events(), vec!["shutdown_started".to_string()]);
+        assert!(!fake.started_workers.get());
+        assert!(fake.started_worker_names.borrow().is_empty());
+    }
+
+    #[test]
+    fn up_accepts_an_identity_report_that_arrives_within_the_poll_budget() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(None),
+            connected_from_probe: Some((2, BTreeSet::new())),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        assert_eq!(
+            outcome.expect("the third identity query answers"),
+            UpOutcome::Ready
+        );
+        assert_eq!(fake.identity_probes.get(), 4);
+        assert_eq!(fake.sleeps.get(), 2);
+        assert_eq!(fake.events(), vec!["start_workers".to_string()]);
+        assert_eq!(&*fake.started_worker_names.borrow(), &["core", "memory"]);
+    }
+
+    #[test]
+    fn zero_identity_timeout_probes_once_and_fails_without_sleeping_or_spawning() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(None),
+            ..Fake::default()
+        };
+        let zero_timeout = UpOptions {
+            launch_tui: false,
+            stage_timeout: Duration::ZERO,
+            poll_interval: Duration::ZERO,
+        };
+        let (outcome, _) = up(&mut fake, &zero_timeout, &config);
+        assert_eq!(
+            outcome
+                .expect_err("an unanswered zero-budget probe must fail")
+                .to_string(),
+            WORKER_IDENTITIES_UNREPORTED
+        );
+        assert_eq!(fake.identity_probes.get(), 1);
+        assert_eq!(fake.sleeps.get(), 0);
+        assert_eq!(fake.events(), vec!["shutdown_started".to_string()]);
+        assert!(!fake.started_workers.get());
+    }
+
+    #[test]
+    fn up_fails_fast_if_the_engine_dies_during_identity_discovery() {
+        let config = existing_config();
+        let mut fake = Fake {
+            unhealthy_from: Some(2),
+            connected: RefCell::new(None),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome
+            .expect_err("engine death must interrupt identity discovery")
+            .to_string();
+        assert!(
+            error.contains("stopped accepting connections on 127.0.0.1:49134"),
+            "{error}"
+        );
+        assert_eq!(fake.identity_probes.get(), 1);
+        assert_eq!(fake.sleeps.get(), 1);
+        assert_eq!(fake.events(), vec!["shutdown_started".to_string()]);
+        assert!(!fake.started_workers.get());
+    }
+
+    #[test]
+    fn up_reuses_a_healthy_engine_without_spawning_another() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(Some(BTreeSet::new())),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert_eq!(outcome.expect("up succeeds"), UpOutcome::Ready);
+        assert_eq!(fake.events(), vec!["start_workers".to_string()]);
+        assert_eq!(&*fake.started_worker_names.borrow(), &["core", "memory"]);
+        assert!(
+            output.contains("already healthy on 127.0.0.1:49134"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn up_starts_the_engine_detached_and_waits_for_health() {
+        let config = existing_config();
+        let mut fake = Fake {
+            healthy_from: Some(2),
+            connected: RefCell::new(Some(BTreeSet::new())),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert_eq!(outcome.expect("up succeeds"), UpOutcome::Ready);
+        assert_eq!(
+            fake.events(),
+            vec!["start_engine".to_string(), "start_workers".to_string()]
+        );
+        assert!(
+            output.contains("healthy on 127.0.0.1:49134 (pid 4242)"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn up_fails_within_the_health_timeout_and_starts_no_workers() {
+        let config = existing_config();
+        let mut fake = Fake {
+            healthy_from: None,
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome.expect_err("unhealthy engine must fail").to_string();
+        assert!(
+            error.contains("did not accept connections on 127.0.0.1:49134"),
+            "{error}"
+        );
+        assert!(error.contains("engine.log"), "{error}");
+        // 3s budget / 500ms poll: bounded, and it gave up on its own.
+        assert_eq!(fake.sleeps.get(), 6);
+        assert_eq!(
+            fake.events(),
+            vec!["start_engine".to_string(), "shutdown_started".to_string()]
+        );
+    }
+
+    #[test]
+    fn zero_timeout_and_zero_poll_interval_still_make_one_bounded_probe() {
+        let options = UpOptions {
+            launch_tui: false,
+            stage_timeout: Duration::ZERO,
+            poll_interval: Duration::ZERO,
+        };
+        let (poll, deadline) = poll_plan(&options);
+        assert_eq!(poll, Duration::from_millis(1));
+        assert!(deadline <= Instant::now());
+
+        let config = existing_config();
+        let mut fake = Fake {
+            healthy_from: None,
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options, &config);
+        assert!(outcome.is_err());
+        assert_eq!(fake.sleeps.get(), 0);
+        assert!(!fake.events().contains(&"start_workers".to_string()));
+    }
+
+    #[test]
+    fn up_fails_when_the_engine_exits_before_it_is_healthy() {
+        let config = existing_config();
+        let mut fake = Fake {
+            healthy_from: None,
+            engine_exits_after: Some(1),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome.expect_err("dead engine must fail").to_string();
+        assert!(error.contains("exited with exit status: 1"), "{error}");
+        assert!(
+            fake.sleeps.get() < 6,
+            "gave up early: {}",
+            fake.sleeps.get()
+        );
+        assert!(!fake.events().contains(&"start_workers".to_string()));
+    }
+
+    #[test]
+    fn up_reports_the_build_hint_for_missing_worker_binaries() {
+        let config = existing_config();
+        let mut fake = Fake {
+            workers: Ok(vec![
+                spec("core", WorkerRuntime::Rust, true),
+                spec("memory", WorkerRuntime::Rust, false),
+            ]),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome.expect_err("missing binaries must fail").to_string();
+        assert!(error.contains("agentos-memory"), "{error}");
+        assert!(
+            error.contains("cargo build --workspace --release"),
+            "{error}"
+        );
+        assert!(!fake.events().contains(&"start_workers".to_string()));
+    }
+
+    #[test]
+    fn up_stops_when_the_worker_launch_fails() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(Some(BTreeSet::new())),
+            worker_start_error: Some("Failed to start /release/agentos-core".to_string()),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(true), &config);
+        let error = outcome.expect_err("worker failure must fail").to_string();
+        assert!(
+            error.contains("Failed to start /release/agentos-core"),
+            "{error}"
+        );
+        assert_eq!(
+            fake.events(),
+            vec!["start_workers".to_string(), "shutdown_started".to_string()]
+        );
+    }
+
+    #[test]
+    fn up_launches_the_tui_last_and_returns_its_exit_code() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(Some(BTreeSet::new())),
+            tui_code: 7,
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(true), &config);
+        assert_eq!(outcome.expect("up succeeds"), UpOutcome::Tui(7));
+        assert_eq!(
+            fake.events(),
+            vec!["start_workers".to_string(), "run_tui".to_string()]
+        );
+        assert!(output.contains("Starting agentos-tui"), "{output}");
+    }
+
+    #[test]
+    fn up_requires_the_tui_binary_before_touching_any_process() {
+        let config = existing_config();
+        let mut fake = Fake {
+            tui: None,
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(true), &config);
+        let error = outcome.expect_err("missing TUI must fail").to_string();
+        assert!(error.contains("agentos-tui not found"), "{error}");
+        assert!(error.contains("--no-tui"), "{error}");
+        assert_eq!(fake.events(), vec!["shutdown_started".to_string()]);
+    }
+
+    #[test]
+    fn up_no_tui_skips_the_tui_check_and_launch() {
+        let config = existing_config();
+        let mut fake = Fake {
+            tui: None,
+            connected: RefCell::new(Some(BTreeSet::new())),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert_eq!(outcome.expect("up succeeds"), UpOutcome::Ready);
+        assert_eq!(fake.events(), vec!["start_workers".to_string()]);
+        assert!(!output.contains("agentos-tui"), "{output}");
+        assert!(output.contains("agentos doctor"), "{output}");
+    }
+
+    #[test]
+    fn up_keeps_workers_that_are_already_connected() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(Some(ids(&["core", "memory"]))),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert_eq!(outcome.expect("up succeeds"), UpOutcome::Ready);
+        assert!(fake.events().is_empty(), "{:?}", fake.events());
+        assert!(
+            output.contains("2 required identities already connected"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn up_starts_the_workers_when_only_part_of_the_required_set_is_connected() {
+        let config = existing_config();
+        // One of the two Rust workers is on the bus: the stack is not up.
+        let mut fake = Fake {
+            connected: RefCell::new(Some(ids(&["core"]))),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert_eq!(outcome.expect("up succeeds"), UpOutcome::Ready);
+        assert_eq!(fake.events(), vec!["start_workers".to_string()]);
+        assert!(
+            output.contains("Starting 1 missing workers (1 connected)"),
+            "{output}"
+        );
+        assert_eq!(&*fake.started_worker_names.borrow(), &["memory"]);
+    }
+
+    #[test]
+    fn up_does_not_accept_an_unrelated_worker_count_as_readiness() {
+        let config = existing_config();
+        // This would have passed the old count-based readiness check: two
+        // workers are connected, but neither required identity is present.
+        let mut fake = Fake {
+            connected: RefCell::new(Some(ids(&["foreign-a", "foreign-b"]))),
+            connected_after_start: Some(ids(&["core", "memory", "foreign-a", "foreign-b"])),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert_eq!(outcome.expect("up succeeds"), UpOutcome::Ready);
+        assert_eq!(fake.events(), vec!["start_workers".to_string()]);
+        assert_eq!(&*fake.started_worker_names.borrow(), &["core", "memory"]);
+        assert!(
+            output.contains("Starting 2 missing workers (2 connected)"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn up_waits_for_the_started_workers_to_connect() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(Some(BTreeSet::new())),
+            connected_after_start: Some(ids(&["core", "memory"])),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert_eq!(outcome.expect("up succeeds"), UpOutcome::Ready);
+        assert!(output.contains("2 connected"), "{output}");
+        assert!(output.contains("2 required identities present"), "{output}");
+    }
+
+    #[test]
+    fn up_fails_when_the_started_workers_never_connect() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(Some(BTreeSet::new())),
+            connected_after_start: Some(ids(&["core"])),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(true), &config);
+        let error = outcome
+            .expect_err("workers that never connect must fail")
+            .to_string();
+        assert!(
+            error.contains("1 worker identities are still missing within 3s: memory"),
+            "{error}"
+        );
+        assert!(error.contains("workers.log"), "{error}");
+        // Bounded, and the TUI never took the terminal.
+        assert_eq!(fake.sleeps.get(), 6);
+        assert_eq!(
+            fake.events(),
+            vec!["start_workers".to_string(), "shutdown_started".to_string()]
+        );
+    }
+
+    #[test]
+    fn up_fails_when_the_engine_never_reports_worker_identities() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(Some(BTreeSet::new())),
+            connected_after_start: None,
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome.expect_err("a silent engine must fail").to_string();
+        assert!(
+            error.contains("did not report connected worker identities within 3s"),
+            "{error}"
+        );
+        assert!(error.contains("workers.log"), "{error}");
+    }
+
+    #[test]
+    fn up_fails_when_a_started_worker_exits_immediately() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(Some(BTreeSet::new())),
+            connected_after_start: Some(BTreeSet::new()),
+            worker_exits: vec!["core (exit status: 1)".to_string()],
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(true), &config);
+        let error = outcome.expect_err("a dead worker must fail").to_string();
+        assert!(
+            error.contains("worker(s) exited right after starting: core (exit status: 1)"),
+            "{error}"
+        );
+        assert!(error.contains("workers.log"), "{error}");
+        // It gave up on the first check instead of burning the whole budget.
+        assert_eq!(fake.sleeps.get(), 0);
+        assert_eq!(
+            fake.events(),
+            vec!["start_workers".to_string(), "shutdown_started".to_string()]
+        );
+    }
+
+    #[test]
+    fn up_fails_when_the_engine_exits_after_becoming_healthy() {
+        let config = existing_config();
+        // Health succeeds on the second probe, then the engine dies before the
+        // workers are started.
+        let mut fake = Fake {
+            healthy_from: Some(1),
+            connected: RefCell::new(Some(BTreeSet::new())),
+            engine_exits_after: Some(1),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(true), &config);
+        let error = outcome.expect_err("a dead engine must fail").to_string();
+        assert!(
+            error.contains("exited with exit status: 1 after it became healthy"),
+            "{error}"
+        );
+        assert_eq!(
+            fake.events(),
+            vec!["start_engine".to_string(), "shutdown_started".to_string()]
+        );
+    }
+
+    #[test]
+    fn up_fails_when_the_engine_dies_while_the_workers_connect() {
+        let config = existing_config();
+        let mut fake = Fake {
+            healthy_from: Some(1),
+            connected: RefCell::new(Some(BTreeSet::new())),
+            connected_after_start: Some(BTreeSet::new()),
+            engine_exits_after: Some(4),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome.expect_err("a dead engine must fail").to_string();
+        assert!(error.contains("exited with exit status: 1"), "{error}");
+        assert!(
+            fake.sleeps.get() < 6,
+            "gave up early: {}",
+            fake.sleeps.get()
+        );
+        assert_eq!(
+            fake.events(),
+            vec![
+                "start_engine".to_string(),
+                "start_workers".to_string(),
+                "shutdown_started".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn up_fails_when_a_reused_engine_stops_listening() {
+        let config = existing_config();
+        // Healthy for the reuse probe, gone by the time the workers matter.
+        let mut fake = Fake {
+            unhealthy_from: Some(1),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(true), &config);
+        let error = outcome.expect_err("a dead engine must fail").to_string();
+        assert!(
+            error.contains("stopped accepting connections on 127.0.0.1:49134"),
+            "{error}"
+        );
+        assert!(!fake.events().contains(&"start_workers".to_string()));
+        assert!(!fake.events().contains(&"run_tui".to_string()));
+    }
+
+    #[test]
+    fn up_fails_when_the_runtime_has_no_rust_workers() {
+        let config = existing_config();
+        let mut fake = Fake {
+            workers: Ok(vec![spec("embedding", WorkerRuntime::Python, false)]),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome.expect_err("an empty runtime must fail").to_string();
+        assert!(error.contains("No Rust workers found"), "{error}");
+        assert!(!fake.events().contains(&"start_workers".to_string()));
+    }
+
+    #[test]
+    fn up_fails_when_the_resolved_config_is_missing() {
+        let missing = std::env::temp_dir().join("agentos-bootstrap-absent/config.yaml");
+        let mut fake = Fake::default();
+        let (outcome, _) = up(&mut fake, &options(false), &missing);
+        let error = outcome.expect_err("missing config must fail").to_string();
+        assert!(error.contains("AgentOS config not found"), "{error}");
+        assert!(error.contains("checkout config.yaml"), "{error}");
+        assert!(!fake.events().contains(&"start_engine".to_string()));
+    }
+
+    fn diagnose(fake: &Fake, discovery: ConfigDiscovery, config: &Path) -> (Readiness, String) {
+        colored::control::set_override(false);
+        let report = readiness(fake, &paths(config, discovery));
+        let mut out = Vec::new();
+        report.render(&mut out).expect("render report");
+        (report, String::from_utf8(out).expect("utf-8 output"))
+    }
+
+    #[test]
+    fn doctor_reports_every_item_green_when_bootstrapped() {
+        let config = existing_config();
+        let fake = Fake::default();
+        let (report, output) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        // State is the only item that depends on a real home directory.
+        let failures: Vec<&str> = report
+            .items
+            .iter()
+            .filter(|item| !item.passed)
+            .map(|item| item.name)
+            .collect();
+        assert_eq!(failures, vec!["State"]);
+        assert!(output.contains("iii 0.22.1"), "{output}");
+        assert!(
+            output.contains("2 connected; all 2 required worker identities present"),
+            "{output}"
+        );
+        assert!(
+            output.contains("accepting connections on 127.0.0.1:49134"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn doctor_passes_when_every_readiness_input_is_green() {
+        let config = existing_config();
+        let paths = RuntimePaths {
+            agentos_home: config
+                .parent()
+                .expect("test executable has a parent")
+                .to_path_buf(),
+            config_path: config.clone(),
+            runtime_dir: config
+                .parent()
+                .expect("test executable has a parent")
+                .to_path_buf(),
+            discovery: ConfigDiscovery::Checkout,
+        };
+        let report = readiness(&Fake::default(), &paths);
+        assert!(
+            report.passed(),
+            "unexpected failures: {:?}",
+            report
+                .items
+                .iter()
+                .filter(|item| !item.passed)
+                .map(|item| (item.name, item.detail.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(report.items.iter().all(|item| item.hint.is_none()));
+        assert_eq!(report.to_json()["passed"], Value::Bool(true));
+    }
+
+    #[test]
+    fn doctor_reports_unknown_engine_version_without_failing_binary_presence() {
+        let config = existing_config();
+        let fake = Fake {
+            engine_version: None,
+            ..Fake::default()
+        };
+        let (report, output) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let binary = report.item("Engine binary").expect("engine binary item");
+        assert!(binary.passed);
+        assert!(
+            binary.detail.contains("version unknown"),
+            "{}",
+            binary.detail
+        );
+        assert!(output.contains("version unknown"), "{output}");
+    }
+
+    #[test]
+    fn doctor_pinpoints_a_missing_engine_binary() {
+        let config = existing_config();
+        let fake = Fake {
+            engine_binary: None,
+            ..Fake::default()
+        };
+        let (report, output) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Engine binary").expect("engine binary item");
+        assert!(!item.passed);
+        assert_eq!(item.hint.as_deref(), Some(ENGINE_INSTALL_HINT));
+        assert!(output.contains("install-iii.sh"), "{output}");
+    }
+
+    #[test]
+    fn doctor_pinpoints_an_engine_that_is_not_running() {
+        let config = existing_config();
+        let fake = Fake {
+            healthy_from: None,
+            connected: RefCell::new(None),
+            ..Fake::default()
+        };
+        let (report, output) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        assert!(report.item("Engine binary").expect("binary item").passed);
+        let engine = report.item("Engine").expect("engine item");
+        assert!(!engine.passed);
+        assert_eq!(
+            engine.hint.as_deref(),
+            Some("start the stack with `agentos up`")
+        );
+        assert!(
+            output.contains("no listener on 127.0.0.1:49134"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn doctor_pinpoints_missing_worker_binaries() {
+        let config = existing_config();
+        let fake = Fake {
+            workers: Ok(vec![
+                spec("core", WorkerRuntime::Rust, true),
+                spec("memory", WorkerRuntime::Rust, false),
+                spec("pulse", WorkerRuntime::Rust, false),
+            ]),
+            ..Fake::default()
+        };
+        let (report, output) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let workers = report.item("Workers").expect("workers item");
+        assert!(!workers.passed);
+        assert!(workers.detail.contains("2 of 3"), "{}", workers.detail);
+        assert!(
+            workers.detail.contains("agentos-memory, agentos-pulse"),
+            "{}",
+            workers.detail
+        );
+        assert_eq!(workers.hint.as_deref(), Some(WORKSPACE_BUILD_HINT));
+        assert!(
+            output.contains("cargo build --workspace --release"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_an_unreadable_workers_directory() {
+        let config = existing_config();
+        let fake = Fake {
+            workers: Err("AgentOS workers directory is missing or unreadable: /x/workers".into()),
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let workers = report.item("Workers").expect("workers item");
+        assert!(!workers.passed);
+        assert!(
+            workers.detail.contains("missing or unreadable"),
+            "{}",
+            workers.detail
+        );
+    }
+
+    #[test]
+    fn doctor_measures_connected_workers_against_the_required_set() {
+        let config = existing_config();
+        let none = Fake {
+            connected: RefCell::new(Some(BTreeSet::new())),
+            ..Fake::default()
+        };
+        let (report, output) = diagnose(&none, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Connected").expect("connected item");
+        assert!(!item.passed);
+        assert!(
+            output.contains("0 connected; missing 2 of 2 required identities: core, memory"),
+            "{output}"
+        );
+
+        // A partial stack is not ready either: one of two required workers.
+        let partial = Fake {
+            connected: RefCell::new(Some(ids(&["core"]))),
+            ..Fake::default()
+        };
+        let (report, output) = diagnose(&partial, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Connected").expect("connected item");
+        assert!(!item.passed);
+        assert!(
+            output.contains("1 connected; missing 1 of 2 required identities: memory"),
+            "{output}"
+        );
+        assert_eq!(
+            item.hint.as_deref(),
+            Some("start them with `agentos up --no-tui`")
+        );
+
+        let some = Fake {
+            connected: RefCell::new(Some(ids(&["core", "memory", "unrelated"]))),
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&some, ConfigDiscovery::Checkout, &config);
+        assert!(report.item("Connected").expect("connected item").passed);
+    }
+
+    #[test]
+    fn doctor_rejects_misleading_counts_and_silent_identity_reports() {
+        let config = existing_config();
+        let unrelated = Fake {
+            connected: RefCell::new(Some(ids(&["foreign-a", "foreign-b"]))),
+            ..Fake::default()
+        };
+        let (report, output) = diagnose(&unrelated, ConfigDiscovery::Checkout, &config);
+        let connected = report.item("Connected").expect("connected item");
+        assert!(!connected.passed);
+        assert!(
+            output.contains("2 connected; missing 2 of 2 required identities: core, memory"),
+            "{output}"
+        );
+
+        let silent = Fake {
+            connected: RefCell::new(None),
+            ..Fake::default()
+        };
+        let (report, output) = diagnose(&silent, ConfigDiscovery::Checkout, &config);
+        let connected = report.item("Connected").expect("connected item");
+        assert!(!connected.passed);
+        assert_eq!(
+            connected.hint.as_deref(),
+            Some("start the stack with `agentos up`, then re-run `agentos doctor`")
+        );
+        assert_eq!(connected.detail, WORKER_IDENTITIES_UNREPORTED);
+        assert!(
+            output.contains("engine did not report connected worker identities"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn doctor_says_so_when_the_runtime_declares_no_rust_workers() {
+        let config = existing_config();
+        let fake = Fake {
+            // Only a Python worker: nothing this stack can start or count.
+            workers: Ok(vec![spec("embedding", WorkerRuntime::Python, false)]),
+            connected: RefCell::new(Some(BTreeSet::new())),
+            ..Fake::default()
+        };
+        let (report, output) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Connected").expect("connected item");
+        assert!(!item.passed);
+        assert!(output.contains("declares no Rust workers"), "{output}");
+    }
+
+    #[test]
+    fn doctor_reports_a_missing_tui_binary() {
+        let config = existing_config();
+        let fake = Fake {
+            tui: None,
+            ..Fake::default()
+        };
+        let (report, output) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let tui = report.item("TUI").expect("tui item");
+        assert!(!tui.passed);
+        assert!(
+            tui.detail.contains("agentos-tui not found"),
+            "{}",
+            tui.detail
+        );
+        assert!(output.contains("reinstall AgentOS"), "{output}");
+    }
+
+    #[test]
+    fn doctor_names_the_active_config_discovery_mode() {
+        let config = existing_config();
+        let fake = Fake::default();
+        for (discovery, label) in [
+            (ConfigDiscovery::Explicit, "explicit AGENTOS_CONFIG"),
+            (ConfigDiscovery::Checkout, "checkout config.yaml"),
+            (
+                ConfigDiscovery::Home,
+                "installed runtime below AGENTOS_HOME",
+            ),
+        ] {
+            let (report, output) = diagnose(&fake, discovery, &config);
+            let item = report.item("Config").expect("config item");
+            assert!(item.passed, "{}", item.detail);
+            assert!(item.detail.starts_with(label), "{}", item.detail);
+            assert!(output.contains(&config.display().to_string()), "{output}");
+        }
+    }
+
+    #[test]
+    fn doctor_reports_a_config_that_does_not_exist() {
+        let missing = std::env::temp_dir().join("agentos-bootstrap-absent/config.yaml");
+        let fake = Fake::default();
+        let (report, _) = diagnose(&fake, ConfigDiscovery::Home, &missing);
+        let item = report.item("Config").expect("config item");
+        assert!(!item.passed);
+        assert!(item.detail.contains("(missing)"), "{}", item.detail);
+    }
+
+    #[test]
+    fn doctor_json_keeps_the_check_shape() {
+        let config = existing_config();
+        let fake = Fake::default();
+        let (report, _) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let json = report.to_json();
+        let checks = json["checks"].as_array().expect("checks array");
+        assert_eq!(checks.len(), report.items.len());
+        assert!(checks.iter().any(|check| check["check"] == "Workers"));
+        assert!(checks.iter().all(|check| check["passed"].is_boolean()));
+        assert_eq!(json["passed"], Value::Bool(report.passed()));
+    }
+
+    #[test]
+    fn dotenv_parser_handles_quotes_comments_and_shell_precedence() {
+        let values = parse_dotenv(
+            "# comment\nPLAIN=value\nexport QUOTED=\"line\\nnext\"\nSINGLE='literal value'\nINLINE=yes # note\nPATH=must-not-override-shell\n",
+            Path::new("/runtime/.env"),
+        )
+        .expect("parse dotenv");
+        assert_eq!(values.get("PLAIN").map(String::as_str), Some("value"));
+        assert_eq!(values.get("QUOTED").map(String::as_str), Some("line\nnext"));
+        assert_eq!(
+            values.get("SINGLE").map(String::as_str),
+            Some("literal value")
+        );
+        assert_eq!(values.get("INLINE").map(String::as_str), Some("yes"));
+        assert!(!values.contains_key("PATH"), "shell PATH must win");
+    }
+
+    #[test]
+    fn dotenv_parser_rejects_malformed_assignments() {
+        let error = parse_dotenv("NOT AN ASSIGNMENT", Path::new("/runtime/.env"))
+            .expect_err("invalid dotenv must fail")
+            .to_string();
+        assert!(error.contains("/runtime/.env:1"), "{error}");
+    }
+
+    #[test]
+    fn dotenv_parser_handles_empty_input_duplicates_and_blank_values() {
+        assert!(
+            parse_dotenv("", Path::new("/runtime/.env"))
+                .expect("empty dotenv is valid")
+                .is_empty()
+        );
+        let values = parse_dotenv(
+            "AGENTOS_TEST_DUPLICATE=first\nAGENTOS_TEST_DUPLICATE=second\nAGENTOS_TEST_EMPTY=\n",
+            Path::new("/runtime/.env"),
+        )
+        .expect("parse edge-case dotenv");
+        assert_eq!(
+            values.get("AGENTOS_TEST_DUPLICATE").map(String::as_str),
+            Some("first")
+        );
+        assert_eq!(
+            values.get("AGENTOS_TEST_EMPTY").map(String::as_str),
+            Some("")
+        );
+        assert!(
+            load_dotenv(Path::new("/agentos-test-path-that-does-not-exist"))
+                .expect("an absent dotenv is optional")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dotenv_parser_rejects_invalid_keys_and_unclosed_quotes() {
+        for (source, expected) in [
+            ("9INVALID=value", "Invalid dotenv key"),
+            ("BAD-KEY=value", "Invalid dotenv key"),
+            ("KEY='unterminated", "Unclosed single quote"),
+            ("KEY=\"unterminated", "Unclosed double quote"),
+        ] {
+            let error = parse_dotenv(source, Path::new("/runtime/.env"))
+                .expect_err("malformed dotenv must fail")
+                .to_string();
+            assert!(error.contains(expected), "{source:?}: {error}");
+            assert!(error.contains("/runtime/.env:1"), "{source:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn engine_function_list_reports_iii_0_22_1_worker_identities() {
+        assert_eq!(
+            reported_worker_ids(&json!({
+                "functions": [
+                    {"function_id": "core::run", "worker_name": "core"},
+                    {"function_id": "core::status", "worker_name": "core"},
+                    {"function_id": "memory::recall", "worker_name": "memory"}
+                ]
+            })),
+            Some(ids(&["core", "memory"]))
+        );
+        assert_eq!(
+            reported_worker_ids(&json!({ "functions": [] })),
+            Some(BTreeSet::new()),
+            "an answered empty registry must remain distinct from no answer"
+        );
+        assert_eq!(
+            reported_worker_ids(&json!({
+                "functions": [
+                    {"function_id": "missing::identity"},
+                    {"function_id": "empty::identity", "worker_name": ""},
+                    {"function_id": "wrong::identity", "worker_name": 7},
+                    {"function_id": "core::run", "worker_name": "core"}
+                ]
+            })),
+            Some(ids(&["core"]))
+        );
+        assert_eq!(reported_worker_ids(&json!({ "functions": 62 })), None);
+    }
+
+    #[test]
+    fn engine_worker_list_fallback_reports_connected_non_engine_identities() {
+        assert_eq!(
+            reported_worker_ids(&json!({
+                "workers": [
+                    {"name": "core", "runtime": "rust", "status": "connected"},
+                    {"name": "memory", "runtime": "rust", "status": "disconnected"},
+                    {"name": "queue", "runtime": "engine", "status": "connected"}
+                ]
+            })),
+            Some(ids(&["core"]))
+        );
+        assert_eq!(reported_worker_ids(&json!({ "workers": 62 })), None);
+        assert_eq!(reported_worker_ids(&json!({ "status": "ok" })), None);
+    }
+
+    #[test]
+    fn engine_registry_parser_handles_wrapped_empty_and_malformed_output() {
+        let wrapped = b"iii 0.22.1 diagnostics\n{\"functions\":[{\"function_id\":\"core::run\",\"worker_name\":\"core\"}]}\n";
+        let parsed = parse_registry_output(wrapped).expect("parse wrapped JSON output");
+        assert_eq!(reported_worker_ids(&parsed), Some(ids(&["core"])));
+        assert_eq!(parse_registry_output(b""), None);
+        assert_eq!(parse_registry_output(b"diagnostic only"), None);
+        assert_eq!(parse_registry_output(b"prefix {not-json} suffix"), None);
+    }
+}

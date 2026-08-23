@@ -40,7 +40,7 @@ AgentOS isn't another agent framework. It's *what's left* when the runtime becom
 | Primitive | What it does | Examples |
 |---|---|---|
 | **Worker** | One Rust binary per domain. Connects to the engine over WebSocket. | `agent-core`, `llm-router`, `realm` |
-| **Function** | A named handler registered by a Worker. | `agent::chat`, `llm::route`, `memory::search` |
+| **Function** | A named handler registered by a Worker. | `agent::chat`, `agentos::llm::route`, `memory::search` |
 | **Trigger** | Binds a Function to HTTP, cron, or pub/sub. | `POST /v1/chat/completions → stream::completion` |
 
 That's the whole protocol. Workers stay narrow; everything else lives in the engine.
@@ -61,16 +61,39 @@ $EDITOR .env   # set CODEX_PROXY_API_KEY for http://127.0.0.1:8317/v1
 # 4. build the workspace
 cargo build --workspace --release
 
-# 5. boot engine + workers (in two terminals, or one with `&`)
-iii --config config.yaml &
-bash scripts/dev-up.sh
-
-# 6. open the chat
-cargo run --release -p agentos-tui
+# 5. bring the stack up: engine, workers, then the chat TUI
+./target/release/agentos up
 ```
-Quickstart uses the local Codex proxy at `http://127.0.0.1:8317/v1`. Anthropic is optional and selected only by an explicit provider/model or when no configured local default exists.
 
-Engine boots on port 49134. The development launcher starts the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source declares 267 literal function registrations. The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
+Quickstart uses the local Codex proxy at `http://127.0.0.1:8317/v1`.
+Anthropic is optional and selected only by an explicit provider/model or when
+no configured local default exists.
+
+`agentos up` runs one ordered policy and never builds or installs anything: it
+resolves the config, verifies the iii binary (missing → `bash scripts/install-iii.sh`),
+reuses an engine already healthy on port 49134 or boots `iii --config config.yaml`
+detached and waits for health with a bounded timeout, verifies every Rust worker
+release binary (missing → `cargo build --workspace --release`), starts the workers
+unless their canonical identities are already connected, waits for the complete
+identity set to register on the bus, and only then hands the terminal to
+`agentos-tui`. A partial stack starts only its missing workers. `up` loads the
+active runtime's `.env` without overriding explicit shell exports and passes those
+values to the engine, workers, and TUI; the TUI sends `AGENTOS_API_KEY` as a bearer
+token on protected routes. Each stage reports its own failure and stops before the
+next one; `--timeout` (default 30s) bounds the engine wait and then the worker wait.
+
+```bash
+agentos up --no-tui   # engine + workers only; leaves them running, no TUI
+agentos doctor        # readiness report; diagnostic only, changes nothing
+```
+
+`agentos doctor` prints the iii binary path and version, engine health, the
+connected worker count and any missing canonical identities, worker and TUI
+binary readiness, and which config discovery mode is in effect.
+`scripts/dev-up.sh` still starts only the workers against an engine you booted
+yourself.
+
+Engine boots on port 49134. `agentos up` starts the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source declares 267 literal function registrations. The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
 
 Prefer driving by HTTP? Same thing without the TUI:
 
@@ -94,7 +117,7 @@ The release installer supports Linux `x86_64` and `aarch64`, and macOS
 ```bash
 curl -fsSL https://raw.githubusercontent.com/wunitb/unitb-iii-agentos/main/scripts/install.sh | bash
 agentos init --quick
-agentos start
+agentos up
 ```
 
 The installer needs network access, `curl`, `tar`, and `sha256sum` or `shasum`.
@@ -105,15 +128,18 @@ relative `AGENTOS_HOME` is resolved against the directory from which `agentos`
 was invoked, before any engine or worker changes directory; an empty override
 uses the platform home plus `.agentos`.
 
-`agentos init`, `agentos onboard`, `agentos doctor`, `agentos start`,
-`agentos reset`, and `agentos config ...` all use the same resolved
-`AGENTOS_HOME`. `AGENTOS_CONFIG` has precedence over runtime discovery. A
-non-empty relative value is resolved against the caller's current directory;
-an empty value is ignored. Without it, a checkout `config.yaml` is used only
-when the checkout also contains `workers/`; otherwise
-`$AGENTOS_HOME/runtime/config.yaml` is used. This lets an installed release
+`agentos init`, `agentos onboard`, `agentos doctor`, `agentos up`,
+`agentos start`, `agentos reset`, and `agentos config ...` all use the same
+resolved `AGENTOS_HOME`. `AGENTOS_CONFIG` has precedence over runtime
+discovery. A non-empty relative value is resolved against the caller's current
+directory; an empty value is ignored. Without it, a checkout `config.yaml` is
+used only when the checkout also contains `workers/` — setting `AGENTOS_HOME`
+alone does not disable that checkout discovery; otherwise
+`$AGENTOS_HOME/runtime/config.yaml` is used. `agentos doctor` names the mode
+and the resolved path. This lets an installed release
 start from any working directory without a checkout. Upgrades replace release
-payload while retaining operator configuration and `$AGENTOS_HOME/runtime/data/**`.
+payload while retaining operator configuration, `$AGENTOS_HOME/runtime/data/**`,
+and the runtime `.env` file.
 
 The engine must be iii `v0.22.1`, installed in `PATH` or by
 `bash scripts/install-iii.sh` (which downloads and verifies it). The embedding
@@ -191,6 +217,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Each worker ships `iii.worker.yaml` declaring its registry shape. CI validates conformance on every PR.
 
+The `workflow` worker auto-loads `workflows/*.yaml` at startup, validates step and agent references, executes dependency-ordered `sequential`, `parallel`, `fanout`, and bounded `loop` steps, and checkpoints run state after every step. Use `AGENTOS_WORKFLOWS_DIR` to override the bundled directory. The CLI exposes the complete lifecycle:
+
+```bash
+agentos workflow list
+agentos workflow show feature-build
+agentos workflow run feature-build --input '{"feature_description":"add caching"}'
+agentos workflow runs feature-build --limit 20
+agentos workflow status <run-id>
+agentos workflow create workflows/feature-build.yaml
+```
+
 ## § 07 · Sandbox surfaces
 
 Two distinct namespaces, never overlap:
@@ -221,7 +258,15 @@ website/         agentsos.sh — design.md aesthetic, three themes
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full primitive flow and worker manifest spec.
 
-## § 09 · TUI
+## § 09 · Development control plane
+
+Repository changes enter as **control-room directives** and are built by the **sweafax** factory; nothing in this repository launches an agent session itself.
+
+1. Intent: a directive records the verbatim request and its acceptance criteria (ISC) in `unitb-control-room` (`cr new --from-sweafax <intake.json>`).
+2. Execution: `cr dispatch <directive> --engine sweafax --spec <intake.json>` registers a sweafax build from the intake's `base_branch`; sweafax runs implementation, verification, the artifact gate (`docs/builds/<build>-<slug>/{INVARIANTS,TRACES,DECISIONS,ATTACK_SURFACE}.md`, `bunx tsc --noEmit`, `bun test`) and a cross-vendor audit. `cr sync` follows the build's state.
+3. Delivery: after audit approval the result branch (`issue/<id>-…`) is pushed by the maintainer and merged through a pull request. `main` is protected; there is no direct push path.
+
+## § 10 · TUI
 
 Chat-first terminal UI lives in `crates/tui`:
 
@@ -241,13 +286,13 @@ cargo run --release -p agentos-tui
 
 If the engine is offline or no workers are connected, the TUI shows a first-run overlay with copy-paste commands instead of an empty list. Slash completions pull from `GET /iii/functions` so anything a worker registers is immediately discoverable.
 
-## § 10 · Build and test
+## § 11 · Build and test
 
 ```bash
 cargo build --workspace --release                                    # 62 Rust workers + CLI + TUI + HTTP adapter
 cargo test --workspace --release                                     # 1,413 Rust tests; 3 live-engine checks ignored by default
 uv run --no-project --with pytest python -m pytest workers/embedding/test_main.py -q  # 161 Python tests
-bun install --frozen-lockfile && bun run test:e2e                    # live engine + workers; model credentials required for chat
+npm ci && npm run test:e2e                                           # live engine + workers; model credentials required for chat
 ```
 
 The Rust commands are offline only when the Rust toolchain and all locked
@@ -256,7 +301,7 @@ the Bun command requires an installed lockfile-matching dependency tree.
 The E2E command is not offline: it needs a running engine/workers stack and
 model credentials for chat assertions.
 
-## § 11 · Versioning
+## § 12 · Versioning
 
 | | version |
 |---|---|
@@ -266,7 +311,7 @@ model credentials for chat assertions.
 | iii-sdk (Python) | pinned at `0.22.1` for the embedding worker |
 | agentos | `0.1.0` — first UnitB-owned release on iii v0.22.1 |
 
-## § 12 · Provenance and license
+## § 13 · Provenance and license
 
 This independent repository started from [`iii-experimental/agentos@caca2b4`](https://github.com/iii-experimental/agentos/commit/caca2b439ff62499f0d4a5af30c2601302238890) and was migrated to the `iii-hq/iii` v0.22.1 engine and SDK contracts. It is not a GitHub fork and carries its own history.
 

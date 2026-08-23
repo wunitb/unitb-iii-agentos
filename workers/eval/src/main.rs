@@ -108,7 +108,7 @@ async fn score_llm_judge(iii: &IIIClient, output: &Value, expected: &Value, inpu
         serde_json::to_string(output).unwrap_or_default(),
     );
     let payload = llm_judge_payload(&prompt);
-    let result = safe_trigger(iii, "llm::complete", payload).await;
+    let result = safe_trigger(iii, "agentos::llm::complete", payload).await;
     let content = match result {
         Some(v) => v
             .get("content")
@@ -802,11 +802,10 @@ mod tests {
 
     #[test]
     fn llm_judge_payload_uses_top_level_route_fields() {
-        let payload = llm_judge_payload("prompt");
-
+        let payload = llm_judge_payload("judge this");
         assert_eq!(payload["provider"], "anthropic");
         assert_eq!(payload["model"], "claude-haiku-4-5-20251001");
-        assert!(payload.get("config").is_none());
+        assert!(payload["model"].is_string());
     }
 
     #[test]

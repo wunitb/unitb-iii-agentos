@@ -1,7 +1,5 @@
 import { execFile } from "node:child_process";
-import { on } from "node:events";
-import { watch } from "node:fs";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -78,53 +76,52 @@ mv "$capture_tmp" "$capture_path"
   );
   await chmod(workerPath, 0o755);
 
-  const watcher = watch(root);
-  const changes = on(watcher, "change");
-
+  let stderr = "";
+  let exitCode = 0;
   try {
-    let stderr = "";
-    let exitCode = 0;
-    try {
-      const result = await execFileAsync("bash", [scriptPath], {
-        encoding: "utf8",
-        env: {
-          PATH: process.env.PATH,
-          HOME: process.env.HOME,
-          TMPDIR: process.env.TMPDIR,
-          ...inherited,
-        },
-      });
-      stderr = result.stderr;
-    } catch (error) {
-      const commandError = error as {
-        code?: number | string | null;
-        stderr?: string;
-      };
-      if (typeof commandError.code !== "number") throw error;
-      exitCode = commandError.code;
-      stderr = commandError.stderr ?? "";
-    }
-    if (exitCode !== 0) {
-      return { captured: null, stderr, exitCode };
-    }
-
-    for await (const [, filename] of changes) {
-      if (filename?.toString() === "captured") break;
-    }
-    const [codex, anthropic, openai, defaultModel] = await Promise.all([
-      readCapturedValue(capturePath, "codex"),
-      readCapturedValue(capturePath, "anthropic"),
-      readCapturedValue(capturePath, "openai"),
-      readCapturedValue(capturePath, "defaultModel"),
-    ]);
-    return {
-      captured: { codex, anthropic, openai, defaultModel },
-      stderr,
-      exitCode,
+    const result = await execFileAsync("bash", [scriptPath], {
+      encoding: "utf8",
+      env: {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        TMPDIR: process.env.TMPDIR,
+        ...inherited,
+      },
+    });
+    stderr = result.stderr;
+  } catch (error) {
+    const commandError = error as {
+      code?: number | string | null;
+      stderr?: string;
     };
-  } finally {
-    watcher.close();
+    if (typeof commandError.code !== "number") throw error;
+    exitCode = commandError.code;
+    stderr = commandError.stderr ?? "";
   }
+  if (exitCode !== 0) {
+    return { captured: null, stderr, exitCode };
+  }
+
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      await access(capturePath);
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  await access(capturePath);
+  const [codex, anthropic, openai, defaultModel] = await Promise.all([
+    readCapturedValue(capturePath, "codex"),
+    readCapturedValue(capturePath, "anthropic"),
+    readCapturedValue(capturePath, "openai"),
+    readCapturedValue(capturePath, "defaultModel"),
+  ]);
+  return {
+    captured: { codex, anthropic, openai, defaultModel },
+    stderr,
+    exitCode,
+  };
 }
 
 afterEach(async () => {
@@ -135,7 +132,7 @@ describe("dev-up dotenv loading", () => {
   it("normalizes surrounding whitespace and matching quotes", async () => {
     const { captured, exitCode } = await runDevUpFixture(
       `CODEX_PROXY_API_KEY="quoted-secret"
-ANTHROPIC_API_KEY=  cloud-secret  
+ANTHROPIC_API_KEY=  cloud-secret${"  "}
 OPENAI_API_KEY='open secret'
 `,
     );

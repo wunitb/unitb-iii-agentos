@@ -14,6 +14,7 @@ agents:
 steps:
   - name: Discovery
     functionId: "agent::chat"
+    agentId: trend-researcher
     promptTemplate: >
       Research the market for: {{goal}}.
       Identify target users, competitors, and key differentiators.
@@ -25,6 +26,7 @@ steps:
 
   - name: Design
     functionId: "agent::chat"
+    agentId: ux-architect
     promptTemplate: >
       Based on this discovery brief: {{discovery_brief}}.
       Create UX wireframes, user flows, and a component inventory.
@@ -36,6 +38,7 @@ steps:
 
   - name: Build
     functionId: "agent::chat"
+    agentId: rapid-prototyper
     promptTemplate: >
       Implement the MVP based on this design spec: {{design_spec}}.
       Prioritize working software over polish.
@@ -51,6 +54,7 @@ steps:
 
   - name: Test
     functionId: "agent::chat"
+    agentId: evidence-collector
     promptTemplate: >
       QA the build output: {{build_output}}.
       Collect evidence (screenshots, test results) for every acceptance criterion.
@@ -62,6 +66,7 @@ steps:
 
   - name: Ship
     functionId: "agent::chat"
+    agentId: devops-lead
     promptTemplate: >
       Deploy the MVP based on QA report: {{qa_report}}.
       Set up monitoring, alerting, and rollback procedures.

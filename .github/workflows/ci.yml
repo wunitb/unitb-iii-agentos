@@ -243,6 +243,12 @@ jobs:
       - name: test startup configuration
         run: bun run test:scripts
 
+      - name: typecheck startup configuration tests
+        run: npm run typecheck:scripts
+
+      - name: test startup configuration
+        run: npm run test:scripts
+
       - name: download worker binaries
         uses: actions/download-artifact@v8
         with:

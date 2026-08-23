@@ -439,6 +439,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn authorization_rejects_empty_credentials_and_accepts_a_match() {
+        assert!(!authorize_token("", ""));
+        assert!(!authorize_token("", "token"));
+        assert!(!authorize_token("expected", ""));
+        assert!(!authorize_token("expected", "different"));
+        assert!(authorize_token("expected", "expected"));
+    }
+
+    #[test]
     fn test_random_nonce_hex_length() {
         let nonce = random_nonce_hex();
         assert_eq!(nonce.len(), 64);

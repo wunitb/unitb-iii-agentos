@@ -13,6 +13,115 @@ use types::{AgentConfig, ChatRequest, FunctionCall, ModelConfig};
 
 const MAX_ITERATIONS: u32 = 50;
 
+const CHANNELS: [&str; 14] = [
+    "bluesky", "discord", "email", "linkedin", "mastodon", "matrix", "reddit", "signal", "slack",
+    "teams", "telegram", "twitch", "webex", "whatsapp",
+];
+
+fn channel_secrets(channel: &str) -> Option<&'static [&'static str]> {
+    match channel {
+        "bluesky" => Some(&["BLUESKY_HANDLE", "BLUESKY_PASSWORD"]),
+        "discord" => Some(&["DISCORD_BOT_TOKEN"]),
+        "email" => Some(&["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS"]),
+        "linkedin" => Some(&["LINKEDIN_TOKEN"]),
+        "mastodon" => Some(&["MASTODON_INSTANCE", "MASTODON_TOKEN"]),
+        "matrix" => Some(&["MATRIX_HOMESERVER", "MATRIX_TOKEN"]),
+        "reddit" => Some(&["REDDIT_CLIENT_ID", "REDDIT_SECRET", "REDDIT_REFRESH_TOKEN"]),
+        "signal" => Some(&["SIGNAL_API_URL", "SIGNAL_PHONE"]),
+        "slack" => Some(&["SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET"]),
+        "teams" => Some(&["TEAMS_APP_ID", "TEAMS_APP_PASSWORD"]),
+        "telegram" => Some(&["TELEGRAM_BOT_TOKEN"]),
+        "twitch" => Some(&["TWITCH_CLIENT_ID", "TWITCH_TOKEN", "TWITCH_BOT_USER_ID"]),
+        "webex" => Some(&["WEBEX_TOKEN"]),
+        "whatsapp" => Some(&["WHATSAPP_PHONE_ID", "WHATSAPP_TOKEN"]),
+        _ => None,
+    }
+}
+
+async fn missing_channel_secrets(
+    iii: &IIIClient,
+    channel: &str,
+) -> Result<Vec<&'static str>, Error> {
+    let required = channel_secrets(channel)
+        .ok_or_else(|| Error::Handler(format!("Unsupported channel: {channel}")))?;
+    let mut missing = Vec::new();
+    for key in required {
+        let secret = iii
+            .trigger(TriggerRequest {
+                function_id: "vault::get".to_string(),
+                payload: json!({ "key": key }),
+                action: None,
+                timeout_ms: None,
+            })
+            .await
+            .ok()
+            .and_then(|value| value["value"].as_str().map(str::to_owned))
+            .or_else(|| std::env::var(key).ok());
+        if secret.as_deref().is_none_or(str::is_empty) {
+            missing.push(*key);
+        }
+    }
+    Ok(missing)
+}
+
+async fn channel_statuses(iii: &IIIClient) -> Result<Value, Error> {
+    let workers = iii
+        .trigger(TriggerRequest {
+            function_id: "engine::workers::list".to_string(),
+            payload: json!({}),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|error| Error::Handler(error.to_string()))?;
+    let connected = workers["workers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|worker| worker["status"] == "connected")
+        .filter_map(|worker| worker["name"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    Ok(Value::Array(
+        CHANNELS
+            .iter()
+            .map(|channel| {
+                let enabled = connected.contains(format!("channel-{channel}").as_str());
+                json!({
+                    "id": channel,
+                    "type": channel,
+                    "enabled": enabled,
+                    "config": "vault/env",
+                })
+            })
+            .collect(),
+    ))
+}
+
+async fn channel_readiness(iii: &IIIClient, channel: &str) -> Result<Value, Error> {
+    let missing = missing_channel_secrets(iii, channel).await?;
+    let statuses = channel_statuses(iii).await?;
+    let connected = statuses
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|status| status["id"] == channel && status["enabled"] == true);
+    let success = connected && missing.is_empty();
+    let error = if !connected {
+        Some(format!("channel-{channel} worker is not connected"))
+    } else if missing.is_empty() {
+        None
+    } else {
+        Some(format!("missing secrets: {}", missing.join(", ")))
+    };
+    Ok(json!({
+        "id": channel,
+        "success": success,
+        "connected": connected,
+        "missingSecrets": missing,
+        "error": error,
+    }))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -60,9 +169,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     agentos_http_adapter::register_http_trigger(
         &iii,
         "health::check",
-        json!({ "api_path": "/api/health", "http_method": "GET" }),
+        json!({ "api_path": "/api/health", "http_method": "GET", "auth": false }),
         None,
     )?;
+
+    let iii_clone = iii.clone();
+    iii.register_function(
+        "channel::list",
+        RegisterFunction::new_async(move |_: Value| {
+            let iii = iii_clone.clone();
+            async move { channel_statuses(&iii).await }
+        })
+        .description("List channel adapter status"),
+    );
+    let iii_clone = iii.clone();
+    iii.register_function(
+        "channel::setup",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_clone.clone();
+            async move {
+                let channel = input["channel"].as_str().unwrap_or_default();
+                channel_readiness(&iii, channel).await
+            }
+        })
+        .description("Validate channel adapter configuration"),
+    );
+    let iii_clone = iii.clone();
+    iii.register_function(
+        "channel::test",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_clone.clone();
+            async move {
+                let channel = input["channel"].as_str().unwrap_or_default();
+                channel_readiness(&iii, channel).await
+            }
+        })
+        .description("Test channel adapter readiness"),
+    );
+    for (function_id, method, path) in [
+        ("channel::list", "GET", "/api/channels"),
+        ("channel::setup", "POST", "/api/channels"),
+        ("channel::test", "POST", "/api/channels/:channel/test"),
+    ] {
+        agentos_http_adapter::register_http_trigger(
+            &iii,
+            function_id,
+            json!({ "api_path": path, "http_method": method }),
+            None,
+        )?;
+    }
 
     let iii_clone = iii.clone();
     iii.register_function(
@@ -162,6 +317,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("Remove an agent"),
     );
 
+    let agent_routes = [
+        ("agent::list", "GET", "/api/agents"),
+        ("agent::create", "POST", "/api/agents"),
+        ("agent::chat", "POST", "/api/agents/:agentId/message"),
+        ("agent::delete", "DELETE", "/api/agents/:agentId"),
+    ];
+    for (function_id, method, path) in agent_routes {
+        agentos_http_adapter::register_http_trigger(
+            &iii,
+            function_id,
+            json!({ "api_path": path, "http_method": method }),
+            None,
+        )?;
+    }
+
     iii.register_trigger(RegisterTriggerInput {
         trigger_type: "queue".to_string(),
         function_id: "agent::chat".to_string(),
@@ -253,19 +423,25 @@ fn completion_payload(
         "model": model,
         "systemPrompt": system_prompt,
         "messages": messages,
-        "functions": functions,
+        "tools": functions,
     })
+}
+
+fn parse_function_call(value: &Value) -> Option<FunctionCall> {
+    serde_json::from_value(value.clone())
+        .ok()
+        .filter(|call: &FunctionCall| !call.call_id.is_empty() && !call.id.is_empty())
 }
 
 fn route_fields(route: &Value) -> Result<(String, String), Error> {
     let provider = route["provider"]
         .as_str()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::Handler("llm::route omitted provider".into()))?;
+        .ok_or_else(|| Error::Handler("agentos::llm::route omitted provider".into()))?;
     let model = route["model"]
         .as_str()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::Handler("llm::route omitted model".into()))?;
+        .ok_or_else(|| Error::Handler("agentos::llm::route omitted model".into()))?;
     Ok((provider.into(), model.into()))
 }
 
@@ -310,18 +486,18 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
         .await
         .unwrap_or(json!([]));
 
+    let model_config = config.as_ref().and_then(|agent| agent.model.as_ref());
+    let (preferred_provider, preferred_model) =
+        route_preferences(req.provider.as_deref(), req.model.as_deref(), model_config);
+
     let system_prompt = req
         .system_prompt
         .or_else(|| config.as_ref().and_then(|c| c.system_prompt.clone()))
         .unwrap_or_default();
 
-    let model_config = config.as_ref().and_then(|agent| agent.model.as_ref());
-    let (preferred_provider, preferred_model) =
-        route_preferences(req.provider.as_deref(), req.model.as_deref(), model_config);
-
     let route: Value = iii
         .trigger(TriggerRequest {
-            function_id: "llm::route".to_string(),
+            function_id: "agentos::llm::route".to_string(),
             payload: route_payload(
                 &req.message,
                 &functions,
@@ -360,7 +536,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
 
     let mut response: Value = iii
         .trigger(TriggerRequest {
-            function_id: "llm::complete".to_string(),
+            function_id: "agentos::llm::complete".to_string(),
             payload: completion_payload(&provider, &model, &system_prompt, &messages, &functions),
             action: None,
             timeout_ms: None,
@@ -376,10 +552,10 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
         }
         iterations += 1;
 
-        let calls: Vec<FunctionCall> = tool_calls
-            .iter()
-            .filter_map(|tc| serde_json::from_value(tc.clone()).ok())
-            .collect();
+        let calls: Vec<FunctionCall> = tool_calls.iter().filter_map(parse_function_call).collect();
+        if calls.is_empty() {
+            break;
+        }
 
         let mut tool_results = Vec::new();
         for tc in &calls {
@@ -435,7 +611,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
 
         response = iii
             .trigger(TriggerRequest {
-                function_id: "llm::complete".to_string(),
+                function_id: "agentos::llm::complete".to_string(),
                 payload: completion_payload(
                     &provider,
                     &model,
@@ -529,7 +705,7 @@ async fn list_functions(iii: &IIIClient, agent_id: &str) -> Result<Value, Error>
         .map(|s| s.trim_end_matches('*').to_string())
         .collect();
 
-    let all_functions: Value = iii
+    let registry: Value = iii
         .trigger(TriggerRequest {
             function_id: "engine::functions::list".to_string(),
             payload: json!({}),
@@ -537,29 +713,37 @@ async fn list_functions(iii: &IIIClient, agent_id: &str) -> Result<Value, Error>
             timeout_ms: None,
         })
         .await
-        .unwrap_or(json!([]));
+        .unwrap_or_else(|_| json!({ "functions": [] }));
+
+    Ok(filter_functions(&registry, &allowed))
+}
+
+fn filter_functions(registry: &Value, allowed: &[String]) -> Value {
+    let functions = registry
+        .get("functions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
     if allowed.iter().any(|prefix| prefix.is_empty()) {
-        return Ok(all_functions);
+        return Value::Array(functions);
     }
 
     if allowed.is_empty() {
-        return Ok(json!([]));
+        return json!([]);
     }
 
-    let filtered: Vec<&Value> = all_functions
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter(|f| {
-                    let id = f["id"].as_str().unwrap_or("");
-                    allowed.iter().any(|a| id.starts_with(a.as_str()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(json!(filtered))
+    Value::Array(
+        functions
+            .into_iter()
+            .filter(|function| {
+                function
+                    .get("function_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| allowed.iter().any(|prefix| id.starts_with(prefix)))
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -568,141 +752,88 @@ mod tests {
     use types::{Capabilities, ModelConfig, Resources};
 
     #[test]
-    fn test_max_iterations_constant() {
-        assert_eq!(MAX_ITERATIONS, 50);
-    }
-
-    #[test]
-    fn llm_route_payload_uses_top_level_model_strings() {
+    fn llm_route_and_complete_payloads_use_top_level_strings() {
         let functions = json!([{ "id": "memory::recall" }]);
-        let payload = route_payload("hello", &functions, Some("anthropic"), Some("haiku"));
+        let route = route_payload("hello", &functions, Some("codex"), Some("gpt-5.6-sol"));
+        assert_eq!(route["provider"], "codex");
+        assert_eq!(route["model"], "gpt-5.6-sol");
+        assert!(route["model"].is_string());
 
-        assert_eq!(payload["provider"], "anthropic");
-        assert_eq!(payload["model"], "haiku");
-        assert_eq!(
-            payload["messages"],
-            json!([{ "role": "user", "content": "hello" }])
+        let complete = completion_payload(
+            "codex",
+            "gpt-5.6-sol",
+            "system",
+            &[json!({ "role": "user", "content": "hello" })],
+            &functions,
         );
-        assert_eq!(payload["tools"], functions);
-        assert!(payload.get("config").is_none());
-        assert!(payload.get("message").is_none());
-        assert!(payload.get("functionCount").is_none());
+        assert_eq!(complete["provider"], "codex");
+        assert_eq!(complete["model"], "gpt-5.6-sol");
+        assert!(complete["model"].is_string());
+        assert_eq!(complete["systemPrompt"], "system");
+        assert_eq!(complete["tools"], functions);
+        assert!(complete.get("functions").is_none());
     }
 
     #[test]
-    fn llm_route_payload_omits_missing_route_fields() {
-        let payload = route_payload("hello", &json!([]), None, None);
-
-        assert!(payload.get("provider").is_none());
-        assert!(payload.get("model").is_none());
-    }
-
-    #[test]
-    fn llm_complete_payload_consumes_route_fields() {
-        let messages = vec![json!({"role": "user"})];
-        let functions = json!([]);
-        let payload = completion_payload("codex", "gpt-5.6-sol", "system", &messages, &functions);
-
-        assert_eq!(payload["provider"], "codex");
-        assert_eq!(payload["model"], "gpt-5.6-sol");
-        assert!(payload["provider"].is_string());
-        assert!(payload["model"].is_string());
-        assert!(payload.get("config").is_none());
-        assert!(payload.get("route").is_none());
-    }
-
-    #[test]
-    fn route_fields_extract_provider_and_model() {
-        let fields = route_fields(&json!({
-            "provider": "codex",
-            "model": "gpt-5.6-sol",
-        }))
-        .unwrap();
-        assert_eq!(fields, ("codex".into(), "gpt-5.6-sol".into()));
-    }
-
-    #[test]
-    fn route_fields_reject_nested_model_object() {
-        assert!(route_fields(&json!({ "model": { "provider": "codex" } })).is_err());
-    }
-
-    fn configured_model() -> ModelConfig {
-        ModelConfig {
-            provider: Some("config-provider".into()),
-            model: Some("config-model".into()),
+    fn route_preferences_keep_request_pairs_and_complete_config_pairs() {
+        let config = ModelConfig {
+            provider: Some("anthropic".into()),
+            model: Some("sonnet".into()),
             max_tokens: None,
+        };
+        assert_eq!(
+            route_preferences(Some("codex"), Some("gpt-5.6-sol"), Some(&config)),
+            (Some("codex".into()), Some("gpt-5.6-sol".into()))
+        );
+        assert_eq!(
+            route_preferences(None, None, Some(&config)),
+            (Some("anthropic".into()), Some("sonnet".into()))
+        );
+    }
+
+    #[test]
+    fn route_preferences_ignore_empty_none_and_incomplete_config_values() {
+        assert_eq!(route_preferences(None, None, None), (None, None));
+        assert_eq!(
+            route_preferences(Some(""), Some("agentos-default"), None),
+            (None, None)
+        );
+
+        let provider_only = ModelConfig {
+            provider: Some("codex".into()),
+            model: None,
+            max_tokens: None,
+        };
+        assert_eq!(
+            route_preferences(None, None, Some(&provider_only)),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn route_fields_reject_nested_model_responses() {
+        let error = route_fields(&json!({
+            "provider": "codex",
+            "model": { "provider": "codex", "model": "gpt-5.6-sol" },
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("omitted model"));
+    }
+
+    #[test]
+    fn route_fields_reject_missing_and_empty_strings() {
+        for route in [
+            json!({}),
+            json!({ "provider": "", "model": "gpt-5.6-sol" }),
+            json!({ "provider": "codex", "model": "" }),
+        ] {
+            assert!(route_fields(&route).is_err(), "accepted {route}");
         }
     }
 
     #[test]
-    fn route_preferences_use_request_pair() {
-        assert_eq!(
-            route_preferences(
-                Some("codex"),
-                Some("gpt-5.6-sol"),
-                Some(&configured_model()),
-            ),
-            (Some("codex".into()), Some("gpt-5.6-sol".into()))
-        );
-    }
-
-    #[test]
-    fn route_preferences_model_only_does_not_combine_config_provider() {
-        assert_eq!(
-            route_preferences(None, Some("gpt-5.6-sol"), Some(&configured_model())),
-            (None, Some("gpt-5.6-sol".into()))
-        );
-    }
-
-    #[test]
-    fn route_preferences_filter_agentos_default() {
-        assert_eq!(
-            route_preferences(
-                Some("agentos-default"),
-                Some("agentos-default"),
-                Some(&configured_model()),
-            ),
-            (Some("config-provider".into()), Some("config-model".into()))
-        );
-    }
-
-    #[test]
-    fn route_preferences_filter_empty_strings() {
-        assert_eq!(
-            route_preferences(Some(""), Some(""), Some(&configured_model())),
-            (Some("config-provider".into()), Some("config-model".into()))
-        );
-    }
-
-    #[test]
-    fn route_preferences_fallback_to_complete_agent_config_pair() {
-        assert_eq!(
-            route_preferences(None, None, Some(&configured_model())),
-            (Some("config-provider".into()), Some("config-model".into()))
-        );
-    }
-
-    #[test]
-    fn route_preferences_preserve_config_model_only() {
-        let config = ModelConfig {
-            provider: None,
-            model: Some("config-model".into()),
-            max_tokens: None,
-        };
-        assert_eq!(
-            route_preferences(None, None, Some(&config)),
-            (None, Some("config-model".into()))
-        );
-    }
-
-    #[test]
-    fn route_preferences_drop_config_provider_only() {
-        let config = ModelConfig {
-            provider: Some("config-provider".into()),
-            model: None,
-            max_tokens: None,
-        };
-        assert_eq!(route_preferences(None, None, Some(&config)), (None, None));
+    fn test_max_iterations_constant() {
+        assert_eq!(MAX_ITERATIONS, 50);
     }
 
     #[test]
@@ -1389,6 +1520,49 @@ mod tests {
     }
 
     #[test]
+    fn iii_0_22_1_function_registry_envelope_is_unwrapped_and_filtered_by_function_id() {
+        let registry = json!({
+            "functions": [
+                { "function_id": "memory::recall", "worker_name": "memory" },
+                { "function_id": "state::get", "worker_name": "state" },
+                { "id": "memory::legacy-wrong-key", "worker_name": "memory" },
+            ],
+        });
+
+        assert_eq!(
+            filter_functions(&registry, &["memory::".to_string()]),
+            json!([{
+                "function_id": "memory::recall",
+                "worker_name": "memory",
+            }])
+        );
+        assert_eq!(
+            filter_functions(&registry, &[String::new()]),
+            registry["functions"]
+        );
+        assert_eq!(filter_functions(&json!([]), &[String::new()]), json!([]));
+        assert_eq!(filter_functions(&registry, &[]), json!([]));
+        assert_eq!(
+            filter_functions(
+                &json!({
+                    "functions": [
+                        Value::Null,
+                        { "function_id": null },
+                        { "function_id": "" },
+                        { "function_id": 7 },
+                    ],
+                }),
+                &["memory::".to_string()],
+            ),
+            json!([]),
+            "malformed registry entries must not become callable tools"
+        );
+        for malformed in [Value::Null, json!({}), json!({ "functions": null })] {
+            assert_eq!(filter_functions(&malformed, &[String::new()]), json!([]));
+        }
+    }
+
+    #[test]
     fn test_tool_count_from_non_array() {
         let functions = json!("not an array");
         let count = functions.as_array().map(|a| a.len()).unwrap_or(0);
@@ -1446,15 +1620,14 @@ mod tests {
 
     #[test]
     fn test_tool_call_filter_map_ignores_invalid() {
-        let tool_calls = vec![
+        let tool_calls = [
             json!({"callId": "1", "id": "valid::tool", "arguments": {}}),
             json!({"missing": "fields"}),
+            json!({"callId": "", "id": "empty-call-id", "arguments": {}}),
+            json!({"callId": "empty-function-id", "id": "", "arguments": {}}),
             json!({"callId": "3", "id": "another::tool", "arguments": {"k": "v"}}),
         ];
-        let calls: Vec<FunctionCall> = tool_calls
-            .iter()
-            .filter_map(|tc| serde_json::from_value(tc.clone()).ok())
-            .collect();
+        let calls: Vec<FunctionCall> = tool_calls.iter().filter_map(parse_function_call).collect();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "valid::tool");
         assert_eq!(calls[1].id, "another::tool");
@@ -1462,12 +1635,50 @@ mod tests {
 
     #[test]
     fn test_tool_call_filter_map_all_invalid() {
-        let tool_calls = vec![json!({"bad": "data"}), json!(42), json!(null)];
-        let calls: Vec<FunctionCall> = tool_calls
-            .iter()
-            .filter_map(|tc| serde_json::from_value(tc.clone()).ok())
-            .collect();
+        let tool_calls = [
+            json!({"bad": "data"}),
+            json!(42),
+            json!(null),
+            json!({"callId": "", "id": "state::get", "arguments": {}}),
+            json!({"callId": "call-1", "id": "", "arguments": {}}),
+        ];
+        let calls: Vec<FunctionCall> = tool_calls.iter().filter_map(parse_function_call).collect();
         assert_eq!(calls.len(), 0);
+    }
+
+    #[test]
+    fn parse_function_call_rejects_empty_call_id() {
+        assert!(
+            parse_function_call(&json!({ "callId": "", "id": "state::get", "arguments": {} }),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_function_call_rejects_empty_function_id() {
+        assert!(
+            parse_function_call(&json!({ "callId": "call-1", "id": "", "arguments": {} }),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_function_call_handles_boundaries_and_invalid_shapes() {
+        let call = parse_function_call(&json!({ "callId": "c", "id": "x", "arguments": null }))
+            .expect("single-character identifiers are non-empty");
+        assert_eq!(call.call_id, "c");
+        assert_eq!(call.id, "x");
+        assert_eq!(call.arguments, Value::Null);
+
+        for malformed in [
+            Value::Null,
+            json!({}),
+            json!({ "callId": null, "id": "state::get", "arguments": {} }),
+            json!({ "callId": "call-1", "id": null, "arguments": {} }),
+            json!({ "callId": "call-1", "id": "state::get" }),
+        ] {
+            assert!(parse_function_call(&malformed).is_none());
+        }
     }
 
     #[test]

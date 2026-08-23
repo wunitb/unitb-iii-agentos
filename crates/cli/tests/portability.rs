@@ -129,17 +129,18 @@ fn run_start_with_relative_config(config_override: &str) {
 
     wait_for_file(&engine_cwd);
     wait_for_file(&worker_cwd);
+    let expected_runtime = fs::canonicalize(&runtime).expect("canonicalize runtime directory");
     assert_eq!(
         fs::read_to_string(&engine_cwd)
             .expect("read engine cwd")
             .trim(),
-        runtime.to_string_lossy()
+        expected_runtime.to_string_lossy()
     );
     assert_eq!(
         fs::read_to_string(&worker_cwd)
             .expect("read worker cwd")
             .trim(),
-        runtime.to_string_lossy()
+        expected_runtime.to_string_lossy()
     );
     assert!(state.is_dir(), "relative AGENTOS_HOME was not created");
     thread::sleep(Duration::from_secs(4));
@@ -214,17 +215,18 @@ fn start_uses_relative_home_for_installed_runtime() {
 
     wait_for_file(&engine_cwd);
     wait_for_file(&worker_cwd);
+    let expected_runtime = fs::canonicalize(&runtime).expect("canonicalize runtime directory");
     assert_eq!(
         fs::read_to_string(&engine_cwd)
             .expect("read engine cwd")
             .trim(),
-        runtime.to_string_lossy()
+        expected_runtime.to_string_lossy()
     );
     assert_eq!(
         fs::read_to_string(&worker_cwd)
             .expect("read worker cwd")
             .trim(),
-        runtime.to_string_lossy()
+        expected_runtime.to_string_lossy()
     );
     assert!(
         home.join("logs").is_dir(),
@@ -364,5 +366,83 @@ fn doctor_reports_unreadable_workers_directory() {
         .permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&workers, permissions).expect("restore workers permissions");
+    fs::remove_dir_all(root).expect("remove temporary doctor directory");
+}
+
+fn doctor_report(runtime: &Path, home: &Path, config: Option<&Path>) -> serde_json::Value {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentos"));
+    command
+        .args(["doctor", "--json"])
+        .current_dir(runtime)
+        .env("AGENTOS_HOME", home)
+        .env("AGENTOS_API_URL", "http://127.0.0.1:1")
+        .env_remove("AGENTOS_CONFIG");
+    if let Some(config) = config {
+        command.env("AGENTOS_CONFIG", config);
+    }
+    let output = command.output().expect("run agentos doctor");
+    assert!(output.status.success());
+    serde_json::from_slice(&output.stdout).expect("parse doctor report")
+}
+
+fn doctor_check(report: &serde_json::Value, name: &str) -> serde_json::Value {
+    report["checks"]
+        .as_array()
+        .and_then(|checks| checks.iter().find(|check| check["check"] == name))
+        .unwrap_or_else(|| panic!("find {name} doctor check"))
+        .clone()
+}
+
+/// Regression: `AGENTOS_HOME` alone must not disable checkout discovery.
+#[test]
+fn doctor_uses_checkout_config_when_only_agentos_home_is_set() {
+    let root = temporary_directory("doctor-checkout-discovery");
+    let checkout = root.join("checkout");
+    let home = root.join("home");
+    fs::create_dir_all(checkout.join("workers")).expect("create checkout workers");
+    fs::write(checkout.join("config.yaml"), "workers: []\n").expect("write checkout config");
+
+    let report = doctor_report(&checkout, &home, None);
+    let config = doctor_check(&report, "Config");
+    let detail = config["detail"].as_str().expect("config detail");
+    assert!(detail.starts_with("checkout config.yaml"), "{detail}");
+    assert!(
+        detail.ends_with(&checkout.join("config.yaml").display().to_string()),
+        "{detail}"
+    );
+    assert_eq!(config["passed"], true);
+
+    // An explicit override still wins over the checkout beside the caller.
+    let explicit = root.join("explicit.yaml");
+    fs::write(&explicit, "workers: []\n").expect("write explicit config");
+    let report = doctor_report(&checkout, &home, Some(&explicit));
+    let detail = doctor_check(&report, "Config")["detail"]
+        .as_str()
+        .expect("config detail")
+        .to_string();
+    assert!(detail.starts_with("explicit AGENTOS_CONFIG"), "{detail}");
+    assert!(
+        detail.ends_with(&explicit.display().to_string()),
+        "{detail}"
+    );
+
+    fs::remove_dir_all(root).expect("remove temporary doctor directory");
+}
+
+/// Doctor is a report, not a repair: it creates nothing.
+#[test]
+fn doctor_does_not_create_state_or_start_processes() {
+    let root = temporary_directory("doctor-side-effects");
+    let runtime = root.join("runtime");
+    let home = root.join("home");
+    fs::create_dir_all(runtime.join("workers")).expect("create workers directory");
+    fs::write(runtime.join("config.yaml"), "workers: []\n").expect("write runtime config");
+
+    let report = doctor_report(&runtime, &home, Some(&runtime.join("config.yaml")));
+    assert!(!home.exists(), "doctor created {}", home.display());
+    let state = doctor_check(&report, "State");
+    assert_eq!(state["passed"], false);
+    assert_eq!(state["hint"], "create it with `agentos init`");
+
     fs::remove_dir_all(root).expect("remove temporary doctor directory");
 }

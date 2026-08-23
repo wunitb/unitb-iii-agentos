@@ -387,6 +387,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -659,6 +660,7 @@ version = "0.1.0"
 dependencies = [
  "iii-sdk",
  "serde_json",
+ "subtle",
 ]
 
 [[package]]
@@ -681,6 +683,7 @@ dependencies = [
 name = "agentos-llm-router"
 version = "0.1.0"
 dependencies = [
+ "agentos-http-adapter",
  "anyhow",
  "dashmap",
  "iii-sdk",
@@ -735,6 +738,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1052,6 +1056,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "urlencoding",
 ]
 
 [[package]]
@@ -1100,6 +1105,7 @@ dependencies = [
  "iii-sdk",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -115,21 +115,20 @@ async fn plan_handler(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         .as_str()
         .ok_or_else(|| Error::Handler("description is required".into()))?
         .to_string();
-    let model = body["model"].as_str().unwrap_or("default").to_string();
+    let model = body["model"].as_str().filter(|model| !model.is_empty());
+
+    let mut llm_payload = json!({
+        "systemPrompt": "Analyze the following feature request. Return JSON: { \"complexity\": \"low\"|\"medium\"|\"high\", \"agents\": [\"<template-name>\", ...], \"reactions\": [{ \"from\": \"<lifecycle-state>\", \"to\": \"<lifecycle-state>\", \"action\": \"send_to_agent\"|\"notify\"|\"escalate\", \"payload\": {} }], \"summary\": \"...\" }",
+        "messages": [{ "role": "user", "content": description }],
+    });
+    if let Some(model) = model {
+        llm_payload["model"] = json!(model);
+    }
 
     let llm_result = iii
         .trigger(TriggerRequest {
-            function_id: "llm::chat".into(),
-            payload: json!({
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Analyze the following feature request. Return JSON: { \"complexity\": \"low\"|\"medium\"|\"high\", \"agents\": [\"<template-name>\", ...], \"reactions\": [{ \"from\": \"<lifecycle-state>\", \"to\": \"<lifecycle-state>\", \"action\": \"send_to_agent\"|\"notify\"|\"escalate\", \"payload\": {} }], \"summary\": \"...\" }",
-                    },
-                    { "role": "user", "content": description },
-                ],
-            }),
+            function_id: "agentos::llm::complete".into(),
+            payload: llm_payload,
             action: None,
             timeout_ms: None,
         })

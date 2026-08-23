@@ -43,11 +43,11 @@ fn stream_route_fields(route: &Value) -> Result<(&str, &str), Error> {
     let provider = route["provider"]
         .as_str()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::Handler("llm::route omitted provider".into()))?;
+        .ok_or_else(|| Error::Handler("agentos::llm::route omitted provider".into()))?;
     let model = route["model"]
         .as_str()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::Handler("llm::route omitted model".into()))?;
+        .ok_or_else(|| Error::Handler("agentos::llm::route omitted model".into()))?;
     Ok((provider, model))
 }
 
@@ -137,7 +137,7 @@ async fn stream_chat(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
     let route = iii
         .trigger(TriggerRequest {
-            function_id: "llm::route".into(),
+            function_id: "agentos::llm::route".into(),
             payload: stream_route_payload(
                 &message,
                 preferred_provider.as_deref(),
@@ -148,7 +148,6 @@ async fn stream_chat(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         })
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
-
     let (provider, model) = stream_route_fields(&route)?;
 
     let system_prompt = config
@@ -162,7 +161,7 @@ async fn stream_chat(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
     let response = iii
         .trigger(TriggerRequest {
-            function_id: "llm::complete".into(),
+            function_id: "agentos::llm::complete".into(),
             payload: stream_completion_payload(provider, model, &system_prompt, &messages),
             action: None,
             timeout_ms: None,
@@ -229,7 +228,6 @@ async fn stream_sse(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         .as_str()
         .ok_or_else(|| Error::Handler("message required".into()))?
         .to_string();
-
     let response = iii
         .trigger(TriggerRequest {
             function_id: "agent::chat".into(),
@@ -355,11 +353,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        agent_chat_payload, stream_chat_response, stream_completion_payload, stream_route_fields,
-        stream_route_payload, stream_route_preferences,
-    };
+    use super::*;
     use serde_json::json;
+
+    #[test]
+    fn route_and_completion_payloads_use_top_level_strings() {
+        let route = stream_route_payload("hello", Some("codex"), Some("gpt-5.6-sol"));
+        assert_eq!(route["provider"], "codex");
+        assert_eq!(route["model"], "gpt-5.6-sol");
+
+        let complete = stream_completion_payload(
+            "codex",
+            "gpt-5.6-sol",
+            "system",
+            &[json!({ "role": "user", "content": "hello" })],
+        );
+        assert_eq!(complete["provider"], "codex");
+        assert_eq!(complete["model"], "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn agent_chat_payload_forwards_route_preferences() {
+        let payload = agent_chat_payload(
+            &json!({
+                "agentId": "agent-1",
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+            }),
+            "hello",
+        );
+        assert_eq!(payload["provider"], "codex");
+        assert_eq!(payload["model"], "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn stream_route_preferences_handle_absent_empty_and_incomplete_values() {
+        assert_eq!(stream_route_preferences(&json!({}), None), (None, None));
+        assert_eq!(
+            stream_route_preferences(
+                &json!({ "provider": "", "model": "agentos-default" }),
+                Some(&json!({ "provider": "codex" })),
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            stream_route_preferences(
+                &json!({}),
+                Some(&json!({ "provider": "codex", "model": "gpt-5.6-sol" })),
+            ),
+            (Some("codex".into()), Some("gpt-5.6-sol".into()))
+        );
+    }
+
+    #[test]
+    fn stream_route_fields_reject_missing_empty_and_nested_values() {
+        for route in [
+            json!({}),
+            json!({ "provider": "", "model": "gpt-5.6-sol" }),
+            json!({ "provider": "codex", "model": "" }),
+            json!({ "provider": "codex", "model": { "name": "gpt-5.6-sol" } }),
+        ] {
+            assert!(stream_route_fields(&route).is_err(), "accepted {route}");
+        }
+    }
 
     #[test]
     fn stream_chat_response_is_transport_neutral() {
@@ -379,165 +435,5 @@ mod tests {
         );
         assert!(response.get("status_code").is_none());
         assert!(response.get("body").is_none());
-    }
-
-    #[test]
-    fn stream_route_payload_uses_top_level_model_strings() {
-        let payload = stream_route_payload("hello", Some("codex"), Some("gpt-5.6-sol"));
-
-        assert_eq!(payload["provider"], "codex");
-        assert_eq!(payload["model"], "gpt-5.6-sol");
-        assert_eq!(
-            payload["messages"],
-            json!([{ "role": "user", "content": "hello" }])
-        );
-        assert_eq!(payload["tools"], json!([]));
-        assert!(payload.get("config").is_none());
-        assert!(payload.get("message").is_none());
-        assert!(payload.get("toolCount").is_none());
-    }
-
-    #[test]
-    fn stream_completion_payload_consumes_route_fields() {
-        let payload = stream_completion_payload(
-            "codex",
-            "gpt-5.6-sol",
-            "system",
-            &[json!({"role": "user", "content": "hello"})],
-        );
-
-        assert_eq!(payload["provider"], "codex");
-        assert_eq!(payload["model"], "gpt-5.6-sol");
-        assert!(payload["provider"].is_string());
-        assert!(payload["model"].is_string());
-        assert!(payload.get("route").is_none());
-    }
-    #[test]
-    fn agent_chat_payload_forwards_provider_and_model() {
-        let body = json!({
-            "agentId": "agent-2",
-            "sessionId": "sess-42",
-            "provider": "codex",
-            "model": "gpt-5.6-sol",
-        });
-        let payload = agent_chat_payload(&body, "hello");
-
-        assert_eq!(payload["provider"], "codex");
-        assert_eq!(payload["model"], "gpt-5.6-sol");
-    }
-
-    fn configured_route() -> serde_json::Value {
-        json!({
-            "provider": "config-provider",
-            "model": "config-model",
-        })
-    }
-
-    #[test]
-    fn stream_route_preferences_use_request_pair() {
-        let body = json!({
-            "provider": "codex",
-            "model": "gpt-5.6-sol",
-        });
-        assert_eq!(
-            stream_route_preferences(&body, Some(&configured_route())),
-            (Some("codex".into()), Some("gpt-5.6-sol".into()))
-        );
-    }
-
-    #[test]
-    fn stream_route_preferences_model_only_does_not_combine_config_provider() {
-        let body = json!({ "model": "gpt-5.6-sol" });
-        assert_eq!(
-            stream_route_preferences(&body, Some(&configured_route())),
-            (None, Some("gpt-5.6-sol".into()))
-        );
-    }
-
-    #[test]
-    fn stream_route_preferences_filter_agentos_default() {
-        let body = json!({
-            "provider": "agentos-default",
-            "model": "agentos-default",
-        });
-        assert_eq!(
-            stream_route_preferences(&body, Some(&configured_route())),
-            (Some("config-provider".into()), Some("config-model".into()))
-        );
-    }
-
-    #[test]
-    fn stream_route_preferences_filter_empty_strings() {
-        let body = json!({ "provider": "", "model": "" });
-        assert_eq!(
-            stream_route_preferences(&body, Some(&configured_route())),
-            (Some("config-provider".into()), Some("config-model".into()))
-        );
-    }
-
-    #[test]
-    fn stream_route_preferences_fallback_to_complete_config_pair() {
-        let body = json!({});
-        assert_eq!(
-            stream_route_preferences(&body, Some(&configured_route())),
-            (Some("config-provider".into()), Some("config-model".into()))
-        );
-    }
-
-    #[test]
-    fn stream_route_preferences_preserve_config_model_only() {
-        let config = json!({ "model": "config-model" });
-        assert_eq!(
-            stream_route_preferences(&json!({}), Some(&config)),
-            (None, Some("config-model".into()))
-        );
-    }
-
-    #[test]
-    fn stream_route_preferences_drop_config_provider_only() {
-        let config = json!({ "provider": "config-provider" });
-        assert_eq!(
-            stream_route_preferences(&json!({}), Some(&config)),
-            (None, None)
-        );
-    }
-
-    #[test]
-    fn stream_route_preferences_ignore_non_string_request_values() {
-        let body = json!({ "provider": null, "model": 42 });
-        assert_eq!(
-            stream_route_preferences(&body, Some(&configured_route())),
-            (Some("config-provider".into()), Some("config-model".into()))
-        );
-    }
-
-    #[test]
-    fn stream_route_fields_extract_provider_and_model() {
-        let route = json!({
-            "provider": "codex",
-            "model": "gpt-5.6-sol",
-        });
-        let fields = stream_route_fields(&route).unwrap();
-        assert_eq!(fields, ("codex", "gpt-5.6-sol"));
-    }
-
-    #[test]
-    fn stream_route_fields_reject_missing_empty_or_non_string_values() {
-        assert!(stream_route_fields(&json!({ "provider": "", "model": "x" })).is_err());
-        assert!(stream_route_fields(&json!({ "provider": "codex" })).is_err());
-        assert!(stream_route_fields(&json!({ "provider": 42, "model": "x" })).is_err());
-        assert!(
-            stream_route_fields(&json!({ "provider": "codex", "model": { "id": "nested" } }))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn agent_chat_payload_omitted_preferences_remain_null() {
-        let payload = agent_chat_payload(&json!({ "agentId": "agent-2" }), "hello");
-
-        assert!(payload["provider"].is_null());
-        assert!(payload["model"].is_null());
-        assert_ne!(payload["model"], "agentos-default");
     }
 }

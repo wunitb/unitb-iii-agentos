@@ -5,9 +5,15 @@ use iii_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
@@ -22,6 +28,34 @@ struct McpTool {
     description: String,
     #[serde(rename = "inputSchema", default)]
     input_schema: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IntegrationDocument {
+    integration: IntegrationManifest,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IntegrationManifest {
+    id: String,
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    category: String,
+    transport: String,
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    url: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, IntegrationEnv>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IntegrationEnv {
+    #[serde(default)]
+    required: bool,
 }
 
 struct McpConnection {
@@ -69,6 +103,229 @@ fn validate_command(cmd: &str) -> Result<(), Error> {
         return Err(Error::Handler("invalid mcp command".into()));
     }
     Ok(())
+}
+
+fn validate_env_key(key: &str) -> Result<(), Error> {
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(Error::Handler(format!("invalid environment key: {key}")));
+    }
+    Ok(())
+}
+
+fn requested_env(body: &Value) -> Result<Vec<(String, String)>, Error> {
+    body.get("env")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(key, value)| {
+            validate_env_key(key)?;
+            let value = value.as_str().ok_or_else(|| {
+                Error::Handler(format!("environment value for {key} must be a string"))
+            })?;
+            Ok((key.clone(), value.to_string()))
+        })
+        .collect()
+}
+
+fn valid_integration_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn integration_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(path) = std::env::var_os("AGENTOS_INTEGRATIONS_DIR") {
+        dirs.push(PathBuf::from(path));
+    }
+    if let Some(home) = std::env::var_os("AGENTOS_HOME") {
+        dirs.push(PathBuf::from(home).join("runtime/integrations"));
+    }
+    if let Ok(current) = std::env::current_dir() {
+        dirs.push(current.join("integrations"));
+    }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        dirs.push(parent.join("integrations"));
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+fn parse_integration(path: &Path) -> Result<IntegrationManifest, Error> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|error| Error::Handler(format!("read {}: {error}", path.display())))?;
+    let document: IntegrationDocument = toml::from_str(&source)
+        .map_err(|error| Error::Handler(format!("parse {}: {error}", path.display())))?;
+    if !valid_integration_id(&document.integration.id) {
+        return Err(Error::Handler(format!(
+            "invalid integration id in {}",
+            path.display()
+        )));
+    }
+    Ok(document.integration)
+}
+
+fn integration_manifests() -> Result<Vec<IntegrationManifest>, Error> {
+    let mut files = Vec::new();
+    for directory in integration_dirs().into_iter().filter(|path| path.is_dir()) {
+        for entry in std::fs::read_dir(&directory)
+            .map_err(|error| Error::Handler(format!("read {}: {error}", directory.display())))?
+        {
+            let path = entry
+                .map_err(|error| Error::Handler(error.to_string()))?
+                .path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        return Err(Error::Handler(
+            "integration manifests not found".to_string(),
+        ));
+    }
+
+    let mut manifests = BTreeMap::new();
+    for path in files {
+        let manifest = parse_integration(&path)?;
+        manifests.entry(manifest.id.clone()).or_insert(manifest);
+    }
+    Ok(manifests.into_values().collect())
+}
+
+fn integration_manifest(id: &str) -> Result<IntegrationManifest, Error> {
+    if !valid_integration_id(id) {
+        return Err(Error::Handler(format!("invalid integration id: {id}")));
+    }
+    integration_manifests()?
+        .into_iter()
+        .find(|manifest| manifest.id == id)
+        .ok_or_else(|| Error::Handler(format!("integration not found: {id}")))
+}
+
+fn integration_environment(
+    manifest: &IntegrationManifest,
+    body: &Value,
+) -> Result<serde_json::Map<String, Value>, Error> {
+    let provided = body.get("env").and_then(Value::as_object);
+    if let Some(provided) = provided {
+        for key in provided.keys() {
+            if !manifest.env.contains_key(key) {
+                return Err(Error::Handler(format!(
+                    "environment key {key} is not declared by integration {}",
+                    manifest.id
+                )));
+            }
+        }
+    }
+
+    let mut shortcut_key = body.get("key").and_then(Value::as_str);
+    let mut environment = serde_json::Map::new();
+    for (key, spec) in &manifest.env {
+        let value = provided
+            .and_then(|values| values.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| std::env::var(key).ok())
+            .or_else(|| {
+                if spec.required {
+                    shortcut_key.take().map(str::to_string)
+                } else {
+                    None
+                }
+            });
+        match value {
+            Some(value) => {
+                environment.insert(key.clone(), json!(value));
+            }
+            None if spec.required => {
+                return Err(Error::Handler(format!(
+                    "integration {} requires environment key {key}",
+                    manifest.id
+                )));
+            }
+            None => {}
+        }
+    }
+    Ok(environment)
+}
+
+async fn list_integrations(state: Arc<State>, input: Value) -> Result<Value, Error> {
+    let query = input
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let integrations = integration_manifests()?
+        .into_iter()
+        .filter(|manifest| {
+            query.is_empty()
+                || manifest.id.to_ascii_lowercase().contains(&query)
+                || manifest.name.to_ascii_lowercase().contains(&query)
+                || manifest.description.to_ascii_lowercase().contains(&query)
+        })
+        .map(|manifest| {
+            let status = if state.connections.contains_key(&manifest.id) {
+                "active"
+            } else {
+                "inactive"
+            };
+            json!({
+                "id": manifest.id,
+                "name": manifest.name,
+                "type": manifest.transport,
+                "category": manifest.category,
+                "status": status,
+                "description": manifest.description,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!(integrations))
+}
+
+async fn add_integration(state: Arc<State>, iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    let body = input.get("body").cloned().unwrap_or(input);
+    let id = body
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Handler("name is required".to_string()))?;
+    let manifest = integration_manifest(id)?;
+    let environment = integration_environment(&manifest, &body)?;
+    connect(
+        state,
+        iii,
+        json!({
+            "name": manifest.id,
+            "transport": manifest.transport,
+            "command": manifest.command,
+            "args": manifest.args,
+            "url": manifest.url,
+            "env": environment,
+        }),
+    )
+    .await
+}
+
+async fn remove_integration(
+    state: Arc<State>,
+    iii: &IIIClient,
+    input: Value,
+) -> Result<Value, Error> {
+    let name = input
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Handler("name is required".to_string()))?;
+    disconnect(state, iii, json!({ "name": name })).await
 }
 
 async fn send_rpc(conn: &McpConnection, method: &str, params: Value) -> Result<Value, Error> {
@@ -159,6 +416,7 @@ async fn connect(state: Arc<State>, iii: &IIIClient, input: Value) -> Result<Val
             .collect()
     });
     let url = body["url"].as_str().map(String::from);
+    let requested_env = requested_env(&body)?;
 
     if state.connections.contains_key(&name) {
         return Err(Error::Handler(format!(
@@ -192,6 +450,9 @@ async fn connect(state: Arc<State>, iii: &IIIClient, input: Value) -> Result<Val
         child_cmd.env_clear();
         for (k, v) in safe_env() {
             child_cmd.env(k, v);
+        }
+        for (key, value) in requested_env {
+            child_cmd.env(key, value);
         }
         child_cmd.stdin(std::process::Stdio::piped());
         child_cmd.stdout(std::process::Stdio::piped());
@@ -678,6 +939,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    {
+        let state = state.clone();
+        iii.register_function(
+            "integration::list",
+            RegisterFunction::new_async(move |input: Value| {
+                let state = state.clone();
+                async move { list_integrations(state, input).await }
+            })
+            .description("List available integration manifests"),
+        );
+    }
+
+    {
+        let state = state.clone();
+        let iii_for_fn = iii.clone();
+        iii.register_function(
+            "integration::add",
+            RegisterFunction::new_async(move |input: Value| {
+                let state = state.clone();
+                let iii = iii_for_fn.clone();
+                async move { add_integration(state, &iii, input).await }
+            })
+            .description("Connect an integration from its manifest"),
+        );
+    }
+
+    {
+        let state = state.clone();
+        let iii_for_fn = iii.clone();
+        iii.register_function(
+            "integration::remove",
+            RegisterFunction::new_async(move |input: Value| {
+                let state = state.clone();
+                let iii = iii_for_fn.clone();
+                async move { remove_integration(state, &iii, input).await }
+            })
+            .description("Disconnect an active integration"),
+        );
+    }
+
     let triggers = [
         ("mcp::connect", "POST", "api/mcp/connect"),
         ("mcp::disconnect", "POST", "api/mcp/disconnect"),
@@ -686,6 +987,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("mcp::list_connections", "GET", "api/mcp/connections"),
         ("mcp::serve", "POST", "api/mcp/serve"),
         ("mcp::unserve", "POST", "api/mcp/unserve"),
+        ("integration::list", "GET", "api/integrations"),
+        ("integration::add", "POST", "api/integrations"),
+        ("integration::remove", "DELETE", "api/integrations/{name}"),
     ];
     for (fid, method, path) in triggers {
         agentos_http_adapter::register_http_trigger(
@@ -700,4 +1004,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     iii.shutdown_async().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn test_manifest() -> IntegrationManifest {
+        IntegrationManifest {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            description: String::new(),
+            category: String::new(),
+            transport: "stdio".to_string(),
+            command: Some("test".to_string()),
+            args: Vec::new(),
+            url: None,
+            env: BTreeMap::from([
+                (
+                    "AGENTOS_TEST_REQUIRED_9C3A".to_string(),
+                    IntegrationEnv { required: true },
+                ),
+                (
+                    "AGENTOS_TEST_OPTIONAL_9C3A".to_string(),
+                    IntegrationEnv { required: false },
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn repository_integration_manifests_are_valid_and_unique() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../integrations");
+        let mut ids = BTreeSet::new();
+        let mut count = 0;
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
+                continue;
+            }
+            let manifest = parse_integration(&path).unwrap();
+            assert_eq!(
+                path.file_stem().and_then(|stem| stem.to_str()),
+                Some(manifest.id.as_str())
+            );
+            assert!(ids.insert(manifest.id));
+            count += 1;
+        }
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn integration_environment_accepts_declared_key_shortcut() {
+        let environment =
+            integration_environment(&test_manifest(), &json!({ "key": "secret-value" })).unwrap();
+        assert_eq!(
+            environment.get("AGENTOS_TEST_REQUIRED_9C3A"),
+            Some(&json!("secret-value"))
+        );
+        assert!(!environment.contains_key("AGENTOS_TEST_OPTIONAL_9C3A"));
+    }
+
+    #[test]
+    fn integration_environment_rejects_undeclared_keys() {
+        let error = integration_environment(
+            &test_manifest(),
+            &json!({ "env": { "UNDECLARED": "secret" } }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("is not declared"));
+    }
 }
