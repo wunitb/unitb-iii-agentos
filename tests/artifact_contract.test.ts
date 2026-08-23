@@ -479,7 +479,6 @@ describe("build 10014 provider adapter artifact contract", () => {
     expect(attackSurface).toContain("Gemini");
   });
 });
-
 describe("build 10008 worker-identity hardening evidence", () => {
   it("contains exactly the four governed artifacts", async () => {
     expect((await readdir(build10008ArtifactDirectory)).sort()).toEqual(
