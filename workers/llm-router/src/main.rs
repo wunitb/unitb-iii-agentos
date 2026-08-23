@@ -603,6 +603,13 @@ fn message_tool_call_id(message: &Value) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
+fn remove_assistant_tool_calls(message: &mut Value) {
+    if let Some(object) = message.as_object_mut() {
+        object.remove("tool_calls");
+        object.remove("toolCalls");
+    }
+}
+
 fn anthropic_messages(messages: &[Value], aliases: &ToolAliases) -> Vec<Value> {
     let mut provider_messages: Vec<Value> = Vec::with_capacity(messages.len());
 
@@ -611,7 +618,9 @@ fn anthropic_messages(messages: &[Value], aliases: &ToolAliases) -> Vec<Value> {
             Some("assistant") => {
                 let calls = message_function_calls(message);
                 if calls.is_empty() {
-                    provider_messages.push(message.clone());
+                    let mut native = message.clone();
+                    remove_assistant_tool_calls(&mut native);
+                    provider_messages.push(native);
                     continue;
                 }
 
@@ -675,25 +684,24 @@ fn openai_messages(messages: &[Value], aliases: &ToolAliases) -> Vec<Value> {
         .map(|message| {
             let mut native = message.clone();
             let calls = message_function_calls(message);
-            if !calls.is_empty() {
-                native["tool_calls"] = Value::Array(
-                    calls
-                        .into_iter()
-                        .filter_map(|call| {
-                            Some(json!({
-                                "id": call.call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": aliases.provider_name(&call.id)?,
-                                    "arguments": serde_json::to_string(&call.arguments)
-                                        .unwrap_or_else(|_| "null".to_string()),
-                                },
-                            }))
-                        })
-                        .collect(),
-                );
-                if let Some(object) = native.as_object_mut() {
-                    object.remove("toolCalls");
+            if message.get("role").and_then(Value::as_str) == Some("assistant") {
+                remove_assistant_tool_calls(&mut native);
+                let calls: Vec<Value> = calls
+                    .into_iter()
+                    .filter_map(|call| {
+                        Some(json!({
+                            "id": call.call_id,
+                            "type": "function",
+                            "function": {
+                                "name": aliases.provider_name(&call.id)?,
+                                "arguments": serde_json::to_string(&call.arguments)
+                                    .unwrap_or_else(|_| "null".to_string()),
+                            },
+                        }))
+                    })
+                    .collect();
+                if !calls.is_empty() {
+                    native["tool_calls"] = Value::Array(calls);
                 }
             }
             if message.get("role").and_then(Value::as_str) == Some("tool")
@@ -1933,6 +1941,191 @@ mod tests {
                     ],
                 },
             ])
+        );
+    }
+
+    #[test]
+    fn provider_adapters_omit_all_invalid_assistant_tool_calls() {
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": "kept text",
+            "tool_calls": [
+                null,
+                { "callId": "", "id": "state::get", "arguments": {} },
+                { "callId": "call-2", "id": "", "arguments": {} },
+            ],
+        })];
+
+        let anthropic = anthropic_request_body("model", None, &messages, &[], 128);
+        assert_eq!(
+            anthropic,
+            json!({
+                "model": "model",
+                "messages": [{ "role": "assistant", "content": "kept text" }],
+                "max_tokens": 128,
+            })
+        );
+        assert!(anthropic["messages"][0].get("tool_calls").is_none());
+        assert!(anthropic["messages"][0].get("toolCalls").is_none());
+
+        let openai = openai_request_body("model", None, &messages, &[], 128);
+        assert_eq!(
+            openai,
+            json!({
+                "model": "model",
+                "messages": [{ "role": "assistant", "content": "kept text" }],
+                "max_tokens": 128,
+            })
+        );
+        assert!(openai["messages"][0].get("tool_calls").is_none());
+        assert!(openai["messages"][0].get("toolCalls").is_none());
+    }
+
+    #[test]
+    fn provider_adapters_strip_empty_null_and_non_array_assistant_tool_call_values() {
+        let messages = vec![
+            json!({ "role": "assistant", "content": "no key" }),
+            json!({ "role": "assistant", "content": "empty", "tool_calls": [] }),
+            json!({ "role": "assistant", "content": "null", "toolCalls": null }),
+            json!({ "role": "assistant", "content": "object", "tool_calls": {} }),
+        ];
+        let expected_messages = json!([
+            { "role": "assistant", "content": "no key" },
+            { "role": "assistant", "content": "empty" },
+            { "role": "assistant", "content": "null" },
+            { "role": "assistant", "content": "object" },
+        ]);
+
+        assert_eq!(
+            anthropic_request_body("model", None, &messages, &[], 0),
+            json!({
+                "model": "model",
+                "messages": expected_messages,
+                "max_tokens": 0,
+            })
+        );
+        assert_eq!(
+            openai_request_body("model", None, &messages, &[], 0),
+            json!({
+                "model": "model",
+                "messages": expected_messages,
+                "max_tokens": 0,
+            })
+        );
+    }
+
+    #[test]
+    fn provider_adapters_omit_normalized_calls_when_provider_alias_resolution_fails() {
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": "kept text",
+            "tool_calls": [
+                { "callId": "call-1", "id": "state::get", "arguments": {} },
+            ],
+        })];
+        let aliases = ToolAliases::default();
+
+        assert_eq!(
+            anthropic_messages(&messages, &aliases),
+            vec![json!({
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "kept text" }],
+            })]
+        );
+        assert_eq!(
+            openai_messages(&messages, &aliases),
+            vec![json!({ "role": "assistant", "content": "kept text" })]
+        );
+    }
+
+    #[test]
+    fn provider_adapters_emit_only_valid_assistant_tool_calls_from_mixed_arrays() {
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": "kept text",
+            "toolCalls": [
+                { "callId": "", "id": "state::get", "arguments": {} },
+                { "callId": "call-1", "id": "state::get", "arguments": { "scope": "agents" } },
+                { "callId": "call-2", "arguments": {} },
+            ],
+        })];
+
+        assert_eq!(
+            anthropic_request_body("model", None, &messages, &[], 128),
+            json!({
+                "model": "model",
+                "messages": [{
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "kept text" },
+                        { "type": "tool_use", "id": "call-1", "name": "state__get", "input": { "scope": "agents" } },
+                    ],
+                }],
+                "max_tokens": 128,
+            })
+        );
+
+        assert_eq!(
+            openai_request_body("model", None, &messages, &[], 128),
+            json!({
+                "model": "model",
+                "messages": [{
+                    "role": "assistant",
+                    "content": "kept text",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "state__get",
+                            "arguments": "{\"scope\":\"agents\"}",
+                        },
+                    }],
+                }],
+                "max_tokens": 128,
+            })
+        );
+    }
+
+    #[test]
+    fn provider_adapters_preserve_all_valid_assistant_tool_calls() {
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+                { "callId": "call-1", "id": "state::get", "arguments": { "scope": "agents" } },
+                { "callId": "call-2", "id": "queue::publish", "arguments": { "topic": "work" } },
+            ],
+        })];
+
+        assert_eq!(
+            anthropic_request_body("model", None, &messages, &[], 128),
+            json!({
+                "model": "model",
+                "messages": [{
+                    "role": "assistant",
+                    "content": [
+                        { "type": "tool_use", "id": "call-1", "name": "state__get", "input": { "scope": "agents" } },
+                        { "type": "tool_use", "id": "call-2", "name": "queue__publish", "input": { "topic": "work" } },
+                    ],
+                }],
+                "max_tokens": 128,
+            })
+        );
+
+        assert_eq!(
+            openai_request_body("model", None, &messages, &[], 128),
+            json!({
+                "model": "model",
+                "messages": [{
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        { "id": "call-1", "type": "function", "function": { "name": "state__get", "arguments": "{\"scope\":\"agents\"}" } },
+                        { "id": "call-2", "type": "function", "function": { "name": "queue__publish", "arguments": "{\"topic\":\"work\"}" } },
+                    ],
+                }],
+                "max_tokens": 128,
+            })
         );
     }
 
