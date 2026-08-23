@@ -27,6 +27,7 @@ pub(crate) const ENGINE_INSTALL_HINT: &str =
 pub(crate) const WORKSPACE_BUILD_HINT: &str = "run `cargo build --workspace --release`";
 
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+const WORKER_IDENTITIES_UNREPORTED: &str = "the engine did not report connected worker identities";
 
 /// Reads `<runtime>/.env` for `agentos up` without mutating this process. Keys
 /// already exported by the invoking shell are deliberately omitted so child
@@ -390,7 +391,7 @@ pub(crate) fn readiness(probes: &dyn Diagnostics, paths: &RuntimePaths) -> Readi
         ),
         (None, _) => ReadinessItem::failed(
             "Connected",
-            "engine did not report connected worker identities",
+            WORKER_IDENTITIES_UNREPORTED,
             "start the stack with `agentos up`, then re-run `agentos doctor`",
         ),
     });
@@ -586,8 +587,7 @@ fn up_stages(
     // 6. workers: compare canonical identities, never aggregate counts. On a
     //    partial stack only missing workers are launched, preserving the
     //    already-connected processes and avoiding duplicate registrations.
-    ensure_engine_alive(effects)?;
-    let already_connected = effects.connected_worker_ids().unwrap_or_default();
+    let already_connected = await_worker_identity_report(effects, options)?;
     let missing = missing_worker_ids(&required, &already_connected);
     let connected = if missing.is_empty() {
         stage_ok(
@@ -669,9 +669,9 @@ fn up_stages(
     }
 }
 
-/// One wall-clock polling budget, shared by both readiness waits. A deadline
-/// caps slow probes too; deriving only an attempt count can exceed the timeout
-/// by the cumulative duration of those probes.
+/// Builds a wall-clock polling budget for each readiness wait. A deadline caps
+/// slow probes too; deriving only an attempt count can exceed the timeout by
+/// the cumulative duration of those probes.
 fn poll_plan(options: &UpOptions) -> (Duration, Instant) {
     let poll = options.poll_interval.max(Duration::from_millis(1));
     let now = Instant::now();
@@ -705,6 +705,28 @@ fn await_engine(effects: &mut dyn Bootstrap, options: &UpOptions) -> Result<()> 
         options.stage_timeout.as_secs_f32(),
         effects.engine_log().display()
     )
+}
+
+/// Waits for the engine to answer the worker-identity query before deciding
+/// what to launch. `None` is an unknown state, while `Some(empty)` is a valid
+/// report that means every required worker still needs to be started.
+fn await_worker_identity_report(
+    effects: &mut dyn Bootstrap,
+    options: &UpOptions,
+) -> Result<BTreeSet<String>> {
+    let (poll, deadline) = poll_plan(options);
+    loop {
+        ensure_engine_alive(effects)?;
+        if let Some(connected) = effects.connected_worker_ids() {
+            return Ok(connected);
+        }
+        let now = effects.now();
+        if now >= deadline {
+            break;
+        }
+        effects.sleep(poll.min(deadline.saturating_duration_since(now)));
+    }
+    anyhow::bail!(WORKER_IDENTITIES_UNREPORTED)
 }
 
 /// Waits for the required workers to be on the bus within the same bounded
@@ -1014,6 +1036,7 @@ mod tests {
         engine_start_error: Option<String>,
         /// Stable worker identities the engine reports; `None` when silent.
         connected: RefCell<Option<BTreeSet<String>>>,
+        identity_probes: Cell<usize>,
         /// What the engine reports once this invocation started the workers.
         connected_after_start: Option<BTreeSet<String>>,
         workers: Result<Vec<WorkerSpec>, String>,
@@ -1041,6 +1064,7 @@ mod tests {
                 stop_checks: Cell::new(0),
                 engine_start_error: None,
                 connected: RefCell::new(Some(ids(&["core", "memory"]))),
+                identity_probes: Cell::new(0),
                 connected_after_start: Some(ids(&["core", "memory"])),
                 workers: Ok(vec![
                     spec("core", WorkerRuntime::Rust, true),
@@ -1098,6 +1122,7 @@ mod tests {
         }
 
         fn connected_worker_ids(&self) -> Option<BTreeSet<String>> {
+            self.identity_probes.set(self.identity_probes.get() + 1);
             self.connected.borrow().clone()
         }
 
@@ -1239,6 +1264,29 @@ mod tests {
     }
 
     #[test]
+    fn up_fails_closed_when_the_initial_worker_identity_query_is_unanswered() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(None),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        assert!(!matches!(&outcome, Ok(UpOutcome::Ready)));
+        let error = outcome
+            .expect_err("an unanswered identity query must fail")
+            .to_string();
+        assert_eq!(error, WORKER_IDENTITIES_UNREPORTED);
+        assert!(
+            fake.identity_probes.get() > 1,
+            "identity query was not retried"
+        );
+        assert_eq!(fake.sleeps.get(), 6);
+        assert_eq!(fake.events(), vec!["shutdown_started".to_string()]);
+        assert!(!fake.started_workers.get());
+        assert!(fake.started_worker_names.borrow().is_empty());
+    }
+
+    #[test]
     fn up_reuses_a_healthy_engine_without_spawning_another() {
         let config = existing_config();
         let mut fake = Fake {
@@ -1248,6 +1296,7 @@ mod tests {
         let (outcome, output) = up(&mut fake, &options(false), &config);
         assert_eq!(outcome.expect("up succeeds"), UpOutcome::Ready);
         assert_eq!(fake.events(), vec!["start_workers".to_string()]);
+        assert_eq!(&*fake.started_worker_names.borrow(), &["core", "memory"]);
         assert!(
             output.contains("already healthy on 127.0.0.1:49134"),
             "{output}"
