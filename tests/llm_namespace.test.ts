@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
 
 const repository = new URL("../", import.meta.url);
-const legacyFunctions = ["complete", "route", "providers", "usage"].map(
+const agentosLlmFunctions = ["chat", "complete", "route", "providers", "usage"];
+const legacyFunctions = agentosLlmFunctions.map(
   (name) => `llm::${name}`,
 );
 
@@ -20,13 +21,13 @@ describe("AgentOS LLM namespace", () => {
       new URL("workers/llm-router/src/main.rs", repository),
     ).text();
 
-    for (const name of ["complete", "route", "providers", "usage"]) {
+    for (const name of agentosLlmFunctions) {
       expect(router).toContain(`"agentos::llm::${name}"`);
       expect(router).not.toContain(`"llm::${name}"`);
     }
   });
 
-  it("has no source call sites for the four colliding legacy ids", async () => {
+  it("has no source call sites for colliding legacy llm ids", async () => {
     const glob = new Bun.Glob("**/*.{rs,ts,tsx,js,jsx}");
     for await (const path of glob.scan({ cwd: repository.pathname })) {
       if (

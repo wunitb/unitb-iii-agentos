@@ -95,7 +95,7 @@ async fn decompose_task(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
     let llm_result = iii
         .trigger(TriggerRequest {
-            function_id: "llm::chat".to_string(),
+            function_id: "agentos::llm::chat".to_string(),
             payload: json!({
                 "model": model,
                 "messages": [

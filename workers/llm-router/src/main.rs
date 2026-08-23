@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use iii_sdk::errors::Error;
 use iii_sdk::{InitOptions, RegisterFunction, register_worker};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,6 +16,14 @@ struct Usage {
     input_tokens: u64,
     output_tokens: u64,
     requests: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct FunctionCall {
+    #[serde(rename = "callId")]
+    call_id: String,
+    id: String,
+    arguments: Value,
 }
 
 struct ProviderConfig {
@@ -386,6 +395,82 @@ fn completion_tools(input: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+fn tool_field<'a>(tool: &'a Value, names: &[&str]) -> Option<&'a Value> {
+    names.iter().find_map(|name| tool.get(*name))
+}
+
+fn agent_tool_id(tool: &Value) -> Option<&str> {
+    tool_field(tool, &["id", "function_id", "functionId", "name"])
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+fn agent_tool_schema(tool: &Value) -> Value {
+    tool_field(
+        tool,
+        &[
+            "request_format",
+            "requestFormat",
+            "input_schema",
+            "inputSchema",
+            "parameters",
+        ],
+    )
+    .filter(|schema| !schema.is_null())
+    .cloned()
+    .unwrap_or_else(|| json!({ "type": "object", "properties": {} }))
+}
+
+fn anthropic_tools(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .filter_map(|tool| {
+            let mut native = serde_json::Map::new();
+            native.insert("name".into(), json!(agent_tool_id(tool)?));
+            if let Some(description) = tool.get("description").and_then(Value::as_str) {
+                native.insert("description".into(), json!(description));
+            }
+            native.insert("input_schema".into(), agent_tool_schema(tool));
+            Some(Value::Object(native))
+        })
+        .collect()
+}
+
+fn openai_tools(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .filter_map(|tool| {
+            let mut function = serde_json::Map::new();
+            function.insert("name".into(), json!(agent_tool_id(tool)?));
+            if let Some(description) = tool.get("description").and_then(Value::as_str) {
+                function.insert("description".into(), json!(description));
+            }
+            function.insert("parameters".into(), agent_tool_schema(tool));
+            Some(json!({ "type": "function", "function": function }))
+        })
+        .collect()
+}
+
+fn gemini_tools(tools: &[Value]) -> Vec<Value> {
+    let declarations: Vec<Value> = tools
+        .iter()
+        .filter_map(|tool| {
+            let mut declaration = serde_json::Map::new();
+            declaration.insert("name".into(), json!(agent_tool_id(tool)?));
+            if let Some(description) = tool.get("description").and_then(Value::as_str) {
+                declaration.insert("description".into(), json!(description));
+            }
+            declaration.insert("parameters".into(), agent_tool_schema(tool));
+            Some(Value::Object(declaration))
+        })
+        .collect();
+    if declarations.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({ "functionDeclarations": declarations })]
+    }
+}
+
 fn anthropic_request_body(
     model: &str,
     system_prompt: Option<&str>,
@@ -401,6 +486,7 @@ fn anthropic_request_body(
     if let Some(system_prompt) = system_prompt.filter(|prompt| !prompt.is_empty()) {
         body["system"] = json!(system_prompt);
     }
+    let tools = anthropic_tools(tools);
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
@@ -425,6 +511,39 @@ fn openai_request_body(
         "messages": provider_messages,
         "max_tokens": max_tokens,
     });
+    let tools = openai_tools(tools);
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+    }
+    body
+}
+
+fn gemini_request_body(
+    system_prompt: Option<&str>,
+    messages: &[Value],
+    tools: &[Value],
+    max_tokens: u64,
+) -> Value {
+    let contents: Vec<Value> = messages
+        .iter()
+        .filter_map(|message| {
+            let text = message.get("content")?.as_str()?;
+            let role = if message.get("role").and_then(Value::as_str) == Some("assistant") {
+                "model"
+            } else {
+                "user"
+            };
+            Some(json!({ "role": role, "parts": [{ "text": text }] }))
+        })
+        .collect();
+    let mut body = json!({
+        "contents": contents,
+        "generationConfig": { "maxOutputTokens": max_tokens },
+    });
+    if let Some(system_prompt) = system_prompt.filter(|prompt| !prompt.is_empty()) {
+        body["systemInstruction"] = json!({ "parts": [{ "text": system_prompt }] });
+    }
+    let tools = gemini_tools(tools);
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
@@ -493,6 +612,101 @@ async fn call_openai_compat(
     Ok(resp)
 }
 
+async fn call_gemini(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    system_prompt: Option<&str>,
+    messages: &[Value],
+    tools: &[Value],
+    max_tokens: u64,
+) -> Result<Value, Error> {
+    let body = gemini_request_body(system_prompt, messages, tools, max_tokens);
+    let resp = client
+        .post(format!("{base_url}/models/{model}:generateContent"))
+        .query(&[("key", api_key)])
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| Error::Handler(e.to_string()))?
+        .error_for_status()
+        .map_err(|e| Error::Handler(e.to_string()))?
+        .json::<Value>()
+        .await
+        .map_err(|e| Error::Handler(e.to_string()))?;
+    Ok(resp)
+}
+
+fn function_arguments(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(arguments)) => {
+            serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.clone()))
+        }
+        Some(arguments) => arguments.clone(),
+        None => json!({}),
+    }
+}
+
+fn function_calls(driver: Driver, result: &Value) -> Vec<FunctionCall> {
+    match driver {
+        Driver::Anthropic => result["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|block| block["type"].as_str() == Some("tool_use"))
+            .filter_map(|block| {
+                Some(FunctionCall {
+                    call_id: block["id"].as_str()?.to_string(),
+                    id: block["name"].as_str()?.to_string(),
+                    arguments: function_arguments(block.get("input")),
+                })
+            })
+            .collect(),
+        Driver::OpenAiCompat | Driver::Bedrock => result["choices"]
+            .as_array()
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice["message"]["tool_calls"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|call| {
+                Some(FunctionCall {
+                    call_id: call["id"].as_str()?.to_string(),
+                    id: call["function"]["name"].as_str()?.to_string(),
+                    arguments: function_arguments(call["function"].get("arguments")),
+                })
+            })
+            .collect(),
+        Driver::Gemini => result["candidates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .flat_map(|(candidate_index, candidate)| {
+                candidate["content"]["parts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .filter_map(move |(part_index, part)| {
+                        let call = part.get("functionCall")?;
+                        let id = call["name"].as_str()?.to_string();
+                        let call_id = call["id"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("gemini-{candidate_index}-{part_index}"));
+                        Some(FunctionCall {
+                            call_id,
+                            id,
+                            arguments: function_arguments(call.get("args")),
+                        })
+                    })
+            })
+            .collect(),
+    }
+}
+
 async fn route_handler(state: Arc<RouterState>, input: Value) -> Result<Value, Error> {
     let messages = input["messages"].as_array().cloned().unwrap_or_default();
     let tools = input["tools"].as_array().cloned().unwrap_or_default();
@@ -544,8 +758,21 @@ async fn complete_handler(
             )
             .await?
         }
-        Driver::OpenAiCompat | Driver::Gemini | Driver::Bedrock => {
+        Driver::OpenAiCompat | Driver::Bedrock => {
             call_openai_compat(
+                client,
+                &provider.base_url,
+                &api_key,
+                model,
+                system_prompt,
+                &messages,
+                &tools,
+                max_tokens,
+            )
+            .await?
+        }
+        Driver::Gemini => {
+            call_gemini(
                 client,
                 &provider.base_url,
                 &api_key,
@@ -564,10 +791,12 @@ async fn complete_handler(
     let input_tokens = result["usage"]["input_tokens"]
         .as_u64()
         .or(result["usage"]["prompt_tokens"].as_u64())
+        .or(result["usageMetadata"]["promptTokenCount"].as_u64())
         .unwrap_or(0);
     let output_tokens = result["usage"]["output_tokens"]
         .as_u64()
         .or(result["usage"]["completion_tokens"].as_u64())
+        .or(result["usageMetadata"]["candidatesTokenCount"].as_u64())
         .unwrap_or(0);
 
     let key = format!("{}:{}", route.provider, model);
@@ -590,24 +819,16 @@ async fn complete_handler(
                 .and_then(|c| c.first())
                 .and_then(|c| c["message"]["content"].as_str())
         })
+        .or_else(|| {
+            result["candidates"]
+                .as_array()
+                .and_then(|candidates| candidates.first())
+                .and_then(|candidate| candidate["content"]["parts"].as_array())
+                .and_then(|parts| parts.iter().find_map(|part| part["text"].as_str()))
+        })
         .unwrap_or("");
 
-    let tool_calls = result["content"]
-        .as_array()
-        .map(|blocks| {
-            blocks
-                .iter()
-                .filter(|b| b["type"].as_str() == Some("tool_use"))
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .or_else(|| {
-            result["choices"]
-                .as_array()
-                .and_then(|c| c.first())
-                .and_then(|c| c["message"]["tool_calls"].as_array().cloned())
-        })
-        .unwrap_or_default();
+    let tool_calls = function_calls(provider.driver, &result);
 
     Ok(json!({
         "content": content,
@@ -777,6 +998,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 async move { complete_handler(state, shared_client, direct_client, input).await }
             })
             .description("Send completion request to routed provider"),
+        );
+    }
+
+    {
+        let state = state.clone();
+        let shared_client = shared_client.clone();
+        let direct_client = direct_client.clone();
+        iii.register_function(
+            "agentos::llm::chat",
+            RegisterFunction::new_async(move |input: Value| {
+                let state = state.clone();
+                let shared_client = shared_client.clone();
+                let direct_client = direct_client.clone();
+                async move { complete_handler(state, shared_client, direct_client, input).await }
+            })
+            .description("Send a chat request to the routed provider"),
         );
     }
 
@@ -1033,7 +1270,15 @@ mod tests {
     #[test]
     fn anthropic_body_preserves_system_prompt_and_agent_tools() {
         let messages = vec![json!({ "role": "user", "content": "hello" })];
-        let tools = vec![json!({ "name": "memory::recall" })];
+        let tools = vec![json!({
+            "function_id": "memory::recall",
+            "description": "Recall matching memories",
+            "request_format": {
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"],
+            },
+        })];
         let body = anthropic_request_body(
             "claude-sonnet-4-20250514",
             Some("Use memory when relevant"),
@@ -1044,13 +1289,28 @@ mod tests {
 
         assert_eq!(body["system"], "Use memory when relevant");
         assert_eq!(body["messages"], json!(messages));
-        assert_eq!(body["tools"], json!(tools));
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "name": "memory::recall",
+                "description": "Recall matching memories",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "query": { "type": "string" } },
+                    "required": ["query"],
+                },
+            }])
+        );
     }
 
     #[test]
     fn openai_body_preserves_system_prompt_and_agent_tools() {
         let messages = vec![json!({ "role": "user", "content": "hello" })];
-        let tools = vec![json!({ "name": "memory::recall" })];
+        let tools = vec![json!({
+            "id": "memory::recall",
+            "description": "Recall matching memories",
+            "inputSchema": { "type": "object", "properties": {} },
+        })];
         let body = openai_request_body(
             DEFAULT_CODEX_MODEL,
             Some("Use memory when relevant"),
@@ -1066,7 +1326,95 @@ mod tests {
                 { "role": "user", "content": "hello" },
             ])
         );
-        assert_eq!(body["tools"], json!(tools));
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "type": "function",
+                "function": {
+                    "name": "memory::recall",
+                    "description": "Recall matching memories",
+                    "parameters": { "type": "object", "properties": {} },
+                },
+            }])
+        );
+    }
+
+    #[test]
+    fn gemini_body_uses_function_declarations_and_native_message_shape() {
+        let body = gemini_request_body(
+            Some("Use memory"),
+            &[json!({ "role": "user", "content": "hello" })],
+            &[json!({ "functionId": "memory::recall" })],
+            512,
+        );
+        assert_eq!(
+            body["contents"],
+            json!([{ "role": "user", "parts": [{ "text": "hello" }] }])
+        );
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "functionDeclarations": [{
+                    "name": "memory::recall",
+                    "parameters": { "type": "object", "properties": {} },
+                }],
+            }])
+        );
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "Use memory");
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 512);
+    }
+
+    #[test]
+    fn provider_tool_calls_normalize_to_the_agent_function_call_contract() {
+        let anthropic = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu-1",
+                "name": "memory::recall",
+                "input": { "query": "rust" },
+            }],
+        });
+        assert_eq!(
+            function_calls(Driver::Anthropic, &anthropic),
+            vec![FunctionCall {
+                call_id: "toolu-1".into(),
+                id: "memory::recall".into(),
+                arguments: json!({ "query": "rust" }),
+            }]
+        );
+
+        let openai = json!({
+            "choices": [{ "message": { "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "state::get",
+                    "arguments": "{\"scope\":\"agents\"}",
+                },
+            }] } }],
+        });
+        assert_eq!(
+            function_calls(Driver::OpenAiCompat, &openai),
+            vec![FunctionCall {
+                call_id: "call-1".into(),
+                id: "state::get".into(),
+                arguments: json!({ "scope": "agents" }),
+            }]
+        );
+
+        let gemini = json!({
+            "candidates": [{ "content": { "parts": [{
+                "functionCall": { "name": "queue::publish", "args": { "topic": "work" } },
+            }] } }],
+        });
+        assert_eq!(
+            function_calls(Driver::Gemini, &gemini),
+            vec![FunctionCall {
+                call_id: "gemini-0-0".into(),
+                id: "queue::publish".into(),
+                arguments: json!({ "topic": "work" }),
+            }]
+        );
     }
 
     #[test]

@@ -119,7 +119,7 @@ async fn plan_handler(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
     let llm_result = iii
         .trigger(TriggerRequest {
-            function_id: "llm::chat".into(),
+            function_id: "agentos::llm::chat".into(),
             payload: json!({
                 "model": model,
                 "messages": [
