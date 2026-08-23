@@ -6,8 +6,8 @@ const lanes = [
   { id: "ws", label: "iii (engine)", port: ":49134", note: "Worker WebSocket bus" },
   { id: "stream", label: "iii-stream", port: ":3112", note: "Server-sent + WS streams" },
   { id: "pubsub", label: "iii-pubsub", port: "—", note: "Topic broadcast" },
-  { id: "cron", label: "iii-cron", port: "—", note: "Scheduled triggers" },
-  { id: "state", label: "iii-state", port: "—", note: "Atomic UpdateOp store" },
+  { id: "cron", label: "cron", port: "—", note: "Scheduled triggers" },
+  { id: "state", label: "state", port: "—", note: "Atomic UpdateOp store" },
   { id: "obs", label: "iii-observability", port: "—", note: "OTel traces + metrics" },
 ];
 

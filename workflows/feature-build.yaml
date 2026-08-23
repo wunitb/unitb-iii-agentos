@@ -12,6 +12,7 @@ agents:
 steps:
   - name: Spec
     functionId: "agent::chat"
+    agentId: architect
     promptTemplate: >
       Design the feature: {{feature_description}}.
       Produce a technical spec with API contracts, data models,
@@ -23,6 +24,7 @@ steps:
 
   - name: Implement
     functionId: "agent::chat"
+    agentId: coder
     promptTemplate: >
       Implement the feature based on this spec: {{tech_spec}}.
       Follow existing codebase patterns. Include unit tests.
@@ -35,6 +37,7 @@ steps:
 
   - name: Review
     functionId: "agent::chat"
+    agentId: code-reviewer
     promptTemplate: >
       Review this implementation: {{implementation}}.
       Previous review feedback (if any): {{review_result}}.
@@ -51,6 +54,7 @@ steps:
 
   - name: Merge
     functionId: "agent::chat"
+    agentId: code-reviewer
     promptTemplate: >
       Final approval for merge. Review result: {{review_result}}.
       Create a changelog entry and confirm merge readiness.

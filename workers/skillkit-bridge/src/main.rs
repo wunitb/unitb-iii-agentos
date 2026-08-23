@@ -130,6 +130,25 @@ fn is_valid_agent_name(name: &str) -> bool {
             .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-'))
 }
 
+fn skill_run_args(id: &str, agent: Option<&str>) -> Result<Vec<String>, String> {
+    if !is_valid_skill_id(id)
+        || Path::new(id).is_absolute()
+        || id.split('/').any(|segment| segment == "..")
+    {
+        return Err("Invalid skill reference".into());
+    }
+
+    let mut args = vec!["run".to_string(), id.to_string(), "--json".to_string()];
+    if let Some(agent) = agent {
+        if !is_valid_agent_name(agent) {
+            return Err("Invalid agent name".into());
+        }
+        args.push("--agent".into());
+        args.push(agent.to_string());
+    }
+    Ok(args)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -222,6 +241,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     iii.register_function(
+        "skillkit::run",
+        RegisterFunction::new_async(move |input: Value| async move {
+            let id = input["id"].as_str().unwrap_or("");
+            let args = skill_run_args(id, input["agent"].as_str()).map_err(Error::Handler)?;
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let result = run_skillkit(&arg_refs, 3_600_000).await;
+            if result.exit_code != 0 {
+                return Ok::<Value, Error>(json!({
+                    "executed": false,
+                    "error": result.stderr,
+                    "exitCode": result.exit_code,
+                }));
+            }
+            match serde_json::from_str::<Value>(&result.stdout) {
+                Ok(value) => Ok(json!({ "executed": true, "result": value, "exitCode": 0 })),
+                Err(_) => {
+                    let mut raw = result.stdout;
+                    truncate_to_char_boundary(&mut raw, 10_000);
+                    Ok(json!({ "executed": true, "raw": raw, "exitCode": 0 }))
+                }
+            }
+        })
+        .description("Execute an installed or workspace SkillKit skill"),
+    );
+
+    iii.register_function(
+        "skillkit::uninstall",
+        RegisterFunction::new_async(move |input: Value| async move {
+            let id = input["id"].as_str().unwrap_or("").to_string();
+            if !is_valid_skill_id(&id) {
+                return Err(Error::Handler("Invalid skill ID format".into()));
+            }
+
+            let result = run_skillkit(&["uninstall", &id, "--json"], 60_000).await;
+            if result.exit_code != 0 {
+                return Ok::<Value, Error>(json!({
+                    "removed": false,
+                    "error": result.stderr,
+                    "exitCode": result.exit_code,
+                }));
+            }
+            match serde_json::from_str::<Value>(&result.stdout) {
+                Ok(value) => Ok(json!({ "removed": true, "result": value, "exitCode": 0 })),
+                Err(_) => Ok(json!({ "removed": true, "exitCode": 0 })),
+            }
+        })
+        .description("Uninstall a SkillKit skill"),
+    );
+
+    iii.register_function(
         "skillkit::recommend",
         RegisterFunction::new_async(move |input: Value| async move {
             let context = input["context"].as_str().map(String::from);
@@ -290,8 +359,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let triggers = [
         ("skillkit::search", "GET", "api/skillkit/search"),
         ("skillkit::install", "POST", "api/skillkit/install"),
+        ("skillkit::uninstall", "POST", "api/skillkit/uninstall"),
         ("skillkit::list", "GET", "api/skillkit/list"),
         ("skillkit::recommend", "GET", "api/skillkit/recommend"),
+        ("skillkit::run", "POST", "api/skillkit/run"),
         ("skillkit::scan", "GET", "api/skillkit/scan"),
     ];
     for (fid, method, path) in triggers {
@@ -387,4 +458,29 @@ fn scan_dir<'a>(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_run_args_builds_verified_command_shape() {
+        assert_eq!(
+            skill_run_args("typescript-strict-mode", Some("claude-code")).unwrap(),
+            vec![
+                "run",
+                "typescript-strict-mode",
+                "--json",
+                "--agent",
+                "claude-code",
+            ]
+        );
+    }
+
+    #[test]
+    fn skill_run_args_rejects_workspace_escape() {
+        assert!(skill_run_args("../outside/SKILL.md", None).is_err());
+        assert!(skill_run_args("/tmp/SKILL.md", None).is_err());
+    }
 }

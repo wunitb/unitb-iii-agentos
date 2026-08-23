@@ -8,3 +8,4 @@ rust-version.workspace = true
 [dependencies]
 iii-sdk.workspace = true
 serde_json.workspace = true
+subtle.workspace = true

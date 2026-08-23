@@ -26,7 +26,7 @@ unitb-iii-agentos/
 
 | Group | Workers | Function namespaces |
 |---|---|---|
-| Reasoning | `agent-core` `llm-router` `council` `swarm` `directive` `mission` | `agent::*` `llm::*` `council::*` `swarm::*` `directive::*` `mission::*` |
+| Reasoning | `agent-core` `llm-router` `council` `swarm` `directive` `mission` | `agent::*` `agentos::llm::*` `council::*` `swarm::*` `directive::*` `mission::*` |
 | State | `realm` `memory` `ledger` `vault` `context-manager` `context-cache` | `realm::*` `memory::*` `ledger::*` `vault::*` `context::*` |
 | Coordination | `orchestrator` `workflow` `hierarchy` `coordination` `task-decomposer` | `orchestrator::*` `workflow::*` `hierarchy::*` `task::*` |
 | Execution | `wasm-sandbox` `browser` `code-agent` `hand-runner` `lsp-tools` | `wasm::*` `browser::*` `code::*` `hand::*` `lsp::*` |
@@ -57,7 +57,7 @@ CI's `validate iii.worker.yaml` job enforces this on every PR.
 
 ## Engine boot
 
-`config.yaml` uses iii v0.22.1's configuration-worker layout. It declares the file-backed configuration store plus seven baseline workers: `iii-http`, `iii-state`, `iii-stream`, `iii-queue`, `iii-pubsub`, `iii-cron`, and `iii-observability`. Their committed values live in `config/iii-*.yaml`; `config.yaml` keeps only worker entries and migration breadcrumbs. AgentOS workers spawn alongside as separate processes — each connects to the engine WebSocket via `register_worker` and stays resident.
+`config.yaml` uses iii v0.22.1's configuration-worker layout. It declares the file-backed configuration store plus seven baseline workers: `iii-http`, `state`, `iii-stream`, `queue`, `iii-pubsub`, `cron`, and `iii-observability`. The state, queue, and cron workers use the canonical 0.22.1 names; declaring their deprecated `iii-*` aliases alongside canonical workers makes the engine reject the config. Their committed values live in matching files under `config/`; `config.yaml` keeps only worker entries and migration breadcrumbs. AgentOS workers spawn alongside as separate processes — each connects to the engine WebSocket via `register_worker` and stays resident.
 
 The engine WebSocket endpoint is configurable via `III_URL` (default `ws://localhost:49134`).
 
@@ -117,6 +117,10 @@ These are **declarative config**, not workers:
 - `workflows/<name>.yaml` — pre-defined workflow definitions for the `workflow` worker.
 
 None ship as registered functions; they configure workers that do.
+
+The `workflow` worker auto-loads every `.yaml`/`.yml` definition from `AGENTOS_WORKFLOWS_DIR` or the bundled `workflows/` directory. Loading rejects invalid IDs, duplicate or missing dependencies, undeclared agent references, unbounded timeout/retry/loop controls, and incompatible consecutive fanout policies. Execution resolves the dependency graph, checks the selected agent's capability before every function call, and supports `sequential`, concurrently joined `parallel`, grouped `fanout`, and bounded `loop` modes with `fail`, `skip`, or retry behavior.
+
+Workflow definitions live under the `workflows` state scope. Runs live under `workflow_runs`; each checkpoint records `status`, `results`, interpolated `vars`, and `nextStep`, so HTTP and CLI clients can inspect the last durable step boundary through `GET /api/workflow-runs/:id`. Routes also expose workflow CRUD, `POST /api/workflows/:id/run`, and paginated run history at `GET /api/workflows/:id/runs`.
 
 ## Development control plane
 

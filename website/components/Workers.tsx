@@ -20,10 +20,10 @@ const workers: Worker[] = [
   },
   {
     name: "llm-router",
-    ns: "llm::*",
+    ns: "agentos::llm::*",
     desc: "Provider-agnostic. Routes by cost, latency, or capability.",
     badge: "ROUTER",
-    snippet: `iii.trigger("llm::route",
+    snippet: `iii.trigger("agentos::llm::route",
   { tier: "premium",
     prompt: "..." })`,
   },

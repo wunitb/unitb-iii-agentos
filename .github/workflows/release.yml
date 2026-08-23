@@ -5,11 +5,11 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
-
+permissions: {}
 jobs:
   build:
+    permissions:
+      contents: read
     name: build ${{ matrix.arch }}-${{ matrix.os }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -33,7 +33,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.88"
+          toolchain: "1.90"
 
       - uses: Swatinem/rust-cache@v2
 
@@ -84,9 +84,69 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
-  publish:
-    name: publish release
+  validate:
+    name: validate ${{ matrix.arch }}-${{ matrix.os }} bundle
     needs: build
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x86_64
+          - os: linux
+            arch: aarch64
+          - os: darwin
+            arch: x86_64
+          - os: darwin
+            arch: aarch64
+    env:
+      TARGET_OS: ${{ matrix.os }}
+      TARGET_ARCH: ${{ matrix.arch }}
+      VERSION: ${{ github.ref_name }}
+      HOME: ${{ runner.temp }}/agentos-release-home
+      AGENTOS_HOME: ${{ runner.temp }}/agentos-release-home/.agentos
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: agentos-${{ matrix.arch }}-${{ matrix.os }}
+          path: dist
+      - name: inspect isolated bundle
+        run: |
+          set -euo pipefail
+          asset="agentos-${VERSION#v}-${TARGET_ARCH}-${TARGET_OS}"
+          archive="dist/$asset.tar.gz"
+          checksum="$archive.sha256"
+          [[ -f "$archive" ]]
+          [[ -f "$checksum" ]]
+          (cd dist && sha256sum --check "$asset.tar.gz.sha256")
+          for required in \
+            ./bin/agentos \
+            ./bin/agentos-tui \
+            ./runtime/config.yaml \
+            ./runtime/workers/agent-core/iii.worker.yaml \
+            ./runtime/target/release/agentos-agent-core \
+            ./runtime/workers/embedding/main.py \
+            ./runtime/workers/embedding/pyproject.toml \
+            ./runtime/workers/embedding/uv.lock; do
+            tar -tzf "$archive" | grep -Fx "$required" >/dev/null
+          done
+          extract="$RUNNER_TEMP/$asset"
+          mkdir -p "$extract" "$HOME" "$AGENTOS_HOME"
+          tar -xzf "$archive" -C "$extract"
+          [[ -x "$extract/bin/agentos" ]]
+          [[ -x "$extract/bin/agentos-tui" ]]
+          [[ -f "$extract/runtime/config.yaml" ]]
+          [[ ! -e "$extract/workers" ]]
+          echo "validated $asset in an isolated home without source checkout"
+
+  publish:
+    permissions:
+      contents: write
+    name: publish release
+    needs: [build, validate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8

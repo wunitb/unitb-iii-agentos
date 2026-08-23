@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 iii-sdk = "=0.22.1"
+agentos-http-adapter = { path = "../../crates/http-adapter" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

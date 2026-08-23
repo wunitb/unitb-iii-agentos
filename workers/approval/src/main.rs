@@ -152,22 +152,70 @@ async fn check(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     }))
 }
 
+fn state_group_names(response: &Value) -> Vec<&str> {
+    response
+        .get("groups")
+        .and_then(Value::as_array)
+        .or_else(|| response.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
+}
+
+async fn resolve_approval_agent(iii: &IIIClient, request_id: &str) -> Result<String, Error> {
+    let scopes = iii
+        .trigger(TriggerRequest {
+            function_id: "state::list_groups".to_string(),
+            payload: json!({}),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|e| Error::Handler(e.to_string()))?;
+
+    let mut found = None;
+    for scope in state_group_names(&scopes) {
+        let Some(agent_id) = scope.strip_prefix("approvals:") else {
+            continue;
+        };
+        let current = iii
+            .trigger(TriggerRequest {
+                function_id: "state::get".to_string(),
+                payload: json!({ "scope": scope, "key": request_id }),
+                action: None,
+                timeout_ms: None,
+            })
+            .await
+            .map_err(|e| Error::Handler(e.to_string()))?;
+        if current.is_null() {
+            continue;
+        }
+        if found.is_some() {
+            return Err(Error::Handler(format!(
+                "approval request {request_id} exists for multiple agents"
+            )));
+        }
+        found = Some(sanitize_id(agent_id).map_err(Error::Handler)?);
+    }
+
+    found.ok_or_else(|| Error::Handler(format!("approval request {request_id} not found")))
+}
+
 async fn decide(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let request_id = input
         .get("requestId")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Handler("requestId is required".into()))?;
-    let agent_id = input
-        .get("agentId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::Handler("agentId is required".into()))?;
+    let safe_request_id = sanitize_id(request_id).map_err(Error::Handler)?;
     let decision = input
         .get("decision")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Handler("decision is required".into()))?;
-
-    let safe_request_id = sanitize_id(request_id).map_err(Error::Handler)?;
-    let safe_agent_id = sanitize_id(agent_id).map_err(Error::Handler)?;
+    let safe_agent_id = match input.get("agentId").and_then(Value::as_str) {
+        Some(agent_id) => sanitize_id(agent_id).map_err(Error::Handler)?,
+        None => resolve_approval_agent(iii, &safe_request_id).await?,
+    };
     let status = match decision {
         "approve" => "approved",
         "deny" => "denied",
@@ -187,7 +235,7 @@ async fn decide(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         payload: json!({
             "scope": format!("approvals:{safe_agent_id}"),
             "key": safe_request_id,
-            "operations": [
+            "ops": [
                 { "type": "set", "path": "status", "value": status },
                 { "type": "set", "path": "decidedBy", "value": decided_by },
                 { "type": "set", "path": "decidedAt", "value": now_ms() },
@@ -486,4 +534,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     iii.shutdown_async().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_group_names_accepts_engine_envelope() {
+        let response = json!({ "groups": ["approvals:one", "workflows"] });
+        assert_eq!(
+            state_group_names(&response),
+            vec!["approvals:one", "workflows"]
+        );
+    }
+
+    #[test]
+    fn state_group_names_accepts_legacy_array() {
+        let response = json!(["approvals:one", 42, "workflow_runs"]);
+        assert_eq!(
+            state_group_names(&response),
+            vec!["approvals:one", "workflow_runs"]
+        );
+    }
 }

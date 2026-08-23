@@ -384,6 +384,54 @@ async fn providers_handler(state: Arc<RouterState>, _input: Value) -> Result<Val
     Ok(json!({ "providers": list }))
 }
 
+fn models_catalog(state: &RouterState) -> Value {
+    let mut models = state
+        .providers
+        .iter()
+        .flat_map(|entry| {
+            let provider = entry.key().clone();
+            entry
+                .value()
+                .models
+                .iter()
+                .map(move |model| {
+                    json!({
+                        "id": model,
+                        "provider": provider,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+    Value::Array(models)
+}
+
+fn provider_catalog(state: &RouterState) -> Value {
+    let mut providers = state
+        .providers
+        .iter()
+        .map(|entry| {
+            let provider = entry.value();
+            json!({
+                "name": entry.key(),
+                "available": provider.env_key.is_empty() || std::env::var(&provider.env_key).is_ok(),
+                "modelCount": provider.models.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    Value::Array(providers)
+}
+
+fn model_aliases() -> Value {
+    json!({
+        "fast": "claude-haiku-4-5-20251001",
+        "balanced": "claude-sonnet-4-20250514",
+        "powerful": "claude-opus-4-20250514",
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -413,7 +461,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let state = state.clone();
         iii.register_function(
-            "llm::route",
+            "agentos::llm::route",
             RegisterFunction::new_async(move |input: Value| {
                 let state = state.clone();
                 async move { route_handler(state, input).await }
@@ -426,7 +474,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = state.clone();
         let client = shared_client.clone();
         iii.register_function(
-            "llm::complete",
+            "agentos::llm::complete",
             RegisterFunction::new_async(move |input: Value| {
                 let state = state.clone();
                 let client = client.clone();
@@ -439,7 +487,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let state = state.clone();
         iii.register_function(
-            "llm::usage",
+            "agentos::llm::usage",
             RegisterFunction::new_async(move |input: Value| {
                 let state = state.clone();
                 async move { usage_handler(state, input).await }
@@ -451,13 +499,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let state = state.clone();
         iii.register_function(
-            "llm::providers",
+            "agentos::llm::providers",
             RegisterFunction::new_async(move |input: Value| {
                 let state = state.clone();
                 async move { providers_handler(state, input).await }
             })
             .description("List available providers and models"),
         );
+    }
+
+    {
+        let state = state.clone();
+        iii.register_function(
+            "agentos::llm::models",
+            RegisterFunction::new_async(move |_: Value| {
+                let state = state.clone();
+                async move { Ok::<Value, Error>(models_catalog(&state)) }
+            })
+            .description("List configured models"),
+        );
+    }
+    {
+        let state = state.clone();
+        iii.register_function(
+            "agentos::llm::provider_catalog",
+            RegisterFunction::new_async(move |_: Value| {
+                let state = state.clone();
+                async move { Ok::<Value, Error>(provider_catalog(&state)) }
+            })
+            .description("List provider availability"),
+        );
+    }
+    iii.register_function(
+        "agentos::llm::aliases",
+        RegisterFunction::new_async(
+            move |_: Value| async move { Ok::<Value, Error>(model_aliases()) },
+        )
+        .description("List stable model aliases"),
+    );
+
+    let catalog_routes = [
+        ("agentos::llm::models", "/api/models"),
+        ("agentos::llm::aliases", "/api/models/aliases"),
+        ("agentos::llm::provider_catalog", "/api/providers"),
+    ];
+    for (function_id, path) in catalog_routes {
+        agentos_http_adapter::register_http_trigger(
+            &iii,
+            function_id,
+            json!({ "api_path": path, "http_method": "GET" }),
+            None,
+        )?;
     }
 
     tracing::info!(
