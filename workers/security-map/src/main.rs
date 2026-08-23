@@ -511,6 +511,31 @@ mod tests {
     }
 
     #[test]
+    fn test_authorize_token_rejects_empty_expected_and_token() {
+        assert!(!authorize_token("", ""));
+    }
+
+    #[test]
+    fn test_authorize_token_rejects_empty_expected() {
+        assert!(!authorize_token("", "token"));
+    }
+
+    #[test]
+    fn test_authorize_token_rejects_empty_token() {
+        assert!(!authorize_token("expected", ""));
+    }
+
+    #[test]
+    fn test_authorize_token_rejects_mismatch() {
+        assert!(!authorize_token("expected", "different"));
+    }
+
+    #[test]
+    fn test_authorize_token_accepts_match() {
+        assert!(authorize_token("expected", "expected"));
+    }
+
+    #[test]
     fn test_constant_time_eq_match() {
         let a = b"abcdef";
         let b = b"abcdef";
