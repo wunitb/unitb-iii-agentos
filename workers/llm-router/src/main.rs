@@ -1800,6 +1800,29 @@ mod tests {
     }
 
     #[test]
+    fn provider_tool_aliases_handle_empty_exact_boundary_and_unicode_ids() {
+        assert_eq!(ToolAliases::from_function_ids([]), ToolAliases::default());
+
+        let exact = "a".repeat(64);
+        let over = "b".repeat(65);
+        let unicode = "memory::récall".to_string();
+        let aliases =
+            ToolAliases::from_function_ids([exact.clone(), over.clone(), unicode.clone()]);
+
+        assert_eq!(aliases.provider_name(&exact), Some(exact.as_str()));
+        for function_id in [&exact, &over, &unicode] {
+            let provider_name = aliases.provider_name(function_id).unwrap();
+            assert!(!provider_name.is_empty());
+            assert!(provider_name.len() <= 64);
+            assert!(provider_name.is_ascii());
+            assert_eq!(
+                aliases.function_id(provider_name),
+                Some(function_id.as_str())
+            );
+        }
+    }
+
+    #[test]
     fn function_call_output_serializes_exactly_the_agent_contract() {
         let call = FunctionCall {
             call_id: "call-1".into(),
@@ -1914,6 +1937,12 @@ mod tests {
             json!({ "tool_calls": null }),
             json!({ "tool_calls": {} }),
             json!({ "tool_calls": [null, {}, { "callId": "call-1" }] }),
+            json!({
+                "tool_calls": [
+                    { "callId": "", "id": "state::get", "arguments": {} },
+                    { "callId": "call-1", "id": "", "arguments": {} },
+                ],
+            }),
         ] {
             assert!(message_function_calls(&malformed).is_empty());
         }
@@ -2003,6 +2032,52 @@ mod tests {
                 call_id: "provider-id".into(),
                 id: "queue::publish".into(),
                 arguments: json!({}),
+            }]
+        );
+    }
+
+    #[test]
+    fn anthropic_function_call_normalization_rejects_empty_ids_and_unknown_aliases() {
+        let aliases = aliases(&["state::get"]);
+        let anthropic = json!({
+            "content": [
+                { "type": "tool_use", "id": "", "name": "state__get", "input": {} },
+                { "type": "tool_use", "id": "call-1", "name": "", "input": {} },
+                { "type": "tool_use", "id": "call-2", "name": "unknown", "input": {} },
+            ],
+        });
+        assert!(function_calls(Driver::Anthropic, &anthropic, &aliases).is_empty());
+    }
+
+    #[test]
+    fn openai_function_call_normalization_rejects_empty_ids_and_unknown_aliases() {
+        let aliases = aliases(&["state::get"]);
+        let openai = json!({
+            "choices": [{ "message": { "tool_calls": [
+                { "id": "", "function": { "name": "state__get", "arguments": null } },
+                { "id": "call-1", "function": { "name": "", "arguments": "{}" } },
+                { "id": "call-2", "function": { "name": "unknown", "arguments": "{}" } },
+            ] } }],
+        });
+        assert!(function_calls(Driver::OpenAiCompat, &openai, &aliases).is_empty());
+    }
+
+    #[test]
+    fn gemini_function_call_normalization_replaces_empty_ids_and_rejects_unknown_aliases() {
+        let aliases = aliases(&["state::get"]);
+        let gemini = json!({
+            "candidates": [{ "content": { "parts": [
+                { "functionCall": { "id": "", "name": "state__get", "args": null } },
+                { "functionCall": { "id": "call-1", "name": "" } },
+                { "functionCall": { "id": "call-2", "name": "unknown" } },
+            ] } }],
+        });
+        assert_eq!(
+            function_calls(Driver::Gemini, &gemini, &aliases),
+            vec![FunctionCall {
+                call_id: "gemini-0-0".into(),
+                id: "state::get".into(),
+                arguments: Value::Null,
             }]
         );
     }

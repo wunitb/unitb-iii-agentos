@@ -1535,6 +1535,25 @@ mod tests {
             registry["functions"]
         );
         assert_eq!(filter_functions(&json!([]), &[String::new()]), json!([]));
+        assert_eq!(filter_functions(&registry, &[]), json!([]));
+        assert_eq!(
+            filter_functions(
+                &json!({
+                    "functions": [
+                        Value::Null,
+                        { "function_id": null },
+                        { "function_id": "" },
+                        { "function_id": 7 },
+                    ],
+                }),
+                &["memory::".to_string()],
+            ),
+            json!([]),
+            "malformed registry entries must not become callable tools"
+        );
+        for malformed in [Value::Null, json!({}), json!({ "functions": null })] {
+            assert_eq!(filter_functions(&malformed, &[String::new()]), json!([]));
+        }
     }
 
     #[test]
