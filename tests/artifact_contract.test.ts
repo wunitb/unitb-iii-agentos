@@ -25,8 +25,8 @@ const build10005ArtifactDirectory = new URL(
   "../docs/builds/10005-salvage-the-five-surviving-agentos-work-items-fr/",
   import.meta.url,
 );
-const build10007ArtifactDirectory = new URL(
-  "../docs/builds/10007-fix-agentos-up-so-a-failed-worker-identity-query/",
+const build10008ArtifactDirectory = new URL(
+  "../docs/builds/10008-fix-agentos-up-so-a-failed-worker-identity-query/",
   import.meta.url,
 );
 const requiredArtifacts = [
@@ -245,14 +245,23 @@ describe("build 10005 governed artifact contract", () => {
   });
 });
 
-describe("build 10007 worker-identity hardening evidence", () => {
+describe("build 10008 worker-identity hardening evidence", () => {
+  it("contains exactly the four governed artifacts", async () => {
+    expect((await readdir(build10008ArtifactDirectory)).sort()).toEqual(
+      [...requiredArtifacts].sort(),
+    );
+    expect(
+      await inspectArtifactDirectory(build10008ArtifactDirectory, [
+        "ISC-000",
+        "ISC-001",
+        "ISC-002",
+      ]),
+    ).toEqual([]);
+  });
+
   it("records the duplicate-registration path and fail-closed behavior", async () => {
-    expect((await readdir(build10007ArtifactDirectory)).sort()).toEqual([
-      "ATTACK_SURFACE.md",
-      "TRACES.md",
-    ]);
     const attackSurface = await Bun.file(
-      new URL("ATTACK_SURFACE.md", build10007ArtifactDirectory),
+      new URL("ATTACK_SURFACE.md", build10008ArtifactDirectory),
     ).text();
     expect(attackSurface).toContain("Duplicate-registration path");
     expect(attackSurface).toContain("fails closed");
@@ -261,7 +270,7 @@ describe("build 10007 worker-identity hardening evidence", () => {
 
   it("traces ISC-000 through ISC-002 as whole tokens", async () => {
     const traces = await Bun.file(
-      new URL("TRACES.md", build10007ArtifactDirectory),
+      new URL("TRACES.md", build10008ArtifactDirectory),
     ).text();
     for (const identifier of ["ISC-000", "ISC-001", "ISC-002"] as const) {
       expect(new RegExp(`\\b${identifier}\\b`).test(traces), identifier).toBe(true);

@@ -1,4 +1,4 @@
-# Build 10007 Attack Surface
+# Build 10008 Attack Surface
 
 This change hardens the process-registration boundary in `agentos up`. The
 engine's `engine::workers::list` response is a remote observation and must be
