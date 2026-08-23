@@ -1982,6 +1982,63 @@ mod tests {
     }
 
     #[test]
+    fn provider_adapters_strip_empty_null_and_non_array_assistant_tool_call_values() {
+        let messages = vec![
+            json!({ "role": "assistant", "content": "no key" }),
+            json!({ "role": "assistant", "content": "empty", "tool_calls": [] }),
+            json!({ "role": "assistant", "content": "null", "toolCalls": null }),
+            json!({ "role": "assistant", "content": "object", "tool_calls": {} }),
+        ];
+        let expected_messages = json!([
+            { "role": "assistant", "content": "no key" },
+            { "role": "assistant", "content": "empty" },
+            { "role": "assistant", "content": "null" },
+            { "role": "assistant", "content": "object" },
+        ]);
+
+        assert_eq!(
+            anthropic_request_body("model", None, &messages, &[], 0),
+            json!({
+                "model": "model",
+                "messages": expected_messages,
+                "max_tokens": 0,
+            })
+        );
+        assert_eq!(
+            openai_request_body("model", None, &messages, &[], 0),
+            json!({
+                "model": "model",
+                "messages": expected_messages,
+                "max_tokens": 0,
+            })
+        );
+    }
+
+    #[test]
+    fn provider_adapters_omit_normalized_calls_when_provider_alias_resolution_fails() {
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": "kept text",
+            "tool_calls": [
+                { "callId": "call-1", "id": "state::get", "arguments": {} },
+            ],
+        })];
+        let aliases = ToolAliases::default();
+
+        assert_eq!(
+            anthropic_messages(&messages, &aliases),
+            vec![json!({
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "kept text" }],
+            })]
+        );
+        assert_eq!(
+            openai_messages(&messages, &aliases),
+            vec![json!({ "role": "assistant", "content": "kept text" })]
+        );
+    }
+
+    #[test]
     fn provider_adapters_emit_only_valid_assistant_tool_calls_from_mixed_arrays() {
         let messages = vec![json!({
             "role": "assistant",
