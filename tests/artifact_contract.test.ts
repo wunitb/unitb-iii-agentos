@@ -25,6 +25,10 @@ const build10005ArtifactDirectory = new URL(
   "../docs/builds/10005-salvage-the-five-surviving-agentos-work-items-fr/",
   import.meta.url,
 );
+const build10010ArtifactDirectory = new URL(
+  "../docs/builds/10010-reconcile-feat-herdr-omp-fleet-with-main-so-that/",
+  import.meta.url,
+);
 const requiredArtifacts = [
   "ATTACK_SURFACE.md",
   "DECISIONS.md",
@@ -41,6 +45,27 @@ const requiredIdentifiers = [
 const salvageBatchRequiredIdentifiers = [
   ...requiredIdentifiers,
   "ISC-005",
+] as const;
+const reconciliationRequiredIdentifiers = [
+  "ISC-000",
+  "ISC-001",
+  "ISC-002",
+  "ISC-003",
+] as const;
+const reconciliationConflictFiles = [
+  "README.md",
+  "crates/cli/src/bootstrap.rs",
+  "crates/cli/src/main.rs",
+  "crates/cli/tests/portability.rs",
+  "e2e/full-stack.test.ts",
+  "scripts/dev-up.sh",
+  "tests/artifact_contract.test.ts",
+  "workers/agent-core/src/main.rs",
+  "workers/context-monitor/src/main.rs",
+  "workers/eval/src/main.rs",
+  "workers/evolve/src/main.rs",
+  "workers/memory/src/main.rs",
+  "workers/streaming/src/main.rs",
 ] as const;
 const minimumArtifactBytes = 200;
 const headingPattern = /^#{1,6} +\S/m;
@@ -238,6 +263,45 @@ describe("build 10005 governed artifact contract", () => {
       new URL("DECISIONS.md", build10005ArtifactDirectory),
     ).text();
     expect(decisions).toContain("bun install --frozen-lockfile");
+  });
+});
+
+describe("build 10010 reconciliation artifact contract", () => {
+  it("uses the canonical real directory with exactly the governed files", async () => {
+    expect(await realpath(build10010ArtifactDirectory)).toBe(
+      resolve(fileURLToPath(build10010ArtifactDirectory)),
+    );
+    expect((await readdir(build10010ArtifactDirectory)).sort()).toEqual(
+      [...requiredArtifacts].sort(),
+    );
+  });
+
+  it("accepts every artifact and ISC-000 through ISC-003 as whole tokens", async () => {
+    expect(
+      await inspectArtifactDirectory(
+        build10010ArtifactDirectory,
+        reconciliationRequiredIdentifiers,
+      ),
+    ).toEqual([]);
+
+    const traces = await Bun.file(
+      new URL("TRACES.md", build10010ArtifactDirectory),
+    ).text();
+    for (const identifier of reconciliationRequiredIdentifiers) {
+      expect(
+        traces.match(new RegExp(`\\b${identifier}\\b`, "g"))?.length ?? 0,
+        identifier,
+      ).toBe(1);
+    }
+  });
+
+  it("records a resolution decision for every conflicting file", async () => {
+    const decisions = await Bun.file(
+      new URL("DECISIONS.md", build10010ArtifactDirectory),
+    ).text();
+    for (const filename of reconciliationConflictFiles) {
+      expect(decisions, filename).toContain(`\`${filename}\``);
+    }
   });
 });
 
