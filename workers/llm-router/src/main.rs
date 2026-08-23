@@ -8,6 +8,7 @@ use std::time::Instant;
 struct RouterState {
     usage: DashMap<String, Usage>,
     providers: DashMap<String, ProviderConfig>,
+    default_route: Option<Route>,
 }
 
 struct Usage {
@@ -21,6 +22,51 @@ struct ProviderConfig {
     env_key: String,
     driver: Driver,
     models: Vec<String>,
+}
+
+const CODEX_PROVIDER: &str = "codex";
+const DEFAULT_CODEX_BASE_URL: &str = "http://127.0.0.1:8317/v1";
+const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
+
+fn resolve_codex_base_url(override_value: Option<&str>) -> String {
+    let Some(raw) = override_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return DEFAULT_CODEX_BASE_URL.to_string();
+    };
+
+    let Some(url) = reqwest::Url::parse(raw).ok() else {
+        return DEFAULT_CODEX_BASE_URL.to_string();
+    };
+    let is_loopback_literal = url
+        .host_str()
+        .and_then(|host| {
+            let host = host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(host);
+            host.parse::<std::net::IpAddr>().ok()
+        })
+        .is_some_and(|host| host.is_loopback());
+    let is_safe = matches!(url.scheme(), "http" | "https")
+        && is_loopback_literal
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none();
+
+    if !is_safe {
+        return DEFAULT_CODEX_BASE_URL.to_string();
+    }
+
+    url.to_string().trim_end_matches('/').to_string()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Route {
+    provider: String,
+    model: String,
 }
 
 #[derive(Clone, Copy)]
@@ -49,6 +95,8 @@ fn default_providers() -> Vec<(
                 "claude-opus-4-20250514",
                 "claude-sonnet-4-20250514",
                 "claude-haiku-4-5-20251001",
+                "claude-opus-4-6",
+                "claude-sonnet-4-6",
             ],
         ),
         (
@@ -120,7 +168,45 @@ fn default_providers() -> Vec<(
             Driver::OpenAiCompat,
             &["llama3.3", "qwen2.5", "deepseek-r1"],
         ),
+        (
+            CODEX_PROVIDER,
+            DEFAULT_CODEX_BASE_URL,
+            "CODEX_PROXY_API_KEY",
+            Driver::OpenAiCompat,
+            &["gpt-5.4", "gpt-5.4-mini", "gpt-5.6-sol"],
+        ),
     ]
+}
+
+struct RuntimeDefaultResolution {
+    route: Option<Route>,
+    disabled_provider: Option<String>,
+}
+
+fn resolve_runtime_default<F>(get_env: F) -> RuntimeDefaultResolution
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let configured = |name: &str| get_env(name).filter(|value| !value.trim().is_empty());
+    let provider = configured("AGENTOS_DEFAULT_PROVIDER");
+    let model = configured("AGENTOS_DEFAULT_MODEL");
+
+    if configured("CODEX_PROXY_API_KEY").is_none() {
+        let default_requested = provider.is_some() || model.is_some();
+        return RuntimeDefaultResolution {
+            route: None,
+            disabled_provider: default_requested
+                .then(|| provider.unwrap_or_else(|| CODEX_PROVIDER.to_string())),
+        };
+    }
+
+    RuntimeDefaultResolution {
+        route: Some(Route {
+            provider: provider.unwrap_or_else(|| CODEX_PROVIDER.to_string()),
+            model: model.unwrap_or_else(|| DEFAULT_CODEX_MODEL.to_string()),
+        }),
+        disabled_provider: None,
+    }
 }
 
 fn score_complexity(messages: &[Value], tools: &[Value]) -> u32 {
@@ -143,21 +229,152 @@ fn score_complexity(messages: &[Value], tools: &[Value]) -> u32 {
     score
 }
 
+fn route_field<'a>(input: &'a Value, name: &str) -> Result<Option<&'a str>, Error> {
+    match input.get(name) {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
+        Some(Value::String(_)) => Ok(None),
+        Some(_) => Err(Error::Handler(format!("{name} must be a string"))),
+    }
+}
+
+fn model_alias(model: &str) -> Option<(&'static str, &'static str)> {
+    match model {
+        "opus" | "claude-opus" => Some(("anthropic", "claude-opus-4-20250514")),
+        "sonnet" | "claude-sonnet" => Some(("anthropic", "claude-sonnet-4-20250514")),
+        "haiku" | "claude-haiku" => Some(("anthropic", "claude-haiku-4-5-20251001")),
+        "gpt-4o" => Some(("openai", "gpt-4o")),
+        "gemini" => Some(("google", "gemini-2.0-flash")),
+        _ => None,
+    }
+}
+
 fn select_model(complexity: u32, preferred: Option<&str>) -> (&'static str, &'static str) {
-    if let Some(p) = preferred {
-        match p {
-            "opus" | "claude-opus" => return ("anthropic", "claude-opus-4-20250514"),
-            "sonnet" | "claude-sonnet" => return ("anthropic", "claude-sonnet-4-20250514"),
-            "haiku" | "claude-haiku" => return ("anthropic", "claude-haiku-4-5-20251001"),
-            "gpt-4o" => return ("openai", "gpt-4o"),
-            "gemini" => return ("google", "gemini-2.0-flash"),
-            _ => {}
-        }
+    if let Some(preferred) = preferred
+        && let Some(route) = model_alias(preferred)
+    {
+        return route;
     }
     match complexity {
         0..=10 => ("anthropic", "claude-haiku-4-5-20251001"),
         11..=40 => ("anthropic", "claude-sonnet-4-20250514"),
         _ => ("anthropic", "claude-opus-4-20250514"),
+    }
+}
+
+fn resolve_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
+    let explicit_provider = route_field(input, "provider")?;
+    let requested_model = route_field(input, "model")?;
+    let explicit_model = requested_model
+        .filter(|value| *value != "agentos-default")
+        .map(|model| {
+            model_alias(model)
+                .map(|(_, canonical)| canonical)
+                .unwrap_or(model)
+        });
+
+    if let (Some(provider), Some(model)) = (explicit_provider, explicit_model) {
+        let config = state
+            .providers
+            .get(provider)
+            .ok_or_else(|| Error::Handler(format!("unknown provider: {provider}")))?;
+        if !config.models.iter().any(|candidate| candidate == model) {
+            return Err(Error::Handler(format!(
+                "model {model} is not registered for provider {provider}"
+            )));
+        }
+        return Ok(Route {
+            provider: provider.into(),
+            model: model.into(),
+        });
+    }
+
+    if let Some(model) = explicit_model {
+        let owners: Vec<String> = state
+            .providers
+            .iter()
+            .filter(|entry| entry.models.iter().any(|candidate| candidate == model))
+            .map(|entry| entry.key().clone())
+            .collect();
+        return match owners.as_slice() {
+            [provider] => Ok(Route {
+                provider: provider.clone(),
+                model: model.into(),
+            }),
+            [] => Err(Error::Handler(format!("unknown model: {model}"))),
+            _ => Err(Error::Handler(format!("ambiguous model: {model}"))),
+        };
+    }
+
+    if explicit_provider.is_some() {
+        return Err(Error::Handler("provider requires model".into()));
+    }
+
+    if let Some(route) = &state.default_route {
+        let config = state.providers.get(&route.provider).ok_or_else(|| {
+            Error::Handler(format!("unknown default provider: {}", route.provider))
+        })?;
+        let model = model_alias(&route.model)
+            .map(|(_, canonical)| canonical)
+            .unwrap_or(route.model.as_str());
+        if !config.models.iter().any(|candidate| candidate == model) {
+            return Err(Error::Handler(format!(
+                "model {} is not registered for provider {}",
+                route.model, route.provider
+            )));
+        }
+        return Ok(Route {
+            provider: route.provider.clone(),
+            model: model.into(),
+        });
+    }
+
+    let messages = input["messages"].as_array().cloned().unwrap_or_default();
+    let tools = input["tools"].as_array().cloned().unwrap_or_default();
+    let complexity = score_complexity(&messages, &tools);
+    let (provider, model) = select_model(complexity, None);
+    Ok(Route {
+        provider: provider.into(),
+        model: model.into(),
+    })
+}
+
+fn has_explicit_route(input: &Value) -> bool {
+    let provider_explicit = match input.get("provider") {
+        None => false,
+        Some(Value::String(value)) => !value.is_empty(),
+        Some(_) => true,
+    };
+    let model_explicit = match input.get("model") {
+        None => false,
+        Some(Value::String(value)) => !value.is_empty() && value != "agentos-default",
+        Some(_) => true,
+    };
+    provider_explicit || model_explicit
+}
+
+fn resolve_complete_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
+    if state.default_route.is_none() && !has_explicit_route(input) {
+        return resolve_route(
+            state,
+            &json!({
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-20250514",
+            }),
+        );
+    }
+    resolve_route(state, input)
+}
+
+fn client_for_provider<'a>(
+    provider: &str,
+    shared_client: &'a reqwest::Client,
+    direct_client: &'a reqwest::Client,
+) -> &'a reqwest::Client {
+    if provider == CODEX_PROVIDER {
+        direct_client
+    } else {
+        shared_client
     }
 }
 
@@ -235,36 +452,34 @@ async fn call_openai_compat(
     Ok(resp)
 }
 
-async fn route_handler(_state: Arc<RouterState>, input: Value) -> Result<Value, Error> {
+async fn route_handler(state: Arc<RouterState>, input: Value) -> Result<Value, Error> {
     let messages = input["messages"].as_array().cloned().unwrap_or_default();
     let tools = input["tools"].as_array().cloned().unwrap_or_default();
-    let preferred = input["model"].as_str();
     let complexity = score_complexity(&messages, &tools);
-    let (provider, model) = select_model(complexity, preferred);
+    let route = resolve_route(&state, &input)?;
     Ok(json!({
-        "provider": provider,
-        "model": model,
+        "provider": route.provider,
+        "model": route.model,
         "complexity": complexity,
     }))
 }
 
 async fn complete_handler(
     state: Arc<RouterState>,
-    client: reqwest::Client,
+    shared_client: reqwest::Client,
+    direct_client: reqwest::Client,
     input: Value,
 ) -> Result<Value, Error> {
-    let provider_name = input["provider"].as_str().unwrap_or("anthropic");
-    let model = input["model"]
-        .as_str()
-        .unwrap_or("claude-sonnet-4-20250514");
+    let route = resolve_complete_route(&state, &input)?;
+    let provider = state
+        .providers
+        .get(&route.provider)
+        .ok_or_else(|| Error::Handler(format!("unknown provider: {}", route.provider)))?;
+    let model = route.model.as_str();
+    let client = client_for_provider(&route.provider, &shared_client, &direct_client);
     let messages = input["messages"].as_array().cloned().unwrap_or_default();
     let tools = input["tools"].as_array().cloned().unwrap_or_default();
     let max_tokens = input["max_tokens"].as_u64().unwrap_or(4096);
-
-    let provider = state
-        .providers
-        .get(provider_name)
-        .ok_or_else(|| Error::Handler(format!("unknown provider: {}", provider_name)))?;
 
     let api_key = if provider.env_key.is_empty() {
         String::new()
@@ -276,11 +491,11 @@ async fn complete_handler(
 
     let result = match provider.driver {
         Driver::Anthropic => {
-            call_anthropic(&client, &api_key, model, &messages, &tools, max_tokens).await?
+            call_anthropic(client, &api_key, model, &messages, &tools, max_tokens).await?
         }
         Driver::OpenAiCompat | Driver::Gemini | Driver::Bedrock => {
             call_openai_compat(
-                &client,
+                client,
                 &provider.base_url,
                 &api_key,
                 model,
@@ -303,7 +518,7 @@ async fn complete_handler(
         .or(result["usage"]["completion_tokens"].as_u64())
         .unwrap_or(0);
 
-    let key = format!("{}:{}", provider_name, model);
+    let key = format!("{}:{}", route.provider, model);
     let mut usage = state.usage.entry(key).or_insert(Usage {
         input_tokens: 0,
         output_tokens: 0,
@@ -370,17 +585,25 @@ async fn usage_handler(state: Arc<RouterState>, _input: Value) -> Result<Value, 
 }
 
 async fn providers_handler(state: Arc<RouterState>, _input: Value) -> Result<Value, Error> {
-    let list: Vec<Value> = state.providers.iter().map(|entry| {
-        let name = entry.key();
-        let provider = entry.value();
-        json!({
-            "name": name,
-            "base_url": &provider.base_url,
-            "env_key": &provider.env_key,
-            "models": &provider.models,
-            "configured": if provider.env_key.is_empty() { true } else { std::env::var(&provider.env_key).is_ok() },
+    let list: Vec<Value> = state
+        .providers
+        .iter()
+        .map(|entry| {
+            let name = entry.key();
+            let provider = entry.value();
+            json!({
+                "name": name,
+                "base_url": &provider.base_url,
+                "env_key": &provider.env_key,
+                "models": &provider.models,
+                "configured": if provider.env_key.is_empty() { true } else {
+                    std::env::var(&provider.env_key)
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+                },
+            })
         })
-    }).collect();
+        .collect();
     Ok(json!({ "providers": list }))
 }
 
@@ -415,7 +638,10 @@ fn provider_catalog(state: &RouterState) -> Value {
             let provider = entry.value();
             json!({
                 "name": entry.key(),
-                "available": provider.env_key.is_empty() || std::env::var(&provider.env_key).is_ok(),
+                "available": provider.env_key.is_empty()
+                    || std::env::var(&provider.env_key)
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false),
                 "modelCount": provider.models.len(),
             })
         })
@@ -439,16 +665,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
     let iii = register_worker(&ws_url, InitOptions::default());
 
+    let default_resolution = resolve_runtime_default(|name| std::env::var(name).ok());
+    if let Some(provider) = &default_resolution.disabled_provider {
+        tracing::warn!(
+            provider,
+            "configured default provider disabled because CODEX_PROXY_API_KEY is empty; unqualified requests can fall back to the Anthropic cloud API"
+        );
+    }
     let state = Arc::new(RouterState {
         usage: DashMap::new(),
         providers: DashMap::new(),
+        default_route: default_resolution.route,
     });
 
     for (name, base_url, env_key, driver, models) in default_providers() {
         state.providers.insert(
             name.to_string(),
             ProviderConfig {
-                base_url: base_url.to_string(),
+                base_url: if name == CODEX_PROVIDER {
+                    resolve_codex_base_url(std::env::var("CODEX_PROXY_BASE_URL").ok().as_deref())
+                } else {
+                    base_url.to_string()
+                },
                 env_key: env_key.to_string(),
                 driver,
                 models: models.iter().map(|s| s.to_string()).collect(),
@@ -457,6 +695,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let shared_client = reqwest::Client::new();
+    let direct_client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build direct HTTP client");
 
     {
         let state = state.clone();
@@ -472,13 +714,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     {
         let state = state.clone();
-        let client = shared_client.clone();
+        let shared_client = shared_client.clone();
+        let direct_client = direct_client.clone();
         iii.register_function(
             "agentos::llm::complete",
             RegisterFunction::new_async(move |input: Value| {
                 let state = state.clone();
-                let client = client.clone();
-                async move { complete_handler(state, client, input).await }
+                let shared_client = shared_client.clone();
+                let direct_client = direct_client.clone();
+                async move { complete_handler(state, shared_client, direct_client, input).await }
             })
             .description("Send completion request to routed provider"),
         );
@@ -564,6 +808,93 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_state(default_route: Option<Route>) -> RouterState {
+        let providers = DashMap::new();
+        for (name, base_url, env_key, driver, models) in default_providers() {
+            providers.insert(
+                name.to_string(),
+                ProviderConfig {
+                    base_url: base_url.to_string(),
+                    env_key: env_key.to_string(),
+                    driver,
+                    models: models.iter().map(|model| model.to_string()).collect(),
+                },
+            );
+        }
+        RouterState {
+            usage: DashMap::new(),
+            providers,
+            default_route,
+        }
+    }
+
+    #[test]
+    fn codex_provider_is_registered() {
+        let (_, base_url, env_key, driver, models) = default_providers()
+            .into_iter()
+            .find(|(name, ..)| *name == CODEX_PROVIDER)
+            .expect("codex provider");
+
+        assert_eq!(base_url, DEFAULT_CODEX_BASE_URL);
+        assert_eq!(env_key, "CODEX_PROXY_API_KEY");
+        assert!(matches!(driver, Driver::OpenAiCompat));
+        assert!(models.contains(&DEFAULT_CODEX_MODEL));
+    }
+
+    #[test]
+    fn codex_base_url_only_accepts_loopback_literals() {
+        assert_eq!(
+            resolve_codex_base_url(Some("http://127.0.0.2:8317/v1/")),
+            "http://127.0.0.2:8317/v1"
+        );
+        for unsafe_url in [
+            "not a url",
+            "http://localhost:8317/v1",
+            "http://192.168.1.10:8317/v1",
+            "http://user:password@127.0.0.1:8317/v1",
+            "http://127.0.0.1:8317/v1?target=https://example.com",
+        ] {
+            assert_eq!(
+                resolve_codex_base_url(Some(unsafe_url)),
+                DEFAULT_CODEX_BASE_URL,
+                "unsafe URL accepted: {unsafe_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_codex_default_and_explicit_models_resolve() {
+        let state = test_state(Some(Route {
+            provider: CODEX_PROVIDER.into(),
+            model: DEFAULT_CODEX_MODEL.into(),
+        }));
+        assert_eq!(
+            resolve_route(&state, &json!({})).unwrap().model,
+            DEFAULT_CODEX_MODEL
+        );
+
+        let explicit = resolve_route(&state, &json!({ "model": "gpt-5.4-mini" })).unwrap();
+        assert_eq!(explicit.provider, CODEX_PROVIDER);
+        assert_eq!(explicit.model, "gpt-5.4-mini");
+    }
+
+    #[test]
+    fn route_contract_rejects_nested_model_objects() {
+        let error = resolve_route(
+            &test_state(None),
+            &json!({ "model": { "provider": "codex", "model": DEFAULT_CODEX_MODEL } }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("model must be a string"));
+    }
+
+    #[test]
+    fn complete_without_explicit_or_runtime_route_preserves_legacy_sonnet() {
+        let route = resolve_complete_route(&test_state(None), &json!({})).unwrap();
+        assert_eq!(route.provider, "anthropic");
+        assert_eq!(route.model, "claude-sonnet-4-20250514");
+    }
 
     #[test]
     fn test_score_complexity_empty_messages() {
@@ -746,7 +1077,7 @@ mod tests {
     #[test]
     fn test_default_providers_count() {
         let providers = default_providers();
-        assert_eq!(providers.len(), 10);
+        assert_eq!(providers.len(), 11);
     }
 
     #[test]
@@ -947,7 +1278,7 @@ mod tests {
             );
         }
         let anthropic = providers.iter().find(|p| p.0 == "anthropic").unwrap();
-        assert_eq!(anthropic.4.len(), 3);
+        assert_eq!(anthropic.4.len(), 5);
         let openai = providers.iter().find(|p| p.0 == "openai").unwrap();
         assert_eq!(openai.4.len(), 4);
     }

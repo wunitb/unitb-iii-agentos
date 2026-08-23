@@ -54,9 +54,9 @@ git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos
 # 2. install the pinned iii v0.22.1 release with checksum verification
 bash scripts/install-iii.sh
 
-# 3. add your model key
-cp .env.example .env
-$EDITOR .env   # set ANTHROPIC_API_KEY=sk-ant-…
+# 3. configure the local model proxy
+install -m 600 .env.example .env
+$EDITOR .env   # set CODEX_PROXY_API_KEY for http://127.0.0.1:8317/v1
 
 # 4. build the workspace
 cargo build --workspace --release
@@ -64,6 +64,10 @@ cargo build --workspace --release
 # 5. bring the stack up: engine, workers, then the chat TUI
 ./target/release/agentos up
 ```
+
+Quickstart uses the local Codex proxy at `http://127.0.0.1:8317/v1`.
+Anthropic is optional and selected only by an explicit provider/model or when
+no configured local default exists.
 
 `agentos up` runs one ordered policy and never builds or installs anything: it
 resolves the config, verifies the iii binary (missing → `bash scripts/install-iii.sh`),
@@ -134,7 +138,8 @@ alone does not disable that checkout discovery; otherwise
 `$AGENTOS_HOME/runtime/config.yaml` is used. `agentos doctor` names the mode
 and the resolved path. This lets an installed release
 start from any working directory without a checkout. Upgrades replace release
-payload while retaining operator configuration and `$AGENTOS_HOME/runtime/data/**`.
+payload while retaining operator configuration, `$AGENTOS_HOME/runtime/data/**`,
+and the runtime `.env` file.
 
 The engine must be iii `v0.22.1`, installed in `PATH` or by
 `bash scripts/install-iii.sh` (which downloads and verifies it). The embedding

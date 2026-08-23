@@ -154,7 +154,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: shellcheck --severity=warning scripts/install.sh website/public/install.sh scripts/install-iii.sh
+      - run: shellcheck --severity=warning scripts/install.sh scripts/dev-up.sh website/public/install.sh scripts/install-iii.sh
 
   worker-yaml:
     name: validate iii.worker.yaml
@@ -238,6 +238,12 @@ jobs:
 
       - name: test Node example adapters
         run: npm run test:examples
+
+      - name: typecheck startup configuration tests
+        run: npm run typecheck:scripts
+
+      - name: test startup configuration
+        run: npm run test:scripts
 
       - name: download worker binaries
         uses: actions/download-artifact@v8
@@ -394,6 +400,7 @@ jobs:
         env:
           AGENTOS_E2E: "1"
           AGENTOS_BASE_URL: http://127.0.0.1:3111
+          AGENTOS_E2E_MODEL: claude-sonnet-4-20250514
           III_URL: ws://localhost:49134
           AGENTOS_API_KEY: ${{ secrets.AGENTOS_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

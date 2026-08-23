@@ -184,30 +184,58 @@ suite("AgentOS full-stack E2E", () => {
     expect(stored.id || stored.deduplicated !== undefined).toBeTruthy();
   });
 
-  it("agentos::llm::providers — 10 providers registered", async () => {
+  it("agentos::llm::providers — secure Codex provider registered", async () => {
     const r = await call<{
-      providers: { name: string; configured: boolean }[];
+      providers: {
+        name: string;
+        base_url: string;
+        models: string[];
+      }[];
     }>("agentos::llm::providers", {});
-    expect(r.providers.length).toBeGreaterThanOrEqual(10);
+    expect(r.providers.length).toBeGreaterThanOrEqual(11);
     const names = r.providers.map((p) => p.name);
     for (const expected of ["anthropic", "openai", "google", "ollama"]) {
       expect(names).toContain(expected);
     }
+    const codex = r.providers.find((p) => p.name === "codex");
+    expect(codex).toBeDefined();
+    const codexUrl = new URL(codex?.base_url ?? "");
+    const codexHost = codexUrl.hostname.replace(/^\[|\]$/g, "");
+    expect(["http:", "https:"]).toContain(codexUrl.protocol);
+    expect(
+      codexHost === "::1" || /^127(?:\.\d{1,3}){3}$/.test(codexHost),
+    ).toBe(true);
+    expect(codexUrl.username).toBe("");
+    expect(codexUrl.password).toBe("");
+    expect(codexUrl.search).toBe("");
+    expect(codexUrl.hash).toBe("");
+    expect(codex?.models).toContain("gpt-5.6-sol");
   });
 
-  it("agentos::llm::route — complexity-based model selection", async () => {
-    const easy = await call<{ provider: string; model: string }>("agentos::llm::route", {
-      messages: [{ role: "user", content: "hi" }],
-      tools: [],
-    });
-    expect(easy.provider).toBe("anthropic");
-    expect(easy.model).toMatch(/haiku/);
+  it("agentos::llm::route — resolves default and explicit model contracts", async () => {
+    const automatic = await call<{ provider: string; model: string }>(
+      "agentos::llm::route",
+      {
+        messages: [{ role: "user", content: "hi" }],
+        tools: [],
+      },
+    );
+    expect(automatic.provider.length).toBeGreaterThan(0);
+    expect(automatic.model.length).toBeGreaterThan(0);
 
-    const forced = await call<{ model: string }>("agentos::llm::route", {
+    const haiku = await call<{ provider: string; model: string }>("agentos::llm::route", {
       messages: [{ role: "user", content: "x" }],
       model: "haiku",
     });
-    expect(forced.model).toMatch(/haiku/);
+    expect(haiku.provider).toBe("anthropic");
+    expect(haiku.model).toMatch(/haiku/);
+
+    const codex = await call<{ provider: string; model: string }>("agentos::llm::route", {
+      messages: [{ role: "user", content: "x" }],
+      model: "gpt-5.6-sol",
+    });
+    expect(codex.provider).toBe("codex");
+    expect(codex.model).toBe("gpt-5.6-sol");
   });
 
   it("agentos::llm::complete — real Anthropic call", async () => {

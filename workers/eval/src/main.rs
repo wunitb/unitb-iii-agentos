@@ -91,6 +91,15 @@ async fn score_exact_match(output: &Value, expected: &Value) -> f64 {
     if output == expected { 1.0 } else { 0.0 }
 }
 
+fn llm_judge_payload(prompt: &str) -> Value {
+    json!({
+        "provider": "anthropic",
+        "model": "claude-haiku-4-5-20251001",
+        "systemPrompt": "You are an eval judge. Score the output 0.0-1.0 for correctness. Respond with ONLY a number.",
+        "messages": [{ "role": "user", "content": prompt }],
+    })
+}
+
 async fn score_llm_judge(iii: &IIIClient, output: &Value, expected: &Value, input: &Value) -> f64 {
     let prompt = format!(
         "Input: {}\nExpected: {}\nActual: {}\n\nScore (0.0-1.0):",
@@ -98,15 +107,7 @@ async fn score_llm_judge(iii: &IIIClient, output: &Value, expected: &Value, inpu
         serde_json::to_string(expected).unwrap_or_default(),
         serde_json::to_string(output).unwrap_or_default(),
     );
-    let payload = json!({
-        "model": {
-            "provider": "anthropic",
-            "model": "claude-haiku-4-5",
-            "maxTokens": 256,
-        },
-        "systemPrompt": "You are an eval judge. Score the output 0.0-1.0 for correctness. Respond with ONLY a number.",
-        "messages": [{ "role": "user", "content": prompt }],
-    });
+    let payload = llm_judge_payload(&prompt);
     let result = safe_trigger(iii, "agentos::llm::complete", payload).await;
     let content = match result {
         Some(v) => v
@@ -798,6 +799,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llm_judge_payload_uses_top_level_route_fields() {
+        let payload = llm_judge_payload("judge this");
+        assert_eq!(payload["provider"], "anthropic");
+        assert_eq!(payload["model"], "claude-haiku-4-5-20251001");
+        assert!(payload["model"].is_string());
+    }
 
     #[test]
     fn test_latency_score_floor_zero() {

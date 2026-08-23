@@ -25,16 +25,26 @@ fn body_or_self(input: &Value) -> Value {
     input.get("body").cloned().unwrap_or_else(|| input.clone())
 }
 
+fn authorize_token(expected: &str, token: &str) -> bool {
+    if expected.is_empty() || token.is_empty() {
+        return false;
+    }
+    bool::from(token.as_bytes().ct_eq(expected.as_bytes()))
+}
+
 fn require_auth(input: &Value) -> Result<(), Error> {
     let expected = std::env::var("AGENTOS_API_KEY")
         .map_err(|_| Error::Handler("AGENTOS_API_KEY not configured".into()))?;
+    if expected.is_empty() {
+        return Err(Error::Handler("AGENTOS_API_KEY not configured".into()));
+    }
     let header = input
         .get("headers")
         .and_then(|h| h.get("authorization"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let token = header.strip_prefix("Bearer ").unwrap_or(header);
-    if token.as_bytes().ct_eq(expected.as_bytes()).into() {
+    if authorize_token(&expected, token) {
         Ok(())
     } else {
         Err(Error::Handler("Unauthorized".into()))
@@ -427,6 +437,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorization_rejects_empty_credentials_and_accepts_a_match() {
+        assert!(!authorize_token("", ""));
+        assert!(!authorize_token("", "token"));
+        assert!(!authorize_token("expected", ""));
+        assert!(!authorize_token("expected", "different"));
+        assert!(authorize_token("expected", "expected"));
+    }
 
     #[test]
     fn test_random_nonce_hex_length() {

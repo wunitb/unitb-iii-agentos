@@ -21,14 +21,14 @@ file carries both concerns, the combined result is kept.
 | `crates/cli/src/main.rs` | Combined | Retain Herdr workflow commands while keeping portable path discovery, installation/upgrade behavior, and the `up`/`doctor` orchestration. |
 | `crates/cli/tests/portability.rs` | Remediation/main | Keep runtime-state preservation and relocatable-install coverage, including canonicalized temporary-path expectations. |
 | `e2e/full-stack.test.ts` | Combined | Preserve fleet/full-stack coverage and the deferred SDK load that lets the iii 0.22.1 boot regression control setup and cleanup safely. |
-| `scripts/dev-up.sh` | Remediation/main | Use the canonical configuration-worker paths and identities expected by iii 0.22.1. |
+| `scripts/dev-up.sh` | Remediation/main | Keep canonical iii 0.22.1 paths together with the secure, allow-listed dotenv loader and local Codex credential diagnostics. |
 | `tests/artifact_contract.test.ts` | Combined | Retain salvage artifact gates and add the governed build-10010 directory, trace-token, and per-conflict decision checks. |
-| `workers/agent-core/src/main.rs` | Remediation/main | Keep AgentOS routing behavior while selecting `agentos::llm::*` for all LLM calls. |
+| `workers/agent-core/src/main.rs` | Remediation/main | Keep the secure route/complete contract and explicit provider/model propagation while selecting `agentos::llm::*` for all LLM calls. |
 | `workers/context-monitor/src/main.rs` | Remediation/main | Preserve monitoring logic with the collision-safe `agentos::llm::complete` consumer name. |
 | `workers/eval/src/main.rs` | Remediation/main | Preserve evaluation logic with the collision-safe `agentos::llm::complete` consumer name. |
 | `workers/evolve/src/main.rs` | Remediation/main | Preserve evolution logic and sandbox allow-list text with only AgentOS-owned LLM function names. |
 | `workers/memory/src/main.rs` | Combined | Keep Herdr memory/session behavior and the remediation namespace change to `agentos::llm::complete`. |
-| `workers/streaming/src/main.rs` | Remediation/main | Preserve streaming behavior while using `agentos::llm::route` and `agentos::llm::complete`. |
+| `workers/streaming/src/main.rs` | Remediation/main | Preserve streaming behavior, request route preferences, and top-level route/complete fields while using `agentos::llm::route` and `agentos::llm::complete`. |
 
 ## D-003 — Keep reconciliation auxiliaries from the agreed tips
 
@@ -43,3 +43,12 @@ The build directory contains exactly `INVARIANTS.md`, `TRACES.md`,
 `DECISIONS.md`, and `ATTACK_SURFACE.md`. The artifact contract checks the real
 directory, all four whole-token criterion references, and all thirteen file
 decisions so future edits cannot silently erase the reconciliation record.
+
+## D-005 — Preserve operator state and secure local routing
+
+Upgrade swaps treat `config`, `config.yaml`, `data`, and `.env` as
+operator-owned state and move them through the staged runtime swap. The local
+Codex provider keeps its loopback-literal URL restriction and proxy-bypassing
+HTTP client; callers consume `route` results as top-level provider/model
+strings before invoking `complete`. These behaviors were restored without
+reintroducing the colliding ecosystem-level `llm::*` function identifiers.
