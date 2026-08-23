@@ -134,7 +134,7 @@ pub(crate) trait Diagnostics {
     /// Whether the engine accepts connections on its worker port.
     fn engine_healthy(&self) -> bool;
     /// Stable names of connected non-engine workers, `None` when the engine
-    /// cannot answer `engine::workers::list`.
+    /// cannot answer `engine::functions::list`.
     fn connected_worker_ids(&self) -> Option<BTreeSet<String>>;
     /// Worker manifests plus the release binary resolved for each of them.
     fn worker_specs(&self) -> Result<Vec<WorkerSpec>>;
@@ -825,8 +825,22 @@ impl SystemEffects {
     }
 }
 
-fn reported_worker_ids(worker_list: &Value) -> Option<BTreeSet<String>> {
-    let workers = worker_list.get("workers")?.as_array()?;
+fn reported_worker_ids(registry: &Value) -> Option<BTreeSet<String>> {
+    if let Some(functions) = registry.get("functions").and_then(Value::as_array) {
+        return Some(
+            functions
+                .iter()
+                .filter_map(|function| function["worker_name"].as_str())
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        );
+    }
+
+    // Keep accepting the richer worker registry used by newer iii builds and
+    // by older AgentOS test fakes. iii 0.22.1 readiness uses the function
+    // registry above because its stable wire identity is `worker_name`.
+    let workers = registry.get("workers")?.as_array()?;
     Some(
         workers
             .iter()
@@ -838,7 +852,7 @@ fn reported_worker_ids(worker_list: &Value) -> Option<BTreeSet<String>> {
     )
 }
 
-fn parse_worker_list_output(output: &[u8]) -> Option<Value> {
+fn parse_registry_output(output: &[u8]) -> Option<Value> {
     serde_json::from_slice(output).ok().or_else(|| {
         let text = String::from_utf8_lossy(output);
         let start = text.find('{')?;
@@ -873,7 +887,7 @@ impl Diagnostics for SystemEffects {
         let output = std::process::Command::new(binary)
             .args([
                 "trigger",
-                "engine::workers::list",
+                "engine::functions::list",
                 "--json",
                 "{}",
                 "--timeout-ms",
@@ -885,7 +899,7 @@ impl Diagnostics for SystemEffects {
         if !output.status.success() {
             return None;
         }
-        reported_worker_ids(&parse_worker_list_output(&output.stdout)?)
+        reported_worker_ids(&parse_registry_output(&output.stdout)?)
     }
 
     fn worker_specs(&self) -> Result<Vec<WorkerSpec>> {
@@ -2156,7 +2170,22 @@ mod tests {
     }
 
     #[test]
-    fn engine_worker_list_reports_only_stable_connected_non_engine_identities() {
+    fn engine_function_list_reports_iii_0_22_1_worker_identities() {
+        assert_eq!(
+            reported_worker_ids(&json!({
+                "functions": [
+                    {"function_id": "core::run", "worker_name": "core"},
+                    {"function_id": "core::status", "worker_name": "core"},
+                    {"function_id": "memory::recall", "worker_name": "memory"}
+                ]
+            })),
+            Some(ids(&["core", "memory"]))
+        );
+        assert_eq!(reported_worker_ids(&json!({ "functions": 62 })), None);
+    }
+
+    #[test]
+    fn engine_worker_list_fallback_reports_connected_non_engine_identities() {
         assert_eq!(
             reported_worker_ids(&json!({
                 "workers": [
@@ -2172,12 +2201,12 @@ mod tests {
     }
 
     #[test]
-    fn engine_worker_list_parser_handles_wrapped_empty_and_malformed_output() {
-        let wrapped = b"iii 0.22.1 diagnostics\n{\"workers\":[{\"name\":\"core\",\"runtime\":\"rust\",\"status\":\"connected\"}]}\n";
-        let parsed = parse_worker_list_output(wrapped).expect("parse wrapped JSON output");
+    fn engine_registry_parser_handles_wrapped_empty_and_malformed_output() {
+        let wrapped = b"iii 0.22.1 diagnostics\n{\"functions\":[{\"function_id\":\"core::run\",\"worker_name\":\"core\"}]}\n";
+        let parsed = parse_registry_output(wrapped).expect("parse wrapped JSON output");
         assert_eq!(reported_worker_ids(&parsed), Some(ids(&["core"])));
-        assert_eq!(parse_worker_list_output(b""), None);
-        assert_eq!(parse_worker_list_output(b"diagnostic only"), None);
-        assert_eq!(parse_worker_list_output(b"prefix {not-json} suffix"), None);
+        assert_eq!(parse_registry_output(b""), None);
+        assert_eq!(parse_registry_output(b"diagnostic only"), None);
+        assert_eq!(parse_registry_output(b"prefix {not-json} suffix"), None);
     }
 }

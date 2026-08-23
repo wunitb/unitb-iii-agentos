@@ -3,6 +3,7 @@ use iii_sdk::errors::Error;
 use iii_sdk::{InitOptions, RegisterFunction, register_worker};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -471,6 +472,224 @@ fn gemini_tools(tools: &[Value]) -> Vec<Value> {
     }
 }
 
+fn message_function_calls(message: &Value) -> Vec<FunctionCall> {
+    message
+        .get("tool_calls")
+        .or_else(|| message.get("toolCalls"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|call| serde_json::from_value(call.clone()).ok())
+        .collect()
+}
+
+fn message_tool_call_id(message: &Value) -> Option<&str> {
+    message
+        .get("tool_call_id")
+        .or_else(|| message.get("toolCallId"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+fn anthropic_messages(messages: &[Value]) -> Vec<Value> {
+    let mut provider_messages: Vec<Value> = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                let calls = message_function_calls(message);
+                if calls.is_empty() {
+                    provider_messages.push(message.clone());
+                    continue;
+                }
+
+                let mut content = Vec::new();
+                if let Some(text) = message.get("content").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    content.push(json!({ "type": "text", "text": text }));
+                }
+                content.extend(calls.into_iter().map(|call| {
+                    json!({
+                        "type": "tool_use",
+                        "id": call.call_id,
+                        "name": call.id,
+                        "input": call.arguments,
+                    })
+                }));
+                provider_messages.push(json!({ "role": "assistant", "content": content }));
+            }
+            Some("tool") => {
+                let Some(call_id) = message_tool_call_id(message) else {
+                    continue;
+                };
+                let block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": message.get("content").cloned().unwrap_or(Value::Null),
+                });
+
+                let appended = provider_messages.last_mut().is_some_and(|previous| {
+                    if previous.get("role").and_then(Value::as_str) != Some("user") {
+                        return false;
+                    }
+                    let Some(content) = previous.get_mut("content").and_then(Value::as_array_mut)
+                    else {
+                        return false;
+                    };
+                    if !content
+                        .iter()
+                        .all(|item| item.get("type").and_then(Value::as_str) == Some("tool_result"))
+                    {
+                        return false;
+                    }
+                    content.push(block.clone());
+                    true
+                });
+                if !appended {
+                    provider_messages.push(json!({ "role": "user", "content": [block] }));
+                }
+            }
+            _ => provider_messages.push(message.clone()),
+        }
+    }
+
+    provider_messages
+}
+
+fn openai_messages(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut native = message.clone();
+            let calls = message_function_calls(message);
+            if !calls.is_empty() {
+                native["tool_calls"] = Value::Array(
+                    calls
+                        .into_iter()
+                        .map(|call| {
+                            json!({
+                                "id": call.call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.id,
+                                    "arguments": serde_json::to_string(&call.arguments)
+                                        .unwrap_or_else(|_| "null".to_string()),
+                                },
+                            })
+                        })
+                        .collect(),
+                );
+                if let Some(object) = native.as_object_mut() {
+                    object.remove("toolCalls");
+                }
+            }
+            if message.get("role").and_then(Value::as_str) == Some("tool")
+                && let Some(call_id) = message_tool_call_id(message)
+            {
+                native["tool_call_id"] = json!(call_id);
+                if let Some(object) = native.as_object_mut() {
+                    object.remove("toolCallId");
+                }
+            }
+            native
+        })
+        .collect()
+}
+
+fn gemini_function_response(content: Option<&Value>) -> Value {
+    let response = match content {
+        Some(Value::String(content)) => {
+            serde_json::from_str(content).unwrap_or_else(|_| json!(content))
+        }
+        Some(content) => content.clone(),
+        None => Value::Null,
+    };
+    if response.is_object() {
+        response
+    } else {
+        json!({ "result": response })
+    }
+}
+
+fn gemini_messages(messages: &[Value]) -> Vec<Value> {
+    let mut call_names = BTreeMap::new();
+    let mut contents: Vec<Value> = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        let calls = message_function_calls(message);
+        for call in &calls {
+            call_names.insert(call.call_id.clone(), call.id.clone());
+        }
+
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") if !calls.is_empty() => {
+                let mut parts = Vec::new();
+                if let Some(text) = message.get("content").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    parts.push(json!({ "text": text }));
+                }
+                parts.extend(calls.into_iter().map(|call| {
+                    json!({
+                        "functionCall": {
+                            "id": call.call_id,
+                            "name": call.id,
+                            "args": call.arguments,
+                        },
+                    })
+                }));
+                contents.push(json!({ "role": "model", "parts": parts }));
+            }
+            Some("tool") => {
+                let Some(call_id) = message_tool_call_id(message) else {
+                    continue;
+                };
+                let Some(name) = call_names.get(call_id) else {
+                    continue;
+                };
+                let part = json!({
+                    "functionResponse": {
+                        "id": call_id,
+                        "name": name,
+                        "response": gemini_function_response(message.get("content")),
+                    },
+                });
+                let appended = contents.last_mut().is_some_and(|previous| {
+                    if previous.get("role").and_then(Value::as_str) != Some("user") {
+                        return false;
+                    }
+                    let Some(parts) = previous.get_mut("parts").and_then(Value::as_array_mut)
+                    else {
+                        return false;
+                    };
+                    if !parts
+                        .iter()
+                        .all(|item| item.get("functionResponse").is_some())
+                    {
+                        return false;
+                    }
+                    parts.push(part.clone());
+                    true
+                });
+                if !appended {
+                    contents.push(json!({ "role": "user", "parts": [part] }));
+                }
+            }
+            Some(role) => {
+                let Some(text) = message.get("content").and_then(Value::as_str) else {
+                    continue;
+                };
+                let role = if role == "assistant" { "model" } else { "user" };
+                contents.push(json!({ "role": role, "parts": [{ "text": text }] }));
+            }
+            None => {}
+        }
+    }
+
+    contents
+}
+
 fn anthropic_request_body(
     model: &str,
     system_prompt: Option<&str>,
@@ -480,7 +699,7 @@ fn anthropic_request_body(
 ) -> Value {
     let mut body = json!({
         "model": model,
-        "messages": messages,
+        "messages": anthropic_messages(messages),
         "max_tokens": max_tokens,
     });
     if let Some(system_prompt) = system_prompt.filter(|prompt| !prompt.is_empty()) {
@@ -504,7 +723,7 @@ fn openai_request_body(
     if let Some(system_prompt) = system_prompt.filter(|prompt| !prompt.is_empty()) {
         provider_messages.push(json!({ "role": "system", "content": system_prompt }));
     }
-    provider_messages.extend_from_slice(messages);
+    provider_messages.extend(openai_messages(messages));
 
     let mut body = json!({
         "model": model,
@@ -524,18 +743,7 @@ fn gemini_request_body(
     tools: &[Value],
     max_tokens: u64,
 ) -> Value {
-    let contents: Vec<Value> = messages
-        .iter()
-        .filter_map(|message| {
-            let text = message.get("content")?.as_str()?;
-            let role = if message.get("role").and_then(Value::as_str) == Some("assistant") {
-                "model"
-            } else {
-                "user"
-            };
-            Some(json!({ "role": role, "parts": [{ "text": text }] }))
-        })
-        .collect();
+    let contents = gemini_messages(messages);
     let mut body = json!({
         "contents": contents,
         "generationConfig": { "maxOutputTokens": max_tokens },
@@ -1003,22 +1211,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     {
         let state = state.clone();
-        let shared_client = shared_client.clone();
-        let direct_client = direct_client.clone();
-        iii.register_function(
-            "agentos::llm::chat",
-            RegisterFunction::new_async(move |input: Value| {
-                let state = state.clone();
-                let shared_client = shared_client.clone();
-                let direct_client = direct_client.clone();
-                async move { complete_handler(state, shared_client, direct_client, input).await }
-            })
-            .description("Send a chat request to the routed provider"),
-        );
-    }
-
-    {
-        let state = state.clone();
         iii.register_function(
             "agentos::llm::usage",
             RegisterFunction::new_async(move |input: Value| {
@@ -1413,6 +1605,214 @@ mod tests {
                 call_id: "gemini-0-0".into(),
                 id: "queue::publish".into(),
                 arguments: json!({ "topic": "work" }),
+            }]
+        );
+    }
+
+    #[test]
+    fn provider_bodies_omit_empty_or_malformed_tools_and_optional_prompts() {
+        let malformed_tools = vec![
+            Value::Null,
+            json!({}),
+            json!({ "id": "" }),
+            json!({ "function_id": 7 }),
+            json!({ "name": null }),
+        ];
+
+        let anthropic = anthropic_request_body("model", None, &[], &malformed_tools, 0);
+        assert!(anthropic.get("system").is_none());
+        assert!(anthropic.get("tools").is_none());
+        assert_eq!(anthropic["messages"], json!([]));
+        assert_eq!(anthropic["max_tokens"], 0);
+
+        let openai = openai_request_body("model", Some(""), &[], &malformed_tools, 0);
+        assert!(openai.get("tools").is_none());
+        assert_eq!(openai["messages"], json!([]));
+        assert_eq!(openai["max_tokens"], 0);
+
+        let gemini = gemini_request_body(Some(""), &[], &malformed_tools, 0);
+        assert!(gemini.get("systemInstruction").is_none());
+        assert!(gemini.get("tools").is_none());
+        assert_eq!(gemini["contents"], json!([]));
+        assert_eq!(gemini["generationConfig"]["maxOutputTokens"], 0);
+    }
+
+    #[test]
+    fn tool_schema_aliases_and_defaults_preserve_object_boundaries() {
+        let tools = vec![
+            json!({ "id": "a", "requestFormat": { "type": "object", "required": [] } }),
+            json!({ "function_id": "b", "input_schema": { "type": "object" } }),
+            json!({ "functionId": "c", "parameters": { "type": "object", "maxProperties": 0 } }),
+            json!({ "name": "d", "request_format": null }),
+        ];
+
+        let translated = openai_tools(&tools);
+        assert_eq!(
+            translated[0]["function"]["parameters"]["required"],
+            json!([])
+        );
+        assert_eq!(translated[1]["function"]["parameters"]["type"], "object");
+        assert_eq!(translated[2]["function"]["parameters"]["maxProperties"], 0);
+        assert_eq!(
+            translated[3]["function"]["parameters"],
+            json!({ "type": "object", "properties": {} })
+        );
+    }
+
+    #[test]
+    fn function_call_output_serializes_exactly_the_agent_contract() {
+        let call = FunctionCall {
+            call_id: "call-1".into(),
+            id: "state::get".into(),
+            arguments: json!({ "scope": "agents" }),
+        };
+
+        assert_eq!(
+            serde_json::to_value(call).unwrap(),
+            json!({
+                "callId": "call-1",
+                "id": "state::get",
+                "arguments": { "scope": "agents" },
+            })
+        );
+    }
+
+    #[test]
+    fn normalized_tool_continuations_translate_to_each_provider_schema() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    { "callId": "call-1", "id": "state::get", "arguments": { "scope": "agents" } },
+                    { "callId": "call-2", "id": "queue::publish", "arguments": { "topic": "work" } },
+                ],
+            }),
+            json!({ "role": "tool", "tool_call_id": "call-1", "content": "{\"value\":1}" }),
+            json!({ "role": "tool", "tool_call_id": "call-2", "content": "published" }),
+        ];
+
+        let anthropic = anthropic_request_body("model", None, &messages, &[], 128);
+        assert_eq!(
+            anthropic["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "tool_use", "id": "call-1", "name": "state::get", "input": { "scope": "agents" } },
+                        { "type": "tool_use", "id": "call-2", "name": "queue::publish", "input": { "topic": "work" } },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "tool_result", "tool_use_id": "call-1", "content": "{\"value\":1}" },
+                        { "type": "tool_result", "tool_use_id": "call-2", "content": "published" },
+                    ],
+                },
+            ])
+        );
+
+        let openai = openai_request_body("model", None, &messages, &[], 128);
+        assert_eq!(
+            openai["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        { "id": "call-1", "type": "function", "function": { "name": "state::get", "arguments": "{\"scope\":\"agents\"}" } },
+                        { "id": "call-2", "type": "function", "function": { "name": "queue::publish", "arguments": "{\"topic\":\"work\"}" } },
+                    ],
+                },
+                { "role": "tool", "tool_call_id": "call-1", "content": "{\"value\":1}" },
+                { "role": "tool", "tool_call_id": "call-2", "content": "published" },
+            ])
+        );
+
+        let gemini = gemini_request_body(None, &messages, &[], 128);
+        assert_eq!(
+            gemini["contents"],
+            json!([
+                {
+                    "role": "model",
+                    "parts": [
+                        { "functionCall": { "id": "call-1", "name": "state::get", "args": { "scope": "agents" } } },
+                        { "functionCall": { "id": "call-2", "name": "queue::publish", "args": { "topic": "work" } } },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        { "functionResponse": { "id": "call-1", "name": "state::get", "response": { "value": 1 } } },
+                        { "functionResponse": { "id": "call-2", "name": "queue::publish", "response": { "result": "published" } } },
+                    ],
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn function_call_normalization_handles_empty_missing_and_malformed_fields() {
+        for driver in [
+            Driver::Anthropic,
+            Driver::OpenAiCompat,
+            Driver::Gemini,
+            Driver::Bedrock,
+        ] {
+            assert!(function_calls(driver, &json!({})).is_empty());
+        }
+
+        let anthropic = json!({
+            "content": [
+                { "type": "text", "text": "not a call" },
+                { "type": "tool_use", "name": "missing-id", "input": {} },
+                { "type": "tool_use", "id": "missing-name", "input": {} },
+                { "type": "tool_use", "id": "valid", "name": "state::get" },
+            ],
+        });
+        assert_eq!(
+            function_calls(Driver::Anthropic, &anthropic),
+            vec![FunctionCall {
+                call_id: "valid".into(),
+                id: "state::get".into(),
+                arguments: json!({}),
+            }]
+        );
+
+        let openai = json!({
+            "choices": [{ "message": { "tool_calls": [
+                { "id": "missing-name", "function": { "arguments": "{}" } },
+                { "function": { "name": "missing-id", "arguments": "{}" } },
+                {
+                    "id": "raw-arguments",
+                    "function": { "name": "state::set", "arguments": "not-json" },
+                },
+            ] } }],
+        });
+        let expected = vec![FunctionCall {
+            call_id: "raw-arguments".into(),
+            id: "state::set".into(),
+            arguments: json!("not-json"),
+        }];
+        assert_eq!(function_calls(Driver::OpenAiCompat, &openai), expected);
+        assert_eq!(function_calls(Driver::Bedrock, &openai), expected);
+
+        let gemini = json!({
+            "candidates": [
+                { "content": { "parts": [{ "text": "not a call" }] } },
+                { "content": { "parts": [
+                    { "functionCall": { "args": {} } },
+                    { "functionCall": { "id": "provider-id", "name": "queue::publish" } },
+                ] } },
+            ],
+        });
+        assert_eq!(
+            function_calls(Driver::Gemini, &gemini),
+            vec![FunctionCall {
+                call_id: "provider-id".into(),
+                id: "queue::publish".into(),
+                arguments: json!({}),
             }]
         );
     }

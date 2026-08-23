@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
 
 const repository = new URL("../", import.meta.url);
-const agentosLlmFunctions = ["chat", "complete", "route", "providers", "usage"];
-const legacyFunctions = agentosLlmFunctions.map(
+const agentosLlmFunctions = ["complete", "route", "providers", "usage"];
+const legacyFunctions = ["chat", ...agentosLlmFunctions].map(
   (name) => `llm::${name}`,
 );
 
@@ -64,6 +64,18 @@ describe("AgentOS LLM namespace", () => {
     }
 
     expect(failures).toEqual([]);
+  });
+
+  it("routes canonical consumers through complete without a fake default model", async () => {
+    for (const path of [
+      "workers/orchestrator/src/main.rs",
+      "workers/task-decomposer/src/main.rs",
+    ]) {
+      const source = await Bun.file(new URL(path, repository)).text();
+      expect(source).toContain('function_id: "agentos::llm::complete"');
+      expect(source).not.toContain("agentos::llm::chat");
+      expect(source).not.toContain('unwrap_or("default")');
+    }
   });
 
   it("legacy namespace detection handles empty, near-miss, and boundary input", () => {

@@ -33,12 +33,13 @@ conflict decisions from both merges.
 | `workers/streaming/src/main.rs` | Current reconciliation | Preserve streaming route preferences and top-level route fields with collision-safe AgentOS LLM calls. |
 | `tests/artifact_contract.test.ts` | Combined | Retain build 10010 reconciliation checks and add build 10008 worker-identity evidence checks from the remediation tip. |
 
-## D-003 — Finish chat migration at the router boundary
+## D-003 — Finish migration at the canonical completion boundary
 
 The remaining orchestrator and task-decomposer callers now target
-`agentos::llm::chat`. The router registers that canonical function as a chat
-alias over the same completion pipeline, and the namespace test treats `chat`
-like `complete`, `route`, `providers`, and `usage` in its repository scan.
+`agentos::llm::complete` and omit `model` when they want runtime default
+routing. The invented `agentos::llm::chat` alias was removed; the namespace
+test still rejects every legacy `llm::chat` call alongside the other colliding
+legacy identifiers.
 
 ## D-004 — Translate tools, normalize calls
 
@@ -46,3 +47,14 @@ The router accepts engine/agent tool metadata aliases at its internal boundary
 and emits each external provider's native declaration shape. Anthropic,
 OpenAI-compatible, and Gemini response shapes are converted back into one
 typed `FunctionCall` contract so agent-core never depends on provider JSON.
+Normalized assistant tool calls and tool results are also translated back to
+Anthropic content blocks, OpenAI-compatible tool calls, or Gemini function
+parts on continuation requests, preserving multi-turn tool loops.
+
+## D-005 — Read worker identity from the pinned function registry
+
+The bootstrap query uses `engine::functions::list` and parses iii 0.22.1's
+`functions[].worker_name` response, deduplicating those stable names. The
+richer worker-list envelope remains a compatibility fallback for existing
+test fakes and later iii builds; malformed or unanswered responses still fail
+closed.

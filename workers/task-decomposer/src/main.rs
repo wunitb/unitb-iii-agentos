@@ -91,23 +91,22 @@ async fn decompose_task(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let model = input
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or("default");
+        .filter(|model| !model.is_empty());
+
+    let mut llm_payload = json!({
+        "systemPrompt": format!(
+            "Decompose the following task into subtasks. Return JSON: {{ \"subtasks\": [{{ \"id\": \"<parentId>.<n>\", \"description\": \"...\" }}] }}. Maximum {MAX_SUBTASKS} subtasks. Parent ID is \"{task_id}\". Use hierarchical numbering (e.g., {task_id}.1, {task_id}.2)."
+        ),
+        "messages": [{ "role": "user", "content": description }],
+    });
+    if let Some(model) = model {
+        llm_payload["model"] = json!(model);
+    }
 
     let llm_result = iii
         .trigger(TriggerRequest {
-            function_id: "agentos::llm::chat".to_string(),
-            payload: json!({
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": format!(
-                            "Decompose the following task into subtasks. Return JSON: {{ \"subtasks\": [{{ \"id\": \"<parentId>.<n>\", \"description\": \"...\" }}] }}. Maximum {MAX_SUBTASKS} subtasks. Parent ID is \"{task_id}\". Use hierarchical numbering (e.g., {task_id}.1, {task_id}.2)."
-                        ),
-                    },
-                    { "role": "user", "content": description },
-                ],
-            }),
+            function_id: "agentos::llm::complete".to_string(),
+            payload: llm_payload,
             action: None,
             timeout_ms: None,
         })
