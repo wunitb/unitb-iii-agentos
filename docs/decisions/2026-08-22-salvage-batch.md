@@ -1,4 +1,6 @@
-# Retired OMP fleet salvage decisions
+# Salvage batch decisions (2026-08-22)
+
+Five work items carried over from the retired fleet backlog and delivered as the first governed sweafax build of this repository.
 
 ## LLM namespace
 
