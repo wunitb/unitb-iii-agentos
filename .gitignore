@@ -16,6 +16,7 @@ pnpm-lock.yaml
 yarn.lock
 
 .gstack/
+.worktrees/
 .vercel
 
 .agentos-*.log

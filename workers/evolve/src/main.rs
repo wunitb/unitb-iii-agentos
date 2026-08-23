@@ -124,18 +124,19 @@ fn strip_code_fences(raw: &str) -> String {
     s.trim().to_string()
 }
 
+fn evolve_completion_payload(prompt: &str) -> Value {
+    json!({
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-20250514",
+        "systemPrompt": "You are a code generator. Output only a single JavaScript arrow function expression. No markdown, no explanation.",
+        "messages": [{ "role": "user", "content": prompt }],
+    })
+}
+
 async fn invoke_llm_complete(iii: &IIIClient, prompt: &str) -> Result<Value, Error> {
     iii.trigger(TriggerRequest {
         function_id: "agentos::llm::complete".to_string(),
-        payload: json!({
-            "model": {
-                "provider": "anthropic",
-                "model": "claude-sonnet-4-20250514",
-                "maxTokens": 2048,
-            },
-            "systemPrompt": "You are a code generator. Output only a single JavaScript arrow function expression. No markdown, no explanation.",
-            "messages": [{ "role": "user", "content": prompt }],
-        }),
+        payload: evolve_completion_payload(prompt),
         action: None,
         timeout_ms: None,
     })
@@ -759,6 +760,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evolve_payload_uses_top_level_route_fields() {
+        let payload = evolve_completion_payload("write code");
+        assert_eq!(payload["provider"], "anthropic");
+        assert_eq!(payload["model"], "claude-sonnet-4-20250514");
+        assert!(payload["model"].is_string());
+    }
 
     #[test]
     fn test_sanitize_id_accepts_valid() {

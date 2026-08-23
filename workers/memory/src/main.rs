@@ -946,6 +946,15 @@ async fn consolidate(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     }))
 }
 
+fn memory_summary_payload(chunk: &str) -> Value {
+    json!({
+        "provider": "anthropic",
+        "model": "claude-haiku-4-5-20251001",
+        "systemPrompt": "Summarize this conversation concisely. Preserve key facts, decisions, and context. Be brief.",
+        "messages": [{ "role": "user", "content": chunk }],
+    })
+}
+
 async fn compact_session(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let agent_id = input["agentId"].as_str().unwrap_or("default");
     let session_id = input["sessionId"].as_str().unwrap_or("default");
@@ -1002,16 +1011,14 @@ async fn compact_session(iii: &IIIClient, input: Value) -> Result<Value, Error> 
     let mut summaries = Vec::new();
 
     for chunk in &chunks {
-        let summary = iii.trigger(TriggerRequest {
-            function_id: "agentos::llm::complete".to_string(),
-            payload: json!({
-            "model": { "provider": "anthropic", "model": "claude-haiku-4-5", "maxTokens": 1024 },
-            "systemPrompt": "Summarize this conversation concisely. Preserve key facts, decisions, and context. Be brief.",
-            "messages": [{ "role": "user", "content": chunk }],
-        }),
-            action: None,
-            timeout_ms: None,
-        }).await;
+        let summary = iii
+            .trigger(TriggerRequest {
+                function_id: "agentos::llm::complete".to_string(),
+                payload: memory_summary_payload(chunk),
+                action: None,
+                timeout_ms: None,
+            })
+            .await;
 
         if let Ok(resp) = summary {
             summaries.push(resp["content"].as_str().unwrap_or("").to_string());
@@ -1311,6 +1318,14 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_summary_payload_uses_top_level_route_fields() {
+        let payload = memory_summary_payload("conversation");
+        assert_eq!(payload["provider"], "anthropic");
+        assert_eq!(payload["model"], "claude-haiku-4-5-20251001");
+        assert!(payload["model"].is_string());
+    }
 
     #[test]
     fn test_sha256_dedup_same_content_same_hash() {

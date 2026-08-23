@@ -54,9 +54,9 @@ git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos
 # 2. install the pinned iii v0.22.1 release with checksum verification
 bash scripts/install-iii.sh
 
-# 3. add your model key
-cp .env.example .env
-$EDITOR .env   # set ANTHROPIC_API_KEY=sk-ant-…
+# 3. configure the local model proxy
+install -m 600 .env.example .env
+$EDITOR .env   # set CODEX_PROXY_API_KEY for http://127.0.0.1:8317/v1
 
 # 4. build the workspace
 cargo build --workspace --release
@@ -64,6 +64,10 @@ cargo build --workspace --release
 # 5. bring the stack up: engine, workers, then the chat TUI
 ./target/release/agentos up
 ```
+
+Quickstart uses the local Codex proxy at `http://127.0.0.1:8317/v1`.
+Anthropic is optional and selected only by an explicit provider/model or when
+no configured local default exists.
 
 `agentos up` runs one ordered policy and never builds or installs anything: it
 resolves the config, verifies the iii binary (missing → `bash scripts/install-iii.sh`),
@@ -134,7 +138,8 @@ alone does not disable that checkout discovery; otherwise
 `$AGENTOS_HOME/runtime/config.yaml` is used. `agentos doctor` names the mode
 and the resolved path. This lets an installed release
 start from any working directory without a checkout. Upgrades replace release
-payload while retaining operator configuration and `$AGENTOS_HOME/runtime/data/**`.
+payload while retaining operator configuration, `$AGENTOS_HOME/runtime/data/**`,
+and the runtime `.env` file.
 
 The engine must be iii `v0.22.1`, installed in `PATH` or by
 `bash scripts/install-iii.sh` (which downloads and verifies it). The embedding
@@ -255,17 +260,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full primitive flow and worker ma
 
 ## § 09 · Development control plane
 
-Repository development is coordinated by the globally installed UNITB DELIVERY control plane. Its configuration, SQLite ledger, credentials, agent sessions, and isolated worktrees live outside this repository under the user's UNITB DELIVERY config and data directories.
+Repository changes enter as **control-room directives** and are built by the **sweafax** factory; nothing in this repository launches an agent session itself.
 
-Use the managed Planner session rather than launching `omp` directly from this repository:
-
-```bash
-unitb-delivery up --project unitb-iii-agentos
-unitb-delivery health --project unitb-iii-agentos
-herdr session attach unitb-delivery-unitb-iii-agentos
-```
-
-The managed Planner is read-only. It creates durable Work Items, assigns a single Writer in an isolated worktree, obtains independent review of the exact submitted commit, and publishes or merges only through protected fleet operations.
+1. Intent: a directive records the verbatim request and its acceptance criteria (ISC) in `unitb-control-room` (`cr new --from-sweafax <intake.json>`).
+2. Execution: `cr dispatch <directive> --engine sweafax --spec <intake.json>` registers a sweafax build from the intake's `base_branch`; sweafax runs implementation, verification, the artifact gate (`docs/builds/<build>-<slug>/{INVARIANTS,TRACES,DECISIONS,ATTACK_SURFACE}.md`, `bunx tsc --noEmit`, `bun test`) and a cross-vendor audit. `cr sync` follows the build's state.
+3. Delivery: after audit approval the result branch (`issue/<id>-…`) is pushed by the maintainer and merged through a pull request. `main` is protected; there is no direct push path.
 
 ## § 10 · TUI
 

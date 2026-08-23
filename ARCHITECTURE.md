@@ -124,9 +124,7 @@ Workflow definitions live under the `workflows` state scope. Runs live under `wo
 
 ## Development control plane
 
-UNITB DELIVERY coordinates repository changes from a global installation outside this repository. The managed Planner is the read-only interactive entry point, each Worker is the single writer for an explicit path contract in an isolated worktree, and the Reviewer inspects the exact submitted commit independently.
-
-Project routing configuration, the SQLite ledger, credentials, agent sessions, and worktrees live under the user's UNITB DELIVERY config and data directories. This repository intentionally contains no embedded fleet runtime or `.omp` fleet extensions. Launching `omp` directly from the repository does not create a managed Planner; operators attach to the registered Herdr session instead.
+Development is coordinated outside this repository: **unitb-control-room** owns the record of intent (directives with verbatim goals and acceptance criteria) and **sweafax** executes builds (implementation → verification → artifact gate → cross-vendor audit). Each build produces a result branch `issue/<id>-…` and a governed artifact directory under `docs/builds/`. Delivery is a pull request opened by the maintainer; `main` accepts no direct pushes. This repository holds no scheduler, ledger, credentials, or agent sessions of its own.
 
 ## Versioning
 
@@ -142,13 +140,13 @@ Eight jobs run on every PR:
 
 | job | gate |
 |---|---|
-| `rust build + test` | `cargo check --all-targets` + `cargo build --release` + `cargo test --workspace --release` (1,330 tests; 2 live-engine checks ignored by default) |
+| `rust build + test` | `cargo check --all-targets` + `cargo build --release` + `cargo test --workspace --release` (1,393 tests; 3 live-engine checks ignored by default) |
 | `python worker tests` | `pytest workers/embedding/test_main.py` |
 | `website build` | `npm ci` + `npm run build` in `website/` |
-| `installer shellcheck` | `shellcheck --severity=warning` over `scripts/install.sh`, `website/public/install.sh`, `scripts/install-iii.sh` |
+| `installer shellcheck` | `shellcheck --severity=warning` over `scripts/install.sh`, `scripts/dev-up.sh`, `website/public/install.sh`, `scripts/install-iii.sh` |
 | `validate iii.worker.yaml` | every `workers/<name>/iii.worker.yaml` parses, matches its folder, declares `runtime.kind` of `rust` or `python`, and carries a `scripts.start` string |
 | `no sandbox::* clash with builtin` | grep ensures no agentos worker registers `sandbox::*` |
-| `e2e smoke (no LLM key required)` | starts engine + workers, asserts ports listen, ≥30 functions register, no namespace clash |
+| `e2e smoke (no LLM key required)` | typechecks and tests the Node examples and startup configuration, then starts engine + workers, asserts ports listen, ≥30 functions register, no namespace clash |
 | `e2e full (requires AGENTOS_API_KEY secret)` | runs vitest e2e suite against the live stack — gated on `AGENTOS_API_KEY` secret |
 
 Plus `.github/workflows/vercel-deploy.yml`: pushes to `main` touching `website/**` trigger a Vercel Deploy Hook.

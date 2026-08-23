@@ -314,10 +314,7 @@ impl App {
 
     async fn refresh_registry(&mut self) {
         let client = Self::client();
-        if let Ok(resp) = client
-            .get(format!("{}/api/metrics/summary", API_BASE))
-            .send()
-            .await
+        if let Ok(resp) = client.get(format!("{}/api/health", API_BASE)).send().await
             && let Ok(data) = resp.json::<Value>().await
         {
             self.worker_count = data["workers"]
@@ -900,11 +897,7 @@ impl App {
         };
 
         let client = Self::client();
-        let body = serde_json::json!({
-            "messages": [{"role": "user", "content": msg}],
-            "agentId": agent_id,
-            "realm": self.chat_realm,
-        });
+        let body = chat_request_body(&msg, &agent_id, &self.chat_realm);
 
         let send_result = client
             .post(format!("{}/api/chat/stream", API_BASE))
@@ -1046,6 +1039,14 @@ impl App {
             _ => 0,
         }
     }
+}
+
+fn chat_request_body(message: &str, agent_id: &str, realm: &str) -> Value {
+    serde_json::json!({
+        "message": message,
+        "agentId": agent_id,
+        "realm": realm,
+    })
 }
 
 fn parse_chat_response(body: &str) -> String {
@@ -4148,6 +4149,16 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_request_body_matches_stream_chat_contract() {
+        let body = chat_request_body("Reply with READY only.", "agent-7", "realm-3");
+
+        assert_eq!(body["message"], "Reply with READY only.");
+        assert_eq!(body["agentId"], "agent-7");
+        assert_eq!(body["realm"], "realm-3");
+        assert!(body.get("messages").is_none());
+    }
+
+    #[test]
     fn test_palette_items_cover_all_screens() {
         let app = App::new();
         let items = app.palette_items();
@@ -4201,6 +4212,21 @@ mod tests {
         for required in ["memory", "browser", "llm-router", "agent-core", "approval"] {
             assert!(names.contains(required), "missing {}", required);
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live iii engine on :3111"]
+    async fn live_refresh_registry_counts_connected_workers() {
+        if std::env::var("AGENTOS_LIVE_TEST").is_err() {
+            return;
+        }
+        let mut app = App::new();
+        app.refresh_registry().await;
+        assert!(
+            app.worker_count > 1,
+            "refresh_registry reported {} connected workers; expected the live engine count",
+            app.worker_count
+        );
     }
 
     #[tokio::test]

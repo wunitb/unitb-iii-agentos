@@ -25,6 +25,22 @@ const build10005ArtifactDirectory = new URL(
   "../docs/builds/10005-salvage-the-five-surviving-agentos-work-items-fr/",
   import.meta.url,
 );
+const build10010ArtifactDirectory = new URL(
+  "../docs/builds/10010-reconcile-feat-herdr-omp-fleet-with-main-so-that/",
+  import.meta.url,
+);
+const build10011ArtifactDirectory = new URL(
+  "../docs/builds/10011-reconcile-feat-herdr-omp-fleet-with-main-so-that/",
+  import.meta.url,
+);
+const build10013ArtifactDirectory = new URL(
+  "../docs/builds/10013-reconcile-feat-herdr-omp-fleet-with-main-so-that/",
+  import.meta.url,
+);
+const build10008ArtifactDirectory = new URL(
+  "../docs/builds/10008-fix-agentos-up-so-a-failed-worker-identity-query/",
+  import.meta.url,
+);
 const requiredArtifacts = [
   "ATTACK_SURFACE.md",
   "DECISIONS.md",
@@ -42,6 +58,45 @@ const salvageBatchRequiredIdentifiers = [
   ...requiredIdentifiers,
   "ISC-005",
 ] as const;
+const reconciliationRequiredIdentifiers = [
+  "ISC-000",
+  "ISC-001",
+  "ISC-002",
+  "ISC-003",
+] as const;
+const reconciliationConflictFiles = [
+  "README.md",
+  "crates/cli/src/bootstrap.rs",
+  "crates/cli/src/main.rs",
+  "crates/cli/tests/portability.rs",
+  "e2e/full-stack.test.ts",
+  "scripts/dev-up.sh",
+  "tests/artifact_contract.test.ts",
+  "workers/agent-core/src/main.rs",
+  "workers/context-monitor/src/main.rs",
+  "workers/eval/src/main.rs",
+  "workers/evolve/src/main.rs",
+  "workers/memory/src/main.rs",
+  "workers/streaming/src/main.rs",
+] as const;
+const followUpConflictFiles = [
+  "README.md",
+  "bun.lock",
+  "crates/cli/src/main.rs",
+  "crates/cli/tests/portability.rs",
+  "e2e/full-stack.test.ts",
+  "package-lock.json",
+  "scripts/dev-up.test.ts",
+  "workers/agent-core/src/main.rs",
+  "workers/agent-core/src/types.rs",
+  "workers/context-monitor/src/main.rs",
+  "workers/eval/src/main.rs",
+  "workers/evolve/src/main.rs",
+  "workers/llm-router/src/main.rs",
+  "workers/memory/src/main.rs",
+  "workers/streaming/src/main.rs",
+  "tests/artifact_contract.test.ts",
+] as const;
 const minimumArtifactBytes = 200;
 const headingPattern = /^#{1,6} +\S/m;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
@@ -55,6 +110,21 @@ function normalizedBuildHeadings(source: string): string[] {
   return markdownHeadings(source).map((heading) =>
     heading.replace(/^# Build \d+ /, "# Build <number> "),
   );
+}
+
+function reconciliationDecision(
+  source: string,
+  filename: string,
+): { side: string; reason: string } | null {
+  const prefix = `| \`${filename}\` |`;
+  const row = source.split(/\r?\n/).find((line) => line.startsWith(prefix));
+  if (!row) return null;
+
+  const columns = row.split("|").map((column) => column.trim());
+  if (columns.length !== 5) return null;
+  const side = columns[2] ?? "";
+  const reason = columns[3] ?? "";
+  return side && reason ? { side, reason } : null;
 }
 
 type ArtifactFailure =
@@ -241,7 +311,183 @@ describe("build 10005 governed artifact contract", () => {
   });
 });
 
+describe("build 10010 reconciliation artifact contract", () => {
+  it("uses the canonical real directory with exactly the governed files", async () => {
+    expect(await realpath(build10010ArtifactDirectory)).toBe(
+      resolve(fileURLToPath(build10010ArtifactDirectory)),
+    );
+    expect((await readdir(build10010ArtifactDirectory)).sort()).toEqual(
+      [...requiredArtifacts].sort(),
+    );
+  });
+
+  it("accepts every artifact and ISC-000 through ISC-003 as whole tokens", async () => {
+    expect(
+      await inspectArtifactDirectory(
+        build10010ArtifactDirectory,
+        reconciliationRequiredIdentifiers,
+      ),
+    ).toEqual([]);
+
+    const traces = await Bun.file(
+      new URL("TRACES.md", build10010ArtifactDirectory),
+    ).text();
+    for (const identifier of reconciliationRequiredIdentifiers) {
+      expect(
+        traces.match(new RegExp(`\\b${identifier}\\b`, "g"))?.length ?? 0,
+        identifier,
+      ).toBe(1);
+    }
+  });
+
+  it("records the chosen side and reason for every conflicting file", async () => {
+    const decisions = await Bun.file(
+      new URL("DECISIONS.md", build10010ArtifactDirectory),
+    ).text();
+    for (const filename of reconciliationConflictFiles) {
+      const decision = reconciliationDecision(decisions, filename);
+      expect(decision, filename).not.toBeNull();
+      expect(decision?.side.length, `${filename} has no chosen side`).toBeGreaterThan(0);
+      expect(decision?.reason.length, `${filename} has no reason`).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("build 10011 follow-up reconciliation artifact contract", () => {
+  it("uses the canonical real directory with exactly the four governed files", async () => {
+    expect(await realpath(build10011ArtifactDirectory)).toBe(
+      resolve(fileURLToPath(build10011ArtifactDirectory)),
+    );
+    expect((await readdir(build10011ArtifactDirectory)).sort()).toEqual(
+      [...requiredArtifacts].sort(),
+    );
+  });
+
+  it("accepts every artifact and ISC-000 through ISC-003 as whole tokens", async () => {
+    expect(
+      await inspectArtifactDirectory(
+        build10011ArtifactDirectory,
+        reconciliationRequiredIdentifiers,
+      ),
+    ).toEqual([]);
+
+    const traces = await Bun.file(
+      new URL("TRACES.md", build10011ArtifactDirectory),
+    ).text();
+    for (const identifier of reconciliationRequiredIdentifiers) {
+      expect(
+        traces.match(new RegExp(`\\b${identifier}\\b`, "g"))?.length ?? 0,
+        identifier,
+      ).toBe(1);
+    }
+  });
+
+  it("records a non-empty chosen side and reason for every conflicting file", async () => {
+    const decisions = await Bun.file(
+      new URL("DECISIONS.md", build10011ArtifactDirectory),
+    ).text();
+    for (const filename of followUpConflictFiles) {
+      const decision = reconciliationDecision(decisions, filename);
+      expect(decision, filename).not.toBeNull();
+      expect(decision?.side.length, `${filename} has no chosen side`).toBeGreaterThan(0);
+      expect(decision?.reason.length, `${filename} has no reason`).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("build 10013 follow-up 2 reconciliation artifact contract", () => {
+  it("uses the canonical real directory with exactly the four governed files", async () => {
+    expect(await realpath(build10013ArtifactDirectory)).toBe(
+      resolve(fileURLToPath(build10013ArtifactDirectory)),
+    );
+    expect((await readdir(build10013ArtifactDirectory)).sort()).toEqual(
+      [...requiredArtifacts].sort(),
+    );
+  });
+
+  it("accepts every artifact and ISC-000 through ISC-003 as whole tokens", async () => {
+    expect(
+      await inspectArtifactDirectory(
+        build10013ArtifactDirectory,
+        reconciliationRequiredIdentifiers,
+      ),
+    ).toEqual([]);
+
+    const traces = await Bun.file(
+      new URL("TRACES.md", build10013ArtifactDirectory),
+    ).text();
+    for (const identifier of reconciliationRequiredIdentifiers) {
+      expect(
+        traces.match(new RegExp(`\\b${identifier}\\b`, "g"))?.length ?? 0,
+        identifier,
+      ).toBe(1);
+    }
+  });
+
+  it("records a non-empty chosen side and reason for every conflicting file", async () => {
+    const decisions = await Bun.file(
+      new URL("DECISIONS.md", build10013ArtifactDirectory),
+    ).text();
+    for (const filename of followUpConflictFiles) {
+      const decision = reconciliationDecision(decisions, filename);
+      expect(decision, filename).not.toBeNull();
+      expect(decision?.side.length, `${filename} has no chosen side`).toBeGreaterThan(0);
+      expect(decision?.reason.length, `${filename} has no reason`).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("build 10008 worker-identity hardening evidence", () => {
+  it("contains exactly the four governed artifacts", async () => {
+    expect((await readdir(build10008ArtifactDirectory)).sort()).toEqual(
+      [...requiredArtifacts].sort(),
+    );
+    expect(
+      await inspectArtifactDirectory(build10008ArtifactDirectory, [
+        "ISC-000",
+        "ISC-001",
+        "ISC-002",
+      ]),
+    ).toEqual([]);
+  });
+
+  it("records the duplicate-registration path and fail-closed behavior", async () => {
+    const attackSurface = await Bun.file(
+      new URL("ATTACK_SURFACE.md", build10008ArtifactDirectory),
+    ).text();
+    expect(attackSurface).toContain("Duplicate-registration path");
+    expect(attackSurface).toContain("fails closed");
+    expect(attackSurface).toContain("does not spawn any worker");
+  });
+
+  it("traces ISC-000 through ISC-002 as whole tokens", async () => {
+    const traces = await Bun.file(
+      new URL("TRACES.md", build10008ArtifactDirectory),
+    ).text();
+    for (const identifier of ["ISC-000", "ISC-001", "ISC-002"] as const) {
+      expect(new RegExp(`\\b${identifier}\\b`).test(traces), identifier).toBe(true);
+    }
+  });
+});
+
 describe("artifact contract edge cases", () => {
+  it("rejects absent, malformed, and empty reconciliation decisions", () => {
+    expect(reconciliationDecision("", "README.md")).toBeNull();
+    expect(reconciliationDecision("| `README.md` |", "README.md")).toBeNull();
+    expect(
+      reconciliationDecision("| `README.md` |  | because |", "README.md"),
+    ).toBeNull();
+    expect(
+      reconciliationDecision("| `README.md` | Combined |  |", "README.md"),
+    ).toBeNull();
+    expect(
+      reconciliationDecision(
+        "| `README.md` | Combined | preserves both lines |",
+        "README.md",
+      ),
+    ).toEqual({ side: "Combined", reason: "preserves both lines" });
+  });
+
   it("rejects missing, non-directory, and symlinked artifact directories", async () => {
     const parent = await temporaryDirectory();
     const missing = new URL("missing/", parent);

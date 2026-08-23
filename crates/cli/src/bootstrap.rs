@@ -27,6 +27,7 @@ pub(crate) const ENGINE_INSTALL_HINT: &str =
 pub(crate) const WORKSPACE_BUILD_HINT: &str = "run `cargo build --workspace --release`";
 
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+const WORKER_IDENTITIES_UNREPORTED: &str = "the engine did not report connected worker identities";
 
 /// Reads `<runtime>/.env` for `agentos up` without mutating this process. Keys
 /// already exported by the invoking shell are deliberately omitted so child
@@ -133,7 +134,7 @@ pub(crate) trait Diagnostics {
     /// Whether the engine accepts connections on its worker port.
     fn engine_healthy(&self) -> bool;
     /// Stable names of connected non-engine workers, `None` when the engine
-    /// cannot answer `engine::workers::list`.
+    /// cannot answer `engine::functions::list`.
     fn connected_worker_ids(&self) -> Option<BTreeSet<String>>;
     /// Worker manifests plus the release binary resolved for each of them.
     fn worker_specs(&self) -> Result<Vec<WorkerSpec>>;
@@ -390,7 +391,7 @@ pub(crate) fn readiness(probes: &dyn Diagnostics, paths: &RuntimePaths) -> Readi
         ),
         (None, _) => ReadinessItem::failed(
             "Connected",
-            "engine did not report connected worker identities",
+            WORKER_IDENTITIES_UNREPORTED,
             "start the stack with `agentos up`, then re-run `agentos doctor`",
         ),
     });
@@ -586,8 +587,7 @@ fn up_stages(
     // 6. workers: compare canonical identities, never aggregate counts. On a
     //    partial stack only missing workers are launched, preserving the
     //    already-connected processes and avoiding duplicate registrations.
-    ensure_engine_alive(effects)?;
-    let already_connected = effects.connected_worker_ids().unwrap_or_default();
+    let already_connected = await_worker_identity_report(effects, options)?;
     let missing = missing_worker_ids(&required, &already_connected);
     let connected = if missing.is_empty() {
         stage_ok(
@@ -669,9 +669,9 @@ fn up_stages(
     }
 }
 
-/// One wall-clock polling budget, shared by both readiness waits. A deadline
-/// caps slow probes too; deriving only an attempt count can exceed the timeout
-/// by the cumulative duration of those probes.
+/// Builds a wall-clock polling budget for each readiness wait. A deadline caps
+/// slow probes too; deriving only an attempt count can exceed the timeout by
+/// the cumulative duration of those probes.
 fn poll_plan(options: &UpOptions) -> (Duration, Instant) {
     let poll = options.poll_interval.max(Duration::from_millis(1));
     let now = Instant::now();
@@ -705,6 +705,28 @@ fn await_engine(effects: &mut dyn Bootstrap, options: &UpOptions) -> Result<()> 
         options.stage_timeout.as_secs_f32(),
         effects.engine_log().display()
     )
+}
+
+/// Waits for the engine to answer the worker-identity query before deciding
+/// what to launch. `None` is an unknown state, while `Some(empty)` is a valid
+/// report that means every required worker still needs to be started.
+fn await_worker_identity_report(
+    effects: &mut dyn Bootstrap,
+    options: &UpOptions,
+) -> Result<BTreeSet<String>> {
+    let (poll, deadline) = poll_plan(options);
+    loop {
+        ensure_engine_alive(effects)?;
+        if let Some(connected) = effects.connected_worker_ids() {
+            return Ok(connected);
+        }
+        let now = effects.now();
+        if now >= deadline {
+            break;
+        }
+        effects.sleep(poll.min(deadline.saturating_duration_since(now)));
+    }
+    anyhow::bail!(WORKER_IDENTITIES_UNREPORTED)
 }
 
 /// Waits for the required workers to be on the bus within the same bounded
@@ -803,8 +825,22 @@ impl SystemEffects {
     }
 }
 
-fn reported_worker_ids(worker_list: &Value) -> Option<BTreeSet<String>> {
-    let workers = worker_list.get("workers")?.as_array()?;
+fn reported_worker_ids(registry: &Value) -> Option<BTreeSet<String>> {
+    if let Some(functions) = registry.get("functions").and_then(Value::as_array) {
+        return Some(
+            functions
+                .iter()
+                .filter_map(|function| function["worker_name"].as_str())
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        );
+    }
+
+    // Keep accepting the richer worker registry used by newer iii builds and
+    // by older AgentOS test fakes. iii 0.22.1 readiness uses the function
+    // registry above because its stable wire identity is `worker_name`.
+    let workers = registry.get("workers")?.as_array()?;
     Some(
         workers
             .iter()
@@ -816,7 +852,7 @@ fn reported_worker_ids(worker_list: &Value) -> Option<BTreeSet<String>> {
     )
 }
 
-fn parse_worker_list_output(output: &[u8]) -> Option<Value> {
+fn parse_registry_output(output: &[u8]) -> Option<Value> {
     serde_json::from_slice(output).ok().or_else(|| {
         let text = String::from_utf8_lossy(output);
         let start = text.find('{')?;
@@ -851,7 +887,7 @@ impl Diagnostics for SystemEffects {
         let output = std::process::Command::new(binary)
             .args([
                 "trigger",
-                "engine::workers::list",
+                "engine::functions::list",
                 "--json",
                 "{}",
                 "--timeout-ms",
@@ -863,7 +899,7 @@ impl Diagnostics for SystemEffects {
         if !output.status.success() {
             return None;
         }
-        reported_worker_ids(&parse_worker_list_output(&output.stdout)?)
+        reported_worker_ids(&parse_registry_output(&output.stdout)?)
     }
 
     fn worker_specs(&self) -> Result<Vec<WorkerSpec>> {
@@ -1014,6 +1050,9 @@ mod tests {
         engine_start_error: Option<String>,
         /// Stable worker identities the engine reports; `None` when silent.
         connected: RefCell<Option<BTreeSet<String>>>,
+        identity_probes: Cell<usize>,
+        /// Overrides `connected` from this zero-based identity probe onwards.
+        connected_from_probe: Option<(usize, BTreeSet<String>)>,
         /// What the engine reports once this invocation started the workers.
         connected_after_start: Option<BTreeSet<String>>,
         workers: Result<Vec<WorkerSpec>, String>,
@@ -1041,6 +1080,8 @@ mod tests {
                 stop_checks: Cell::new(0),
                 engine_start_error: None,
                 connected: RefCell::new(Some(ids(&["core", "memory"]))),
+                identity_probes: Cell::new(0),
+                connected_from_probe: None,
                 connected_after_start: Some(ids(&["core", "memory"])),
                 workers: Ok(vec![
                     spec("core", WorkerRuntime::Rust, true),
@@ -1098,7 +1139,18 @@ mod tests {
         }
 
         fn connected_worker_ids(&self) -> Option<BTreeSet<String>> {
-            self.connected.borrow().clone()
+            let probe = self.identity_probes.get();
+            self.identity_probes.set(probe + 1);
+            let connected = self.connected.borrow().clone();
+            if connected.is_some() {
+                return connected;
+            }
+            if let Some((threshold, connected)) = &self.connected_from_probe {
+                if probe >= *threshold {
+                    return Some(connected.clone());
+                }
+            }
+            None
         }
 
         fn worker_specs(&self) -> Result<Vec<WorkerSpec>> {
@@ -1239,6 +1291,95 @@ mod tests {
     }
 
     #[test]
+    fn up_fails_closed_when_the_initial_worker_identity_query_is_unanswered() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(None),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        assert!(!matches!(&outcome, Ok(UpOutcome::Ready)));
+        let error = outcome
+            .expect_err("an unanswered identity query must fail")
+            .to_string();
+        assert_eq!(error, WORKER_IDENTITIES_UNREPORTED);
+        assert!(
+            fake.identity_probes.get() > 1,
+            "identity query was not retried"
+        );
+        assert_eq!(fake.sleeps.get(), 6);
+        assert_eq!(fake.events(), vec!["shutdown_started".to_string()]);
+        assert!(!fake.started_workers.get());
+        assert!(fake.started_worker_names.borrow().is_empty());
+    }
+
+    #[test]
+    fn up_accepts_an_identity_report_that_arrives_within_the_poll_budget() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(None),
+            connected_from_probe: Some((2, BTreeSet::new())),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        assert_eq!(
+            outcome.expect("the third identity query answers"),
+            UpOutcome::Ready
+        );
+        assert_eq!(fake.identity_probes.get(), 4);
+        assert_eq!(fake.sleeps.get(), 2);
+        assert_eq!(fake.events(), vec!["start_workers".to_string()]);
+        assert_eq!(&*fake.started_worker_names.borrow(), &["core", "memory"]);
+    }
+
+    #[test]
+    fn zero_identity_timeout_probes_once_and_fails_without_sleeping_or_spawning() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(None),
+            ..Fake::default()
+        };
+        let zero_timeout = UpOptions {
+            launch_tui: false,
+            stage_timeout: Duration::ZERO,
+            poll_interval: Duration::ZERO,
+        };
+        let (outcome, _) = up(&mut fake, &zero_timeout, &config);
+        assert_eq!(
+            outcome
+                .expect_err("an unanswered zero-budget probe must fail")
+                .to_string(),
+            WORKER_IDENTITIES_UNREPORTED
+        );
+        assert_eq!(fake.identity_probes.get(), 1);
+        assert_eq!(fake.sleeps.get(), 0);
+        assert_eq!(fake.events(), vec!["shutdown_started".to_string()]);
+        assert!(!fake.started_workers.get());
+    }
+
+    #[test]
+    fn up_fails_fast_if_the_engine_dies_during_identity_discovery() {
+        let config = existing_config();
+        let mut fake = Fake {
+            unhealthy_from: Some(2),
+            connected: RefCell::new(None),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome
+            .expect_err("engine death must interrupt identity discovery")
+            .to_string();
+        assert!(
+            error.contains("stopped accepting connections on 127.0.0.1:49134"),
+            "{error}"
+        );
+        assert_eq!(fake.identity_probes.get(), 1);
+        assert_eq!(fake.sleeps.get(), 1);
+        assert_eq!(fake.events(), vec!["shutdown_started".to_string()]);
+        assert!(!fake.started_workers.get());
+    }
+
+    #[test]
     fn up_reuses_a_healthy_engine_without_spawning_another() {
         let config = existing_config();
         let mut fake = Fake {
@@ -1248,6 +1389,7 @@ mod tests {
         let (outcome, output) = up(&mut fake, &options(false), &config);
         assert_eq!(outcome.expect("up succeeds"), UpOutcome::Ready);
         assert_eq!(fake.events(), vec!["start_workers".to_string()]);
+        assert_eq!(&*fake.started_worker_names.borrow(), &["core", "memory"]);
         assert!(
             output.contains("already healthy on 127.0.0.1:49134"),
             "{output}"
@@ -1876,6 +2018,7 @@ mod tests {
             connected.hint.as_deref(),
             Some("start the stack with `agentos up`, then re-run `agentos doctor`")
         );
+        assert_eq!(connected.detail, WORKER_IDENTITIES_UNREPORTED);
         assert!(
             output.contains("engine did not report connected worker identities"),
             "{output}"
@@ -2027,7 +2170,38 @@ mod tests {
     }
 
     #[test]
-    fn engine_worker_list_reports_only_stable_connected_non_engine_identities() {
+    fn engine_function_list_reports_iii_0_22_1_worker_identities() {
+        assert_eq!(
+            reported_worker_ids(&json!({
+                "functions": [
+                    {"function_id": "core::run", "worker_name": "core"},
+                    {"function_id": "core::status", "worker_name": "core"},
+                    {"function_id": "memory::recall", "worker_name": "memory"}
+                ]
+            })),
+            Some(ids(&["core", "memory"]))
+        );
+        assert_eq!(
+            reported_worker_ids(&json!({ "functions": [] })),
+            Some(BTreeSet::new()),
+            "an answered empty registry must remain distinct from no answer"
+        );
+        assert_eq!(
+            reported_worker_ids(&json!({
+                "functions": [
+                    {"function_id": "missing::identity"},
+                    {"function_id": "empty::identity", "worker_name": ""},
+                    {"function_id": "wrong::identity", "worker_name": 7},
+                    {"function_id": "core::run", "worker_name": "core"}
+                ]
+            })),
+            Some(ids(&["core"]))
+        );
+        assert_eq!(reported_worker_ids(&json!({ "functions": 62 })), None);
+    }
+
+    #[test]
+    fn engine_worker_list_fallback_reports_connected_non_engine_identities() {
         assert_eq!(
             reported_worker_ids(&json!({
                 "workers": [
@@ -2043,12 +2217,12 @@ mod tests {
     }
 
     #[test]
-    fn engine_worker_list_parser_handles_wrapped_empty_and_malformed_output() {
-        let wrapped = b"iii 0.22.1 diagnostics\n{\"workers\":[{\"name\":\"core\",\"runtime\":\"rust\",\"status\":\"connected\"}]}\n";
-        let parsed = parse_worker_list_output(wrapped).expect("parse wrapped JSON output");
+    fn engine_registry_parser_handles_wrapped_empty_and_malformed_output() {
+        let wrapped = b"iii 0.22.1 diagnostics\n{\"functions\":[{\"function_id\":\"core::run\",\"worker_name\":\"core\"}]}\n";
+        let parsed = parse_registry_output(wrapped).expect("parse wrapped JSON output");
         assert_eq!(reported_worker_ids(&parsed), Some(ids(&["core"])));
-        assert_eq!(parse_worker_list_output(b""), None);
-        assert_eq!(parse_worker_list_output(b"diagnostic only"), None);
-        assert_eq!(parse_worker_list_output(b"prefix {not-json} suffix"), None);
+        assert_eq!(parse_registry_output(b""), None);
+        assert_eq!(parse_registry_output(b"diagnostic only"), None);
+        assert_eq!(parse_registry_output(b"prefix {not-json} suffix"), None);
     }
 }
