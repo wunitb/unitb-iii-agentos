@@ -1037,6 +1037,8 @@ mod tests {
         /// Stable worker identities the engine reports; `None` when silent.
         connected: RefCell<Option<BTreeSet<String>>>,
         identity_probes: Cell<usize>,
+        /// Overrides `connected` from this zero-based identity probe onwards.
+        connected_from_probe: Option<(usize, BTreeSet<String>)>,
         /// What the engine reports once this invocation started the workers.
         connected_after_start: Option<BTreeSet<String>>,
         workers: Result<Vec<WorkerSpec>, String>,
@@ -1065,6 +1067,7 @@ mod tests {
                 engine_start_error: None,
                 connected: RefCell::new(Some(ids(&["core", "memory"]))),
                 identity_probes: Cell::new(0),
+                connected_from_probe: None,
                 connected_after_start: Some(ids(&["core", "memory"])),
                 workers: Ok(vec![
                     spec("core", WorkerRuntime::Rust, true),
@@ -1122,8 +1125,18 @@ mod tests {
         }
 
         fn connected_worker_ids(&self) -> Option<BTreeSet<String>> {
-            self.identity_probes.set(self.identity_probes.get() + 1);
-            self.connected.borrow().clone()
+            let probe = self.identity_probes.get();
+            self.identity_probes.set(probe + 1);
+            let connected = self.connected.borrow().clone();
+            if connected.is_some() {
+                return connected;
+            }
+            if let Some((threshold, connected)) = &self.connected_from_probe {
+                if probe >= *threshold {
+                    return Some(connected.clone());
+                }
+            }
+            None
         }
 
         fn worker_specs(&self) -> Result<Vec<WorkerSpec>> {
@@ -1284,6 +1297,72 @@ mod tests {
         assert_eq!(fake.events(), vec!["shutdown_started".to_string()]);
         assert!(!fake.started_workers.get());
         assert!(fake.started_worker_names.borrow().is_empty());
+    }
+
+    #[test]
+    fn up_accepts_an_identity_report_that_arrives_within_the_poll_budget() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(None),
+            connected_from_probe: Some((2, BTreeSet::new())),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        assert_eq!(
+            outcome.expect("the third identity query answers"),
+            UpOutcome::Ready
+        );
+        assert_eq!(fake.identity_probes.get(), 4);
+        assert_eq!(fake.sleeps.get(), 2);
+        assert_eq!(fake.events(), vec!["start_workers".to_string()]);
+        assert_eq!(&*fake.started_worker_names.borrow(), &["core", "memory"]);
+    }
+
+    #[test]
+    fn zero_identity_timeout_probes_once_and_fails_without_sleeping_or_spawning() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(None),
+            ..Fake::default()
+        };
+        let zero_timeout = UpOptions {
+            launch_tui: false,
+            stage_timeout: Duration::ZERO,
+            poll_interval: Duration::ZERO,
+        };
+        let (outcome, _) = up(&mut fake, &zero_timeout, &config);
+        assert_eq!(
+            outcome
+                .expect_err("an unanswered zero-budget probe must fail")
+                .to_string(),
+            WORKER_IDENTITIES_UNREPORTED
+        );
+        assert_eq!(fake.identity_probes.get(), 1);
+        assert_eq!(fake.sleeps.get(), 0);
+        assert_eq!(fake.events(), vec!["shutdown_started".to_string()]);
+        assert!(!fake.started_workers.get());
+    }
+
+    #[test]
+    fn up_fails_fast_if_the_engine_dies_during_identity_discovery() {
+        let config = existing_config();
+        let mut fake = Fake {
+            unhealthy_from: Some(2),
+            connected: RefCell::new(None),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome
+            .expect_err("engine death must interrupt identity discovery")
+            .to_string();
+        assert!(
+            error.contains("stopped accepting connections on 127.0.0.1:49134"),
+            "{error}"
+        );
+        assert_eq!(fake.identity_probes.get(), 1);
+        assert_eq!(fake.sleeps.get(), 1);
+        assert_eq!(fake.events(), vec!["shutdown_started".to_string()]);
+        assert!(!fake.started_workers.get());
     }
 
     #[test]
@@ -1925,6 +2004,7 @@ mod tests {
             connected.hint.as_deref(),
             Some("start the stack with `agentos up`, then re-run `agentos doctor`")
         );
+        assert_eq!(connected.detail, WORKER_IDENTITIES_UNREPORTED);
         assert!(
             output.contains("engine did not report connected worker identities"),
             "{output}"

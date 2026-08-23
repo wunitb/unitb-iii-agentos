@@ -25,6 +25,10 @@ const build10005ArtifactDirectory = new URL(
   "../docs/builds/10005-salvage-the-five-surviving-agentos-work-items-fr/",
   import.meta.url,
 );
+const build10007ArtifactDirectory = new URL(
+  "../docs/builds/10007-fix-agentos-up-so-a-failed-worker-identity-query/",
+  import.meta.url,
+);
 const requiredArtifacts = [
   "ATTACK_SURFACE.md",
   "DECISIONS.md",
@@ -238,6 +242,30 @@ describe("build 10005 governed artifact contract", () => {
       new URL("DECISIONS.md", build10005ArtifactDirectory),
     ).text();
     expect(decisions).toContain("bun install --frozen-lockfile");
+  });
+});
+
+describe("build 10007 worker-identity hardening evidence", () => {
+  it("records the duplicate-registration path and fail-closed behavior", async () => {
+    expect((await readdir(build10007ArtifactDirectory)).sort()).toEqual([
+      "ATTACK_SURFACE.md",
+      "TRACES.md",
+    ]);
+    const attackSurface = await Bun.file(
+      new URL("ATTACK_SURFACE.md", build10007ArtifactDirectory),
+    ).text();
+    expect(attackSurface).toContain("Duplicate-registration path");
+    expect(attackSurface).toContain("fails closed");
+    expect(attackSurface).toContain("does not spawn any worker");
+  });
+
+  it("traces ISC-000 through ISC-002 as whole tokens", async () => {
+    const traces = await Bun.file(
+      new URL("TRACES.md", build10007ArtifactDirectory),
+    ).text();
+    for (const identifier of ["ISC-000", "ISC-001", "ISC-002"] as const) {
+      expect(new RegExp(`\\b${identifier}\\b`).test(traces), identifier).toBe(true);
+    }
   });
 });
 
