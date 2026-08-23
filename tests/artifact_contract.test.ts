@@ -33,6 +33,10 @@ const build10011ArtifactDirectory = new URL(
   "../docs/builds/10011-reconcile-feat-herdr-omp-fleet-with-main-so-that/",
   import.meta.url,
 );
+const build10013ArtifactDirectory = new URL(
+  "../docs/builds/10013-reconcile-feat-herdr-omp-fleet-with-main-so-that/",
+  import.meta.url,
+);
 const build10008ArtifactDirectory = new URL(
   "../docs/builds/10008-fix-agentos-up-so-a-failed-worker-identity-query/",
   import.meta.url,
@@ -381,6 +385,48 @@ describe("build 10011 follow-up reconciliation artifact contract", () => {
   it("records a non-empty chosen side and reason for every conflicting file", async () => {
     const decisions = await Bun.file(
       new URL("DECISIONS.md", build10011ArtifactDirectory),
+    ).text();
+    for (const filename of followUpConflictFiles) {
+      const decision = reconciliationDecision(decisions, filename);
+      expect(decision, filename).not.toBeNull();
+      expect(decision?.side.length, `${filename} has no chosen side`).toBeGreaterThan(0);
+      expect(decision?.reason.length, `${filename} has no reason`).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("build 10013 follow-up 2 reconciliation artifact contract", () => {
+  it("uses the canonical real directory with exactly the four governed files", async () => {
+    expect(await realpath(build10013ArtifactDirectory)).toBe(
+      resolve(fileURLToPath(build10013ArtifactDirectory)),
+    );
+    expect((await readdir(build10013ArtifactDirectory)).sort()).toEqual(
+      [...requiredArtifacts].sort(),
+    );
+  });
+
+  it("accepts every artifact and ISC-000 through ISC-003 as whole tokens", async () => {
+    expect(
+      await inspectArtifactDirectory(
+        build10013ArtifactDirectory,
+        reconciliationRequiredIdentifiers,
+      ),
+    ).toEqual([]);
+
+    const traces = await Bun.file(
+      new URL("TRACES.md", build10013ArtifactDirectory),
+    ).text();
+    for (const identifier of reconciliationRequiredIdentifiers) {
+      expect(
+        traces.match(new RegExp(`\\b${identifier}\\b`, "g"))?.length ?? 0,
+        identifier,
+      ).toBe(1);
+    }
+  });
+
+  it("records a non-empty chosen side and reason for every conflicting file", async () => {
+    const decisions = await Bun.file(
+      new URL("DECISIONS.md", build10013ArtifactDirectory),
     ).text();
     for (const filename of followUpConflictFiles) {
       const decision = reconciliationDecision(decisions, filename);

@@ -553,6 +553,9 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
         iterations += 1;
 
         let calls: Vec<FunctionCall> = tool_calls.iter().filter_map(parse_function_call).collect();
+        if calls.is_empty() {
+            break;
+        }
 
         let mut tool_results = Vec::new();
         for tc in &calls {
@@ -1641,6 +1644,41 @@ mod tests {
         ];
         let calls: Vec<FunctionCall> = tool_calls.iter().filter_map(parse_function_call).collect();
         assert_eq!(calls.len(), 0);
+    }
+
+    #[test]
+    fn parse_function_call_rejects_empty_call_id() {
+        assert!(
+            parse_function_call(&json!({ "callId": "", "id": "state::get", "arguments": {} }),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_function_call_rejects_empty_function_id() {
+        assert!(
+            parse_function_call(&json!({ "callId": "call-1", "id": "", "arguments": {} }),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_function_call_handles_boundaries_and_invalid_shapes() {
+        let call = parse_function_call(&json!({ "callId": "c", "id": "x", "arguments": null }))
+            .expect("single-character identifiers are non-empty");
+        assert_eq!(call.call_id, "c");
+        assert_eq!(call.id, "x");
+        assert_eq!(call.arguments, Value::Null);
+
+        for malformed in [
+            Value::Null,
+            json!({}),
+            json!({ "callId": null, "id": "state::get", "arguments": {} }),
+            json!({ "callId": "call-1", "id": null, "arguments": {} }),
+            json!({ "callId": "call-1", "id": "state::get" }),
+        ] {
+            assert!(parse_function_call(&malformed).is_none());
+        }
     }
 
     #[test]

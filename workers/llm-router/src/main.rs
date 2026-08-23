@@ -1020,8 +1020,11 @@ fn function_calls(driver: Driver, result: &Value, aliases: &ToolAliases) -> Vec<
                         let call = part.get("functionCall")?;
                         let id = aliases.function_id(call["name"].as_str()?)?.to_string();
                         let call_id = match call.get("id") {
-                            Some(id) => id.as_str()?.to_string(),
-                            None => format!("gemini-{candidate_index}-{part_index}"),
+                            Some(Value::String(id)) if !id.is_empty() => id.clone(),
+                            Some(Value::String(_)) | None => {
+                                format!("gemini-{candidate_index}-{part_index}")
+                            }
+                            Some(_) => return None,
                         };
                         FunctionCall::normalized(call_id, id, function_arguments(call.get("args")))
                     })
@@ -1986,6 +1989,46 @@ mod tests {
     }
 
     #[test]
+    fn normalized_function_call_rejects_empty_call_id() {
+        assert_eq!(
+            FunctionCall::normalized(String::new(), "state::get".into(), json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn normalized_function_call_rejects_empty_function_id() {
+        assert_eq!(
+            FunctionCall::normalized("call-1".into(), String::new(), json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn normalized_function_call_value_handles_boundaries_and_invalid_shapes() {
+        assert_eq!(
+            FunctionCall::from_normalized_value(
+                json!({ "callId": "c", "id": "x", "arguments": null }),
+            ),
+            Some(FunctionCall {
+                call_id: "c".into(),
+                id: "x".into(),
+                arguments: Value::Null,
+            })
+        );
+
+        for malformed in [
+            Value::Null,
+            json!({}),
+            json!({ "callId": null, "id": "state::get", "arguments": {} }),
+            json!({ "callId": "call-1", "id": null, "arguments": {} }),
+            json!({ "callId": 1, "id": "state::get", "arguments": {} }),
+        ] {
+            assert_eq!(FunctionCall::from_normalized_value(malformed), None);
+        }
+    }
+
+    #[test]
     fn function_call_normalization_handles_empty_missing_and_malformed_fields() {
         let aliases = aliases(&["state::get", "state::set", "queue::publish"]);
         for driver in [
@@ -2081,12 +2124,11 @@ mod tests {
     }
 
     #[test]
-    fn gemini_function_call_normalization_rejects_empty_ids_and_unknown_aliases() {
+    fn gemini_function_call_normalization_replaces_empty_ids_and_rejects_unknown_aliases() {
         let aliases = aliases(&["state::get"]);
         let gemini = json!({
             "candidates": [{ "content": { "parts": [
                 { "functionCall": { "id": "", "name": "state__get", "args": null } },
-                { "functionCall": { "name": "state__get", "args": null } },
                 { "functionCall": { "id": "call-1", "name": "" } },
                 { "functionCall": { "id": "call-2", "name": "unknown" } },
             ] } }],
@@ -2094,7 +2136,7 @@ mod tests {
         assert_eq!(
             function_calls(Driver::Gemini, &gemini, &aliases),
             vec![FunctionCall {
-                call_id: "gemini-0-1".into(),
+                call_id: "gemini-0-0".into(),
                 id: "state::get".into(),
                 arguments: Value::Null,
             }]
