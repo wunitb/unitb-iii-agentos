@@ -37,6 +37,10 @@ const build10013ArtifactDirectory = new URL(
   "../docs/builds/10013-reconcile-feat-herdr-omp-fleet-with-main-so-that/",
   import.meta.url,
 );
+const build10014ArtifactDirectory = new URL(
+  "../docs/builds/10014-provider-adapters-must-not-forward-an-assistant/",
+  import.meta.url,
+);
 const build10008ArtifactDirectory = new URL(
   "../docs/builds/10008-fix-agentos-up-so-a-failed-worker-identity-query/",
   import.meta.url,
@@ -64,6 +68,7 @@ const reconciliationRequiredIdentifiers = [
   "ISC-002",
   "ISC-003",
 ] as const;
+const assistantAdapterRequiredIdentifiers = ["ISC-000", "ISC-001", "ISC-002"] as const;
 const reconciliationConflictFiles = [
   "README.md",
   "crates/cli/src/bootstrap.rs",
@@ -434,6 +439,44 @@ describe("build 10013 follow-up 2 reconciliation artifact contract", () => {
       expect(decision?.side.length, `${filename} has no chosen side`).toBeGreaterThan(0);
       expect(decision?.reason.length, `${filename} has no reason`).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("build 10014 provider adapter artifact contract", () => {
+  it("uses the canonical real directory with exactly the four governed files", async () => {
+    expect(await realpath(build10014ArtifactDirectory)).toBe(
+      resolve(fileURLToPath(build10014ArtifactDirectory)),
+    );
+    expect((await readdir(build10014ArtifactDirectory)).sort()).toEqual(
+      [...requiredArtifacts].sort(),
+    );
+  });
+
+  it("accepts every artifact and ISC-000 through ISC-002 as whole tokens", async () => {
+    expect(
+      await inspectArtifactDirectory(
+        build10014ArtifactDirectory,
+        assistantAdapterRequiredIdentifiers,
+      ),
+    ).toEqual([]);
+
+    const traces = await Bun.file(
+      new URL("TRACES.md", build10014ArtifactDirectory),
+    ).text();
+    for (const identifier of assistantAdapterRequiredIdentifiers) {
+      expect(new RegExp(`\\b${identifier}\\b`).test(traces), identifier).toBe(true);
+    }
+  });
+
+  it("states the adapter-scoped history filtering boundary", async () => {
+    const attackSurface = await Bun.file(
+      new URL("ATTACK_SURFACE.md", build10014ArtifactDirectory),
+    ).text();
+    expect(attackSurface).toContain("not a global history filter");
+    expect(attackSurface).toContain("openai_messages");
+    expect(attackSurface).toContain("anthropic_messages");
+    expect(attackSurface).toContain("persisted sessions");
+    expect(attackSurface).toContain("Gemini");
   });
 });
 
