@@ -1,4 +1,4 @@
-# Build 10039 Invariants
+# Build 10040 Invariants
 
 ## Delivered-content contract
 
@@ -19,6 +19,6 @@ it neither removes nor weakens any other test.
 ## Scope
 
 This build adds its governed artifacts only at
-`docs/builds/10039-repair-the-reconciliation-contract-test-which-ha/`, adds one
+`docs/builds/10040-repair-the-reconciliation-contract-test-which-ha/`, adds one
 dated decision, and changes the reconciliation contract test. It does not edit
 source code, workflows, other tests, or any earlier build record.

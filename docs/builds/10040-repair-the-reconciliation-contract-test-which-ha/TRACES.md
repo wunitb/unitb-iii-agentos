@@ -1,4 +1,4 @@
-# Build 10039 Traces
+# Build 10040 Traces
 
 ## Acceptance traceability
 
@@ -28,7 +28,7 @@
 | `git merge-base --is-ancestor 5490d3b8c00149ea100b419a600672ad01f9dbf0 HEAD` on the result branch | Exit 1, confirming the throwaway deletion commit is not an ancestor of the result branch. |
 | `git diff --check main` | Exit 0; no whitespace errors. |
 | `git diff --name-only main` | Exit 0; reported only the test, dated decision, and four files in this build's exact governed directory. |
-| `find docs/builds/10039-repair-the-reconciliation-contract-test-which-ha -maxdepth 1 -type f` with filename and byte-count checks | Exit 0; exactly the four required substantive files were present. |
+| `find docs/builds/10040-repair-the-reconciliation-contract-test-which-ha -maxdepth 1 -type f` with filename and byte-count checks | Exit 0; exactly the four required substantive files were present. |
 
 The negative probe exercised the committed replacement test, not a modified
 copy of the test. Its only mutation was the prescribed artifact deletion.
