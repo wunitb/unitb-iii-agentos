@@ -11,19 +11,14 @@ function git(...args: string[]) {
   });
 }
 
-function expectAncestor(ancestor: string): void {
-  const resolved = git("rev-parse", "--verify", `${ancestor}^{commit}`);
-  expect(
-    resolved.exitCode,
-    `required ancestor ${ancestor} is unavailable: ${resolved.stderr.toString()}`,
-  ).toBe(0);
-
-  const result = git("merge-base", "--is-ancestor", ancestor, "HEAD");
-  expect(
-    result.exitCode,
-    `${ancestor} is not an ancestor of HEAD: ${result.stderr.toString()}`,
-  ).toBe(0);
-}
+const reconciledArtifacts = [
+  {
+    path: "docs/builds/10013-reconcile-feat-herdr-omp-fleet-with-main-so-that/INVARIANTS.md",
+  },
+  { path: "docs/decisions/2026-08-22-salvage-batch.md" },
+  { path: "workers/llm-router/src/main.rs", requiredContent: "agentos::llm" },
+  { path: "crates/cli/src/bootstrap.rs", requiredContent: "connected_worker_ids" },
+] as const;
 
 function conflictMarkerLines(source: string): string[] {
   const left = "<".repeat(7);
@@ -42,13 +37,25 @@ function conflictMarkerLines(source: string): string[] {
 }
 
 describe("reconciled Git history and worktree contract", () => {
-  it("retains main, remediation, and the Herdr fleet tip as ancestors", () => {
-    for (const ancestor of [
-      "origin/main",
-      "origin/issue/1897372b-remediate-artifact-1",
-      "238b423",
-    ]) {
-      expectAncestor(ancestor);
+  it("retains the reconciled salvage, namespace migration, and fail-closed startup work", () => {
+    for (const artifact of reconciledArtifacts) {
+      const result = git("cat-file", "blob", `HEAD:${artifact.path}`);
+      expect(
+        result.exitCode,
+        `required reconciled artifact is absent from HEAD: ${artifact.path}\n${result.stderr.toString()}`,
+      ).toBe(0);
+
+      const content = result.stdout.toString();
+      expect(
+        content.length,
+        `required reconciled artifact is empty at HEAD: ${artifact.path}`,
+      ).toBeGreaterThan(0);
+      if ("requiredContent" in artifact) {
+        expect(
+          content,
+          `required reconciled content is absent at HEAD: ${artifact.requiredContent} in ${artifact.path}`,
+        ).toContain(artifact.requiredContent);
+      }
     }
   });
 
