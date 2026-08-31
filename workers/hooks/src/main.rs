@@ -117,10 +117,10 @@ async fn load_hooks(iii: &IIIClient) -> Result<Vec<HookDefinition>, Error> {
     for e in entries {
         // entries can be either {key, value} or just the value, depending on engine
         let v = e.get("value").cloned().unwrap_or(e);
-        if let Ok(h) = serde_json::from_value::<HookDefinition>(v) {
-            if !h.id.is_empty() {
-                out.push(h);
-            }
+        if let Ok(h) = serde_json::from_value::<HookDefinition>(v)
+            && !h.id.is_empty()
+        {
+            out.push(h);
         }
     }
     Ok(out)
@@ -348,12 +348,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 break;
                             }
 
-                            if hook_type == "BeforePromptBuild" {
-                                if let Some(mp) = res.get("modifiedPayload") {
-                                    if !mp.is_null() {
-                                        modified_payload = mp.clone();
-                                    }
-                                }
+                            if hook_type == "BeforePromptBuild"
+                                && let Some(mp) = res.get("modifiedPayload")
+                                && !mp.is_null()
+                            {
+                                modified_payload = mp.clone();
                             }
 
                             results.push(Value::Object(hook_result));

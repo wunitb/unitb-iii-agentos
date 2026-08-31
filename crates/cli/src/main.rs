@@ -1318,7 +1318,7 @@ async fn main() -> Result<()> {
                     None => input,
                 };
                 let workflow_input = raw_input
-                    .map(|raw| serde_json::from_str(&raw).unwrap_or_else(|_| Value::String(raw)))
+                    .map(|raw| serde_json::from_str(&raw).unwrap_or(Value::String(raw)))
                     .unwrap_or(Value::Null);
                 let mut body = json!({ "workflowId": id, "input": workflow_input });
                 if let Some(agent) = agent {

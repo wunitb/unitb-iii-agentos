@@ -28,8 +28,7 @@ fn assert_path_contained(resolved: &Path) -> Result<(), Error> {
 
 /// JS expression `(hash << 5) - hash + ch + seed | 0` — mirror with i32 wrapping.
 pub fn compute_line_hash(line_number: i64, content: &str) -> String {
-    let stripped: &str =
-        content.trim_end_matches(|c: char| c == ' ' || c == '\t' || c == '\n' || c == '\r');
+    let stripped: &str = content.trim_end_matches([' ', '\t', '\n', '\r']);
     let has_alnum = stripped.chars().any(|c| c.is_alphanumeric());
     let seed: i32 = if has_alnum { 0 } else { line_number as i32 };
 
@@ -263,10 +262,10 @@ fn format_region(lines: &[String], start_line: usize, end_line: usize) -> Vec<St
 }
 
 fn extract_body(input: &Value) -> Value {
-    if let Some(b) = input.get("body") {
-        if !b.is_null() {
-            return b.clone();
-        }
+    if let Some(b) = input.get("body")
+        && !b.is_null()
+    {
+        return b.clone();
     }
     input.clone()
 }

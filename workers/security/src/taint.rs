@@ -113,6 +113,117 @@ fn parse_sink(s: &str) -> Option<TaintSink> {
     }
 }
 
+pub fn register(iii: &IIIClient) {
+    let _iii_declassify = iii.clone();
+    iii.register_function(
+        "taint::label",
+        RegisterFunction::new_async(move |input: Value| async move {
+            let value = input.get("value").cloned().unwrap_or(json!(null));
+            let label_strs = input["labels"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            let labels: Vec<TaintLabel> =
+                label_strs.iter().filter_map(|s| parse_label(s)).collect();
+
+            let tainted = TaintedValue::new(value, TaintSet::from_labels(labels));
+            serde_json::to_value(tainted).map_err(|e| Error::Handler(e.to_string()))
+        })
+        .description("Apply taint labels to a value"),
+    );
+
+    iii.register_function(
+        "taint::check",
+        RegisterFunction::new_async(move |input: Value| async move {
+            let taint_set: TaintSet = serde_json::from_value(
+                input
+                    .get("taints")
+                    .cloned()
+                    .unwrap_or(json!({ "labels": [] })),
+            )
+            .map_err(|e| Error::Handler(e.to_string()))?;
+
+            let sink_str = input["sink"].as_str().unwrap_or("");
+            let sink = parse_sink(sink_str)
+                .ok_or_else(|| Error::Handler(format!("Unknown sink: {}", sink_str)))?;
+
+            let allowed = can_flow_to(&taint_set, &sink);
+            let blocking_labels: Vec<&TaintLabel> = if !allowed {
+                taint_set.labels().iter().collect()
+            } else {
+                vec![]
+            };
+
+            Ok::<Value, Error>(json!({
+                "allowed": allowed,
+                "sink": sink_str,
+                "blockingLabels": blocking_labels,
+            }))
+        })
+        .description("Check if tainted value can flow to a sink"),
+    );
+
+    let iii_for_declassify = _iii_declassify;
+    iii.register_function(
+        "taint::declassify",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_for_declassify.clone();
+            async move {
+                let mut taint_set: TaintSet = serde_json::from_value(
+                    input
+                        .get("taints")
+                        .cloned()
+                        .unwrap_or(json!({ "labels": [] })),
+                )
+                .map_err(|e| Error::Handler(e.to_string()))?;
+
+                let remove_strs = input["remove"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                for s in &remove_strs {
+                    if let Some(label) = parse_label(s) {
+                        taint_set.declassify(&label);
+                    }
+                }
+
+                {
+                    let _iii = iii.clone();
+                    let _payload = json!({
+                        "type": "taint_declassified",
+                        "detail": { "removedLabels": &remove_strs },
+                    });
+                    tokio::spawn(async move {
+                        let _ = _iii
+                            .trigger(TriggerRequest {
+                                function_id: "security::audit".to_string(),
+                                payload: _payload,
+                                action: None,
+                                timeout_ms: None,
+                            })
+                            .await;
+                    });
+                };
+
+                let value = input.get("value").cloned().unwrap_or(json!(null));
+                let result = TaintedValue::new(value, taint_set);
+                serde_json::to_value(result).map_err(|e| Error::Handler(e.to_string()))
+            }
+        })
+        .description("Remove taint labels from a value"),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,7 +640,7 @@ mod tests {
     #[test]
     fn test_taint_label_clone_and_copy() {
         let label = TaintLabel::Secret;
-        let cloned = label.clone();
+        let cloned = label;
         let copied = label;
         assert_eq!(label, cloned);
         assert_eq!(label, copied);
@@ -612,115 +723,4 @@ mod tests {
         assert_eq!(parse_sink("networkSend"), None);
         assert_eq!(parse_sink("filewrite"), None);
     }
-}
-
-pub fn register(iii: &IIIClient) {
-    let _iii_declassify = iii.clone();
-    iii.register_function(
-        "taint::label",
-        RegisterFunction::new_async(move |input: Value| async move {
-            let value = input.get("value").cloned().unwrap_or(json!(null));
-            let label_strs = input["labels"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-
-            let labels: Vec<TaintLabel> =
-                label_strs.iter().filter_map(|s| parse_label(s)).collect();
-
-            let tainted = TaintedValue::new(value, TaintSet::from_labels(labels));
-            serde_json::to_value(tainted).map_err(|e| Error::Handler(e.to_string()))
-        })
-        .description("Apply taint labels to a value"),
-    );
-
-    iii.register_function(
-        "taint::check",
-        RegisterFunction::new_async(move |input: Value| async move {
-            let taint_set: TaintSet = serde_json::from_value(
-                input
-                    .get("taints")
-                    .cloned()
-                    .unwrap_or(json!({ "labels": [] })),
-            )
-            .map_err(|e| Error::Handler(e.to_string()))?;
-
-            let sink_str = input["sink"].as_str().unwrap_or("");
-            let sink = parse_sink(sink_str)
-                .ok_or_else(|| Error::Handler(format!("Unknown sink: {}", sink_str)))?;
-
-            let allowed = can_flow_to(&taint_set, &sink);
-            let blocking_labels: Vec<&TaintLabel> = if !allowed {
-                taint_set.labels().iter().collect()
-            } else {
-                vec![]
-            };
-
-            Ok::<Value, Error>(json!({
-                "allowed": allowed,
-                "sink": sink_str,
-                "blockingLabels": blocking_labels,
-            }))
-        })
-        .description("Check if tainted value can flow to a sink"),
-    );
-
-    let iii_for_declassify = _iii_declassify;
-    iii.register_function(
-        "taint::declassify",
-        RegisterFunction::new_async(move |input: Value| {
-            let iii = iii_for_declassify.clone();
-            async move {
-                let mut taint_set: TaintSet = serde_json::from_value(
-                    input
-                        .get("taints")
-                        .cloned()
-                        .unwrap_or(json!({ "labels": [] })),
-                )
-                .map_err(|e| Error::Handler(e.to_string()))?;
-
-                let remove_strs = input["remove"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-
-                for s in &remove_strs {
-                    if let Some(label) = parse_label(s) {
-                        taint_set.declassify(&label);
-                    }
-                }
-
-                let _ = {
-                    let _iii = iii.clone();
-                    let _payload = json!({
-                        "type": "taint_declassified",
-                        "detail": { "removedLabels": &remove_strs },
-                    });
-                    tokio::spawn(async move {
-                        let _ = _iii
-                            .trigger(TriggerRequest {
-                                function_id: "security::audit".to_string(),
-                                payload: _payload,
-                                action: None,
-                                timeout_ms: None,
-                            })
-                            .await;
-                    });
-                };
-
-                let value = input.get("value").cloned().unwrap_or(json!(null));
-                let result = TaintedValue::new(value, taint_set);
-                serde_json::to_value(result).map_err(|e| Error::Handler(e.to_string()))
-            }
-        })
-        .description("Remove taint labels from a value"),
-    );
 }

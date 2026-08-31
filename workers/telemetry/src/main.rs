@@ -73,7 +73,7 @@ fn dashboard() -> Result<Value, Error> {
     let rss_mb = mem.rss as f64 / 1024.0 / 1024.0;
     let heap_mb = mem.heap_used as f64 / 1024.0 / 1024.0;
 
-    let lines = vec![
+    let lines = [
         format!("Memory RSS: {:.1} MB", rss_mb),
         format!("Heap Used: {:.1} MB", heap_mb),
         format!("Uptime: {:.0} s", uptime),

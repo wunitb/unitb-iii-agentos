@@ -51,7 +51,7 @@ That's the whole protocol. Workers stay narrow; everything else lives in the eng
 # 1. clone this repository
 git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos
 
-# 2. install the pinned iii v0.22.1 release with checksum verification
+# 2. install the stable iii version pinned in .iii-version with checksum verification
 bash scripts/install-iii.sh
 
 # 3. configure the local model proxy
@@ -67,7 +67,9 @@ cargo build --workspace --release
 
 Quickstart uses the local Codex proxy at `http://127.0.0.1:8317/v1`.
 Anthropic is optional and selected only by an explicit provider/model or when
-no configured local default exists.
+no configured local default exists. Set `AGENTOS_API_KEY` in the mode-600 `.env`;
+every HTTP route is authenticated except routes explicitly registered with
+`auth: false` such as `/api/health`. There is no global auth-disable switch.
 
 `agentos up` runs one ordered policy and never builds or installs anything: it
 resolves the config, verifies the iii binary (missing → `bash scripts/install-iii.sh`),
@@ -121,6 +123,9 @@ agentos up
 ```
 
 The installer needs network access, `curl`, `tar`, and `sha256sum` or `shasum`.
+Every release also publishes an SPDX JSON SBOM and GitHub build-provenance
+attestation for each native bundle; CI verifies both checksum and attestation
+before publication.
 It installs the CLI in `$HOME/.local/bin` by default and places the replaceable
 runtime payload at `$HOME/.agentos/runtime`. Set `BIN_DIR` or `PREFIX` for the
 CLI destination and set `AGENTOS_HOME` for the runtime/state root. A non-empty
@@ -141,8 +146,10 @@ start from any working directory without a checkout. Upgrades replace release
 payload while retaining operator configuration, `$AGENTOS_HOME/runtime/data/**`,
 and the runtime `.env` file.
 
-The engine must be iii `v0.22.1`, installed in `PATH` or by
-`bash scripts/install-iii.sh` (which downloads and verifies it). The embedding
+The engine must match the stable version in `.iii-version` (`v0.22.1`),
+installed in `PATH` or by `bash scripts/install-iii.sh` (which downloads and
+verifies it). Installers reject prerelease pins unless a maintainer explicitly
+changes the repository contract. The embedding
 worker needs Python `>=3.11`, a working `venv` module, and `ensurepip`.
 Its setup installs the core `iii-sdk` dependency without downloading the
 optional `sentence-transformers`/`torch` model stack; absent those packages,
@@ -289,10 +296,12 @@ If the engine is offline or no workers are connected, the TUI shows a first-run 
 ## § 11 · Build and test
 
 ```bash
-cargo build --workspace --release                                    # 62 Rust workers + CLI + TUI + HTTP adapter
-cargo test --workspace --release                                     # 1,413 Rust tests; 3 live-engine checks ignored by default
-uv run --no-project --with pytest python -m pytest workers/embedding/test_main.py -q  # 161 Python tests
-npm ci && npm run test:e2e                                           # live engine + workers; model credentials required for chat
+rustup run 1.90 cargo fmt --all -- --check
+rustup run 1.90 cargo clippy --workspace --all-targets --locked -- -D warnings
+rustup run 1.90 cargo test --workspace --release --locked
+bun run check                                                        # strict TS + source-only contracts + website build
+python -m pytest workers/embedding/test_main.py -q
+bun run test:e2e                                                     # live engine + workers; model credentials required
 ```
 
 The Rust commands are offline only when the Rust toolchain and all locked
@@ -305,11 +314,12 @@ model credentials for chat assertions.
 
 | | version |
 |---|---|
-| iii engine | pinned at `v0.22.1` by `scripts/install-iii.sh` |
-| iii-sdk (Rust) | pinned at `=0.22.1` in workspace |
-| iii-sdk (Node) | pinned at `0.22.1` for the e2e harness |
-| iii-sdk (Python) | pinned at `0.22.1` for the embedding worker |
-| agentos | `0.1.0` — first UnitB-owned release on iii v0.22.1 |
+| iii version contract | `.iii-version` contains stable `0.22.1` |
+| iii engine | installers consume `.iii-version` and verify upstream checksums |
+| iii-sdk (Rust) | pinned at `=0.22.1`; contract test checks every manifest |
+| iii-sdk (Node) | pinned at `0.22.1`; root package manager is Bun |
+| iii-sdk (Python) | pinned at `0.22.1`; worker manifest and pyproject are checked |
+| agentos | `0.1.0` — stable contract on iii v0.22.1 |
 
 ## § 13 · Provenance and license
 

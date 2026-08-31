@@ -912,6 +912,10 @@ async fn call_anthropic(
     Ok(resp)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "provider boundary mirrors the upstream chat request fields"
+)]
 async fn call_openai_compat(
     client: &reqwest::Client,
     base_url: &str,
@@ -945,6 +949,10 @@ async fn call_openai_compat(
     Ok(resp)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "provider boundary mirrors the upstream chat request fields"
+)]
 async fn call_gemini(
     client: &reqwest::Client,
     base_url: &str,
@@ -1303,10 +1311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let shared_client = reqwest::Client::new();
-    let direct_client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("build direct HTTP client");
+    let direct_client = reqwest::Client::builder().no_proxy().build()?;
 
     {
         let state = state.clone();
@@ -2712,7 +2717,7 @@ mod tests {
         let providers = default_providers();
         for (name, _, _, _, models) in &providers {
             assert!(
-                models.len() >= 1,
+                !models.is_empty(),
                 "Provider {} should have at least 1 model",
                 name
             );

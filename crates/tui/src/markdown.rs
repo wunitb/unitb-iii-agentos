@@ -73,11 +73,11 @@ pub fn render(body: &str) -> Vec<Line<'static>> {
             ]));
             continue;
         }
-        if line.starts_with("> ") {
+        if let Some(rest) = line.strip_prefix("> ") {
             out.push(Line::from(vec![
                 Span::styled("│ ", Style::default().fg(theme::MUTED)),
                 Span::styled(
-                    line[2..].to_string(),
+                    rest.to_string(),
                     Style::default()
                         .fg(theme::MUTED)
                         .add_modifier(Modifier::ITALIC),

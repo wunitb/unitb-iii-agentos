@@ -623,28 +623,24 @@ impl App {
                     .send()
                     .await
                     && let Ok(data) = resp.json::<Value>().await
+                    && let Some(plans) = data["plans"].as_array()
                 {
-                    if let Some(plans) = data["plans"].as_array() {
-                        let mut all_tasks = vec![];
-                        for plan in plans {
-                            if let Some(root_id) =
-                                plan["rootTaskId"].as_str().or(plan["rootId"].as_str())
-                            {
-                                if let Ok(task_resp) = client
-                                    .post(format!("{}/api/tasks/list", API_BASE))
-                                    .json(&serde_json::json!({ "rootId": root_id }))
-                                    .send()
-                                    .await
-                                    && let Ok(task_data) = task_resp.json::<Value>().await
-                                {
-                                    if let Some(tasks) = task_data["tasks"].as_array() {
-                                        all_tasks.extend(tasks.clone());
-                                    }
-                                }
-                            }
+                    let mut all_tasks = vec![];
+                    for plan in plans {
+                        if let Some(root_id) =
+                            plan["rootTaskId"].as_str().or(plan["rootId"].as_str())
+                            && let Ok(task_resp) = client
+                                .post(format!("{}/api/tasks/list", API_BASE))
+                                .json(&serde_json::json!({ "rootId": root_id }))
+                                .send()
+                                .await
+                            && let Ok(task_data) = task_resp.json::<Value>().await
+                            && let Some(tasks) = task_data["tasks"].as_array()
+                        {
+                            all_tasks.extend(tasks.clone());
                         }
-                        self.task_tree = all_tasks;
                     }
+                    self.task_tree = all_tasks;
                 }
             }
             Screen::Recovery => {
@@ -1050,14 +1046,13 @@ fn chat_request_body(message: &str, agent_id: &str, realm: &str) -> Value {
 }
 
 fn parse_chat_response(body: &str) -> String {
-    if let Ok(json) = serde_json::from_str::<Value>(body) {
-        if let Some(s) = json["content"]
+    if let Ok(json) = serde_json::from_str::<Value>(body)
+        && let Some(s) = json["content"]
             .as_str()
             .or_else(|| json["response"].as_str())
             .or_else(|| json["message"].as_str())
-        {
-            return s.to_string();
-        }
+    {
+        return s.to_string();
     }
     let mut out = String::new();
     for line in body.split('\n') {
@@ -1119,11 +1114,11 @@ async fn main() -> Result<()> {
             last_health = std::time::Instant::now();
         }
 
-        if let Some(timeout) = app.chord_timeout {
-            if timeout.elapsed() > std::time::Duration::from_secs(2) {
-                app.pending_chord = None;
-                app.chord_timeout = None;
-            }
+        if let Some(timeout) = app.chord_timeout
+            && timeout.elapsed() > std::time::Duration::from_secs(2)
+        {
+            app.pending_chord = None;
+            app.chord_timeout = None;
         }
 
         if event::poll(std::time::Duration::from_millis(SPINNER_INTERVAL_MS))?
@@ -1485,11 +1480,7 @@ async fn main() -> Result<()> {
                 KeyCode::Char('w') => navigate_to(&mut app, Screen::Wizard),
                 KeyCode::Char('r') => app.refresh_screen().await,
                 KeyCode::Char('a') if app.screen == Screen::Approvals => {
-                    if app.approval_mode {
-                        app.approve_selected().await;
-                    } else {
-                        app.approve_selected().await;
-                    }
+                    app.approve_selected().await;
                 }
                 KeyCode::Char('a') => navigate_to(&mut app, Screen::Audit),
                 KeyCode::Char('s') => navigate_to(&mut app, Screen::Security),
@@ -1501,11 +1492,7 @@ async fn main() -> Result<()> {
                 KeyCode::Char('R') => navigate_to(&mut app, Screen::Recovery),
                 KeyCode::Char('O') => navigate_to(&mut app, Screen::Orchestrator),
                 KeyCode::Char('d') if app.screen == Screen::Approvals => {
-                    if app.approval_mode {
-                        app.deny_selected().await;
-                    } else {
-                        app.deny_selected().await;
-                    }
+                    app.deny_selected().await;
                 }
                 KeyCode::Enter if app.screen == Screen::Approvals => {
                     if app.selected < app.approvals.len() {
@@ -1905,251 +1892,6 @@ fn draw_worker_picker(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_dashboard(f: &mut Frame, app: &App, block: Block, area: Rect) {
-    if !app.healthy {
-        let logo = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                r"     _                    _    ___  ____  ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                r"    / \   __ _  ___ _ __ | |_ / _ \/ ___| ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                r"   / _ \ / _` |/ _ \ '_ \| __| | | \___ \ ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                r"  / ___ \ (_| |  __/ | | | |_| |_| |___) |",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                r" /_/   \_\__, |\___|_| |_|\__|\___/|____/ ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                r"         |___/                             ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Agent Operating System v0.1.0",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Engine offline — waiting for connection...",
-                Style::default().fg(Color::Yellow),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Keybindings:",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "    1-0   Core screens (Dashboard, Agents, Chat...)",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "    m     Memory          a  Audit",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "    s     Security        p  Peers",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "    e     Extensions      t  Triggers",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "    u     Usage           T  Templates",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "    S     Settings        w  Wizard",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "    W     Wf Builder      L  Lifecycle",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "    K     Tasks           R  Recovery",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "    O     Orchestrator",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "    Tab / Shift-Tab to cycle screens",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "    Ctrl+X then k/r/e for chords",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "    r to refresh, q to quit",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ];
-        f.render_widget(Paragraph::new(logo).block(block), area);
-        return;
-    }
-
-    let stats = &app.dashboard_stats;
-    let agents = stats["agents"].as_u64().unwrap_or(0);
-    let skills = stats["skills"].as_u64().unwrap_or(0);
-    let hands = stats["hands"].as_u64().unwrap_or(0);
-    let workflows = stats["workflows"].as_u64().unwrap_or(0);
-    let sessions = stats["sessions"].as_u64().unwrap_or(0);
-    let approvals = stats["approvals"].as_u64().unwrap_or(0);
-    let requests = stats["requests"].as_u64().unwrap_or(0);
-    let cost = stats["cost"].as_f64().unwrap_or(0.0);
-    let tokens_total = stats["tokens"]["total"].as_u64().unwrap_or(0);
-    let tokens_input = stats["tokens"]["input"].as_u64().unwrap_or(0);
-    let tokens_output = stats["tokens"]["output"].as_u64().unwrap_or(0);
-    let uptime = stats["uptime"].as_f64().unwrap_or(0.0);
-
-    let uptime_str = if uptime < 60.0 {
-        format!("{}s", uptime as u64)
-    } else if uptime < 3600.0 {
-        format!("{}m {}s", (uptime / 60.0) as u64, (uptime % 60.0) as u64)
-    } else {
-        let h = (uptime / 3600.0) as u64;
-        let m = ((uptime % 3600.0) / 60.0) as u64;
-        format!("{}h {}m", h, m)
-    };
-
-    let text = vec![
-        Line::from(Span::styled(
-            "Agent Operating System",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "  Status:     ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                stats["status"].as_str().unwrap_or("unknown"),
-                Style::default().fg(Color::Green),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Uptime:     ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(uptime_str),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Resources",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(format!("    Agents:     {}", agents)),
-        Line::from(format!("    Skills:     {}", skills)),
-        Line::from(format!("    Hands:      {}", hands)),
-        Line::from(format!("    Workflows:  {}", workflows)),
-        Line::from(format!("    Sessions:   {}", sessions)),
-        Line::from(format!("    Approvals:  {} pending", approvals)),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Usage",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(format!("    Requests:   {}", requests)),
-        Line::from(format!(
-            "    Tokens:     {} (in: {} / out: {})",
-            tokens_total, tokens_input, tokens_output
-        )),
-        Line::from(format!("    Cost:       ${:.4}", cost)),
-        Line::from(""),
-        if let Some(ref err) = app.last_error {
-            Line::from(Span::styled(
-                format!("  Error: {}", err),
-                Style::default().fg(Color::Red),
-            ))
-        } else {
-            Line::from(Span::styled(
-                "  Press r to refresh, 1-0 to navigate",
-                Style::default().fg(Color::DarkGray),
-            ))
-        },
-    ];
-    f.render_widget(Paragraph::new(text).block(block), area);
-}
-
-fn draw_agents(f: &mut Frame, app: &App, block: Block, area: Rect) {
-    let rows: Vec<Row> = app
-        .agents
-        .iter()
-        .enumerate()
-        .map(|(i, a)| {
-            let style = if i == app.selected {
-                Style::default().bg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            let id = a["id"].as_str().or(a["name"].as_str()).unwrap_or("-");
-            let name = a["name"].as_str().unwrap_or("-");
-            let model = a["model"].as_str().unwrap_or("-");
-            let status = a["status"].as_str().unwrap_or("ready");
-            Row::new(vec![
-                Cell::from(truncate(id, 20)),
-                Cell::from(name.to_string()),
-                Cell::from(model.to_string()),
-                Cell::from(status_cell(status)),
-            ])
-            .style(style)
-        })
-        .collect();
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(25),
-            Constraint::Percentage(30),
-            Constraint::Percentage(25),
-            Constraint::Percentage(20),
-        ],
-    )
-    .header(
-        Row::new(["ID", "Name", "Model", "Status"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .block(block);
-
-    f.render_widget(table, area);
-}
-
 fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     let chat_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2332,54 +2074,6 @@ fn draw_channels(f: &mut Frame, app: &App, block: Block, area: Rect) {
     .header(
         Row::new(["Name", "Status", "Type", "Last Message"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .block(block);
-
-    f.render_widget(table, area);
-}
-
-fn draw_skills(f: &mut Frame, app: &App, block: Block, area: Rect) {
-    let rows: Vec<Row> = app
-        .skills
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let style = if i == app.selected {
-                Style::default().bg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            Row::new(vec![
-                Cell::from(
-                    s["id"]
-                        .as_str()
-                        .or(s["name"].as_str())
-                        .unwrap_or("-")
-                        .to_string(),
-                ),
-                Cell::from(s["category"].as_str().unwrap_or("-").to_string()),
-                Cell::from(
-                    s["name"]
-                        .as_str()
-                        .or(s["description"].as_str())
-                        .unwrap_or("-")
-                        .to_string(),
-                ),
-            ])
-            .style(style)
-        })
-        .collect();
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(30),
-            Constraint::Percentage(20),
-            Constraint::Percentage(50),
-        ],
-    )
-    .header(
-        Row::new(["ID", "Category", "Name"]).style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .block(block);
 
@@ -2680,44 +2374,6 @@ fn draw_approvals(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(table, area);
 }
 
-fn draw_logs(f: &mut Frame, app: &App, block: Block, area: Rect) {
-    let lines: Vec<Line> = app
-        .logs
-        .iter()
-        .map(|l| {
-            let text = if let Some(s) = l.as_str() {
-                s.to_string()
-            } else if let Some(obj) = l.as_object() {
-                let level = obj.get("level").and_then(|v| v.as_str()).unwrap_or("info");
-                let msg = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                let ts = obj.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
-                format!("[{}] {} {}", level.to_uppercase(), ts, msg)
-            } else {
-                l.to_string()
-            };
-
-            let color = if text.contains("ERROR") || text.contains("error") {
-                Color::Red
-            } else if text.contains("WARN") || text.contains("warn") {
-                Color::Yellow
-            } else if text.contains("INFO") || text.contains("info") {
-                Color::Green
-            } else {
-                Color::White
-            };
-            Line::from(Span::styled(text, Style::default().fg(color)))
-        })
-        .collect();
-
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .scroll((app.scroll_offset, 0))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
 fn draw_memory(f: &mut Frame, app: &App, block: Block, area: Rect) {
     let rows: Vec<Row> = app
         .memories
@@ -2759,69 +2415,6 @@ fn draw_memory(f: &mut Frame, app: &App, block: Block, area: Rect) {
     )
     .header(
         Row::new(["ID", "Type", "Score", "Preview", "Created"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .block(block);
-
-    f.render_widget(table, area);
-}
-
-fn draw_audit(f: &mut Frame, app: &App, block: Block, area: Rect) {
-    let rows: Vec<Row> = app
-        .audit_entries
-        .iter()
-        .enumerate()
-        .map(|(i, a)| {
-            let style = if i == app.selected {
-                Style::default().bg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            Row::new(vec![
-                Cell::from(
-                    a["action"]
-                        .as_str()
-                        .or(a["type"].as_str())
-                        .unwrap_or("-")
-                        .to_string(),
-                ),
-                Cell::from(
-                    a["agent"]
-                        .as_str()
-                        .or(a["agentId"].as_str())
-                        .unwrap_or("-")
-                        .to_string(),
-                ),
-                Cell::from(truncate(
-                    a["details"]
-                        .as_str()
-                        .or(a["message"].as_str())
-                        .unwrap_or("-"),
-                    30,
-                )),
-                Cell::from(
-                    a["timestamp"]
-                        .as_str()
-                        .or(a["createdAt"].as_str())
-                        .unwrap_or("-")
-                        .to_string(),
-                ),
-            ])
-            .style(style)
-        })
-        .collect();
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(20),
-            Constraint::Percentage(20),
-            Constraint::Percentage(35),
-            Constraint::Percentage(25),
-        ],
-    )
-    .header(
-        Row::new(["Action", "Agent", "Details", "Timestamp"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .block(block);
@@ -3171,31 +2764,6 @@ fn draw_usage(f: &mut Frame, app: &App, block: Block, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_settings(f: &mut Frame, app: &App, block: Block, area: Rect) {
-    let rows: Vec<Row> = app
-        .settings
-        .iter()
-        .enumerate()
-        .map(|(i, (k, v))| {
-            let style = if i == app.selected {
-                Style::default().bg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            Row::new(vec![Cell::from(k.as_str()), Cell::from(v.as_str())]).style(style)
-        })
-        .collect();
-
-    let table = Table::new(
-        rows,
-        [Constraint::Percentage(40), Constraint::Percentage(60)],
-    )
-    .header(Row::new(["Key", "Value"]).style(Style::default().add_modifier(Modifier::BOLD)))
-    .block(block);
-
-    f.render_widget(table, area);
-}
-
 fn draw_wizard(f: &mut Frame, app: &App, area: Rect) {
     let step_labels = [
         "API Key",
@@ -3500,7 +3068,7 @@ fn draw_tasks(f: &mut Frame, app: &App, block: Block, area: Rect) {
                     format!("{} ", status_icon),
                     Style::default().fg(status_color),
                 ),
-                Span::styled(format!("{}", task_id), Style::default().fg(Color::DarkGray)),
+                Span::styled(task_id.to_string(), Style::default().fg(Color::DarkGray)),
                 Span::raw(format!(" \u{2014} {}", task_name)),
             ])
             .style(row_style),
@@ -4296,7 +3864,6 @@ mod tests {
 
     #[test]
     fn test_spinner_frames_not_empty() {
-        assert!(!SPINNER_FRAMES.is_empty());
         assert_eq!(SPINNER_FRAMES.len(), 10);
     }
 

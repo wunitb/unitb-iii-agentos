@@ -1,6 +1,6 @@
 # UnitB AgentOS architecture
 
-This codebase is an independent continuation of `iii-experimental/agentos`, migrated to iii v0.22.1. AgentOS is an agent operating system built on the [iii engine](https://github.com/iii-hq/iii). The repo ships **63 narrow workers** (62 Rust workers and one Python worker), declarative config (hands, integrations, agents), and two surfaces (`crates/cli`, `crates/tui`). Everything coordinates through iii primitives — `register_function`, `register_trigger`, `iii.trigger` — over the engine's WebSocket on port 49134.
+This codebase is an independent continuation of `iii-experimental/agentos`, migrated to the stable iii version pinned in `.iii-version` (v0.22.1). AgentOS is an agent operating system built on the [iii engine](https://github.com/iii-hq/iii). The repo ships **63 narrow workers** (62 Rust workers and one Python worker), declarative config (hands, integrations, agents), and two surfaces (`crates/cli`, `crates/tui`). Everything coordinates through iii primitives — `register_function`, `register_trigger`, `iii.trigger` — over the engine's WebSocket on port 49134.
 
 ## Repository layout
 
@@ -57,7 +57,7 @@ CI's `validate iii.worker.yaml` job enforces this on every PR.
 
 ## Engine boot
 
-`config.yaml` uses iii v0.22.1's configuration-worker layout. It declares the file-backed configuration store plus seven baseline workers: `iii-http`, `state`, `iii-stream`, `queue`, `iii-pubsub`, `cron`, and `iii-observability`. The state, queue, and cron workers use the canonical 0.22.1 names; declaring their deprecated `iii-*` aliases alongside canonical workers makes the engine reject the config. Their committed values live in matching files under `config/`; `config.yaml` keeps only worker entries and migration breadcrumbs. AgentOS workers spawn alongside as separate processes — each connects to the engine WebSocket via `register_worker` and stays resident.
+`config.yaml` uses the `.iii-version` stable pin, currently iii v0.22.1, and its configuration-worker layout. It declares the file-backed configuration store plus seven baseline workers: `iii-http`, `state`, `iii-stream`, `queue`, `iii-pubsub`, `cron`, and `iii-observability`. The state, queue, and cron workers use the canonical 0.22.1 names; declaring their deprecated `iii-*` aliases alongside canonical workers makes the engine reject the config. Their committed values live in matching files under `config/`; `config.yaml` keeps only worker entries and migration breadcrumbs. AgentOS workers spawn alongside as separate processes — each connects to the engine WebSocket via `register_worker` and stays resident.
 
 The engine WebSocket endpoint is configurable via `III_URL` (default `ws://localhost:49134`).
 
@@ -101,11 +101,16 @@ CI's `no sandbox::* clash with builtin` job greps the workspace to ensure no age
 
 iii v0.22.1 exposes `state::update` / `stream::update` with `UpdateOp::set`, `UpdateOp::increment`, `UpdateOp::append`, plus nested shallow-merge paths. Workers prefer these over `state::list + state::set` race patterns when mutating lists or counters.
 
-`council::activity` still uses a manual hash-chain on `state::list + state::set` — a separate refactor will move it onto `UpdateOp::append` once the chain protocol tolerates concurrent appends without compare-and-swap.
+`coordination::{post,reply}` reserves a slot through an atomic `state::update`
+counter before persistence, reconciles pre-counter channel history on first use,
+and decrements the reservation on quota rejection or write failure. This prevents
+concurrent callers from crossing the per-channel post limit.
+
+`council::activity` retains its manual hash-chain on `state::list + state::set` because ordering and previous-hash validation are the protocol itself; replacing it requires compare-and-swap semantics, not an unguarded append.
 
 ## Surfaces (cli, tui)
 
-`crates/cli` and `crates/tui` are clients, not workers. They speak HTTP to `iii-http` on port 3111. They register no functions. Future work moves them onto the iii client SDK so they call workers via `iii.trigger` directly.
+`crates/cli` and `crates/tui` are clients, not workers. They speak HTTP to `iii-http` on port 3111. They register no functions. HTTP routes fail closed: protected routes require a non-empty `AGENTOS_API_KEY`; only triggers explicitly declaring `auth: false` bypass authentication, and there is no process-wide disable switch. Future work moves them onto the iii client SDK so they call workers via `iii.trigger` directly.
 
 ## Hands, integrations, agents, workflows
 

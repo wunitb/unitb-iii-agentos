@@ -165,7 +165,7 @@ fn resolve_http_auth(config: &mut Value) -> Result<Option<Arc<str>>, Error> {
         None => true,
     };
 
-    if !auth_required || auth_is_disabled() {
+    if !auth_required {
         return Ok(None);
     }
 
@@ -173,14 +173,9 @@ fn resolve_http_auth(config: &mut Value) -> Result<Option<Arc<str>>, Error> {
         .ok()
         .filter(|key| !key.is_empty())
         .ok_or_else(|| {
-            Error::Handler("AGENTOS_API_KEY is required unless AGENTOS_AUTH_DISABLED=1".to_string())
+            Error::Handler("AGENTOS_API_KEY is required for protected HTTP routes".to_string())
         })?;
     Ok(Some(Arc::from(key)))
-}
-
-fn auth_is_disabled() -> bool {
-    std::env::var("AGENTOS_AUTH_DISABLED")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"))
 }
 
 fn is_authorized(request: &Value, expected: &str) -> bool {

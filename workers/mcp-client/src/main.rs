@@ -807,7 +807,7 @@ async fn serve(state: Arc<State>, iii: &IIIClient, input: Value) -> Result<Value
     }).description("Handle incoming MCP JSON-RPC requests"));
 
     let trigger_ref = agentos_http_adapter::register_http_trigger(
-        &iii,
+        iii,
         "mcp::serve_handler",
         json!({ "http_method": "POST", "api_path": "mcp/rpc" }),
         None,

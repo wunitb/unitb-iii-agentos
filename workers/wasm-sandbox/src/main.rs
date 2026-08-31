@@ -421,6 +421,64 @@ async fn execute_wasm(iii: &IIIClient, cache: &ModuleCache, input: Value) -> Res
     }))
 }
 
+async fn validate_wasm(cache: &ModuleCache, input: Value) -> Result<Value, Error> {
+    let req: ValidateRequest =
+        serde_json::from_value(input).map_err(|e| Error::Handler(e.to_string()))?;
+
+    let module =
+        Module::new(&cache.engine, &req.wasm).map_err(|e| Error::Handler(e.to_string()))?;
+
+    let mut has_memory = false;
+    let mut has_alloc = false;
+    let mut has_execute = false;
+
+    for export in module.exports() {
+        match export.name() {
+            "memory" => {
+                if matches!(export.ty(), ExternType::Memory(_)) {
+                    has_memory = true;
+                }
+            }
+            "alloc" => {
+                if let ExternType::Func(ft) = export.ty() {
+                    has_alloc = ft.params().len() == 1 && ft.results().len() == 1;
+                }
+            }
+            "execute" => {
+                if let ExternType::Func(ft) = export.ty() {
+                    has_execute = ft.params().len() == 2 && ft.results().len() == 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !has_memory || !has_alloc || !has_execute {
+        let mut missing = Vec::new();
+        if !has_memory {
+            missing.push("memory");
+        }
+        if !has_alloc {
+            missing.push("alloc(size) -> ptr");
+        }
+        if !has_execute {
+            missing.push("execute(input_ptr, input_len) -> i64");
+        }
+        return Err(Error::Handler(format!(
+            "Module missing required exports: {}",
+            missing.join(", ")
+        )));
+    }
+
+    cache.modules.insert(req.module_id.clone(), module);
+
+    Ok(json!({
+        "valid": true,
+        "moduleId": req.module_id,
+        "cached": true,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1235,62 +1293,4 @@ mod tests {
         let req: ValidateRequest = serde_json::from_value(json_val).unwrap();
         assert_eq!(req.wasm[0..4], [0x00, 0x61, 0x73, 0x6D]);
     }
-}
-
-async fn validate_wasm(cache: &ModuleCache, input: Value) -> Result<Value, Error> {
-    let req: ValidateRequest =
-        serde_json::from_value(input).map_err(|e| Error::Handler(e.to_string()))?;
-
-    let module =
-        Module::new(&cache.engine, &req.wasm).map_err(|e| Error::Handler(e.to_string()))?;
-
-    let mut has_memory = false;
-    let mut has_alloc = false;
-    let mut has_execute = false;
-
-    for export in module.exports() {
-        match export.name() {
-            "memory" => {
-                if matches!(export.ty(), ExternType::Memory(_)) {
-                    has_memory = true;
-                }
-            }
-            "alloc" => {
-                if let ExternType::Func(ft) = export.ty() {
-                    has_alloc = ft.params().len() == 1 && ft.results().len() == 1;
-                }
-            }
-            "execute" => {
-                if let ExternType::Func(ft) = export.ty() {
-                    has_execute = ft.params().len() == 2 && ft.results().len() == 1;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if !has_memory || !has_alloc || !has_execute {
-        let mut missing = Vec::new();
-        if !has_memory {
-            missing.push("memory");
-        }
-        if !has_alloc {
-            missing.push("alloc(size) -> ptr");
-        }
-        if !has_execute {
-            missing.push("execute(input_ptr, input_len) -> i64");
-        }
-        return Err(Error::Handler(format!(
-            "Module missing required exports: {}",
-            missing.join(", ")
-        )));
-    }
-
-    cache.modules.insert(req.module_id.clone(), module);
-
-    Ok(json!({
-        "valid": true,
-        "moduleId": req.module_id,
-        "cached": true,
-    }))
 }

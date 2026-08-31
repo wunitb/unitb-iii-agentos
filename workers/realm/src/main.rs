@@ -42,7 +42,7 @@ async fn create_realm(iii: &IIIClient, req: CreateRealmRequest) -> Result<Value,
     .await
     .map_err(|e| Error::Handler(e.to_string()))?;
 
-    let _ = {
+    {
         let _iii = iii.clone();
         let _payload = json!({
             "topic": "realm.lifecycle",
@@ -128,7 +128,7 @@ async fn update_realm(iii: &IIIClient, req: UpdateRealmRequest) -> Result<Value,
     .await
     .map_err(|e| Error::Handler(e.to_string()))?;
 
-    let _ = {
+    {
         let _iii = iii.clone();
         let _payload = json!({
             "topic": "realm.lifecycle",
@@ -162,7 +162,7 @@ async fn delete_realm(iii: &IIIClient, id: &str) -> Result<Value, Error> {
     .await
     .map_err(|e| Error::Handler(e.to_string()))?;
 
-    let _ = {
+    {
         let _iii = iii.clone();
         let _payload = json!({
             "topic": "realm.lifecycle",
@@ -225,10 +225,8 @@ async fn export_realm(iii: &IIIClient, req: ExportRequest) -> Result<Value, Erro
         "hierarchy": hierarchy,
     });
 
-    if scrub {
-        if let Some(obj) = export.as_object_mut() {
-            obj.remove("secrets");
-        }
+    if scrub && let Some(obj) = export.as_object_mut() {
+        obj.remove("secrets");
     }
 
     Ok(export)

@@ -140,7 +140,7 @@ async fn register_pulse(iii: &IIIClient, req: RegisterPulseRequest) -> Result<Va
 async fn invoke_pulse(iii: &IIIClient, req: InvokeRequest) -> Result<Value, Error> {
     let realm_id = &req.realm_id;
     let mode = req.context_mode.unwrap_or(ContextMode::Thin);
-    let context = build_context(iii, &req.agent_id, &realm_id, &mode).await;
+    let context = build_context(iii, &req.agent_id, realm_id, &mode).await;
 
     let run_id = format!("run-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
@@ -161,7 +161,7 @@ async fn invoke_pulse(iii: &IIIClient, req: InvokeRequest) -> Result<Value, Erro
     iii.trigger(TriggerRequest {
         function_id: "state::set".to_string(),
         payload: json!({
-            "scope": runs_scope(&realm_id),
+            "scope": runs_scope(realm_id),
             "key": &run_id,
             "value": run_val,
         }),
@@ -201,7 +201,7 @@ async fn invoke_pulse(iii: &IIIClient, req: InvokeRequest) -> Result<Value, Erro
         .trigger(TriggerRequest {
             function_id: "state::set".to_string(),
             payload: json!({
-                "scope": runs_scope(&realm_id),
+                "scope": runs_scope(realm_id),
                 "key": &run_id,
                 "value": run_val,
             }),

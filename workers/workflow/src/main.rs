@@ -413,6 +413,10 @@ fn concurrent_group_end(workflow: &Workflow, index: usize, completed: &HashSet<S
     end
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "step execution keeps shared workflow state explicit"
+)]
 async fn run_step(
     iii: &IIIClient,
     workflow: &Workflow,

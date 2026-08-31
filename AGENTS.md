@@ -4,7 +4,7 @@ This file governs the repository root and all descendants unless a nearer `AGENT
 
 ## Project
 
-AgentOS is UnitB's independent continuation of `iii-experimental/agentos`, migrated to iii **v0.22.1** under Apache-2.0. It is a Rust workspace of narrow iii workers and three client/transport crates, plus the Python embedding worker, TypeScript examples and live-stack e2e harness, website, declarative content, and engine/runtime configuration. Workers register functions and triggers with the iii engine; they do not share in-process state.
+AgentOS is UnitB's independent continuation of `iii-experimental/agentos`, migrated to the stable iii version pinned by `.iii-version` (**v0.22.1**) under Apache-2.0. It is a Rust workspace of narrow iii workers and three client/transport crates, plus the Python embedding worker, TypeScript examples and live-stack e2e harness, website, declarative content, and engine/runtime configuration. Workers register functions and triggers with the iii engine; they do not share in-process state.
 
 ## Repository map
 
@@ -12,6 +12,7 @@ AgentOS is UnitB's independent continuation of `iii-experimental/agentos`, migra
 - `crates/` — `cli` and `tui` user clients, plus the HTTP adapter boundary.
 - `hands/` — TOML personas consumed by `hand-runner`; `agents/` — agent templates; `plugin/` — reusable agents, commands, skills, and hooks.
 - `integrations/` — MCP connection TOML consumed by `mcp-client`; `workflows/` — workflow YAML consumed by `workflow`.
+- `.iii-version` — canonical stable iii engine/SDK pin; `tests/iii_version.test.ts` rejects version drift and prerelease pins.
 - `config.yaml` and `config/` — iii engine and built-in worker configuration.
 - `tests/` — Rust integration tests; `examples/` and `scripts/*.test.ts` — local TypeScript tests; `e2e/` — Vitest tests against a live engine and workers.
 - `scripts/` — installation and development-stack scripts; `website/` — independently locked Vite/React site.
@@ -26,22 +27,23 @@ Run every command from the stated directory. A command below is offline only whe
 
 | Purpose | Command | Offline/cache prerequisites and boundary |
 | --- | --- | --- |
-| Rust format check | root: `cargo fmt --all -- --check` | Rust **1.88** toolchain with `rustfmt`; no dependency download. |
-| Rust lint | root: `cargo clippy --workspace --all-targets -- -D warnings` | Rust 1.88 toolchain with `clippy` and the Cargo registry/source cache already available. |
-| Rust metadata | root: `cargo metadata --offline --format-version 1 --locked` | Rust 1.88 plus Cargo registry/index and crate sources from `Cargo.lock` must already be cached. |
-| Rust build | root: `cargo build --workspace --release --offline --locked` | Rust 1.88 and the same Cargo cache prerequisite; produces `target/` artifacts. |
-| Rust tests | root: `cargo test --workspace --release --offline --locked` | Rust 1.88 and the same Cargo cache prerequisite. Live-engine tests are ignored by default. Target one package with `cargo test -p <workspace-package> --offline --locked`; do not broaden unrelated packages. |
-| Root TypeScript checks | root: `bun run typecheck:examples && bun run test:examples && bun run typecheck:scripts && bun run test:scripts` | Bun and root `node_modules` must already match `bun.lock`. `bun install --frozen-lockfile` is connected setup, not an offline guarantee. |
+| Rust format check | root: `rustup run 1.90 cargo fmt --all -- --check` | Rust **1.90** toolchain with `rustfmt`; no dependency download. |
+| Rust lint | root: `rustup run 1.90 cargo clippy --workspace --all-targets --locked -- -D warnings` | Rust 1.90 with `clippy` and the locked Cargo sources already available. |
+| Rust metadata | root: `rustup run 1.90 cargo metadata --offline --format-version 1 --locked` | Rust 1.90 plus Cargo registry/index and crate sources from `Cargo.lock` must already be cached. |
+| Rust build | root: `rustup run 1.90 cargo build --workspace --release --offline --locked` | Rust 1.90 and the same Cargo cache prerequisite; produces `target/` artifacts. |
+| Rust tests | root: `rustup run 1.90 cargo test --workspace --release --offline --locked` | Rust 1.90 and the same Cargo cache prerequisite. Live-engine tests are ignored by default. Target one package with `cargo test -p <workspace-package> --offline --locked`; do not broaden unrelated packages. |
+| Root TypeScript checks | root: `bun run check` | Bun and root `node_modules` must match `bun.lock`; source-contract tests exclude generated/dependency trees and the command also builds the npm-locked website. `bun install --frozen-lockfile` is connected setup, not an offline guarantee. |
 | Live TypeScript e2e | root: `bun run test:e2e` | **Not offline.** Requires installed root dependencies, `AGENTOS_E2E=1` (set by the script), a running iii engine and workers at `AGENTOS_BASE_URL`/`III_URL`, and model credentials for the chat assertion (`AGENTOS_API_KEY` or configured provider). The smoke name only selects health/chat tests; it still needs the live stack. |
 | Website build | `website/`: `npm run build` | Node/npm and a **writable** `website/node_modules` installed from `website/package-lock.json`; produces `website/dist/`. `npm ci --no-audit --no-fund` is connected setup unless the complete npm cache is intentionally used offline. |
 | Python embedding tests | `workers/embedding/`: `python -m pytest test_main.py -q` | Python >=3.11 and pytest already installed. CI installs only pytest, so the test's mocked iii and absent `sentence_transformers` use the fallback path. This is not an offline guarantee if a locally installed `sentence_transformers` tries to download its model; remove it or ensure that model is cached. |
 
-From root, `bash scripts/install-iii.sh` downloads and checksum-verifies the pinned iii v0.22.1 release; it is connected setup, never an offline command. From root, starting a development stack also needs a built release workspace, `iii --config config.yaml`, and usually `.env` credentials (mode 600) before `bash scripts/dev-up.sh`.
+From root, `bash scripts/install-iii.sh` reads `.iii-version`, rejects prerelease pins, and checksum-verifies the pinned iii v0.22.1 release; it is connected setup, never an offline command. From root, starting a development stack also needs a built release workspace, `iii --config config.yaml`, and usually `.env` credentials (mode 600) before `bash scripts/dev-up.sh`.
 
 ## Portability and release boundaries
 
-Released bundles are built for Linux `x86_64`/`aarch64` and macOS
-`x86_64`/`aarch64`. The bundle contains the CLI, TUI, runtime configuration,
+Released bundles are built natively for Linux `x86_64`/`aarch64` and macOS
+`x86_64`/`aarch64`, then checksum-inspected with an SPDX SBOM and verified
+GitHub build-provenance attestation before publication. The bundle contains the CLI, TUI, runtime configuration,
 Rust worker binaries, and embedding-worker source; it must not require the
 source checkout at runtime. The installer keeps the operator-owned
 `$AGENTOS_HOME/runtime/config`, `config.yaml`, `.env`, and
@@ -69,7 +71,7 @@ four supported targets.
 ## Conventions
 
 - Rust uses edition 2024 and workspace dependency versions. Format with `cargo fmt`; treat the clippy command above, including `-D warnings`, as the lint bar. Target a workspace package with `-p`; preserve the worker-per-process/function-registration design and the reserved `sandbox::*` namespace.
-- Root TypeScript is strict and NodeNext for examples and script tests; use ESM-compatible imports and Vitest `*.test.ts` conventions. The website has its own strict TypeScript/Vite configuration.
+- Root TypeScript is strict and NodeNext for examples and script tests; Bun is the root package manager and `bun.lock` is authoritative. The website is independently npm-locked and has its own strict TypeScript/Vite configuration.
 - Python embedding code requires Python >=3.11; tests use pytest. Keep dependency changes lockfile-driven rather than editing generated locks.
 - Every `workers/<name>/iii.worker.yaml` must name its containing directory, declare a `rust` or `python` runtime, and have a string `scripts.start`; CI validates this.
 - Never edit generated, runtime, credential, vendor, or lock artifacts by hand. Do not change vendored `.upstream-iii/` while working on root AgentOS behavior unless that subtree's guidance and task explicitly require it.

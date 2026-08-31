@@ -428,8 +428,8 @@ mod tests {
 
     #[test]
     fn test_canonical_json_number_float() {
-        let result = canonical_json(&json!(3.14));
-        assert_eq!(result, "3.14");
+        let result = canonical_json(&json!(1.25));
+        assert_eq!(result, "1.25");
     }
 
     #[test]

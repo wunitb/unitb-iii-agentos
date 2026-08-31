@@ -71,9 +71,9 @@ describe("reconciled Git history and worktree contract", () => {
 
     const failures: string[] = [];
     for (const path of listed.stdout.toString().split("\0").filter(Boolean)) {
-      const markers = conflictMarkerLines(
-        await Bun.file(new URL(path, repository)).text(),
-      );
+      const file = Bun.file(new URL(path, repository));
+        if (!(await file.exists())) continue;
+      const markers = conflictMarkerLines(await file.text());
       if (markers.length > 0) failures.push(`${path}: ${markers.join(", ")}`);
     }
     expect(failures).toEqual([]);

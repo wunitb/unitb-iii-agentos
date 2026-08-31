@@ -166,7 +166,7 @@ async fn invoke_runtime(
             tracing::error!(run_id = %run_id_bg, error = %e, "failed to persist terminal run state");
         }
 
-        let _ = {
+        {
             let _iii = iii_bg.clone();
             let _payload = json!({
                 "topic": "bridge.run.completed",
@@ -256,16 +256,16 @@ async fn execute_runtime(
             let mut command_args = args.to_vec();
             command_args.push(context_str);
 
-            let result = tokio::time::timeout(timeout, async {
+            tokio::time::timeout(timeout, async {
                 let mut cmd_builder = tokio::process::Command::new(cmd);
                 cmd_builder.args(&command_args).current_dir(&work_dir);
 
-                if let Some(ref env_vars) = config.env_vars {
-                    if let Some(obj) = env_vars.as_object() {
-                        for (k, v) in obj {
-                            if let Some(val) = v.as_str() {
-                                cmd_builder.env(k, val);
-                            }
+                if let Some(ref env_vars) = config.env_vars
+                    && let Some(obj) = env_vars.as_object()
+                {
+                    for (k, v) in obj {
+                        if let Some(val) = v.as_str() {
+                            cmd_builder.env(k, val);
                         }
                     }
                 }
@@ -284,9 +284,7 @@ async fn execute_runtime(
                 }
             })
             .await
-            .map_err(|_| Error::Handler("runtime execution timed out".into()))?;
-
-            result
+            .map_err(|_| Error::Handler("runtime execution timed out".into()))?
         }
     }
 }
