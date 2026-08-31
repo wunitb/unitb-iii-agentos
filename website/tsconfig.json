@@ -9,6 +9,7 @@
     "allowImportingTsExtensions": true,
     "isolatedModules": true,
     "moduleDetection": "force",
+    "noUncheckedSideEffectImports": false,
     "noEmit": true,
     "jsx": "react-jsx",
     "strict": true,
