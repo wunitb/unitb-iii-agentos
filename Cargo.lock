@@ -952,7 +952,7 @@ version = "0.1.0"
 dependencies = [
  "agentos-http-adapter",
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "ed25519-dalek",
  "iii-sdk",
  "regex",
@@ -1066,7 +1066,7 @@ dependencies = [
  "aes-gcm",
  "agentos-http-adapter",
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "iii-sdk",
  "rand 0.10.2",
