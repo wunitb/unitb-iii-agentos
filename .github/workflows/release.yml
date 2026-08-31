@@ -24,9 +24,6 @@ jobs:
           - runner: ubuntu-24.04-arm
             os: linux
             arch: aarch64
-          - runner: macos-13
-            os: darwin
-            arch: x86_64
           - runner: macos-15
             os: darwin
             arch: aarch64
@@ -121,8 +118,6 @@ jobs:
             arch: x86_64
           - os: linux
             arch: aarch64
-          - os: darwin
-            arch: x86_64
           - os: darwin
             arch: aarch64
     env:
