@@ -51,8 +51,8 @@ jobs:
           ASSET="agentos-${VERSION#v}-$TARGET"
           STAGE="dist/$ASSET"
           mkdir -p "$STAGE/bin" "$STAGE/runtime/target/release"
-          cp target/release/agentos "$STAGE/bin/agentos"
-          cp target/release/agentos-tui "$STAGE/bin/agentos-tui"
+          install -m 0755 target/release/agentos "$STAGE/bin/agentos"
+          install -m 0755 target/release/agentos-tui "$STAGE/bin/agentos-tui"
           cp .iii-version "$STAGE/runtime/.iii-version"
           cp config.yaml "$STAGE/runtime/config.yaml"
           cp -R config agents hands identity integrations plugin workflows "$STAGE/runtime/"
@@ -64,7 +64,7 @@ jobs:
             cargo_toml="$(dirname "$manifest")/Cargo.toml"
             if [ -f "$cargo_toml" ]; then
               source_binary="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^name *=/{gsub(/^name *= *"|"$/,"");print;exit}' "$cargo_toml")"
-              cp "target/release/$source_binary" "$STAGE/runtime/target/release/$packaged_binary"
+              install -m 0755 "target/release/$source_binary" "$STAGE/runtime/target/release/$packaged_binary"
             elif [ "$packaged_binary" = "agentos-embedding" ]; then
               cp workers/embedding/{main.py,pyproject.toml,uv.lock} "$destination/"
             else
@@ -149,6 +149,7 @@ jobs:
           [[ -f "dist/$asset.spdx.json" ]]
           (cd dist && sha256sum --check "$asset.tar.gz.sha256")
           gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+          tar -tzf "$archive" > "$archive.contents"
           for required in \
             ./bin/agentos \
             ./bin/agentos-tui \
@@ -159,16 +160,22 @@ jobs:
             ./runtime/workers/embedding/main.py \
             ./runtime/workers/embedding/pyproject.toml \
             ./runtime/workers/embedding/uv.lock; do
-            tar -tzf "$archive" | grep -Fx "$required" >/dev/null
+            grep -Fx "$required" "$archive.contents" >/dev/null \
+              || { echo "::error::bundle missing $required"; exit 1; }
           done
           extract="$RUNNER_TEMP/$asset"
           mkdir -p "$extract" "$HOME" "$AGENTOS_HOME"
           tar -xzf "$archive" -C "$extract"
-          [[ -x "$extract/bin/agentos" ]]
-          [[ -x "$extract/bin/agentos-tui" ]]
-          [[ "$(cat "$extract/runtime/.iii-version")" == "$(cat .iii-version)" ]]
-          [[ -f "$extract/runtime/config.yaml" ]]
-          [[ ! -e "$extract/workers" ]]
+          [[ -x "$extract/bin/agentos" ]] \
+              || { echo "::error::packaged agentos is not executable"; stat "$extract/bin/agentos"; exit 1; }
+          [[ -x "$extract/bin/agentos-tui" ]] \
+              || { echo "::error::packaged agentos-tui is not executable"; stat "$extract/bin/agentos-tui"; exit 1; }
+          [[ "$(cat "$extract/runtime/.iii-version")" == "$(cat .iii-version)" ]] \
+            || { echo "::error::packaged iii version mismatch"; exit 1; }
+          [[ -f "$extract/runtime/config.yaml" ]] \
+            || { echo "::error::packaged config.yaml missing"; exit 1; }
+          [[ ! -e "$extract/workers" ]] \
+            || { echo "::error::checkout-relative workers directory leaked into bundle"; exit 1; }
           echo "validated $asset in an isolated home without source checkout"
 
   publish:

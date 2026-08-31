@@ -51,7 +51,7 @@ That's the whole protocol. Workers stay narrow; everything else lives in the eng
 # 1. clone this repository
 git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos
 
-# 2. install the stable iii version pinned in .iii-version with checksum verification
+# 2. install the pinned iii engine + iii-worker runtime with checksum verification
 bash scripts/install-iii.sh
 
 # 3. configure the local model proxy
@@ -113,8 +113,9 @@ AGENTOS_E2E_MODEL=claude-sonnet-4-20250514 bun run test:e2e
 
 ### Installed releases and portability
 
-The release installer supports Linux `x86_64` and `aarch64`, and macOS
-`x86_64` and `aarch64`:
+The full-stack release installer supports Linux `x86_64` and `aarch64`, and
+macOS `aarch64`. Upstream iii `v0.22.1` does not publish the required
+`iii-worker` runtime for macOS `x86_64`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/wunitb/unitb-iii-agentos/main/scripts/install.sh | bash
@@ -146,10 +147,11 @@ start from any working directory without a checkout. Upgrades replace release
 payload while retaining operator configuration, `$AGENTOS_HOME/runtime/data/**`,
 and the runtime `.env` file.
 
-The engine must match the stable version in `.iii-version` (`v0.22.1`),
-installed in `PATH` or by `bash scripts/install-iii.sh` (which downloads and
-verifies it). Installers reject prerelease pins unless a maintainer explicitly
-changes the repository contract. The embedding
+The engine and `iii-worker` runtime must match the stable version in
+`.iii-version` (`v0.22.1`), installed in `PATH` or by
+`bash scripts/install-iii.sh` (which downloads and verifies both binaries).
+Installers reject prerelease pins unless a maintainer explicitly changes the
+repository contract. The embedding
 worker needs Python `>=3.11`, a working `venv` module, and `ensurepip`.
 Its setup installs the core `iii-sdk` dependency without downloading the
 optional `sentence-transformers`/`torch` model stack; absent those packages,

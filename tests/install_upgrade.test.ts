@@ -69,7 +69,8 @@ async function upgradeFixture(
     join(stubs, "iii"),
     `#!/bin/sh\nprintf '${iiiVersion}\\n'\n`,
   );
-  await executable(
+  await executable(join(stubs, "iii-worker"), "#!/bin/sh\nexit 0\n");
+    await executable(
     join(stubs, "curl"),
     `#!/bin/sh
 set -eu

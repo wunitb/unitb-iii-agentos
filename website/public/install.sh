@@ -207,69 +207,69 @@ install_iii() {
   local current_version=""
   if check_cmd iii; then
     current_version="$(iii --version 2>/dev/null | head -1 | sed 's/[^0-9.]//g')"
-    if [ "$current_version" = "$III_VERSION" ]; then
-      ok "iii-engine v${III_VERSION} already installed"
+    if [ "$current_version" = "$III_VERSION" ] && check_cmd iii-worker; then
+      ok "iii-engine and iii-worker v${III_VERSION} already installed"
       return
     fi
-    warn "Replacing iii-engine v${current_version:-unknown} with pinned v${III_VERSION}"
+    if [ "$current_version" = "$III_VERSION" ]; then
+      warn "Installing missing iii-worker runtime for iii v${III_VERSION}"
+    else
+      warn "Replacing iii-engine v${current_version:-unknown} with pinned v${III_VERSION}"
+    fi
   fi
 
-  local os arch target ext asset base_url tmp_dir checksum_asset binary_name found_binary
+  local os arch target ext base_url tmp_dir component asset checksum_asset binary_name found_binary extract_dir
   os="$(detect_os)"
   arch="$(detect_arch)"
 
   case "$os/$arch" in
     linux/armv7) target="armv7-unknown-linux-gnueabihf" ;;
     linux/*) target="${arch}-unknown-linux-gnu" ;;
-    darwin/x86_64|darwin/aarch64) target="${arch}-apple-darwin" ;;
-    windows/x86_64|windows/aarch64) target="${arch}-pc-windows-msvc" ;;
+    darwin/aarch64) target="aarch64-apple-darwin" ;;
+    darwin/x86_64) err "iii v${III_VERSION} does not publish the required iii-worker runtime for macOS x86_64" ;;
+    windows/*) err "iii v${III_VERSION} does not publish the required iii-worker runtime for Windows" ;;
     *) err "iii v${III_VERSION} has no release for ${os}/${arch}" ;;
   esac
 
   ext="tar.gz"
-  binary_name="iii"
-  if [ "$os" = "windows" ]; then
-    ext="zip"
-    binary_name="iii.exe"
-  fi
-
-  asset="iii-${target}.${ext}"
-  checksum_asset="iii-${target}.sha256"
   base_url="https://github.com/iii-hq/iii/releases/download/iii/v${III_VERSION}"
   tmp_dir="$(mktemp -d)"
   # Capture the function-local path before it leaves scope.
   # shellcheck disable=SC2064
   trap "rm -rf '$tmp_dir'" EXIT
-
-  info "Downloading verified iii-engine v${III_VERSION} for ${os}/${arch}..."
-  curl -fsSLo "$tmp_dir/$asset" "$base_url/$asset" || err "Failed to download $asset"
-  curl -fsSLo "$tmp_dir/$checksum_asset" "$base_url/$checksum_asset" || err "Failed to download $checksum_asset"
-
-  if check_cmd sha256sum; then
-    (cd "$tmp_dir" && sha256sum --check "$checksum_asset") || err "Checksum verification failed for $asset"
-  elif check_cmd shasum; then
-    local expected actual
-    expected="$(cut -d ' ' -f 1 "$tmp_dir/$checksum_asset")"
-    actual="$(shasum -a 256 "$tmp_dir/$asset" | cut -d ' ' -f 1)"
-    [ "$actual" = "$expected" ] || err "Checksum verification failed for $asset"
-  else
-    err "sha256sum or shasum is required to verify iii-engine"
-  fi
-
-  if [ "$ext" = "zip" ]; then
-    unzip -qo "$tmp_dir/$asset" -d "$tmp_dir"
-  else
-    tar -xzf "$tmp_dir/$asset" -C "$tmp_dir"
-  fi
-
-  found_binary="$(find "$tmp_dir" -name "$binary_name" -type f | head -1)"
-  [ -n "$found_binary" ] || err "Could not find $binary_name in $asset"
-
   mkdir -p "$INSTALL_DIR"
-  cp "$found_binary" "$INSTALL_DIR/$binary_name"
-  chmod +x "$INSTALL_DIR/$binary_name"
+
+  for component in iii iii-worker; do
+    binary_name="$component"
+    asset="${component}-${target}.${ext}"
+    checksum_asset="${component}-${target}.sha256"
+    extract_dir="$tmp_dir/$component"
+    mkdir -p "$extract_dir"
+
+    info "Downloading verified ${component} v${III_VERSION} for ${os}/${arch}..."
+    curl -fsSLo "$tmp_dir/$asset" "$base_url/$asset" || err "Failed to download $asset"
+    curl -fsSLo "$tmp_dir/$checksum_asset" "$base_url/$checksum_asset" || err "Failed to download $checksum_asset"
+
+    if check_cmd sha256sum; then
+      (cd "$tmp_dir" && sha256sum --check "$checksum_asset") || err "Checksum verification failed for $asset"
+    elif check_cmd shasum; then
+      local expected actual
+      expected="$(cut -d ' ' -f 1 "$tmp_dir/$checksum_asset")"
+      actual="$(shasum -a 256 "$tmp_dir/$asset" | cut -d ' ' -f 1)"
+      [ "$actual" = "$expected" ] || err "Checksum verification failed for $asset"
+    else
+      err "sha256sum or shasum is required to verify iii runtime binaries"
+    fi
+
+    tar -xzf "$tmp_dir/$asset" -C "$extract_dir"
+    found_binary="$(find "$extract_dir" -name "$binary_name" -type f | head -1)"
+    [ -n "$found_binary" ] || err "Could not find $binary_name in $asset"
+    cp "$found_binary" "$INSTALL_DIR/$binary_name"
+    chmod +x "$INSTALL_DIR/$binary_name"
+  done
+
   export PATH="$INSTALL_DIR:$PATH"
-  ok "iii-engine v${III_VERSION} installed to ${INSTALL_DIR}/${binary_name}"
+  ok "iii-engine and iii-worker v${III_VERSION} installed to ${INSTALL_DIR}"
 }
 
 install_agentos() {
@@ -277,6 +277,10 @@ install_agentos() {
 
   os="$(detect_os)"
   arch="$(detect_arch)"
+
+  if [ "$os/$arch" = "darwin/x86_64" ]; then
+    err "Full-stack install is unavailable: pinned iii does not publish iii-worker for macOS x86_64"
+  fi
 
   info "Detected platform: ${os}/${arch}"
 
