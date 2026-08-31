@@ -21,7 +21,7 @@ colored = "2"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 dialoguer = "0.11"
 indicatif = "0.18.6"
-dirs = "5"
+dirs = "6"
 toml = "0.8"
 urlencoding = "2"
 clap_complete = "4"
