@@ -24,10 +24,10 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
             .last()
             .map(|(i, _)| i)
             .unwrap_or(remaining.len());
-        if let Some(nl) = remaining[..split_idx].rfind('\n') {
-            if nl >= max_len / 2 {
-                split_idx = nl;
-            }
+        if let Some(nl) = remaining[..split_idx].rfind('\n')
+            && nl >= max_len / 2
+        {
+            split_idx = nl;
         }
         chunks.push(remaining[..split_idx].to_string());
         remaining = &remaining[split_idx..];
@@ -80,12 +80,11 @@ async fn get_secret(iii: &IIIClient, key: &str) -> String {
             timeout_ms: None,
         })
         .await;
-    if let Ok(v) = result {
-        if let Some(value) = v.get("value").and_then(|s| s.as_str()) {
-            if !value.is_empty() {
-                return value.to_string();
-            }
-        }
+    if let Ok(v) = result
+        && let Some(value) = v.get("value").and_then(|s| s.as_str())
+        && !value.is_empty()
+    {
+        return value.to_string();
     }
     std::env::var(key).unwrap_or_default()
 }

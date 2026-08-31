@@ -616,10 +616,10 @@ mod tests {
             check(&mut state, 100.0, 1000.0);
         }
         let r = check(&mut state, 100.0, 1000.0);
-        if !r.allowed {
-            if let Some(secs) = r.retry_after {
-                assert!(secs >= 1);
-            }
+        if !r.allowed
+            && let Some(secs) = r.retry_after
+        {
+            assert!(secs >= 1);
         }
     }
 

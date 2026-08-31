@@ -13,6 +13,7 @@ use types::{
 
 const MAX_POSTS_PER_CHANNEL: usize = 1000;
 const MAX_PINNED: usize = 25;
+static POST_COUNTER_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -75,15 +76,82 @@ fn entry_value(entry: &Value) -> Value {
     entry.get("value").cloned().unwrap_or_else(|| entry.clone())
 }
 
-/// Shared per-channel quota check used by both `post` and `reply`.
-///
-/// TODO: this is a non-atomic check-then-write; concurrent callers can race
-/// past the limit. The engine does not yet expose a counter primitive that
-/// would let us increment-and-check atomically across `state::list`-backed
-/// scopes, so we accept eventual-consistency soft enforcement here.
-async fn ensure_within_post_limit(iii: &IIIClient, posts_scope: &str) -> Result<(), Error> {
-    let existing = state_list(iii, posts_scope).await?;
-    if existing.len() >= MAX_POSTS_PER_CHANNEL {
+fn post_count_from_update(result: &Value) -> Result<(bool, usize), Error> {
+    if let Some(errors) = result.get("errors").and_then(Value::as_array)
+        && !errors.is_empty()
+    {
+        return Err(Error::Handler(format!(
+            "Post counter update failed: {}",
+            Value::Array(errors.clone())
+        )));
+    }
+
+    let count = result
+        .get("new_value")
+        .and_then(|value| value.get("count"))
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| Error::Handler("Post counter returned an invalid value".into()))?;
+    let was_missing = result.get("old_value").is_none_or(Value::is_null);
+    Ok((was_missing, count))
+}
+
+async fn change_post_count(
+    iii: &IIIClient,
+    posts_scope: &str,
+    delta: i64,
+) -> Result<(bool, usize), Error> {
+    let (operation, by) = if delta >= 0 {
+        ("increment", delta)
+    } else {
+        ("decrement", -delta)
+    };
+    let result = iii
+        .trigger(TriggerRequest {
+            function_id: "state::update".to_string(),
+            payload: json!({
+                "scope": "coord_post_counts",
+                "key": posts_scope,
+                "ops": [{ "type": operation, "path": "count", "by": by }],
+            }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|error| Error::Handler(error.to_string()))?;
+    post_count_from_update(&result)
+}
+
+async fn release_post_slot(iii: &IIIClient, posts_scope: &str) -> Result<(), Error> {
+    change_post_count(iii, posts_scope, -1).await.map(|_| ())
+}
+
+/// Atomically reserves one post slot before either `post` or `reply` persists.
+async fn reserve_post_slot(iii: &IIIClient, posts_scope: &str) -> Result<(), Error> {
+    let _initialization_guard = POST_COUNTER_INIT_LOCK.lock().await;
+    let (was_missing, mut count) = change_post_count(iii, posts_scope, 1).await?;
+
+    if was_missing {
+        let existing = match state_list(iii, posts_scope).await {
+            Ok(existing) => existing.len(),
+            Err(error) => {
+                let _ = release_post_slot(iii, posts_scope).await;
+                return Err(error);
+            }
+        };
+        if existing > 0 {
+            match change_post_count(iii, posts_scope, existing as i64).await {
+                Ok((_, reconciled_count)) => count = reconciled_count,
+                Err(error) => {
+                    let _ = release_post_slot(iii, posts_scope).await;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    if count > MAX_POSTS_PER_CHANNEL {
+        release_post_slot(iii, posts_scope).await?;
         return Err(Error::Handler("Channel has reached the post limit".into()));
     }
     Ok(())
@@ -164,8 +232,6 @@ async fn post(iii: &IIIClient, req: PostRequest) -> Result<Value, Error> {
     }
 
     let posts_scope = format!("coord_posts:{safe_channel_id}");
-    ensure_within_post_limit(iii, &posts_scope).await?;
-
     let post_id = uuid::Uuid::new_v4().to_string();
     let safe_agent = sanitize_id(&agent_id).map_err(Error::Handler)?;
     let post = Post {
@@ -179,7 +245,13 @@ async fn post(iii: &IIIClient, req: PostRequest) -> Result<Value, Error> {
     };
 
     let value = serde_json::to_value(&post).map_err(|e| Error::Handler(e.to_string()))?;
-    state_set(iii, &posts_scope, &post_id, value).await?;
+    reserve_post_slot(iii, &posts_scope).await?;
+    if let Err(error) = state_set(iii, &posts_scope, &post_id, value).await {
+        if let Err(rollback_error) = release_post_slot(iii, &posts_scope).await {
+            tracing::error!(%rollback_error, %posts_scope, "failed to roll back reserved post slot");
+        }
+        return Err(error);
+    }
 
     fire_and_forget(
         iii,
@@ -215,7 +287,6 @@ async fn reply(iii: &IIIClient, req: ReplyRequest) -> Result<Value, Error> {
     let safe_agent = sanitize_id(&agent_id).map_err(Error::Handler)?;
 
     let posts_scope = format!("coord_posts:{safe_channel_id}");
-    ensure_within_post_limit(iii, &posts_scope).await?;
 
     if state_get(iii, &posts_scope, &safe_parent_id)
         .await?
@@ -236,7 +307,13 @@ async fn reply(iii: &IIIClient, req: ReplyRequest) -> Result<Value, Error> {
     };
 
     let value = serde_json::to_value(&reply).map_err(|e| Error::Handler(e.to_string()))?;
-    state_set(iii, &posts_scope, &post_id, value).await?;
+    reserve_post_slot(iii, &posts_scope).await?;
+    if let Err(error) = state_set(iii, &posts_scope, &post_id, value).await {
+        if let Err(rollback_error) = release_post_slot(iii, &posts_scope).await {
+            tracing::error!(%rollback_error, %posts_scope, "failed to roll back reserved reply slot");
+        }
+        return Err(error);
+    }
 
     fire_and_forget(
         iii,
@@ -359,9 +436,7 @@ async fn pin(iii: &IIIClient, req: PinRequest) -> Result<Value, Error> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let ws_url = std::env::var("III_URL")
-        .or_else(|_| std::env::var("III_URL"))
-        .unwrap_or_else(|_| "ws://localhost:49134".to_string());
+    let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
     let iii = register_worker(&ws_url, InitOptions::default());
 
     let iii_clone = iii.clone();
@@ -498,4 +573,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     iii.shutdown_async().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_atomic_post_counter_updates() {
+        assert_eq!(
+            post_count_from_update(&json!({
+                "old_value": null,
+                "new_value": { "count": 1 },
+            }))
+            .unwrap(),
+            (true, 1)
+        );
+        assert_eq!(
+            post_count_from_update(&json!({
+                "old_value": { "count": 1 },
+                "new_value": { "count": 2 },
+            }))
+            .unwrap(),
+            (false, 2)
+        );
+    }
+
+    #[test]
+    fn rejects_counter_errors_and_invalid_shapes() {
+        assert!(
+            post_count_from_update(&json!({
+                "old_value": null,
+                "new_value": {},
+                "errors": [{ "code": "increment.type_mismatch" }],
+            }))
+            .is_err()
+        );
+        assert!(post_count_from_update(&json!({ "new_value": {} })).is_err());
+    }
 }

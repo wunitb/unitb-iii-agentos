@@ -91,6 +91,188 @@ pub fn check_policy(
     PolicyAction::Deny
 }
 
+pub fn register(iii: &IIIClient) {
+    let iii_ref = iii.clone();
+    iii.register_function(
+        "policy::check",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_ref.clone();
+            async move {
+                let agent_id = input["agentId"].as_str().unwrap_or("");
+                let tool_name = input["tool"].as_str().unwrap_or("");
+                let subagent_depth = input["subagentDepth"].as_u64().unwrap_or(0) as u32;
+                let current_concurrency = input["currentConcurrency"].as_u64().unwrap_or(0) as u32;
+
+                let agent_policy: Option<PolicyConfig> = iii
+                    .trigger(TriggerRequest {
+                        function_id: "state::get".to_string(),
+                        payload: json!({
+                            "scope": "policies",
+                            "key": agent_id,
+                        }),
+                        action: None,
+                        timeout_ms: None,
+                    })
+                    .await
+                    .ok()
+                    .and_then(|v| serde_json::from_value(v).ok());
+
+                let global_policy: Option<PolicyConfig> = iii
+                    .trigger(TriggerRequest {
+                        function_id: "state::get".to_string(),
+                        payload: json!({
+                            "scope": "policies",
+                            "key": "__global",
+                        }),
+                        action: None,
+                        timeout_ms: None,
+                    })
+                    .await
+                    .ok()
+                    .and_then(|v| serde_json::from_value(v).ok());
+
+                let agent_rules = agent_policy
+                    .as_ref()
+                    .map(|p| p.rules.as_slice())
+                    .unwrap_or(&[]);
+
+                let global_rules = global_policy
+                    .as_ref()
+                    .map(|p| p.rules.as_slice())
+                    .unwrap_or(&[]);
+
+                let action = check_policy(agent_rules, global_rules, tool_name);
+
+                let max_depth = agent_policy
+                    .as_ref()
+                    .and_then(|p| p.max_subagent_depth)
+                    .or(global_policy.as_ref().and_then(|p| p.max_subagent_depth))
+                    .unwrap_or(5);
+
+                if subagent_depth > max_depth {
+                    return Ok(json!({
+                        "allowed": false,
+                        "reason": "subagent_depth_exceeded",
+                        "maxDepth": max_depth,
+                        "currentDepth": subagent_depth,
+                    }));
+                }
+
+                let max_concurrency = agent_policy
+                    .as_ref()
+                    .and_then(|p| p.max_concurrency)
+                    .or(global_policy.as_ref().and_then(|p| p.max_concurrency))
+                    .unwrap_or(10);
+
+                if current_concurrency >= max_concurrency {
+                    return Ok(json!({
+                        "allowed": false,
+                        "reason": "concurrency_limit_exceeded",
+                        "maxConcurrency": max_concurrency,
+                        "currentConcurrency": current_concurrency,
+                    }));
+                }
+
+                let allowed = action == PolicyAction::Allow;
+
+                Ok::<Value, Error>(json!({
+                    "allowed": allowed,
+                    "action": action,
+                    "tool": tool_name,
+                    "agentId": agent_id,
+                }))
+            }
+        })
+        .description("Check if a function call is allowed by policy"),
+    );
+
+    let iii_ref = iii.clone();
+    iii.register_function(
+        "policy::set_rules",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_ref.clone();
+            async move {
+                let key = input["agentId"].as_str().unwrap_or("__global").to_string();
+
+                let policy: PolicyConfig = serde_json::from_value(
+                    input
+                        .get("policy")
+                        .cloned()
+                        .unwrap_or(json!({ "rules": [] })),
+                )
+                .map_err(|e| Error::Handler(e.to_string()))?;
+
+                iii.trigger(TriggerRequest {
+                    function_id: "state::set".to_string(),
+                    payload: json!({
+                        "scope": "policies",
+                        "key": &key,
+                        "value": &policy,
+                    }),
+                    action: None,
+                    timeout_ms: None,
+                })
+                .await
+                .map_err(|e| Error::Handler(e.to_string()))?;
+
+                {
+                    let _iii = iii.clone();
+                    let _payload = json!({
+                        "type": "policy_updated",
+                        "agentId": &key,
+                        "detail": { "ruleCount": policy.rules.len() },
+                    });
+                    tokio::spawn(async move {
+                        let _ = _iii
+                            .trigger(TriggerRequest {
+                                function_id: "security::audit".to_string(),
+                                payload: _payload,
+                                action: None,
+                                timeout_ms: None,
+                            })
+                            .await;
+                    });
+                };
+
+                Ok::<Value, Error>(
+                    json!({ "updated": true, "key": key, "ruleCount": policy.rules.len() }),
+                )
+            }
+        })
+        .description("Set policy rules for an agent or globally"),
+    );
+
+    let iii_ref = iii.clone();
+    iii.register_function(
+        "policy::get_rules",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_ref.clone();
+            async move {
+                let key = input["agentId"].as_str().unwrap_or("__global");
+
+                let policy: Value = iii
+                    .trigger(TriggerRequest {
+                        function_id: "state::get".to_string(),
+                        payload: json!({
+                            "scope": "policies",
+                            "key": key,
+                        }),
+                        action: None,
+                        timeout_ms: None,
+                    })
+                    .await
+                    .unwrap_or(json!({ "rules": [], "maxSubagentDepth": 5, "maxConcurrency": 10 }));
+
+                Ok::<Value, Error>(json!({
+                    "key": key,
+                    "policy": policy,
+                }))
+            }
+        })
+        .description("Get policy rules for an agent or globally"),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,186 +828,4 @@ mod tests {
             PolicyAction::Deny
         );
     }
-}
-
-pub fn register(iii: &IIIClient) {
-    let iii_ref = iii.clone();
-    iii.register_function(
-        "policy::check",
-        RegisterFunction::new_async(move |input: Value| {
-            let iii = iii_ref.clone();
-            async move {
-                let agent_id = input["agentId"].as_str().unwrap_or("");
-                let tool_name = input["tool"].as_str().unwrap_or("");
-                let subagent_depth = input["subagentDepth"].as_u64().unwrap_or(0) as u32;
-                let current_concurrency = input["currentConcurrency"].as_u64().unwrap_or(0) as u32;
-
-                let agent_policy: Option<PolicyConfig> = iii
-                    .trigger(TriggerRequest {
-                        function_id: "state::get".to_string(),
-                        payload: json!({
-                            "scope": "policies",
-                            "key": agent_id,
-                        }),
-                        action: None,
-                        timeout_ms: None,
-                    })
-                    .await
-                    .ok()
-                    .and_then(|v| serde_json::from_value(v).ok());
-
-                let global_policy: Option<PolicyConfig> = iii
-                    .trigger(TriggerRequest {
-                        function_id: "state::get".to_string(),
-                        payload: json!({
-                            "scope": "policies",
-                            "key": "__global",
-                        }),
-                        action: None,
-                        timeout_ms: None,
-                    })
-                    .await
-                    .ok()
-                    .and_then(|v| serde_json::from_value(v).ok());
-
-                let agent_rules = agent_policy
-                    .as_ref()
-                    .map(|p| p.rules.as_slice())
-                    .unwrap_or(&[]);
-
-                let global_rules = global_policy
-                    .as_ref()
-                    .map(|p| p.rules.as_slice())
-                    .unwrap_or(&[]);
-
-                let action = check_policy(agent_rules, global_rules, tool_name);
-
-                let max_depth = agent_policy
-                    .as_ref()
-                    .and_then(|p| p.max_subagent_depth)
-                    .or(global_policy.as_ref().and_then(|p| p.max_subagent_depth))
-                    .unwrap_or(5);
-
-                if subagent_depth > max_depth {
-                    return Ok(json!({
-                        "allowed": false,
-                        "reason": "subagent_depth_exceeded",
-                        "maxDepth": max_depth,
-                        "currentDepth": subagent_depth,
-                    }));
-                }
-
-                let max_concurrency = agent_policy
-                    .as_ref()
-                    .and_then(|p| p.max_concurrency)
-                    .or(global_policy.as_ref().and_then(|p| p.max_concurrency))
-                    .unwrap_or(10);
-
-                if current_concurrency >= max_concurrency {
-                    return Ok(json!({
-                        "allowed": false,
-                        "reason": "concurrency_limit_exceeded",
-                        "maxConcurrency": max_concurrency,
-                        "currentConcurrency": current_concurrency,
-                    }));
-                }
-
-                let allowed = action == PolicyAction::Allow;
-
-                Ok::<Value, Error>(json!({
-                    "allowed": allowed,
-                    "action": action,
-                    "tool": tool_name,
-                    "agentId": agent_id,
-                }))
-            }
-        })
-        .description("Check if a function call is allowed by policy"),
-    );
-
-    let iii_ref = iii.clone();
-    iii.register_function(
-        "policy::set_rules",
-        RegisterFunction::new_async(move |input: Value| {
-            let iii = iii_ref.clone();
-            async move {
-                let key = input["agentId"].as_str().unwrap_or("__global").to_string();
-
-                let policy: PolicyConfig = serde_json::from_value(
-                    input
-                        .get("policy")
-                        .cloned()
-                        .unwrap_or(json!({ "rules": [] })),
-                )
-                .map_err(|e| Error::Handler(e.to_string()))?;
-
-                iii.trigger(TriggerRequest {
-                    function_id: "state::set".to_string(),
-                    payload: json!({
-                        "scope": "policies",
-                        "key": &key,
-                        "value": &policy,
-                    }),
-                    action: None,
-                    timeout_ms: None,
-                })
-                .await
-                .map_err(|e| Error::Handler(e.to_string()))?;
-
-                {
-                    let _iii = iii.clone();
-                    let _payload = json!({
-                        "type": "policy_updated",
-                        "agentId": &key,
-                        "detail": { "ruleCount": policy.rules.len() },
-                    });
-                    tokio::spawn(async move {
-                        let _ = _iii
-                            .trigger(TriggerRequest {
-                                function_id: "security::audit".to_string(),
-                                payload: _payload,
-                                action: None,
-                                timeout_ms: None,
-                            })
-                            .await;
-                    });
-                };
-
-                Ok::<Value, Error>(
-                    json!({ "updated": true, "key": key, "ruleCount": policy.rules.len() }),
-                )
-            }
-        })
-        .description("Set policy rules for an agent or globally"),
-    );
-
-    let iii_ref = iii.clone();
-    iii.register_function(
-        "policy::get_rules",
-        RegisterFunction::new_async(move |input: Value| {
-            let iii = iii_ref.clone();
-            async move {
-                let key = input["agentId"].as_str().unwrap_or("__global");
-
-                let policy: Value = iii
-                    .trigger(TriggerRequest {
-                        function_id: "state::get".to_string(),
-                        payload: json!({
-                            "scope": "policies",
-                            "key": key,
-                        }),
-                        action: None,
-                        timeout_ms: None,
-                    })
-                    .await
-                    .unwrap_or(json!({ "rules": [], "maxSubagentDepth": 5, "maxConcurrency": 10 }));
-
-                Ok::<Value, Error>(json!({
-                    "key": key,
-                    "policy": policy,
-                }))
-            }
-        })
-        .description("Get policy rules for an agent or globally"),
-    );
 }

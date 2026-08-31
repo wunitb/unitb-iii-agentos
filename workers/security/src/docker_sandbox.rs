@@ -50,6 +50,151 @@ const BLOCKED_PATHS: &[&str] = &[
     "/etc", "/var", "/root", "/proc", "/sys", "/dev", "/boot", "/bin", "/sbin", "/lib", "/run",
 ];
 
+pub fn register(iii: &IIIClient) {
+    iii.register_function(
+        "security::docker_exec",
+        RegisterFunction::new_async(move |input: Value| async move { docker_exec(input).await })
+            .description("Execute a command inside a Docker container sandbox"),
+    );
+}
+
+async fn docker_exec(input: Value) -> Result<Value, Error> {
+    let req: DockerExecRequest =
+        serde_json::from_value(input).map_err(|e| Error::Handler(e.to_string()))?;
+
+    if req.command.is_empty() {
+        return Err(Error::Handler("command must not be empty".into()));
+    }
+
+    let image = req.image.as_deref().unwrap_or(DEFAULT_IMAGE);
+
+    if !ALLOWED_IMAGES.iter().any(|allowed| {
+        image == *allowed
+            || image.starts_with(&format!("{}:", allowed.split(':').next().unwrap_or("")))
+    }) {
+        return Err(Error::Handler(format!(
+            "Docker image not allowed: {}. Allowed: {:?}",
+            image, ALLOWED_IMAGES
+        )));
+    }
+
+    let memory_limit = req.memory_limit.as_deref().unwrap_or(DEFAULT_MEMORY_LIMIT);
+    let cpu_limit = req.cpu_limit.as_deref().unwrap_or(DEFAULT_CPU_LIMIT);
+    let network_mode = req.network_mode.as_deref().unwrap_or(DEFAULT_NETWORK_MODE);
+    let timeout_secs = req.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let container_name = format!("agentos-sandbox-{}", &id[..8]);
+
+    let mut args = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "--name".to_string(),
+        container_name.clone(),
+        "--memory".to_string(),
+        memory_limit.to_string(),
+        "--cpus".to_string(),
+        cpu_limit.to_string(),
+        "--network".to_string(),
+        network_mode.to_string(),
+        "--pids-limit".to_string(),
+        "256".to_string(),
+        "--read-only".to_string(),
+        "--no-new-privileges".to_string(),
+    ];
+
+    if let Some(workspace) = &req.workspace_path {
+        if workspace.contains("..")
+            || workspace == "/"
+            || BLOCKED_PATHS
+                .iter()
+                .any(|p| workspace == *p || workspace.starts_with(&format!("{}/", p)))
+        {
+            return Err(Error::Handler("Blocked workspace path".to_string()));
+        }
+        args.push("-v".to_string());
+        args.push(format!("{}:/workspace:rw", workspace));
+        args.push("-w".to_string());
+        args.push("/workspace".to_string());
+    }
+
+    if let Some(env_vars) = &req.env {
+        for var in env_vars {
+            if !var.contains('=') {
+                return Err(Error::Handler(format!("Env var must contain '=': {}", var)));
+            }
+            let upper = var.to_uppercase();
+            let name_upper = upper.split('=').next().unwrap_or(&upper);
+            let blocked = BLOCKED_ENV_PREFIXES.iter().any(|p| {
+                let prefix = p.trim_end_matches('=');
+                name_upper.starts_with(prefix)
+            });
+            if blocked {
+                return Err(Error::Handler(format!(
+                    "Blocked env var: {}",
+                    var.split('=').next().unwrap_or("")
+                )));
+            }
+            args.push("-e".to_string());
+            args.push(var.clone());
+        }
+    }
+
+    args.push(image.to_string());
+    args.extend(req.command.clone());
+
+    let start = std::time::Instant::now();
+
+    let child = tokio::process::Command::new("docker")
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::Handler(e.to_string()))?;
+
+    let timeout = tokio::time::Duration::from_secs(timeout_secs);
+    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let exit_code = output.status.code().unwrap_or(-1);
+
+            Ok(json!({
+                "exitCode": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "durationMs": duration_ms,
+                "timedOut": false,
+            }))
+        }
+        Ok(Err(e)) => Ok(json!({
+            "exitCode": -1,
+            "stdout": "",
+            "stderr": e.to_string(),
+            "durationMs": duration_ms,
+            "timedOut": false,
+        })),
+        Err(_) => {
+            let _ = tokio::process::Command::new("docker")
+                .args(["rm", "-f", &container_name])
+                .output()
+                .await;
+
+            Ok(json!({
+                "exitCode": -1,
+                "stdout": "",
+                "stderr": "Execution timed out",
+                "durationMs": duration_ms,
+                "timedOut": true,
+            }))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -829,150 +974,5 @@ mod tests {
         let input = json!({"command": ["echo"], "image": "latest"});
         let result = docker_exec(input).await;
         assert!(result.is_err());
-    }
-}
-
-pub fn register(iii: &IIIClient) {
-    iii.register_function(
-        "security::docker_exec",
-        RegisterFunction::new_async(move |input: Value| async move { docker_exec(input).await })
-            .description("Execute a command inside a Docker container sandbox"),
-    );
-}
-
-async fn docker_exec(input: Value) -> Result<Value, Error> {
-    let req: DockerExecRequest =
-        serde_json::from_value(input).map_err(|e| Error::Handler(e.to_string()))?;
-
-    if req.command.is_empty() {
-        return Err(Error::Handler("command must not be empty".into()));
-    }
-
-    let image = req.image.as_deref().unwrap_or(DEFAULT_IMAGE);
-
-    if !ALLOWED_IMAGES.iter().any(|allowed| {
-        image == *allowed
-            || image.starts_with(&format!("{}:", allowed.split(':').next().unwrap_or("")))
-    }) {
-        return Err(Error::Handler(format!(
-            "Docker image not allowed: {}. Allowed: {:?}",
-            image, ALLOWED_IMAGES
-        )));
-    }
-
-    let memory_limit = req.memory_limit.as_deref().unwrap_or(DEFAULT_MEMORY_LIMIT);
-    let cpu_limit = req.cpu_limit.as_deref().unwrap_or(DEFAULT_CPU_LIMIT);
-    let network_mode = req.network_mode.as_deref().unwrap_or(DEFAULT_NETWORK_MODE);
-    let timeout_secs = req.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let container_name = format!("agentos-sandbox-{}", &id[..8]);
-
-    let mut args = vec![
-        "run".to_string(),
-        "--rm".to_string(),
-        "--name".to_string(),
-        container_name.clone(),
-        "--memory".to_string(),
-        memory_limit.to_string(),
-        "--cpus".to_string(),
-        cpu_limit.to_string(),
-        "--network".to_string(),
-        network_mode.to_string(),
-        "--pids-limit".to_string(),
-        "256".to_string(),
-        "--read-only".to_string(),
-        "--no-new-privileges".to_string(),
-    ];
-
-    if let Some(workspace) = &req.workspace_path {
-        if workspace.contains("..")
-            || workspace == "/"
-            || BLOCKED_PATHS
-                .iter()
-                .any(|p| workspace == *p || workspace.starts_with(&format!("{}/", p)))
-        {
-            return Err(Error::Handler("Blocked workspace path".to_string()));
-        }
-        args.push("-v".to_string());
-        args.push(format!("{}:/workspace:rw", workspace));
-        args.push("-w".to_string());
-        args.push("/workspace".to_string());
-    }
-
-    if let Some(env_vars) = &req.env {
-        for var in env_vars {
-            if !var.contains('=') {
-                return Err(Error::Handler(format!("Env var must contain '=': {}", var)));
-            }
-            let upper = var.to_uppercase();
-            let name_upper = upper.split('=').next().unwrap_or(&upper);
-            let blocked = BLOCKED_ENV_PREFIXES.iter().any(|p| {
-                let prefix = p.trim_end_matches('=');
-                name_upper.starts_with(prefix)
-            });
-            if blocked {
-                return Err(Error::Handler(format!(
-                    "Blocked env var: {}",
-                    var.split('=').next().unwrap_or("")
-                )));
-            }
-            args.push("-e".to_string());
-            args.push(var.clone());
-        }
-    }
-
-    args.push(image.to_string());
-    args.extend(req.command.clone());
-
-    let start = std::time::Instant::now();
-
-    let child = tokio::process::Command::new("docker")
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| Error::Handler(e.to_string()))?;
-
-    let timeout = tokio::time::Duration::from_secs(timeout_secs);
-    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-
-    match result {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let exit_code = output.status.code().unwrap_or(-1);
-
-            Ok(json!({
-                "exitCode": exit_code,
-                "stdout": stdout,
-                "stderr": stderr,
-                "durationMs": duration_ms,
-                "timedOut": false,
-            }))
-        }
-        Ok(Err(e)) => Ok(json!({
-            "exitCode": -1,
-            "stdout": "",
-            "stderr": e.to_string(),
-            "durationMs": duration_ms,
-            "timedOut": false,
-        })),
-        Err(_) => {
-            let _ = tokio::process::Command::new("docker")
-                .args(["rm", "-f", &container_name])
-                .output()
-                .await;
-
-            Ok(json!({
-                "exitCode": -1,
-                "stdout": "",
-                "stderr": "Execution timed out",
-                "durationMs": duration_ms,
-                "timedOut": true,
-            }))
-        }
     }
 }

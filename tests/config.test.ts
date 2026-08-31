@@ -7,6 +7,20 @@ const deprecatedAliases = new Map([
   ["iii-cron", "cron"],
 ]);
 
+const excludedSourcePrefixes = [
+  "target/",
+  "node_modules/",
+  "website/node_modules/",
+  "website/dist/",
+  "dist/",
+  "coverage/",
+  ".upstream-iii/",
+] as const;
+
+function isRepositorySource(path: string): boolean {
+  return !excludedSourcePrefixes.some((prefix) => path.startsWith(prefix));
+}
+
 function configuredWorkers(source: string): string[] {
   return [...source.matchAll(/^\s*-\s+name:\s*([^\s#]+)/gm)].map(
     (match) => match[1],
@@ -45,13 +59,9 @@ describe("iii 0.22.1 engine config", () => {
   it("has no deprecated worker references outside this regression test", async () => {
     const glob = new Bun.Glob("**/*.{yaml,yml,rs,ts,tsx,js,jsx,md,sh}");
     for await (const path of glob.scan({ cwd: repository.pathname })) {
-      if (
-        path === "tests/config.test.ts" ||
-        path.startsWith("target/") ||
-        path.startsWith("node_modules/")
-      ) {
+      if (path === "tests/config.test.ts" || !isRepositorySource(path)) {
         continue;
-      }
+        }
       const source = await Bun.file(new URL(path, repository)).text();
       for (const deprecated of deprecatedAliases.keys()) {
         expect(source, `${path} still references ${deprecated}`).not.toContain(

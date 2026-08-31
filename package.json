@@ -3,13 +3,19 @@
   "version": "0.1.0",
   "description": "UnitB continuation of AgentOS on iii v0.22.1 primitives",
   "type": "module",
+  "packageManager": "bun@1.3.14",
   "scripts": {
+    "test": "bun test",
+    "test:unit": "bun test examples scripts tests",
     "test:e2e": "AGENTOS_E2E=1 vitest --run --config vitest.e2e.config.ts",
     "test:e2e:smoke": "AGENTOS_E2E=1 vitest --run --config vitest.e2e.config.ts --testNamePattern=\"health|chat_completions\"",
     "test:examples": "vitest --run examples/shared.test.ts",
     "test:scripts": "vitest --run scripts/dev-up.test.ts",
+    "typecheck": "bun run typecheck:examples && bun run typecheck:scripts",
     "typecheck:examples": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck examples/*.ts",
-    "typecheck:scripts": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck scripts/dev-up.test.ts"
+    "typecheck:scripts": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck scripts/dev-up.test.ts",
+    "build:website": "bash -lc 'cd website && npm run build'",
+    "check": "bun run typecheck && bun run test:unit && bun run build:website"
   },
   "dependencies": {
     "iii-sdk": "0.22.1"

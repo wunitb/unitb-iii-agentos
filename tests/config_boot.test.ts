@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const repository = new URL("../", import.meta.url);
+const expectedVersion = (
+  await Bun.file(new URL(".iii-version", repository)).text()
+).trim();
 const iii = Bun.which("iii");
 const liveEngineTest = iii ? it : it.skip;
 const temporaryDirectories: string[] = [];
@@ -59,14 +62,14 @@ async function waitForQueueProvider(binary: string): Promise<string> {
   throw new Error(`queue provider did not register within 15s:\n${lastOutput}`);
 }
 
-describe("iii 0.22.1 boot compatibility", () => {
+describe(`iii ${expectedVersion} boot compatibility`, () => {
   liveEngineTest(
     "boots the checkout config and exposes the standalone queue provider",
     async () => {
       const binary = iii as string;
       const version = await run([binary, "--version"]);
       expect(version.exitCode).toBe(0);
-      expect(version.stdout.trim()).toBe("0.22.1");
+      expect(version.stdout.trim()).toBe(expectedVersion);
 
       const runtime = await mkdtemp(join(tmpdir(), "agentos-config-boot-"));
       temporaryDirectories.push(runtime);

@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${III_VERSION:-0.22.1}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VERSION_FILE="$ROOT/.iii-version"
+[[ -f "$VERSION_FILE" ]] || { echo "missing iii version file: $VERSION_FILE" >&2; exit 1; }
+VERSION="${III_VERSION:-$(tr -d '[:space:]' < "$VERSION_FILE")}"
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "invalid stable iii version: $VERSION" >&2; exit 1; }
 INSTALL_DIR="${III_INSTALL_DIR:-$HOME/.local/bin}"
 
 case "$(uname -s)" in

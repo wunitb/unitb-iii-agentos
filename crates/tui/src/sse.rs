@@ -45,15 +45,12 @@ pub async fn subscribe(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        loop {
-            let Some(idx) = buf.find("\n\n") else {
-                break;
-            };
+        while let Some(idx) = buf.find("\n\n") {
             let frame = buf.drain(..idx + 2).collect::<String>();
-            if let Some(evt) = parse_frame(&frame) {
-                if tx.send(evt).await.is_err() {
-                    return Ok(());
-                }
+            if let Some(evt) = parse_frame(&frame)
+                && tx.send(evt).await.is_err()
+            {
+                return Ok(());
             }
         }
     }

@@ -28,6 +28,9 @@ async function upgradeFixture(
   beforeInstall?: (paths: UpgradeFixturePaths) => Promise<void>,
 ) {
   const root = await mkdtemp(join(tmpdir(), "agentos-install-upgrade-"));
+  const iiiVersion = (
+    await Bun.file(new URL(".iii-version", repository)).text()
+  ).trim();
   sandboxes.push(root);
   const home = join(root, "home");
   const agentosHome = join(home, ".agentos");
@@ -55,13 +58,17 @@ async function upgradeFixture(
     writeFile(join(runtime, "data", "sessions", "s-1.json"), '{"turns":7}\n'),
     writeFile(join(runtime, ".env"), "ANTHROPIC_API_KEY=preserve-me\n"),
     writeFile(join(runtime, "stale-release-file"), "remove me\n"),
+    writeFile(join(payload, "runtime", ".iii-version"), `${iiiVersion}\n`),
     writeFile(join(payload, "runtime", "config.yaml"), "release: default\n"),
     writeFile(join(payload, "runtime", "config", "state.yaml"), "release default\n"),
     writeFile(join(payload, "runtime", "data", "default.db"), "release default\n"),
     writeFile(join(payload, "runtime", "workers", "fresh", "iii.worker.yaml"), "name: fresh\n"),
   ]);
   await executable(join(payload, "bin", "agentos"), "#!/bin/sh\nexit 0\n");
-  await executable(join(stubs, "iii"), "#!/bin/sh\nprintf '0.22.1\\n'\n");
+  await executable(
+    join(stubs, "iii"),
+    `#!/bin/sh\nprintf '${iiiVersion}\\n'\n`,
+  );
   await executable(
     join(stubs, "curl"),
     `#!/bin/sh

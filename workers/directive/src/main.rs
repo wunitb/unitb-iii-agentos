@@ -67,7 +67,7 @@ async fn create_directive(iii: &IIIClient, req: CreateDirectiveRequest) -> Resul
     .await
     .map_err(|e| Error::Handler(e.to_string()))?;
 
-    let _ = {
+    {
         let _iii = iii.clone();
         let _payload = json!({
             "topic": "directive.lifecycle",
@@ -117,12 +117,12 @@ async fn list_directives(iii: &IIIClient, req: ListDirectivesRequest) -> Result<
         arr.iter()
             .filter_map(|v| serde_json::from_value::<Directive>(v.clone()).ok())
             .filter(|d| {
-                let level_ok = req.level.as_ref().map_or(true, |l| &d.level == l);
-                let status_ok = req.status.as_ref().map_or(true, |s| &d.status == s);
+                let level_ok = req.level.as_ref().is_none_or(|l| &d.level == l);
+                let status_ok = req.status.as_ref().is_none_or(|s| &d.status == s);
                 let parent_ok = req
                     .parent_id
                     .as_ref()
-                    .map_or(true, |p| d.parent_id.as_ref() == Some(p));
+                    .is_none_or(|p| d.parent_id.as_ref() == Some(p));
                 level_ok && status_ok && parent_ok
             })
             .collect()

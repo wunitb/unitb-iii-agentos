@@ -612,7 +612,7 @@ async fn recall_memory(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         .into_iter()
         .take(limit)
         .map(|(score, m)| {
-            let _ = {
+            {
                 let _iii = iii.clone();
                 let _payload = json!({
                     "scope": format!("memory:{}", m.agent_id),
@@ -1809,7 +1809,7 @@ mod tests {
         let text =
             "\u{4e16}\u{754c}\u{4f60}\u{597d}\u{6211}\u{4eec}\u{5b66}\u{4e60}\u{7f16}\u{7a0b}";
         let chunks = chunk_text(text, 15);
-        assert!(chunks.len() >= 1);
+        assert!(!chunks.is_empty());
         let rejoined: String = chunks.join("");
         assert_eq!(rejoined, text);
     }
@@ -1836,7 +1836,7 @@ mod tests {
     fn test_chunk_text_only_newlines() {
         let text = "\n\n\n\n\n";
         let chunks = chunk_text(text, 3);
-        assert!(chunks.len() >= 1);
+        assert!(!chunks.is_empty());
         let rejoined: String = chunks.join("");
         assert_eq!(rejoined, text);
     }
@@ -2212,7 +2212,7 @@ mod tests {
 
     #[test]
     fn test_repair_dedup_by_id() {
-        let messages = vec![
+        let messages = [
             json!({"id": "m-1", "role": "user"}),
             json!({"id": "m-1", "role": "user"}),
             json!({"id": "m-2", "role": "assistant"}),
@@ -2269,11 +2269,11 @@ mod tests {
         let mut prev_ts = 0u64;
         for msg in &mut messages {
             let ts = msg["timestamp"].as_u64().unwrap_or(0);
-            if ts < prev_ts {
-                if let Some(obj) = msg.as_object_mut() {
-                    obj.insert("timestamp".into(), json!(prev_ts + 1));
-                    reordered += 1;
-                }
+            if ts < prev_ts
+                && let Some(obj) = msg.as_object_mut()
+            {
+                obj.insert("timestamp".into(), json!(prev_ts + 1));
+                reordered += 1;
             }
             prev_ts = msg["timestamp"].as_u64().unwrap_or(prev_ts);
         }
@@ -2459,7 +2459,7 @@ mod tests {
         let confidence_just_below = 0.09999;
         let confidence_at = 0.1;
         assert!(confidence_just_below < 0.1);
-        assert!(!(confidence_at < 0.1));
+        assert!(confidence_at >= 0.1);
     }
 
     #[test]
@@ -2525,7 +2525,7 @@ mod tests {
 
     #[test]
     fn test_repair_no_duplicates() {
-        let messages = vec![
+        let messages = [
             json!({"id": "m-1", "role": "user"}),
             json!({"id": "m-2", "role": "assistant"}),
             json!({"id": "m-3", "role": "user"}),
@@ -2579,11 +2579,11 @@ mod tests {
         let mut prev_ts = 0u64;
         for msg in &mut messages {
             let ts = msg["timestamp"].as_u64().unwrap_or(0);
-            if ts < prev_ts {
-                if let Some(obj) = msg.as_object_mut() {
-                    obj.insert("timestamp".into(), json!(prev_ts + 1));
-                    reordered += 1;
-                }
+            if ts < prev_ts
+                && let Some(obj) = msg.as_object_mut()
+            {
+                obj.insert("timestamp".into(), json!(prev_ts + 1));
+                reordered += 1;
             }
             prev_ts = msg["timestamp"].as_u64().unwrap_or(prev_ts);
         }
@@ -2601,11 +2601,11 @@ mod tests {
         let mut prev_ts = 0u64;
         for msg in &mut messages {
             let ts = msg["timestamp"].as_u64().unwrap_or(0);
-            if ts < prev_ts {
-                if let Some(obj) = msg.as_object_mut() {
-                    obj.insert("timestamp".into(), json!(prev_ts + 1));
-                    reordered += 1;
-                }
+            if ts < prev_ts
+                && let Some(obj) = msg.as_object_mut()
+            {
+                obj.insert("timestamp".into(), json!(prev_ts + 1));
+                reordered += 1;
             }
             prev_ts = msg["timestamp"].as_u64().unwrap_or(prev_ts);
         }

@@ -142,7 +142,7 @@ async fn submit_proposal(iii: &IIIClient, req: SubmitProposalRequest) -> Result<
     )
     .await;
 
-    let _ = {
+    {
         let _iii = iii.clone();
         let _payload = json!({
             "topic": "council.proposal",
@@ -229,7 +229,7 @@ async fn decide_proposal(iii: &IIIClient, req: DecideProposalRequest) -> Result<
     )
     .await;
 
-    let _ = {
+    {
         let _iii = iii.clone();
         let _payload = json!({
             "topic": "council.proposal",
@@ -274,7 +274,7 @@ async fn list_proposals(
         .map(|arr| {
             arr.iter()
                 .filter_map(|v| serde_json::from_value::<Proposal>(v.clone()).ok())
-                .filter(|p| status_filter.map_or(true, |s| p.status == s))
+                .filter(|p| status_filter.is_none_or(|s| p.status == s))
                 .collect()
         })
         .unwrap_or_default();
@@ -321,7 +321,7 @@ async fn override_agent(iii: &IIIClient, req: OverrideRequest) -> Result<Value, 
     )
     .await;
 
-    let _ = {
+    {
         let _iii = iii.clone();
         let _payload = json!({
             "topic": "council.override",

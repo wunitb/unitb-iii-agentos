@@ -1145,10 +1145,10 @@ mod tests {
             if connected.is_some() {
                 return connected;
             }
-            if let Some((threshold, connected)) = &self.connected_from_probe {
-                if probe >= *threshold {
-                    return Some(connected.clone());
-                }
+            if let Some((threshold, connected)) = &self.connected_from_probe
+                && probe >= *threshold
+            {
+                return Some(connected.clone());
             }
             None
         }

@@ -54,11 +54,12 @@ impl VaultState {
     }
 
     fn check_auto_lock(&mut self) {
-        if let (Some(last), key) = (self.last_activity, self.crypto_key.as_ref()) {
-            if key.is_some() && last.elapsed() >= Duration::from_millis(self.auto_lock_ms) {
-                self.crypto_key = None;
-                self.last_activity = None;
-            }
+        if let (Some(last), key) = (self.last_activity, self.crypto_key.as_ref())
+            && key.is_some()
+            && last.elapsed() >= Duration::from_millis(self.auto_lock_ms)
+        {
+            self.crypto_key = None;
+            self.last_activity = None;
         }
     }
 
@@ -965,14 +966,14 @@ mod tests {
 
     #[test]
     fn test_derive_key_different_salt_different_key() {
-        let k1 = derive_key("password", &vec![0u8; 32]).unwrap();
-        let k2 = derive_key("password", &vec![1u8; 32]).unwrap();
+        let k1 = derive_key("password", &[0u8; 32]).unwrap();
+        let k2 = derive_key("password", &[1u8; 32]).unwrap();
         assert_ne!(k1, k2);
     }
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
-        let key = derive_key("test-password", &vec![5u8; 32]).unwrap();
+        let key = derive_key("test-password", &[5u8; 32]).unwrap();
         let (iv, ct, tag) = encrypt(&key, "secret-value-123").unwrap();
         let plaintext = decrypt(&key, &iv, &ct, &tag).unwrap();
         assert_eq!(plaintext, "secret-value-123");
@@ -980,7 +981,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_unicode() {
-        let key = derive_key("test-password", &vec![5u8; 32]).unwrap();
+        let key = derive_key("test-password", &[5u8; 32]).unwrap();
         let unicode = "emoji: \u{1f600} CJK: \u{4f60}\u{597d} arabic: \u{0645}\u{0631}\u{062d}\u{0628}\u{0627}";
         let (iv, ct, tag) = encrypt(&key, unicode).unwrap();
         let plaintext = decrypt(&key, &iv, &ct, &tag).unwrap();
@@ -989,7 +990,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_special_chars() {
-        let key = derive_key("test-password", &vec![5u8; 32]).unwrap();
+        let key = derive_key("test-password", &[5u8; 32]).unwrap();
         let special = "key=val&foo=bar\n\ttab \"quotes\" 'single'";
         let (iv, ct, tag) = encrypt(&key, special).unwrap();
         let plaintext = decrypt(&key, &iv, &ct, &tag).unwrap();
@@ -998,7 +999,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_empty_string() {
-        let key = derive_key("test-password", &vec![5u8; 32]).unwrap();
+        let key = derive_key("test-password", &[5u8; 32]).unwrap();
         let (iv, ct, tag) = encrypt(&key, "").unwrap();
         let plaintext = decrypt(&key, &iv, &ct, &tag).unwrap();
         assert_eq!(plaintext, "");
@@ -1006,7 +1007,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_long_value() {
-        let key = derive_key("test-password", &vec![5u8; 32]).unwrap();
+        let key = derive_key("test-password", &[5u8; 32]).unwrap();
         let big = "x".repeat(100_000);
         let (iv, ct, tag) = encrypt(&key, &big).unwrap();
         let plaintext = decrypt(&key, &iv, &ct, &tag).unwrap();
@@ -1015,7 +1016,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_iv_unique() {
-        let key = derive_key("test-password", &vec![5u8; 32]).unwrap();
+        let key = derive_key("test-password", &[5u8; 32]).unwrap();
         let (iv1, _, _) = encrypt(&key, "same").unwrap();
         let (iv2, _, _) = encrypt(&key, "same").unwrap();
         assert_ne!(iv1, iv2);
@@ -1023,8 +1024,8 @@ mod tests {
 
     #[test]
     fn test_decrypt_with_wrong_key_fails() {
-        let key1 = derive_key("password1", &vec![5u8; 32]).unwrap();
-        let key2 = derive_key("password2", &vec![5u8; 32]).unwrap();
+        let key1 = derive_key("password1", &[5u8; 32]).unwrap();
+        let key2 = derive_key("password2", &[5u8; 32]).unwrap();
         let (iv, ct, tag) = encrypt(&key1, "secret").unwrap();
         let result = decrypt(&key2, &iv, &ct, &tag);
         assert!(result.is_err());
@@ -1032,7 +1033,7 @@ mod tests {
 
     #[test]
     fn test_decrypt_tampered_ciphertext_fails() {
-        let key = derive_key("test-password", &vec![5u8; 32]).unwrap();
+        let key = derive_key("test-password", &[5u8; 32]).unwrap();
         let (iv, ct, tag) = encrypt(&key, "secret").unwrap();
         let mut tampered = B64.decode(&ct).unwrap();
         if !tampered.is_empty() {
@@ -1045,17 +1046,17 @@ mod tests {
 
     #[test]
     fn test_decrypt_invalid_iv_length_fails() {
-        let key = derive_key("test-password", &vec![5u8; 32]).unwrap();
-        let bad_iv = B64.encode(&[0u8; 8]);
+        let key = derive_key("test-password", &[5u8; 32]).unwrap();
+        let bad_iv = B64.encode([0u8; 8]);
         let result = decrypt(&key, &bad_iv, "AAAA", "AAAAAAAAAAAAAAAAAAAAAA==");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_decrypt_invalid_tag_length_fails() {
-        let key = derive_key("test-password", &vec![5u8; 32]).unwrap();
-        let iv = B64.encode(&[0u8; 12]);
-        let bad_tag = B64.encode(&[0u8; 4]);
+        let key = derive_key("test-password", &[5u8; 32]).unwrap();
+        let iv = B64.encode([0u8; 12]);
+        let bad_tag = B64.encode([0u8; 4]);
         let result = decrypt(&key, &iv, "AAAA", &bad_tag);
         assert!(result.is_err());
     }
@@ -1215,7 +1216,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_outputs_are_base64() {
-        let key = derive_key("test-password", &vec![5u8; 32]).unwrap();
+        let key = derive_key("test-password", &[5u8; 32]).unwrap();
         let (iv, ct, tag) = encrypt(&key, "hello").unwrap();
         assert!(B64.decode(&iv).is_ok());
         assert!(B64.decode(&ct).is_ok());
@@ -1224,7 +1225,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_iv_decodes_to_12_bytes() {
-        let key = derive_key("test-password", &vec![5u8; 32]).unwrap();
+        let key = derive_key("test-password", &[5u8; 32]).unwrap();
         let (iv, _, _) = encrypt(&key, "hello").unwrap();
         let decoded = B64.decode(&iv).unwrap();
         assert_eq!(decoded.len(), NONCE_LEN);
@@ -1232,7 +1233,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_tag_decodes_to_16_bytes() {
-        let key = derive_key("test-password", &vec![5u8; 32]).unwrap();
+        let key = derive_key("test-password", &[5u8; 32]).unwrap();
         let (_, _, tag) = encrypt(&key, "hello").unwrap();
         let decoded = B64.decode(&tag).unwrap();
         assert_eq!(decoded.len(), TAG_LEN);

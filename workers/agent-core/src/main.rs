@@ -445,6 +445,10 @@ fn route_fields(route: &Value) -> Result<(String, String), Error> {
     Ok((provider.into(), model.into()))
 }
 
+fn session_id_or_default(session_id: Option<String>, agent_id: &str) -> String {
+    session_id.unwrap_or_else(|| format!("default:{agent_id}"))
+}
+
 async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
     let start = Instant::now();
 
@@ -626,9 +630,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
             .map_err(|e| Error::Handler(e.to_string()))?;
     }
 
-    let session_id = req
-        .session_id
-        .unwrap_or_else(|| format!("default:{}", req.agent_id));
+    let session_id = session_id_or_default(req.session_id, &req.agent_id);
 
     spawn_trigger(
         iii,
@@ -744,6 +746,47 @@ fn filter_functions(registry: &Value, allowed: &[String]) -> Value {
             })
             .collect(),
     )
+}
+
+async fn create_agent(iii: &IIIClient, config: AgentConfig) -> Result<Value, Error> {
+    let agent_id = config
+        .id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    iii.trigger(TriggerRequest {
+        function_id: "state::set".to_string(),
+        payload: json!({
+        "scope": "agents",
+        "key": &agent_id,
+        "value": {
+            "id": &agent_id,
+            "name": &config.name,
+            "description": &config.description,
+            "model": &config.model,
+            "systemPrompt": &config.system_prompt,
+            "capabilities": &config.capabilities,
+            "resources": &config.resources,
+            "tags": &config.tags,
+            "createdAt": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
+        },
+    }),
+        action: None,
+        timeout_ms: None,
+    })
+    .await
+    .map_err(|e| Error::Handler(e.to_string()))?;
+
+    spawn_trigger(
+        iii,
+        "publish",
+        json!({
+            "topic": "agent.lifecycle",
+            "data": { "type": "created", "agentId": &agent_id },
+        }),
+    );
+
+    Ok(json!({ "agentId": agent_id }))
 }
 
 #[cfg(test)]
@@ -981,15 +1024,13 @@ mod tests {
     #[test]
     fn test_session_id_default_format() {
         let agent_id = "agent-42";
-        let session_id: Option<String> = None;
-        let result = session_id.unwrap_or_else(|| format!("default:{}", agent_id));
+        let result = session_id_or_default(None, agent_id);
         assert_eq!(result, "default:agent-42");
     }
 
     #[test]
     fn test_session_id_explicit() {
-        let session_id = Some("custom-session".to_string());
-        let result = session_id.unwrap_or_else(|| "default:x".to_string());
+        let result = session_id_or_default(Some("custom-session".to_string()), "x");
         assert_eq!(result, "custom-session");
     }
 
@@ -1029,13 +1070,13 @@ mod tests {
 
     #[test]
     fn test_wildcard_tool_filter() {
-        let allowed = vec!["*".to_string()];
+        let allowed = ["*".to_string()];
         assert!(allowed.contains(&"*".to_string()));
     }
 
     #[test]
     fn test_tool_filter_prefix_match() {
-        let allowed = vec!["file::".to_string(), "memory::".to_string()];
+        let allowed = ["file::".to_string(), "memory::".to_string()];
         let tool_id = "file::read";
         let matches = allowed.iter().any(|a| tool_id.starts_with(a.as_str()));
         assert!(matches);
@@ -1043,7 +1084,7 @@ mod tests {
 
     #[test]
     fn test_tool_filter_no_match() {
-        let allowed = vec!["file::".to_string()];
+        let allowed = ["file::".to_string()];
         let tool_id = "network::send";
         let matches = allowed.iter().any(|a| tool_id.starts_with(a.as_str()));
         assert!(!matches);
@@ -1225,7 +1266,7 @@ mod tests {
             iterations += 1;
         }
         assert_eq!(iterations, MAX_ITERATIONS);
-        assert!(!(iterations < MAX_ITERATIONS));
+        assert!((iterations >= MAX_ITERATIONS));
     }
 
     #[test]
@@ -1374,7 +1415,7 @@ mod tests {
 
     #[test]
     fn test_tool_filter_multiple_prefixes() {
-        let allowed = vec![
+        let allowed = [
             "file::".to_string(),
             "memory::".to_string(),
             "fn::".to_string(),
@@ -1412,7 +1453,7 @@ mod tests {
 
     #[test]
     fn test_tool_filter_exact_match() {
-        let allowed = vec!["file::read".to_string()];
+        let allowed = ["file::read".to_string()];
         let tool_id = "file::read";
         let matches = allowed.iter().any(|a| tool_id.starts_with(a.as_str()));
         assert!(matches);
@@ -1420,7 +1461,7 @@ mod tests {
 
     #[test]
     fn test_tool_filter_partial_prefix_no_match() {
-        let allowed = vec!["file::read_all".to_string()];
+        let allowed = ["file::read_all".to_string()];
         let tool_id = "file::read";
         let matches = allowed.iter().any(|a| tool_id.starts_with(a.as_str()));
         assert!(!matches);
@@ -1470,8 +1511,7 @@ mod tests {
     #[test]
     fn test_session_id_format_with_special_chars() {
         let agent_id = "agent/special-chars_123";
-        let session_id: Option<String> = None;
-        let result = session_id.unwrap_or_else(|| format!("default:{}", agent_id));
+        let result = session_id_or_default(None, agent_id);
         assert_eq!(result, "default:agent/special-chars_123");
     }
 
@@ -1703,7 +1743,7 @@ mod tests {
         let scan_result = json!({ "safe": true, "riskScore": "not_a_number" });
         let risk_score = scan_result["riskScore"].as_f64().unwrap_or(0.0);
         assert_eq!(risk_score, 0.0);
-        assert!(!(risk_score > 0.5));
+        assert!(risk_score <= 0.5);
     }
 
     #[test]
@@ -1732,7 +1772,7 @@ mod tests {
 
     #[test]
     fn test_tool_filter_case_sensitive() {
-        let allowed = vec!["File::".to_string()];
+        let allowed = ["File::".to_string()];
         let tool_id = "file::read";
         let matches = allowed.iter().any(|a| tool_id.starts_with(a.as_str()));
         assert!(!matches);
@@ -1794,8 +1834,7 @@ mod tests {
     #[test]
     fn test_session_id_default_format_unicode_agent() {
         let agent_id = "agent-\u{1f600}";
-        let session_id: Option<String> = None;
-        let result = session_id.unwrap_or_else(|| format!("default:{}", agent_id));
+        let result = session_id_or_default(None, agent_id);
         assert!(result.starts_with("default:"));
         assert!(result.contains('\u{1f600}'));
     }
@@ -1840,45 +1879,4 @@ mod tests {
             .unwrap_or("");
         assert_eq!(content, "");
     }
-}
-
-async fn create_agent(iii: &IIIClient, config: AgentConfig) -> Result<Value, Error> {
-    let agent_id = config
-        .id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-    iii.trigger(TriggerRequest {
-        function_id: "state::set".to_string(),
-        payload: json!({
-        "scope": "agents",
-        "key": &agent_id,
-        "value": {
-            "id": &agent_id,
-            "name": &config.name,
-            "description": &config.description,
-            "model": &config.model,
-            "systemPrompt": &config.system_prompt,
-            "capabilities": &config.capabilities,
-            "resources": &config.resources,
-            "tags": &config.tags,
-            "createdAt": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
-        },
-    }),
-        action: None,
-        timeout_ms: None,
-    })
-    .await
-    .map_err(|e| Error::Handler(e.to_string()))?;
-
-    spawn_trigger(
-        iii,
-        "publish",
-        json!({
-            "topic": "agent.lifecycle",
-            "data": { "type": "created", "agentId": &agent_id },
-        }),
-    );
-
-    Ok(json!({ "agentId": agent_id }))
 }

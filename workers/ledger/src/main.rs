@@ -169,7 +169,7 @@ async fn record_spend(iii: &IIIClient, req: RecordSpendRequest) -> Result<Value,
         serde_json::from_value(check).map_err(|e| Error::Handler(e.to_string()))?;
 
     if !check_result.allowed {
-        let _ = {
+        {
             let _iii = iii.clone();
             let _payload = json!({
                 "topic": "ledger.alert",
@@ -256,61 +256,60 @@ async fn record_spend(iii: &IIIClient, req: RecordSpendRequest) -> Result<Value,
         .await
         .ok();
 
-    if let Some(val) = budget_val {
-        if let Ok(mut budget) = serde_json::from_value::<Budget>(val) {
-            let prev_version = budget.version;
-            budget.spent_cents += req.cost_cents;
-            budget.version = prev_version + 1;
-            budget.updated_at = chrono::Utc::now().to_rfc3339();
+    if let Some(val) = budget_val
+        && let Ok(mut budget) = serde_json::from_value::<Budget>(val)
+    {
+        let prev_version = budget.version;
+        budget.spent_cents += req.cost_cents;
+        budget.version = prev_version + 1;
+        budget.updated_at = chrono::Utc::now().to_rfc3339();
 
-            let updated =
-                serde_json::to_value(&budget).map_err(|e| Error::Handler(e.to_string()))?;
-            let _ = iii
-                .trigger(TriggerRequest {
-                    function_id: "state::set".to_string(),
-                    payload: json!({
-                        "scope": budget_scope(&req.realm_id),
-                        "key": &req.agent_id,
-                        "value": updated,
-                        "expectedVersion": prev_version,
-                    }),
-                    action: None,
-                    timeout_ms: None,
-                })
-                .await;
+        let updated = serde_json::to_value(&budget).map_err(|e| Error::Handler(e.to_string()))?;
+        let _ = iii
+            .trigger(TriggerRequest {
+                function_id: "state::set".to_string(),
+                payload: json!({
+                    "scope": budget_scope(&req.realm_id),
+                    "key": &req.agent_id,
+                    "value": updated,
+                    "expectedVersion": prev_version,
+                }),
+                action: None,
+                timeout_ms: None,
+            })
+            .await;
 
-            let utilization = if budget.monthly_cents > 0 {
-                (budget.spent_cents as f64 / budget.monthly_cents as f64) * 100.0
-            } else {
-                0.0
-            };
-            if budget.monthly_cents > 0
-                && utilization >= budget.soft_threshold * 100.0
-                && utilization < 100.0
+        let utilization = if budget.monthly_cents > 0 {
+            (budget.spent_cents as f64 / budget.monthly_cents as f64) * 100.0
+        } else {
+            0.0
+        };
+        if budget.monthly_cents > 0
+            && utilization >= budget.soft_threshold * 100.0
+            && utilization < 100.0
+        {
             {
-                let _ = {
-                    let _iii = iii.clone();
-                    let _payload = json!({
-                        "topic": "ledger.alert",
-                        "data": {
-                            "type": "soft_threshold",
-                            "realmId": req.realm_id,
-                            "agentId": req.agent_id,
-                            "utilizationPct": utilization,
-                        },
-                    });
-                    tokio::spawn(async move {
-                        let _ = _iii
-                            .trigger(TriggerRequest {
-                                function_id: "publish".to_string(),
-                                payload: _payload,
-                                action: None,
-                                timeout_ms: None,
-                            })
-                            .await;
-                    });
-                };
-            }
+                let _iii = iii.clone();
+                let _payload = json!({
+                    "topic": "ledger.alert",
+                    "data": {
+                        "type": "soft_threshold",
+                        "realmId": req.realm_id,
+                        "agentId": req.agent_id,
+                        "utilizationPct": utilization,
+                    },
+                });
+                tokio::spawn(async move {
+                    let _ = _iii
+                        .trigger(TriggerRequest {
+                            function_id: "publish".to_string(),
+                            payload: _payload,
+                            action: None,
+                            timeout_ms: None,
+                        })
+                        .await;
+                });
+            };
         }
     }
 

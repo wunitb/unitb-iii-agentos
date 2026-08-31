@@ -8,18 +8,30 @@ on:
       - '.github/workflows/vercel-deploy.yml'
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   trigger:
     name: trigger vercel production deploy
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: trigger via deploy hook
         env:
           HOOK_URL: ${{ secrets.VERCEL_DEPLOY_HOOK_URL }}
         run: |
+          set -euo pipefail
           if [ -z "${HOOK_URL:-}" ]; then
-            echo "::warning::VERCEL_DEPLOY_HOOK_URL not set; create one in Vercel project Settings -> Git -> Deploy Hooks (branch=main) and add as repo secret"
-            exit 0
+            echo "::error::VERCEL_DEPLOY_HOOK_URL is required"
+            exit 1
           fi
-          response=$(curl -fsSL -X POST "$HOOK_URL")
-          echo "vercel response: $response"
+          case "$HOOK_URL" in
+            https://api.vercel.com/v1/integrations/deploy/*) ;;
+            *) echo "::error::invalid Vercel deploy hook origin"; exit 1 ;;
+          esac
+          status=$(curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors \
+            --connect-timeout 10 --max-time 30 --request POST \
+            --output /dev/null --write-out '%{http_code}' "$HOOK_URL")
+          [[ "$status" == 2* ]] || { echo "::error::Vercel deploy hook returned HTTP $status"; exit 1; }
+          echo "Vercel production deployment accepted (HTTP $status)"

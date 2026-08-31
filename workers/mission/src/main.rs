@@ -57,7 +57,7 @@ async fn create_mission(iii: &IIIClient, req: CreateMissionRequest) -> Result<Va
     .await
     .map_err(|e| Error::Handler(e.to_string()))?;
 
-    let _ = {
+    {
         let _iii = iii.clone();
         let _payload = json!({
             "topic": "mission.lifecycle",
@@ -144,7 +144,7 @@ async fn checkout_mission(iii: &IIIClient, req: CheckoutRequest) -> Result<Value
 
     save_mission(iii, &mission).await?;
 
-    let _ = {
+    {
         let _iii = iii.clone();
         let _payload = json!({
             "topic": "mission.lifecycle",
@@ -218,7 +218,7 @@ async fn transition_mission(iii: &IIIClient, req: TransitionRequest) -> Result<V
 
     save_mission(iii, &mission).await?;
 
-    let _ = {
+    {
         let _iii = iii.clone();
         let _payload = json!({
             "topic": "mission.lifecycle",
@@ -263,7 +263,7 @@ async fn add_comment(iii: &IIIClient, req: CommentRequest) -> Result<Value, Erro
     iii.trigger(TriggerRequest {
         function_id: "state::set".to_string(),
         payload: json!({
-            "scope": comments_scope(&realm_id, &req.mission_id),
+            "scope": comments_scope(realm_id, &req.mission_id),
             "key": id,
             "value": value,
         }),
@@ -306,15 +306,15 @@ async fn list_missions(iii: &IIIClient, req: ListMissionsRequest) -> Result<Valu
             arr.iter()
                 .filter_map(|v| serde_json::from_value::<Mission>(v.clone()).ok())
                 .filter(|m| {
-                    let status_ok = req.status.as_ref().map_or(true, |s| &m.status == s);
+                    let status_ok = req.status.as_ref().is_none_or(|s| &m.status == s);
                     let assignee_ok = req
                         .assignee_id
                         .as_ref()
-                        .map_or(true, |a| m.assignee_id.as_ref() == Some(a));
+                        .is_none_or(|a| m.assignee_id.as_ref() == Some(a));
                     let dir_ok = req
                         .directive_id
                         .as_ref()
-                        .map_or(true, |d| m.directive_id.as_ref() == Some(d));
+                        .is_none_or(|d| m.directive_id.as_ref() == Some(d));
                     status_ok && assignee_ok && dir_ok
                 })
                 .collect()

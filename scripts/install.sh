@@ -2,7 +2,8 @@
 set -e
 
 AGENTOS_REPO="wunitb/unitb-iii-agentos"
-III_VERSION="${III_VERSION:-0.22.1}"
+III_VERSION_OVERRIDE="${III_VERSION:-}"
+III_VERSION=""
 INSTALL_DIR="${BIN_DIR:-${PREFIX:-$HOME/.local}/bin}"
 AGENTOS_HOME="${AGENTOS_HOME:-$HOME/.agentos}"
 
@@ -186,6 +187,22 @@ ensure_path() {
   fi
 }
 
+resolve_iii_version() {
+  local version_file="$AGENTOS_HOME/runtime/.iii-version"
+  if [ -n "$III_VERSION_OVERRIDE" ]; then
+    III_VERSION="$III_VERSION_OVERRIDE"
+  elif [ -f "$version_file" ]; then
+    III_VERSION="$(tr -d '[:space:]' < "$version_file")"
+  else
+    err "Installed AgentOS runtime is missing .iii-version"
+  fi
+
+  case "$III_VERSION" in
+    ''|*[!0-9.]*) err "Invalid stable iii version: ${III_VERSION:-empty}" ;;
+    *-*) err "Refusing prerelease iii version: $III_VERSION" ;;
+  esac
+}
+
 install_iii() {
   local current_version=""
   if check_cmd iii; then
@@ -286,8 +303,9 @@ main() {
     err "curl is required. Install it and try again."
   fi
 
-  install_iii
   install_agentos
+  resolve_iii_version
+  install_iii
   ensure_path
 
   printf "\n"

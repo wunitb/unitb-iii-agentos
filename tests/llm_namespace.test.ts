@@ -6,6 +6,20 @@ const legacyFunctions = ["chat", ...agentosLlmFunctions].map(
   (name) => `llm::${name}`,
 );
 
+const excludedSourcePrefixes = [
+  "target/",
+  "node_modules/",
+  "website/node_modules/",
+  "website/dist/",
+  "dist/",
+  "coverage/",
+  ".upstream-iii/",
+] as const;
+
+function isRepositorySource(path: string): boolean {
+  return !excludedSourcePrefixes.some((prefix) => path.startsWith(prefix));
+}
+
 function legacyLlmCalls(source: string): string[] {
   const namespace = ["llm", "::"].join("");
   const quotedFunctionId = new RegExp(
@@ -30,13 +44,9 @@ describe("AgentOS LLM namespace", () => {
   it("has no source call sites for colliding legacy llm ids", async () => {
     const glob = new Bun.Glob("**/*.{rs,ts,tsx,js,jsx}");
     for await (const path of glob.scan({ cwd: repository.pathname })) {
-      if (
-        path === "tests/llm_namespace.test.ts" ||
-        path.startsWith("target/") ||
-        path.startsWith("node_modules/")
-      ) {
+      if (path === "tests/llm_namespace.test.ts" || !isRepositorySource(path)) {
         continue;
-      }
+        }
       const source = await Bun.file(new URL(path, repository)).text();
       for (const legacy of legacyFunctions) {
         expect(source, `${path} still references ${legacy}`).not.toMatch(
@@ -50,13 +60,9 @@ describe("AgentOS LLM namespace", () => {
     const failures: string[] = [];
     const glob = new Bun.Glob("**/*.{rs,ts,tsx,js,jsx}");
     for await (const path of glob.scan({ cwd: repository.pathname })) {
-      if (
-        path === "tests/llm_namespace.test.ts" ||
-        path.startsWith("target/") ||
-        path.startsWith("node_modules/")
-      ) {
+      if (path === "tests/llm_namespace.test.ts" || !isRepositorySource(path)) {
         continue;
-      }
+        }
       const calls = legacyLlmCalls(
         await Bun.file(new URL(path, repository)).text(),
       );
