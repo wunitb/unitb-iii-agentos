@@ -6,7 +6,7 @@ use iii_sdk::errors::Error;
 use iii_sdk::{
     IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
 };
-use rand::RngCore;
+use rand::RngExt;
 use scrypt::{Params, scrypt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -80,7 +80,7 @@ fn now_ms() -> i64 {
 
 fn random_bytes(len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill(&mut buf);
     buf
 }
 

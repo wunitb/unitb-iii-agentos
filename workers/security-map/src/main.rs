@@ -3,7 +3,7 @@ use iii_sdk::errors::Error;
 use iii_sdk::{
     IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
 };
-use rand::RngCore;
+use rand::RngExt;
 use serde_json::{Value, json};
 use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -53,7 +53,7 @@ fn require_auth(input: &Value) -> Result<(), Error> {
 
 fn random_nonce_hex() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill(&mut bytes);
     hex::encode(bytes)
 }
 
