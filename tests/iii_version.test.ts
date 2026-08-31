@@ -61,6 +61,7 @@ describe("iii stable version contract", () => {
     for (const path of ["scripts/install-iii.sh", "scripts/install.sh"]) {
       const source = await Bun.file(new URL(path, repository)).text();
       expect(source, path).toContain(".iii-version");
+      expect(source, path).toContain("iii-worker");
     }
     for (const path of ["README.md", "AGENTS.md", "ARCHITECTURE.md"]) {
       const source = await Bun.file(new URL(path, repository)).text();

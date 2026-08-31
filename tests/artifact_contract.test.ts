@@ -185,16 +185,12 @@ async function inspectArtifactDirectory(
   const directoryPath = fileURLToPath(directory);
   let metadata;
   try {
-    metadata = await lstat(directory);
+    metadata = await lstat(resolve(directoryPath));
   } catch {
     return [{ code: "ARTIFACT_DIRECTORY_INVALID", path: directoryPath }];
   }
 
-  if (
-    !metadata.isDirectory() ||
-    metadata.isSymbolicLink() ||
-    (await realpath(directory)) !== resolve(directoryPath)
-  ) {
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
     return [{ code: "ARTIFACT_DIRECTORY_INVALID", path: directoryPath }];
   }
 
