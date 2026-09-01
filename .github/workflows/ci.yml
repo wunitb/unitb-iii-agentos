@@ -204,7 +204,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - run: shellcheck --severity=warning scripts/install.sh scripts/dev-up.sh website/public/install.sh scripts/install-iii.sh
+      - run: shellcheck --severity=warning scripts/install.sh scripts/dev-up.sh scripts/memworkr-sync.sh website/public/install.sh scripts/install-iii.sh
 
   worker-yaml:
     name: validate iii.worker.yaml

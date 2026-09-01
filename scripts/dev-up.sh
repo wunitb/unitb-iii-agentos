@@ -212,7 +212,7 @@ if [[ -n "$memworkr_bin" && -x "$memworkr_bin" ]]; then
         exit 1
     fi
 
-    MEMWORKR_COMPAT= \
+    MEMWORKR_COMPAT='' \
     MEMWORKR_DB="${MEMWORKR_DB:-surrealkv://$ROOT/data/memworkr}" \
         "$memworkr_bin" >> "$ROOT/.agentos-memworkr.log" 2>&1 &
     echo $! >> "$PIDFILE"
