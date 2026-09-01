@@ -45,7 +45,9 @@ ${EDITOR:-vi} .env
 cargo build --workspace --release
 ```
 
-Set the required model/API credentials in `.env`. `install-iii.sh` installs checksum-verified, platform-matched `iii`, `iii-worker`, `iii-init`, and `iii-console` binaries; it verifies every binary's native format and executes each version-capable binary before accepting the installation so a Linux artifact cannot silently replace a macOS binary. The iii engine listens on `127.0.0.1:49134`; AgentOS HTTP routes use port `3111`.
+Set the required model/API credentials in `.env`. `install-iii.sh` installs checksum-verified, platform-matched `iii`, `iii-worker`, and `iii-console` binaries. Linux also receives `iii-init`; macOS skips it because the upstream `iii-init-*-apple-darwin` assets are Linux ELF binaries and are not host-executable ([iii-hq/iii#2119](https://github.com/iii-hq/iii/issues/2119)). The installer verifies every installed binary's native format before accepting it. The iii engine listens on `127.0.0.1:49134`; AgentOS HTTP routes use port `3111`.
+
+The tracked shell configuration confines `shell::fs::*`, `coder::*`, and command `cwd` values to `${III_COMPOSE_DIR:.}` (this repository checkout, with `.` as the direct-engine fallback) with `allow_unjailed: false`. Existing installations receive the same persisted value from `config/shell.yaml` after pulling this revision; do not replace it with a whole-host root.
 
 ## 3. Integrate and sync memworkr
 
@@ -129,7 +131,7 @@ fi
 "$COMPOSE_RUNTIME" compose up -d --build
 ```
 
-Configure database, Redis, public URL, model providers, and secrets in Clawith's `.env`. Preserve `backend/agent_data/` and the configured database during upgrades.
+Configure database, Redis, public URL, model providers, and secrets in Clawith's `.env`. Preserve `backend/agent_data/` and the configured database during upgrades. Compose variants without a `minio` service now default the frontend's unused `MINIO_UPSTREAM` to `127.0.0.1:9000`, so Nginx starts without a manual IP override; deployments that provide MinIO should set the real service address.
 
 Default endpoints:
 

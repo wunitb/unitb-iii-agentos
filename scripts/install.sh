@@ -70,6 +70,19 @@ adopt_runtime_state() {
   done
 }
 
+apply_release_security_defaults() {
+    local release_runtime="$1"
+    local installed_runtime="$2"
+    local relative_path="config/shell.yaml"
+
+    # Security policy files are release-governed, not operator overrides. Apply
+    # them after adopting state so upgrades cannot retain an unjailed shell.
+    if [ -f "$release_runtime/$relative_path" ]; then
+        mkdir -p "$(dirname "$installed_runtime/$relative_path")"
+        cp "$release_runtime/$relative_path" "$installed_runtime/$relative_path"
+    fi
+}
+
 download_and_install() {
   local repo="$1"
   local version="$2"
@@ -147,6 +160,8 @@ download_and_install() {
     adopt_runtime_state "$runtime_retired" "$runtime_dir"
     rm -rf "$runtime_retired"
   fi
+
+  apply_release_security_defaults "$tmp_dir/runtime" "$runtime_dir"
 
   ok "${binary_name} ${version} installed to ${INSTALL_DIR}/${binary_name}"
   ok "Runtime installed to ${AGENTOS_HOME}/runtime"

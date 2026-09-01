@@ -1,0 +1,8 @@
+id: shell
+name: Shell
+description: Shell worker settings with filesystem access confined to this checkout.
+value:
+  fs:
+    host_roots:
+      - ${III_COMPOSE_DIR:.}
+    allow_unjailed: false

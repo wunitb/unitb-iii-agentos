@@ -63,6 +63,14 @@ describe("iii stable version contract", () => {
       expect(source, path).toContain(".iii-version");
       expect(source, path).toContain("iii-worker");
     }
+    const installer = await Bun.file(
+      new URL("scripts/install-iii.sh", repository),
+    ).text();
+    expect(installer).toContain("binaries=(iii iii-worker iii-console)");
+    expect(installer).toContain("binaries+=(iii-init)");
+    expect(installer).toContain("skipping broken macOS release artifact");
+    expect(installer).toContain("iii-hq/iii#2119");
+
     for (const path of ["README.md", "AGENTS.md", "ARCHITECTURE.md"]) {
       const source = await Bun.file(new URL(path, repository)).text();
       expect(source, path).toContain(`v${version}`);
