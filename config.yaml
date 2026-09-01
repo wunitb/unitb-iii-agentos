@@ -7,6 +7,22 @@
 # by editing ./config/X.yaml.
 
 workers:
+  - name: iii-http
+  - name: iii-pubsub
+  - name: state
+  - name: llm-router
+  - name: context-manager
+  - name: cron
+  - name: iii-directory
+  - name: iii-observability
+  - name: iii-stream
+  - name: provider-anthropic
+  - name: provider-openai
+  - name: provider-openai-codex
+  - name: queue
+  - name: session-manager
+  - name: shell
+  - name: harness
   - name: configuration
     config:
       adapter:
@@ -14,11 +30,4 @@ workers:
         config:
           directory: ./config
       ttl_seconds: 0
-
-  - name: iii-http
-  - name: state
-  - name: iii-stream
-  - name: queue
-  - name: iii-pubsub
-  - name: cron
-  - name: iii-observability
+  - name: console

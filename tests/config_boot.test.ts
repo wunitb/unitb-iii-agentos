@@ -103,6 +103,7 @@ describe(`iii ${expectedVersion} boot compatibility`, () => {
       const runtime = await mkdtemp(join(tmpdir(), "agentos-config-boot-"));
       temporaryDirectories.push(runtime);
       await cp(new URL("config.yaml", repository), join(runtime, "config.yaml"));
+      await cp(new URL("iii.lock", repository), join(runtime, "iii.lock"));
       await cp(new URL("config", repository), join(runtime, "config"), {
         recursive: true,
       });

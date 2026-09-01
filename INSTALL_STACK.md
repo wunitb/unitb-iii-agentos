@@ -14,7 +14,7 @@ AgentOS and memworkr share the iii engine at `ws://127.0.0.1:49134`. Clawith is 
 
 - Linux `x86_64`/`aarch64` or macOS `aarch64`
 - Git, curl, tar, Rust/Cargo, Python 3.11+, Node.js 20+
-- Docker with Compose for Clawith
+- Podman with `podman compose` (preferred) or Docker with Compose for Clawith
 - `sha256sum` or `shasum`
 
 ## 1. Clone all repositories
@@ -45,7 +45,7 @@ ${EDITOR:-vi} .env
 cargo build --workspace --release
 ```
 
-Set the required model/API credentials in `.env`. The iii engine listens on `127.0.0.1:49134`; AgentOS HTTP routes use port `3111`.
+Set the required model/API credentials in `.env`. `install-iii.sh` installs checksum-verified, platform-matched `iii`, `iii-worker`, `iii-init`, and `iii-console` binaries; it verifies every binary's native format and executes each version-capable binary before accepting the installation so a Linux artifact cannot silently replace a macOS binary. The iii engine listens on `127.0.0.1:49134`; AgentOS HTTP routes use port `3111`.
 
 ## 3. Integrate and sync memworkr
 
@@ -91,12 +91,23 @@ cd "$HOME/unitb-stack/unitb-iii-agentos"
 bash scripts/dev-up.sh
 ```
 
-`dev-up.sh` starts only immutable synced memworkr binaries and waits for schema-v6 `memory::health`. Diagnose failures with:
+`dev-up.sh` starts only immutable synced memworkr binaries and waits for schema-v6 `memory::health`.
+
+Install the canonical iii Desktop chat graph and console worker against the running engine:
+
+```bash
+bash scripts/desktop-up.sh
+```
+
+This registry `console` worker serves the chat workspace on `http://127.0.0.1:3113` and is what `iii-desktop` renders. Do not start the standalone `iii-console` binary on port 3113: that binary is the developer operations console, redirects `/` to `/workers`, and has no Chat route.
+
+Diagnose failures with:
 
 ```bash
 bash scripts/memworkr-sync.sh status
 ./target/release/agentos doctor
 iii trigger memory::health --json '{}'
+iii worker status
 ```
 
 Production memory calls must traverse the authenticated AgentOS/iii route; direct `iii trigger` mutation calls are development-only.
@@ -107,7 +118,15 @@ Production memory calls must traverse the authenticated AgentOS/iii route; direc
 cd "$HOME/unitb-stack/Clawith"
 cp .env.example .env
 ${EDITOR:-vi} .env
-docker compose up -d --build
+touch ss-nodes.json
+
+# Linux: systemctl --user enable --now podman.socket
+# macOS: podman machine start
+COMPOSE_RUNTIME="${COMPOSE_RUNTIME:-podman}"
+if [[ "$COMPOSE_RUNTIME" == "podman" ]]; then
+  export CONTAINER_SOCKET="$(podman info --format '{{.Host.RemoteSocket.Path}}')"
+fi
+"$COMPOSE_RUNTIME" compose up -d --build
 ```
 
 Configure database, Redis, public URL, model providers, and secrets in Clawith's `.env`. Preserve `backend/agent_data/` and the configured database during upgrades.
@@ -122,9 +141,11 @@ Default endpoints:
 
 ```bash
 curl -fsS http://127.0.0.1:3111/api/health
+curl -fsS http://127.0.0.1:3113/
 curl -fsS http://127.0.0.1:8008/api/health
 iii trigger memory::health --json '{}'
-docker compose -f "$HOME/unitb-stack/Clawith/docker-compose.yml" ps
+COMPOSE_RUNTIME="${COMPOSE_RUNTIME:-podman}"
+"$COMPOSE_RUNTIME" compose -f "$HOME/unitb-stack/Clawith/docker-compose.yml" ps
 ```
 
 Then open `http://127.0.0.1:3008`, sign in, create/select an agent, and send a chat message. Do not accept `[object Object]` or `COULD NOT CREATE THE SESSION` as a successful smoke test.
@@ -141,7 +162,11 @@ bash scripts/memworkr-sync.sh sync ../unitb-iii-memworkr
 cargo build --workspace --release
 
 cd "$HOME/unitb-stack/Clawith"
-docker compose up -d --build
+COMPOSE_RUNTIME="${COMPOSE_RUNTIME:-podman}"
+if [[ "$COMPOSE_RUNTIME" == "podman" ]]; then
+  export CONTAINER_SOCKET="$(podman info --format '{{.Host.RemoteSocket.Path}}')"
+fi
+"$COMPOSE_RUNTIME" compose up -d --build
 ```
 
 Back up AgentOS `data/memworkr`, Clawith's database, and `Clawith/backend/agent_data/` before production upgrades. See the memworkr `OPERATIONS.md` for schema migration, backup verification, rollback, and memory-pressure settings.
