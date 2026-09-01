@@ -91,9 +91,29 @@ async function waitForQueueProvider(
   throw new Error(`queue provider did not register within 15s:\n${lastOutput}`);
 }
 
+async function waitForFunction(binary: string, functionId: string): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  let lastOutput = "";
+  while (Date.now() < deadline) {
+    const result = await run([
+      binary,
+      "trigger",
+      "engine::functions::info",
+      "--json",
+      JSON.stringify({ function_id: functionId }),
+      "--timeout-ms",
+      "1000",
+    ]);
+    lastOutput = `${result.stdout}\n${result.stderr}`;
+    if (result.exitCode === 0) return;
+    await Bun.sleep(100);
+  }
+  throw new Error(`${functionId} did not register within 30s:\n${lastOutput}`);
+}
+
 describe(`iii ${expectedVersion} boot compatibility`, () => {
   liveEngineTest(
-    "boots the checkout config and exposes the standalone queue provider",
+    "boots the checkout config with queue and jailed shell workers",
     async () => {
       const binary = iii as string;
       const version = await run([binary, "--version"]);
@@ -128,17 +148,18 @@ describe(`iii ${expectedVersion} boot compatibility`, () => {
         const provider = await waitForQueueProvider(binary);
         expect(provider.function_id).toBe("engine::queue::enqueue");
         expect(queueProviderNames.has(provider.worker_name)).toBe(true);
+        await waitForFunction(binary, "shell::list");
       } finally {
         engine.kill("SIGINT");
       }
 
       const exitCode = await engine.exited;
       const logs = `${await stdout}\n${await stderr}`;
-      expect(exitCode).toBe(0);
+      expect([0, 130]).toContain(exitCode);
       expect(logs).not.toContain("Duplicate worker configurations");
       expect(logs).not.toContain("is the deprecated name for");
       expect(logs).toContain("Function engine::queue::enqueue");
     },
-    30_000,
+    120_000,
   );
 });

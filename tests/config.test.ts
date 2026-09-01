@@ -56,6 +56,16 @@ describe("iii 0.22.1 engine config", () => {
     }
   });
 
+  it("keeps the shell worker confined to the checkout", async () => {
+    for (const path of ["config.yaml", "config/shell.yaml"]) {
+      const source = await Bun.file(new URL(path, repository)).text();
+      expect(source, path).toContain("host_roots:");
+      expect(source, path).toContain("${III_COMPOSE_DIR:.}");
+      expect(source, path).toContain("allow_unjailed: false");
+      expect(source, path).not.toContain("allow_unjailed: true");
+    }
+  });
+
   it("has no deprecated worker references outside this regression test", async () => {
     const glob = new Bun.Glob("**/*.{yaml,yml,rs,ts,tsx,js,jsx,md,sh}");
     for await (const path of glob.scan({ cwd: repository.pathname })) {

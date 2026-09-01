@@ -52,7 +52,8 @@ That's the whole protocol. Workers stay narrow; everything else lives in the eng
 # 1. clone this repository
 git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos
 
-# 2. install pinned platform-matched iii, worker, init, and console binaries
+# 2. install pinned platform-matched iii, worker, and console binaries
+#    (iii-init is installed only on Linux; upstream macOS assets are Linux binaries)
 bash scripts/install-iii.sh
 
 # 3. configure the local model proxy

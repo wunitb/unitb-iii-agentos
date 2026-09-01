@@ -22,6 +22,11 @@ workers:
   - name: queue
   - name: session-manager
   - name: shell
+    config:
+      fs:
+        host_roots:
+          - ${III_COMPOSE_DIR:.}
+        allow_unjailed: false
   - name: harness
   - name: configuration
     config:

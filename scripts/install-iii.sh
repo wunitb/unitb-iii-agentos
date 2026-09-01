@@ -30,7 +30,15 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 mkdir -p "$INSTALL_DIR"
 
-for binary in iii iii-worker iii-init iii-console; do
+binaries=(iii iii-worker iii-console)
+if [[ "$os" == "unknown-linux-gnu" ]]; then
+    binaries+=(iii-init)
+else
+    rm -f "$INSTALL_DIR/iii-init"
+    echo "iii-init is Linux guest-runtime infrastructure; skipping broken macOS release artifact (iii-hq/iii#2119)" >&2
+fi
+
+for binary in "${binaries[@]}"; do
     asset="${binary}-${arch}-${os}.tar.gz"
     checksum_asset="${binary}-${arch}-${os}.sha256"
 
@@ -57,7 +65,7 @@ command -v file >/dev/null 2>&1 || { echo "file is required to verify release bi
 expected_format="ELF"
 [[ "$os" == "apple-darwin" ]] && expected_format="Mach-O"
 
-for binary in iii iii-worker iii-init iii-console; do
+for binary in "${binaries[@]}"; do
     [[ -x "$INSTALL_DIR/$binary" ]] || { echo "$binary installation failed" >&2; exit 1; }
     if ! file "$INSTALL_DIR/$binary" | grep -q "$expected_format"; then
         echo "$binary has the wrong binary format for ${arch}-${os}" >&2

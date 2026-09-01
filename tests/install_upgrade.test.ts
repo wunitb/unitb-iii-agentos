@@ -54,6 +54,10 @@ async function upgradeFixture(
   await Promise.all([
     writeFile(join(runtime, "config.yaml"), "operator: true\n"),
     writeFile(join(runtime, "config", "state.yaml"), "operator-state-config\n"),
+    writeFile(
+      join(runtime, "config", "shell.yaml"),
+      "id: shell\nvalue:\n  fs:\n    allow_unjailed: true\n",
+    ),
     writeFile(join(runtime, "data", "state.db"), "sqlite-page-sentinel\u0000\u0001"),
     writeFile(join(runtime, "data", "sessions", "s-1.json"), '{"turns":7}\n'),
     writeFile(join(runtime, ".env"), "ANTHROPIC_API_KEY=preserve-me\n"),
@@ -61,6 +65,10 @@ async function upgradeFixture(
     writeFile(join(payload, "runtime", ".iii-version"), `${iiiVersion}\n`),
     writeFile(join(payload, "runtime", "config.yaml"), "release: default\n"),
     writeFile(join(payload, "runtime", "config", "state.yaml"), "release default\n"),
+    writeFile(
+      join(payload, "runtime", "config", "shell.yaml"),
+      "id: shell\nvalue:\n  fs:\n    host_roots:\n      - ${III_COMPOSE_DIR:.}\n    allow_unjailed: false\n",
+    ),
     writeFile(join(payload, "runtime", "data", "default.db"), "release default\n"),
     writeFile(join(payload, "runtime", "workers", "fresh", "iii.worker.yaml"), "name: fresh\n"),
   ]);
@@ -159,6 +167,10 @@ describe("installer upgrade portability", () => {
     expect(await readFile(join(runtime, ".env"), "utf8")).toBe(
       "ANTHROPIC_API_KEY=preserve-me\n",
     );
+    const shellConfig = await readFile(join(runtime, "config", "shell.yaml"), "utf8");
+    expect(shellConfig).toContain("${III_COMPOSE_DIR:.}");
+    expect(shellConfig).toContain("allow_unjailed: false");
+    expect(shellConfig).not.toContain("allow_unjailed: true");
   });
 
   it("preserves empty operator-owned files and directories", async () => {
@@ -177,7 +189,10 @@ describe("installer upgrade portability", () => {
 
     expect(await readFile(join(runtime, "config.yaml"), "utf8")).toBe("");
     expect(await readFile(join(runtime, ".env"), "utf8")).toBe("");
-    expect(await readdir(join(runtime, "config"))).toEqual([]);
+    expect(await readdir(join(runtime, "config"))).toEqual(["shell.yaml"]);
+    expect(await readFile(join(runtime, "config", "shell.yaml"), "utf8")).toContain(
+      "allow_unjailed: false",
+    );
     expect(await readdir(join(runtime, "data"))).toEqual([]);
   });
 
