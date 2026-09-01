@@ -17,6 +17,7 @@
 <p align="center">
   <a href="https://www.agentsos.sh">website</a> ·
   <a href="ARCHITECTURE.md">architecture</a> ·
+  <a href="INSTALL_STACK.md">complete stack install</a> ·
   <a href="#-03--quickstart">quickstart</a> ·
   <a href="#-06--workers">workers</a>
 </p>
