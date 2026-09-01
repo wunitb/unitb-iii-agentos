@@ -30,22 +30,22 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 mkdir -p "$INSTALL_DIR"
 
-for binary in iii iii-worker; do
+for binary in iii iii-worker iii-init iii-console; do
     asset="${binary}-${arch}-${os}.tar.gz"
     checksum_asset="${binary}-${arch}-${os}.sha256"
 
     curl -fsSLo "$tmp_dir/$asset" "$base_url/$asset"
     curl -fsSLo "$tmp_dir/$checksum_asset" "$base_url/$checksum_asset"
 
+    expected="$(awk '{print $1; exit}' "$tmp_dir/$checksum_asset")"
     if command -v sha256sum >/dev/null 2>&1; then
-        (cd "$tmp_dir" && sha256sum --check "$checksum_asset")
+        actual="$(sha256sum "$tmp_dir/$asset" | awk '{print $1}')"
     else
-        expected="$(cut -d ' ' -f 1 "$tmp_dir/$checksum_asset")"
-        actual="$(shasum -a 256 "$tmp_dir/$asset" | cut -d ' ' -f 1)"
-        if [[ "$actual" != "$expected" ]]; then
-            echo "checksum verification failed for $asset" >&2
-            exit 1
-        fi
+        actual="$(shasum -a 256 "$tmp_dir/$asset" | awk '{print $1}')"
+    fi
+    if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ || "$actual" != "$expected" ]]; then
+        echo "checksum verification failed for $asset" >&2
+        exit 1
     fi
 
     tar -xzf "$tmp_dir/$asset" -C "$tmp_dir"
@@ -53,5 +53,22 @@ for binary in iii iii-worker; do
     install -m 0755 "$tmp_dir/$binary" "$INSTALL_DIR/$binary"
 done
 
+command -v file >/dev/null 2>&1 || { echo "file is required to verify release binaries" >&2; exit 1; }
+expected_format="ELF"
+[[ "$os" == "apple-darwin" ]] && expected_format="Mach-O"
+
+for binary in iii iii-worker iii-init iii-console; do
+    [[ -x "$INSTALL_DIR/$binary" ]] || { echo "$binary installation failed" >&2; exit 1; }
+    if ! file "$INSTALL_DIR/$binary" | grep -q "$expected_format"; then
+        echo "$binary has the wrong binary format for ${arch}-${os}" >&2
+        exit 1
+    fi
+done
+for binary in iii iii-worker iii-console; do
+    if ! "$INSTALL_DIR/$binary" --version >/dev/null 2>&1; then
+        echo "$binary cannot execute on ${arch}-${os}; refusing mismatched release artifact" >&2
+        exit 1
+    fi
+done
+
 "$INSTALL_DIR/iii" --version
-[[ -x "$INSTALL_DIR/iii-worker" ]] || { echo "iii-worker installation failed" >&2; exit 1; }

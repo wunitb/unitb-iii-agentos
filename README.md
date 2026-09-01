@@ -52,7 +52,7 @@ That's the whole protocol. Workers stay narrow; everything else lives in the eng
 # 1. clone this repository
 git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos
 
-# 2. install the pinned iii engine + iii-worker runtime with checksum verification
+# 2. install pinned platform-matched iii, worker, init, and console binaries
 bash scripts/install-iii.sh
 
 # 3. configure the local model proxy

@@ -124,6 +124,7 @@ jobs:
           install -m 0755 target/release/agentos-tui "$stage/bin/agentos-tui"
           cp .iii-version "$stage/runtime/.iii-version"
           cp config.yaml "$stage/runtime/config.yaml"
+          cp iii.lock "$stage/runtime/iii.lock"
           cp -R config agents hands identity integrations plugin workflows "$stage/runtime/"
           while IFS= read -r manifest; do
             destination="$stage/runtime/$(dirname "$manifest")"
@@ -149,6 +150,7 @@ jobs:
             ./bin/agentos-tui \
             ./runtime/.iii-version \
             ./runtime/config.yaml \
+            ./runtime/iii.lock \
             ./runtime/workers/agent-core/iii.worker.yaml \
             ./runtime/target/release/agentos-agent-core \
             ./runtime/workers/embedding/main.py \
@@ -204,7 +206,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - run: shellcheck --severity=warning scripts/install.sh scripts/dev-up.sh scripts/memworkr-sync.sh website/public/install.sh scripts/install-iii.sh
+      - run: shellcheck --severity=warning scripts/install.sh scripts/dev-up.sh scripts/desktop-up.sh scripts/memworkr-sync.sh website/public/install.sh scripts/install-iii.sh
 
   worker-yaml:
     name: validate iii.worker.yaml
@@ -331,6 +333,14 @@ jobs:
           done
           timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/3111" 2>/dev/null \
             || { echo "::error::engine HTTP port never opened"; cat engine.log; exit 1; }
+          for _ in {1..120}; do
+            console_probe="$(curl -sS --max-redirs 0 -o /dev/null -w '%{http_code} %{redirect_url}' http://127.0.0.1:3113/ 2>/dev/null || true)"
+            [[ "$console_probe" == 200\ * ]] && break
+            kill -0 "$ENGINE_PID" 2>/dev/null || { cat engine.log; exit 1; }
+            sleep 1
+          done
+          [[ "$console_probe" == 200\ * ]] \
+            || { echo "::error::registry chat console never opened"; cat engine.log; exit 1; }
           for w in agentos-core agentos-llm-router agentos-memory agentos-security agentos-realm agentos-mission agentos-directive agentos-hierarchy agentos-council agentos-ledger agentos-pulse agentos-bridge agentos-wasm-sandbox; do
             ./target/release/$w > "$w.log" 2>&1 &
           done
