@@ -49,16 +49,14 @@ Set the required model/API credentials in `.env`. The iii engine listens on `127
 
 ## 3. Integrate and sync memworkr
 
-The AgentOS checkout must contain the runtime integration supplied by memworkr. Apply it once, then sync the clean memworkr commit into AgentOS-owned immutable runtime storage:
+AgentOS includes the memworkr runtime integration. Sync the clean memworkr commit into AgentOS-owned immutable runtime storage:
 
 ```bash
 cd "$HOME/unitb-stack/unitb-iii-agentos"
-git apply --check ../unitb-iii-memworkr/integrations/agentos/agentos-runtime.patch \
-  && git apply ../unitb-iii-memworkr/integrations/agentos/agentos-runtime.patch
 bash scripts/memworkr-sync.sh sync ../unitb-iii-memworkr
 ```
 
-If `git apply --check` reports that the patch is already applied, do not apply it again. Confirm that `scripts/memworkr-sync.sh` exists before continuing.
+Confirm that `scripts/memworkr-sync.sh status` prints the selected commit before continuing. Never run the binary directly from the memworkr development checkout.
 
 Production configuration must use an absolute database path and a stable instance ID:
 
@@ -79,14 +77,24 @@ Do not set `MEMWORKR_COMPAT=1` for the normal combined deployment. AgentOS remai
 
 ## 4. Start AgentOS and memworkr
 
+Start the iii engine in the first terminal:
+
 ```bash
 cd "$HOME/unitb-stack/unitb-iii-agentos"
-./target/release/agentos up --no-tui
+iii --config config.yaml
 ```
 
-The integrated startup waits for `memory::health`. Diagnose failures with:
+Start AgentOS workers and the synced memworkr runtime in a second terminal:
 
 ```bash
+cd "$HOME/unitb-stack/unitb-iii-agentos"
+bash scripts/dev-up.sh
+```
+
+`dev-up.sh` starts only immutable synced memworkr binaries and waits for schema-v6 `memory::health`. Diagnose failures with:
+
+```bash
+bash scripts/memworkr-sync.sh status
 ./target/release/agentos doctor
 iii trigger memory::health --json '{}'
 ```

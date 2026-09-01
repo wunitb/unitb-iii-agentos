@@ -65,6 +65,23 @@ if [[ -e "$env_file" || -L "$env_file" ]]; then
         fi
     done < "$ROOT/.env.example"
 
+    # Runtime-only memworkr settings are deliberately accepted without putting
+    # production values in the distributable dotenv template.
+    trusted_runtime_names=(
+        III_WS_URL MEMWORKR_RUNTIME_ROOT MEMWORKR_PRODUCTION
+        MEMWORKR_REQUIRE_CALLER MEMWORKR_INSTANCE_ID MEMWORKR_DB
+        MEMWORKR_MAX_IN_FLIGHT MEMWORKR_EXPENSIVE_MAX_IN_FLIGHT
+        MEMWORKR_MEMORY_SOFT_LIMIT_MIB MEMWORKR_REQUEST_TIMEOUT_MS
+        MEMWORKR_SHUTDOWN_GRACE_MS MEMWORKR_CANDIDATE_RECONCILE_MAX
+        MEMWORKR_AUTH_TRIGGER
+    )
+    for runtime_name in "${trusted_runtime_names[@]}"; do
+        case "$allowed_names" in
+            *$'\n'"$runtime_name"$'\n'*) ;;
+            *) allowed_names="${allowed_names}${runtime_name}"$'\n' ;;
+        esac
+    done
+
     seen_names=$'\n'
     line_number=0
     while IFS= read -r env_line || [[ -n "$env_line" ]]; do
@@ -167,6 +184,63 @@ for bin in "$RELEASE_DIR"/agentos-*; do
     echo $! >> "$PIDFILE"
     spawned=$((spawned + 1))
 done
+
+# memworkr runs from an immutable version explicitly installed by
+# scripts/memworkr-sync.sh. Never execute a development checkout directly.
+MEMWORKR_RUNTIME_ROOT="${MEMWORKR_RUNTIME_ROOT:-$ROOT/.agentos-runtime/memworkr}"
+memworkr_current="$MEMWORKR_RUNTIME_ROOT/current"
+memworkr_version=""
+if [[ -f "$memworkr_current" ]]; then
+    memworkr_version="$(tr -d '\r\n' < "$memworkr_current")"
+fi
+if [[ "$memworkr_version" =~ ^[0-9a-f]{40}$ ]]; then
+    memworkr_bin="$MEMWORKR_RUNTIME_ROOT/versions/$memworkr_version/memworkr"
+else
+    memworkr_bin=""
+fi
+
+if [[ -n "$memworkr_bin" && -x "$memworkr_bin" ]]; then
+    if [[ "${MEMWORKR_PRODUCTION:-0}" == "1" ]] &&
+       [[ "${MEMWORKR_REQUIRE_CALLER:-0}" != "1" || -z "${MEMWORKR_INSTANCE_ID:-}" ]]; then
+        echo "production memworkr requires MEMWORKR_REQUIRE_CALLER=1 and MEMWORKR_INSTANCE_ID" >&2
+        stop_workers
+        exit 1
+    fi
+    if ! command -v iii >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        echo "iii CLI and jq are required for memworkr readiness checks" >&2
+        stop_workers
+        exit 1
+    fi
+
+    MEMWORKR_COMPAT= \
+    MEMWORKR_DB="${MEMWORKR_DB:-surrealkv://$ROOT/data/memworkr}" \
+        "$memworkr_bin" >> "$ROOT/.agentos-memworkr.log" 2>&1 &
+    echo $! >> "$PIDFILE"
+    spawned=$((spawned + 1))
+
+    memworkr_ready=0
+    for _ in {1..30}; do
+        if health="$(iii trigger memory::health --json '{}' 2>/dev/null)" &&
+           jq -e --arg production "${MEMWORKR_PRODUCTION:-0}" \
+             '.status == "ok" and .schemaVersion == 6 and
+              ($production != "1" or
+               (.callerEnforced == true and .instanceClaimed == true))' \
+             >/dev/null <<< "$health"; then
+            memworkr_ready=1
+            break
+        fi
+        sleep 1
+    done
+    if [[ $memworkr_ready -ne 1 ]]; then
+        echo "memworkr failed memory::health readiness check" >&2
+        stop_workers
+        exit 1
+    fi
+    echo "▸ memworkr $memworkr_version ready"
+else
+    echo "note: memworkr is not synced — memory::assert/as_of/provenance unavailable"
+    echo "      run: bash scripts/memworkr-sync.sh sync /path/to/unitb-iii-memworkr"
+fi
 
 echo "▸ spawned $spawned workers · pids in $PIDFILE"
 echo "  logs:  $ROOT/.agentos-*.log"
