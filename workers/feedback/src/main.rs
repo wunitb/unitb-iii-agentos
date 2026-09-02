@@ -89,18 +89,19 @@ async fn state_get(iii: &IIIClient, scope: &str, key: &str) -> Option<Value> {
     safe_trigger(iii, "state::get", json!({ "scope": scope, "key": key })).await
 }
 
-async fn state_list(iii: &IIIClient, scope: &str) -> Vec<Value> {
+async fn state_list(iii: &IIIClient, scope: &str) -> Value {
     safe_trigger(iii, "state::list", json!({ "scope": scope }))
         .await
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default()
+        .unwrap_or(Value::Null)
 }
 
-fn entries_to_records(entries: Vec<Value>) -> Vec<Value> {
-    entries
-        .into_iter()
-        .map(|e| e.get("value").cloned().unwrap_or(e))
-        .collect()
+/// Records from a `state::list` response.
+///
+/// The engine answers a bare array of the stored values themselves: there is
+/// no `{key, value}` envelope. Unwrapping a `value` field would replace any
+/// record that carries one with just that field.
+fn entries_to_records(list: &Value) -> Vec<Value> {
+    list.as_array().cloned().unwrap_or_default()
 }
 
 async fn get_policy(iii: &IIIClient) -> FeedbackPolicy {
@@ -130,7 +131,7 @@ async fn get_policy(iii: &IIIClient) -> FeedbackPolicy {
 
 async fn get_recent_evals(iii: &IIIClient, function_id: &str, limit: usize) -> Vec<Value> {
     let entries = state_list(iii, "eval_results").await;
-    let mut results: Vec<Value> = entries_to_records(entries)
+    let mut results: Vec<Value> = entries_to_records(&entries)
         .into_iter()
         .filter(|r| r.get("functionId").and_then(|v| v.as_str()) == Some(function_id))
         .collect();
@@ -676,7 +677,7 @@ async fn feedback_leaderboard(iii: &IIIClient, input: Value) -> Result<Value, Er
     };
 
     let entries = state_list(iii, "evolved_functions").await;
-    let mut functions = entries_to_records(entries);
+    let mut functions = entries_to_records(&entries);
 
     functions.retain(|f| f.get("status").and_then(|v| v.as_str()) != Some("killed"));
 
@@ -821,7 +822,7 @@ async fn feedback_auto_review(iii: &IIIClient, _input: Value) -> Result<Value, E
     .await?;
 
     let entries = state_list(iii, "evolved_functions").await;
-    let reviewable: Vec<Value> = entries_to_records(entries)
+    let reviewable: Vec<Value> = entries_to_records(&entries)
         .into_iter()
         .filter(|f| {
             let s = f.get("status").and_then(|v| v.as_str()).unwrap_or("");
@@ -979,7 +980,7 @@ async fn feedback_list_signals(iii: &IIIClient, input: Value) -> Result<Value, E
     };
 
     let entries = state_list(iii, &format!("feedback_signals:{agent_id}")).await;
-    let mut signals: Vec<Value> = entries_to_records(entries)
+    let mut signals: Vec<Value> = entries_to_records(&entries)
         .into_iter()
         .filter(|s| s.get("createdAt").and_then(|v| v.as_i64()).is_some())
         .collect();
@@ -1264,5 +1265,34 @@ mod tests {
         assert_eq!(correctness_of(&e), Some(0.7));
         assert!((overall_of(&e) - 0.6).abs() < 1e-9);
         assert!((safety_of(&e) - 0.9).abs() < 1e-9);
+    }
+
+    // --- state::list protocol (verified against iii 0.22.1) ---
+
+    #[test]
+    fn records_are_read_from_a_bare_list() {
+        let list = json!([
+            { "functionId": "fn_a_v1", "score": 1 },
+            { "functionId": "fn_a_v2", "score": 2 }
+        ]);
+        let records = entries_to_records(&list);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["functionId"], "fn_a_v1");
+        assert_eq!(records[1]["score"], 2);
+    }
+
+    #[test]
+    fn a_record_carrying_its_own_value_field_survives_intact() {
+        // The old reader unwrapped `entry["value"]` when present, so a record
+        // with a `value` field was replaced by that field alone.
+        let list = json!([{ "functionId": "fn_a_v1", "value": { "functionId": "wrong" } }]);
+        let records = entries_to_records(&list);
+        assert_eq!(records[0]["functionId"], "fn_a_v1");
+    }
+
+    #[test]
+    fn a_non_array_list_response_yields_no_records() {
+        assert!(entries_to_records(&Value::Null).is_empty());
+        assert!(entries_to_records(&json!({ "entries": [] })).is_empty());
     }
 }

@@ -1,6 +1,6 @@
 import type { IIIClient, JsonValue } from "iii-sdk";
 import { describe, expect, it, vi } from "vitest";
-import { registerHttpTrigger } from "./shared.js";
+import { agentStateWrites, registerHttpTrigger } from "./shared.js";
 
 type Handler = (input: JsonValue) => Promise<JsonValue>;
 
@@ -86,5 +86,54 @@ describe("registerHttpTrigger", () => {
     await expect(getHandler()({ body: { name: "seven" } })).resolves.toEqual(
       explicitResponse,
     );
+  });
+});
+
+describe("agentStateWrites", () => {
+  it("puts the agent id inside the document because state::list drops keys", () => {
+    const writes = agentStateWrites(
+      "researcher",
+      { name: "Researcher", capabilities: { tools: ["tool::*"] } },
+      1_700_000_000_000,
+    );
+
+    const agents = writes.find((w) => w.scope === "agents");
+    expect(agents).toBeDefined();
+    expect(agents!.key).toBe("researcher");
+    expect(agents!.value).toEqual({
+      name: "Researcher",
+      capabilities: { tools: ["tool::*"] },
+      id: "researcher",
+    });
+  });
+
+  it("writes the capability document to the scope the reader uses", () => {
+    const writes = agentStateWrites(
+      "researcher",
+      { capabilities: { tools: ["memory::*", "workflow::run"] } },
+      1_700_000_000_000,
+    );
+
+    const capabilities = writes.find((w) => w.scope === "capabilities");
+    expect(capabilities).toBeDefined();
+    expect(capabilities!.key).toBe("researcher");
+    expect(capabilities!.value).toEqual({
+      tools: ["memory::*", "workflow::run"],
+      updatedAt: 1_700_000_000_000,
+    });
+  });
+
+  it("grants no tool when the config declares none", () => {
+    const writes = agentStateWrites("plain", { name: "Plain" }, 1);
+    const capabilities = writes.find((w) => w.scope === "capabilities");
+    expect(capabilities!.value).toEqual({ tools: [], updatedAt: 1 });
+  });
+
+  it("keeps every write in the state::set shape the engine accepts", () => {
+    for (const write of agentStateWrites("a", { name: "A" }, 1)) {
+      expect(Object.keys(write).sort()).toEqual(["key", "scope", "value"]);
+      expect(typeof write.scope).toBe("string");
+      expect(typeof write.key).toBe("string");
+    }
   });
 });

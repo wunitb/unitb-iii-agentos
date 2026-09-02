@@ -118,6 +118,48 @@ async fn state_set(iii: &IIIClient, scope: &str, key: &str, value: Value) -> Res
     Ok(())
 }
 
+async fn state_delete(iii: &IIIClient, scope: &str, key: &str) -> Result<(), Error> {
+    iii.trigger(TriggerRequest {
+        function_id: "state::delete".to_string(),
+        payload: json!({ "scope": scope, "key": key }),
+        action: None,
+        timeout_ms: None,
+    })
+    .await
+    .map_err(|e| Error::Handler(e.to_string()))?;
+    Ok(())
+}
+
+/// `state::update` payload for an atomic counter step.
+///
+/// The engine names the operation list `ops` (an `operations` key fails the
+/// whole invocation with "missing field `ops`") and an `increment` carries the
+/// step in `by`, not `value`.
+fn increment_payload(scope: &str, key: &str, delta: i64) -> Value {
+    json!({
+        "scope": scope,
+        "key": key,
+        "ops": [
+            { "type": "increment", "path": "", "by": delta },
+        ],
+    })
+}
+
+/// A rejected operation still answers success at the transport level: the
+/// engine reports it inside an `errors` array of an otherwise normal result.
+fn update_rejection(result: &Value) -> Option<String> {
+    let errors = result.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    Some(Value::Array(errors.clone()).to_string())
+}
+
+/// The post-update counter, read from the `new_value` the engine returns.
+fn counter_from_update(result: &Value) -> Option<i64> {
+    result.get("new_value")?.as_i64()
+}
+
 /// Atomic increment of an integer counter at scope/key. Returns the post-increment value.
 async fn state_increment(
     iii: &IIIClient,
@@ -128,22 +170,22 @@ async fn state_increment(
     let res = iii
         .trigger(TriggerRequest {
             function_id: "state::update".to_string(),
-            payload: json!({
-                "scope": scope,
-                "key": key,
-                "operations": [
-                    { "type": "increment", "path": "", "value": delta },
-                ],
-            }),
+            payload: increment_payload(scope, key, delta),
             action: None,
             timeout_ms: None,
         })
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
-    Ok(res
-        .as_i64()
-        .or_else(|| res.get("value").and_then(|v| v.as_i64()))
-        .unwrap_or(0))
+    if let Some(rejection) = update_rejection(&res) {
+        return Err(Error::Handler(format!(
+            "counter update rejected for {scope}/{key}: {rejection}"
+        )));
+    }
+    counter_from_update(&res).ok_or_else(|| {
+        Error::Handler(format!(
+            "counter update for {scope}/{key} returned no numeric new_value"
+        ))
+    })
 }
 
 async fn get_agent_index(iii: &IIIClient) -> Vec<String> {
@@ -177,7 +219,10 @@ async fn set_warning_keys(iii: &IIIClient, agent_id: &str, keys: Vec<String>) ->
 async fn clear_warning_buckets(iii: &IIIClient, agent_id: &str) -> Result<(), Error> {
     let keys = get_warning_keys(iii, agent_id).await;
     for key in keys {
-        state_set(iii, "loop_guard_warnings", &key, Value::Null).await?;
+        // Delete, never `set null`: the engine rejects an `increment` over a
+        // stored null ("Expected number at path 'root', got null") while a
+        // missing key increments from zero.
+        state_delete(iii, "loop_guard_warnings", &key).await?;
     }
     set_warning_keys(iii, agent_id, vec![]).await?;
     Ok(())
@@ -198,7 +243,7 @@ async fn evict_stale_agents(iii: &IIIClient) -> Result<(), Error> {
         let last = history.last().unwrap();
         if now - last.timestamp > AGENT_TTL_MS {
             state_set(iii, "loop_guard_history", &agent_id, Value::Null).await?;
-            state_set(iii, "loop_guard_counts", &agent_id, Value::Null).await?;
+            state_delete(iii, "loop_guard_counts", &agent_id).await?;
             clear_warning_buckets(iii, &agent_id).await?;
         } else {
             remaining.push(agent_id);
@@ -371,7 +416,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let agent_id = input["agentId"].as_str().unwrap_or("").to_string();
                 state_set(&iii, "loop_guard_history", &agent_id, Value::Null).await?;
                 clear_warning_buckets(&iii, &agent_id).await?;
-                state_set(&iii, "loop_guard_counts", &agent_id, Value::Null).await?;
+                state_delete(&iii, "loop_guard_counts", &agent_id).await?;
                 let index = get_agent_index(&iii).await;
                 let filtered: Vec<String> =
                     index.into_iter().filter(|id| id != &agent_id).collect();
@@ -587,5 +632,67 @@ mod tests {
     #[test]
     fn backoff_schedule_has_four_entries() {
         assert_eq!(BACKOFF_SCHEDULE, &[5000, 10000, 30000, 60000]);
+    }
+
+    // --- state::update protocol (verified against iii 0.22.1) ---
+
+    #[test]
+    fn increment_payload_uses_ops_not_operations() {
+        let payload = increment_payload("loop_guard_counts", "a1", 1);
+        assert!(
+            payload.get("operations").is_none(),
+            "`operations` fails the whole invocation with `missing field ops`"
+        );
+        assert!(payload["ops"].is_array());
+    }
+
+    #[test]
+    fn increment_payload_carries_the_step_in_by() {
+        let payload = increment_payload("loop_guard_counts", "a1", 3);
+        let op = &payload["ops"][0];
+        assert_eq!(op["type"], "increment");
+        assert_eq!(op["by"], json!(3));
+        assert!(
+            op.get("value").is_none(),
+            "`value` fails the whole invocation with `missing field by`"
+        );
+    }
+
+    #[test]
+    fn increment_payload_accepts_a_negative_step() {
+        let payload = increment_payload("loop_guard_counts", "a1", -1);
+        assert_eq!(payload["ops"][0]["by"], json!(-1));
+    }
+
+    #[test]
+    fn counter_reads_new_value_from_the_engine_result() {
+        let engine_result = json!({ "new_value": 7, "old_value": 6 });
+        assert_eq!(counter_from_update(&engine_result), Some(7));
+    }
+
+    #[test]
+    fn counter_rejects_the_shapes_this_worker_used_to_assume() {
+        assert_eq!(counter_from_update(&json!(7)), None);
+        assert_eq!(counter_from_update(&json!({ "value": 7 })), None);
+    }
+
+    #[test]
+    fn rejection_is_detected_inside_a_successful_response() {
+        let engine_result = json!({
+            "errors": [{ "code": "increment.not_number", "op_index": 0 }],
+            "new_value": null,
+            "old_value": null,
+        });
+        let rejection = update_rejection(&engine_result).expect("rejection must be reported");
+        assert!(rejection.contains("increment.not_number"));
+    }
+
+    #[test]
+    fn a_clean_result_has_no_rejection() {
+        assert_eq!(update_rejection(&json!({ "new_value": 1 })), None);
+        assert_eq!(
+            update_rejection(&json!({ "new_value": 1, "errors": [] })),
+            None
+        );
     }
 }

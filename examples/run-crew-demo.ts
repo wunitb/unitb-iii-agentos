@@ -1,5 +1,10 @@
 import { registerWorker } from "iii-sdk";
-import { ENGINE_URL, OTEL_CONFIG, registerShutdown } from "./shared.js";
+import {
+  ENGINE_URL,
+  OTEL_CONFIG,
+  agentStateWrites,
+  registerShutdown,
+} from "./shared.js";
 import { readFileSync, readdirSync, existsSync } from "fs";
 import { join } from "path";
 
@@ -49,7 +54,11 @@ async function loadAgents() {
     };
 
     try {
-      await trigger("state::set", { scope: "agents", key: dir, value: config });
+      // `state::list` returns values without their keys, and capabilities are
+      // read from their own scope, so registering an agent takes both writes.
+      for (const write of agentStateWrites(dir, config, Date.now())) {
+        await trigger("state::set", write);
+      }
       loaded++;
     } catch {
       console.error(`  Failed to load: ${dir}`);

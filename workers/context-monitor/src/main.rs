@@ -14,6 +14,14 @@ use types::{
     score_token_utilization, score_tool_density, truncate_chars,
 };
 
+/// Function id of this worker's LLM-free in-turn compressor.
+///
+/// It must not be `context::trim`: `workers/context-manager` registers that id
+/// for a different, LLM-backed handler, and the engine gives the id to
+/// whichever worker connects last, so the two implementations were silently
+/// replacing each other depending on process start order.
+const TRIM_MICRO_FUNCTION_ID: &str = "context::trim_micro";
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -560,7 +568,7 @@ async fn auto_optimize(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         };
         let micro = iii
             .trigger(TriggerRequest {
-                function_id: "context::trim".into(),
+                function_id: TRIM_MICRO_FUNCTION_ID.into(),
                 payload: json!({ "messages": messages }),
                 action: None,
                 timeout_ms: None,
@@ -623,7 +631,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     iii.register_function(
-        "context::trim",
+        TRIM_MICRO_FUNCTION_ID,
         RegisterFunction::new_async(move |input: Value| async move { trim_micro(input).await })
             .description("Lightweight in-turn compression without LLM"),
     );
@@ -664,7 +672,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     agentos_http_adapter::register_http_trigger(
         &iii,
-        "context::trim",
+        TRIM_MICRO_FUNCTION_ID,
         json!({ "http_method": "POST", "api_path": "api/context/micro-compact" }),
         None,
     )?;
@@ -912,5 +920,21 @@ mod tests {
     fn message_role_check() {
         let m = msg("user", "hi");
         assert_eq!(m.role, "user");
+    }
+
+    // --- function-id uniqueness ---
+
+    #[test]
+    fn the_micro_compressor_does_not_claim_context_managers_id() {
+        // `workers/context-manager` registers `context::trim` for its
+        // LLM-backed handler. The engine gives an id to whichever worker
+        // connects last, so sharing it silently disabled one of the two.
+        assert_ne!(TRIM_MICRO_FUNCTION_ID, "context::trim");
+        assert_eq!(TRIM_MICRO_FUNCTION_ID, "context::trim_micro");
+    }
+
+    #[test]
+    fn the_micro_compressor_id_stays_in_the_context_namespace() {
+        assert!(TRIM_MICRO_FUNCTION_ID.starts_with("context::"));
     }
 }

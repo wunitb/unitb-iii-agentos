@@ -73,26 +73,57 @@ async fn get_task_order(iii: &IIIClient) -> Result<Vec<String>, Error> {
         .unwrap_or_default())
 }
 
+/// `state::update` payload that appends one task id to the `_order` index.
+///
+/// The engine names the operation list `ops`; an `operations` key fails the
+/// whole invocation with "missing field `ops`", which silently demoted every
+/// append to the read-modify-write fallback below.
+fn append_order_payload(task_id: &str) -> Value {
+    json!({
+        "scope": "a2a_tasks",
+        "key": "_order",
+        "ops": [
+            { "type": "append", "path": "", "value": task_id },
+        ],
+    })
+}
+
+/// A rejected operation still answers success at the transport level: the
+/// engine reports it inside an `errors` array of an otherwise normal result.
+fn update_rejection(result: &Value) -> Option<String> {
+    let errors = result.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    Some(Value::Array(errors.clone()).to_string())
+}
+
 /// Atomically append a task id to the `_order` index using `state::update`.
 /// Falls back to read-modify-write if the engine rejects the operation.
 async fn append_task_to_order(iii: &IIIClient, task_id: &str) -> Result<(), Error> {
     let result = iii
         .trigger(TriggerRequest {
             function_id: "state::update".to_string(),
-            payload: json!({
-                "scope": "a2a_tasks",
-                "key": "_order",
-                "operations": [
-                    { "type": "append", "path": "", "value": task_id },
-                ],
-            }),
+            payload: append_order_payload(task_id),
             action: None,
             timeout_ms: None,
         })
         .await;
     match result {
-        Ok(_) => Ok(()),
-        Err(_) => {
+        Ok(value) if update_rejection(&value).is_none() => Ok(()),
+        outcome => {
+            match outcome {
+                Ok(value) => tracing::warn!(
+                    task_id = %task_id,
+                    rejection = %update_rejection(&value).unwrap_or_default(),
+                    "atomic order append rejected; falling back to read-modify-write"
+                ),
+                Err(e) => tracing::warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "atomic order append failed; falling back to read-modify-write"
+                ),
+            }
             let mut order = get_task_order(iii).await?;
             order.push(task_id.to_string());
             state_set(iii, "a2a_tasks", "_order", json!(order)).await
@@ -828,4 +859,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     iii.shutdown_async().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- state::update protocol (verified against iii 0.22.1) ---
+
+    #[test]
+    fn append_order_payload_uses_ops_not_operations() {
+        let payload = append_order_payload("task-1");
+        assert!(
+            payload.get("operations").is_none(),
+            "`operations` fails the whole invocation with `missing field ops`"
+        );
+        assert_eq!(payload["scope"], "a2a_tasks");
+        assert_eq!(payload["key"], "_order");
+    }
+
+    #[test]
+    fn append_order_payload_appends_the_element_itself() {
+        let op = append_order_payload("task-1")["ops"][0].clone();
+        assert_eq!(op["type"], "append");
+        assert_eq!(op["path"], "");
+        assert_eq!(op["value"], json!("task-1"));
+    }
+
+    #[test]
+    fn a_rejected_append_is_detected_inside_a_successful_response() {
+        let engine_result = json!({
+            "errors": [{ "code": "append.type_mismatch", "op_index": 0 }],
+            "new_value": 5,
+            "old_value": 5,
+        });
+        assert!(
+            update_rejection(&engine_result)
+                .expect("rejection must be reported")
+                .contains("append.type_mismatch")
+        );
+    }
+
+    #[test]
+    fn a_clean_append_reports_no_rejection() {
+        assert_eq!(update_rejection(&json!({ "new_value": ["task-1"] })), None);
+        assert_eq!(
+            update_rejection(&json!({ "new_value": ["task-1"], "errors": [] })),
+            None
+        );
+    }
 }
