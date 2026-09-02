@@ -20,47 +20,13 @@ workers:
   - name: iii-worker-manager
     config:
       host: 127.0.0.1
-      # Bus RBAC. `rbac.auth_function_id` is called once per connection and, unlike
-      # the stream's auth_function, it FAILS CLOSED: an error, a missing function or
-      # an undeserialisable answer makes the engine send an error frame and close the
-      # socket (engine/src/engine/mod.rs, the Err arm of rbac_session::handle_session).
-      # The function is served by `agentos-bus-authd`, which `agentos up` starts
-      # BEFORE the engine, and reached through the `iii-bridge` entry below — it
-      # cannot be an AgentOS worker, because the engine calls it for EVERY
-      # connection including that worker's own.
-      # If the daemon is down, every new bus connection is refused and the stack does
-      # not come up. That is the intended failure direction.
-      rbac:
-        auth_function_id: agentos::bus_auth
-        on_function_registration_function_id: agentos::bus_on_register
-        on_trigger_registration_function_id: agentos::bus_on_trigger
-        # 0.22.1's `expose_functions` is GLOBAL to every session, so it cannot be the
-        # per-tier control; a session can only be NARROWED afterwards with an exact-id
-        # `forbidden_functions` list. The wildcard therefore stays open here and the
-        # untrusted tier is denied by exact id in crates/bus-auth/src/policy.rs
-        # (UNTRUSTED_FORBIDDEN_FUNCTIONS).
-        expose_functions:
-          - match("*")
-  # Client of the bus-auth daemon. `forward:` registers the three RBAC functions with
-  # `engine.register_function_handler` inside `register_functions`, which the engine
-  # runs for every worker during the build loop — before `serve()` calls
-  # `start_background_tasks` and the bus listener binds. That is what makes the gate
-  # bootstrappable, and it is why the order of entries in this file does not matter.
-  # `url` must never be the engine's own bus (49134): the bridge would then depend on
-  # the listener it is gating.
-  - name: iii-bridge
-    config:
-      url: ws://127.0.0.1:49129
-      forward:
-        - local_function: agentos::bus_auth
-          remote_function: agentos::bus_auth
-          timeout_ms: 5000
-        - local_function: agentos::bus_on_register
-          remote_function: agentos::bus_on_register
-          timeout_ms: 5000
-        - local_function: agentos::bus_on_trigger
-          remote_function: agentos::bus_on_trigger
-          timeout_ms: 5000
+      # Bus RBAC is NOT armed here. It is fail-closed by design, so an armed
+      # config with no `agentos-bus-authd` listening refuses every worker
+      # connection and the stack does not come up — which is what the documented
+      # `iii --config config.yaml` path would do on a clean clone. The opt-in
+      # overlay and its instructions live in `bus-rbac.overlay.yaml` (repo root, so the
+      # configuration worker does not try to parse it as a worker config);
+      # `agentos up` starts the daemon and `agentos doctor` reports the state.
   - name: iii-http
   - name: iii-pubsub
   - name: state

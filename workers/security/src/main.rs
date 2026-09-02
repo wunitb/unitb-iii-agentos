@@ -1762,8 +1762,16 @@ mod config_tree_guards {
         rest[..end].to_string()
     }
 
+    /// The opt-in bus RBAC overlay, which is NOT part of the default stack.
+    fn rbac_overlay() -> String {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bus-rbac.overlay.yaml");
+        std::fs::read_to_string(path)
+            .expect("bus-rbac.overlay.yaml is readable from the worker crate")
+    }
+
     #[test]
-    fn the_bus_is_pinned_to_loopback_and_carries_the_rbac_block() {
+    fn the_bus_is_pinned_to_loopback() {
         let source = config_yaml();
         let entry = worker_entry(&source, "iii-worker-manager");
 
@@ -1776,55 +1784,74 @@ mod config_tree_guards {
             !entry.contains("0.0.0.0"),
             "the bus must not bind all interfaces"
         );
+    }
 
+    #[test]
+    fn the_default_stack_does_not_arm_a_gate_it_cannot_serve() {
+        // Bus RBAC fails closed: armed with no `agentos-bus-authd` listening, the
+        // engine refuses every worker connection after the bridge timeout. The
+        // documented `iii --config config.yaml` path starts no daemon, so an armed
+        // default breaks a clean clone - measured, in CI run 33628742702.
+        let source = config_yaml();
         assert!(
-            entry.contains("rbac:"),
-            "the rbac block is gone; the engine then admits every bus connection"
+            !source.contains("rbac:"),
+            "config.yaml arms bus RBAC; it belongs in config/bus-rbac.overlay.yaml \
+             so that `iii --config config.yaml` still boots without the daemon"
         );
-        for id in [
-            AUTH_FUNCTION_ID,
-            FUNCTION_REGISTRATION_HOOK_ID,
-            TRIGGER_REGISTRATION_HOOK_ID,
-        ] {
-            assert!(
-                entry.contains(id),
-                "rbac block does not reference {id}; the hook it belongs to is unarmed"
-            );
-        }
         assert!(
-            entry.contains(&format!("auth_function_id: {AUTH_FUNCTION_ID}")),
-            "auth_function_id must name {AUTH_FUNCTION_ID}"
+            !source.contains("- name: iii-bridge\n"),
+            "the iii-bridge entry only exists to serve the RBAC hooks; it belongs \
+             with the overlay"
         );
     }
 
     #[test]
-    fn the_bridge_serves_the_rbac_hooks_from_off_the_bus() {
-        let source = config_yaml();
-        let entry = worker_entry(&source, "iii-bridge");
+    fn the_overlay_arms_every_hook_and_serves_them_from_off_the_bus() {
+        let overlay = rbac_overlay();
+        let manager = worker_entry(&overlay, "iii-worker-manager");
+        let bridge = worker_entry(&overlay, "iii-bridge");
 
         assert!(
-            entry.contains("url: ws://127.0.0.1:"),
+            manager.contains("rbac:"),
+            "the overlay must carry the rbac block; it is the only thing that arms the gate"
+        );
+        assert!(
+            manager.contains("host: 127.0.0.1"),
+            "the overlay replaces the whole iii-worker-manager entry, so it must keep the \
+             loopback pin"
+        );
+        assert!(
+            bridge.contains("url: ws://127.0.0.1:"),
             "iii-bridge must reach the bus-auth daemon over loopback"
         );
         assert!(
-            !entry.contains(ENGINE_BUS_PORT),
+            !bridge.contains(ENGINE_BUS_PORT),
             "iii-bridge.url must not be the engine's own bus ({ENGINE_BUS_PORT}); that deadlocks by construction"
         );
+
         for id in [
             AUTH_FUNCTION_ID,
             FUNCTION_REGISTRATION_HOOK_ID,
             TRIGGER_REGISTRATION_HOOK_ID,
         ] {
             assert!(
-                entry.contains(&format!("local_function: {id}")),
+                manager.contains(id),
+                "rbac block does not reference {id}; the hook it belongs to is unarmed"
+            );
+            assert!(
+                bridge.contains(&format!("local_function: {id}")),
                 "iii-bridge does not forward {id}; the engine would answer \
                  `Function not found` and refuse every bus connection"
             );
             assert!(
-                entry.contains(&format!("remote_function: {id}")),
+                bridge.contains(&format!("remote_function: {id}")),
                 "iii-bridge does not map {id} to the daemon"
             );
         }
+        assert!(
+            manager.contains(&format!("auth_function_id: {AUTH_FUNCTION_ID}")),
+            "auth_function_id must name {AUTH_FUNCTION_ID}"
+        );
     }
 
     #[test]

@@ -1,0 +1,72 @@
+# Bus RBAC overlay — OPT-IN, and it must be applied together with a running
+# `agentos-bus-authd`.
+#
+# Why this is not in `config.yaml`: `rbac.auth_function_id` is called once per bus
+# connection and FAILS CLOSED. With the block armed and no daemon listening, the
+# engine refuses every worker connection after the bridge timeout and the stack
+# does not come up. The documented boot path `iii --config config.yaml` starts the
+# engine on its own, so an armed default would break a clean clone — CI run
+# 33628742702 proved exactly that: 107 refused registrations and a dead smoke job.
+#
+# To arm it:
+#   1. build the daemon:  cargo build --workspace --release
+#   2. start it BEFORE the engine (agentos up does this for you), or run it by hand:
+#        ./target/release/agentos-bus-authd --listen=127.0.0.1:49129
+#   3. merge the two entries below into `config.yaml`: the `rbac:` mapping goes on
+#      the existing `iii-worker-manager` entry, and `iii-bridge` is a new entry.
+#   4. `agentos doctor` reports whether the gate is armed and whether the daemon is
+#      listening on the address `iii-bridge.url` names.
+#
+# What it buys, and what it does not: the engine's own registry workers cannot
+# present a credential and are indistinguishable from a local attacker, so the
+# policy is TIERED. A credential-less session is admitted but cannot read the
+# vault, mint a cron job or an HTTP trigger, connect an MCP server, fire a hook,
+# grant capabilities, or claim an id another worker owns — including while that
+# worker is dead. It does NOT stop a local process from doing anything a registry
+# worker may do. See crates/bus-auth/src/policy.rs.
+
+workers:
+  - name: iii-worker-manager
+    config:
+      host: 127.0.0.1
+      # `rbac.auth_function_id` is called once per connection and, unlike
+      # the stream's auth_function, it FAILS CLOSED: an error, a missing function or
+      # an undeserialisable answer makes the engine send an error frame and close the
+      # socket (engine/src/engine/mod.rs, the Err arm of rbac_session::handle_session).
+      # The function is served by `agentos-bus-authd`, which `agentos up` starts
+      # BEFORE the engine, and reached through the `iii-bridge` entry below — it
+      # cannot be an AgentOS worker, because the engine calls it for EVERY
+      # connection including that worker's own.
+      # If the daemon is down, every new bus connection is refused and the stack does
+      # not come up. That is the intended failure direction.
+      rbac:
+        auth_function_id: agentos::bus_auth
+        on_function_registration_function_id: agentos::bus_on_register
+        on_trigger_registration_function_id: agentos::bus_on_trigger
+        # 0.22.1's `expose_functions` is GLOBAL to every session, so it cannot be the
+        # per-tier control; a session can only be NARROWED afterwards with an exact-id
+        # `forbidden_functions` list. The wildcard therefore stays open here and the
+        # untrusted tier is denied by exact id in crates/bus-auth/src/policy.rs
+        # (UNTRUSTED_FORBIDDEN_FUNCTIONS).
+        expose_functions:
+          - match("*")
+  # Client of the bus-auth daemon. `forward:` registers the three RBAC functions with
+  # `engine.register_function_handler` inside `register_functions`, which the engine
+  # runs for every worker during the build loop — before `serve()` calls
+  # `start_background_tasks` and the bus listener binds. That is what makes the gate
+  # bootstrappable, and it is why the order of entries in this file does not matter.
+  # `url` must never be the engine's own bus (49134): the bridge would then depend on
+  # the listener it is gating.
+  - name: iii-bridge
+    config:
+      url: ws://127.0.0.1:49129
+      forward:
+        - local_function: agentos::bus_auth
+          remote_function: agentos::bus_auth
+          timeout_ms: 5000
+        - local_function: agentos::bus_on_register
+          remote_function: agentos::bus_on_register
+          timeout_ms: 5000
+        - local_function: agentos::bus_on_trigger
+          remote_function: agentos::bus_on_trigger
+          timeout_ms: 5000
