@@ -1,18 +1,17 @@
 # Install the UnitB stack
 
-This guide covers two things, and it is explicit about which is which:
+This guide covers two repositories, and it is explicit about which is which:
 
 | Repository | Access | Needed for | Role |
 |---|---|---|---|
 | `wunitb/unitb-iii-agentos` | **public** | everything | iii engine configuration, AgentOS workers, CLI, and TUI |
-| `wunitb/Clawith` | **public** | optional | team web application and chat UI/backend |
 | `wunitb/unitb-iii-memworkr` | **private (UnitB only)** | optional | durable tri-temporal fact memory on the same iii engine |
 
 **AgentOS runs without memworkr.** No AgentOS code path calls `memory::assert`, `memory::as_of` or
 `memory::provenance` today (`rg 'memory::(assert|as_of|provenance)' workers crates` finds no call site), and
 `scripts/dev-up.sh` treats memworkr as optional: absent, unverifiable, misconfigured or unhealthy, it prints
-a warning and leaves the rest of the stack running. Sections 1, 2, 4 and 6 below are the complete public
-path. Section 3 (memworkr) and section 5 (Clawith) are additions.
+a warning and leaves the rest of the stack running. Sections 1, 2, 4 and 5 below are the complete public
+path; section 3 is the only addition.
 
 If you do not have access to `wunitb/unitb-iii-memworkr`, `git clone` fails with an authentication error.
 That is expected: skip section 3 entirely.
@@ -24,7 +23,6 @@ That is expected: skip section 3 entirely.
 - `sha256sum` or `shasum` — the installer and `scripts/memworkr-sync.sh` verify digests with them
 - `file` — `scripts/install-iii.sh:64` exits without it
 - `jq` — only for the memworkr readiness check in `scripts/dev-up.sh`; without it memworkr is skipped
-- Podman with `podman compose` (preferred) or Docker with Compose, for Clawith only
 - For section 3 only: `cargo-audit` **exactly 0.22.2**, required by the memworkr release gate
 
 ## 1. Clone
@@ -33,12 +31,10 @@ That is expected: skip section 3 entirely.
 mkdir -p "$HOME/unitb-stack"
 cd "$HOME/unitb-stack"
 git clone https://github.com/wunitb/unitb-iii-agentos.git
-git clone https://github.com/wunitb/Clawith.git          # optional, public
 git clone https://github.com/wunitb/unitb-iii-memworkr.git   # optional, PRIVATE
 ```
 
-Use the `wunitb` fork of Clawith: it contains the session-error fix. Require clean, pinned source before
-installation:
+Require clean, pinned source before installation:
 
 ```bash
 git -C unitb-iii-agentos status --short
@@ -190,55 +186,27 @@ iii trigger memory::health --json '{}'     # only when section 3 was used
 Production memory calls must traverse the authenticated AgentOS/iii route; direct `iii trigger` mutation
 calls are development-only.
 
-## 5. Configure and start Clawith (optional)
-
-```bash
-cd "$HOME/unitb-stack/Clawith"
-cp .env.example .env
-${EDITOR:-vi} .env
-touch ss-nodes.json
-
-# Linux: systemctl --user enable --now podman.socket
-# macOS: podman machine start
-COMPOSE_RUNTIME="${COMPOSE_RUNTIME:-podman}"
-if [[ "$COMPOSE_RUNTIME" == "podman" ]]; then
-  export CONTAINER_SOCKET="$(podman info --format '{{.Host.RemoteSocket.Path}}')"
-fi
-"$COMPOSE_RUNTIME" compose up -d --build
-```
-
-Configure database, Redis, public URL, model providers, and secrets in Clawith's `.env`. Preserve
-`backend/agent_data/` and the configured database during upgrades. Compose variants without a `minio`
-service now default the frontend's unused `MINIO_UPSTREAM` to `127.0.0.1:9000`, so Nginx starts without a
-manual IP override; deployments that provide MinIO should set the real service address.
-
-Default endpoints:
-
-- Clawith frontend: `http://127.0.0.1:3008`
-- Clawith backend: `http://127.0.0.1:8008`
-- Clawith health: `http://127.0.0.1:8008/api/health`
-
-## 6. Verify
-
-Public path:
+## 5. Verify
 
 ```bash
 curl -fsS http://127.0.0.1:3111/api/health
 ./target/release/agentos doctor
 curl -fsS http://127.0.0.1:3113/    # only when you opted into the console worker
+iii trigger memory::health --json '{}'   # only when you installed section 3
 ```
 
-Additions, only when you installed them:
+`/api/health` is the only route registered with `auth: false`
+(`workers/agent-core/src/main.rs:172`), so it answers without a bearer token; every other route needs
+`AGENTOS_API_KEY`. `agentos doctor` is the real acceptance check: it reports the engine, the connected
+worker identities, the machine key, which provider credential is present, the resulting default route, the
+bus-auth daemon, and which agents have a capability document. A check it prints red is a stack that will
+fail at runtime, whatever the health endpoint says.
+
+`agentos up` ends in the TUI by itself. On the two-terminal path, open it and send a message:
 
 ```bash
-iii trigger memory::health --json '{}'                   # section 3
-curl -fsS http://127.0.0.1:8008/api/health               # section 5
-COMPOSE_RUNTIME="${COMPOSE_RUNTIME:-podman}"
-"$COMPOSE_RUNTIME" compose -f "$HOME/unitb-stack/Clawith/docker-compose.yml" ps
+./target/release/agentos tui
 ```
-
-With Clawith running, open `http://127.0.0.1:3008`, sign in, create/select an agent, and send a chat
-message. Do not accept `[object Object]` or `COULD NOT CREATE THE SESSION` as a successful smoke test.
 
 ## Upgrading an existing install
 
@@ -270,19 +238,13 @@ git -C "$HOME/unitb-stack/unitb-iii-agentos" pull --ff-only
 cd "$HOME/unitb-stack/unitb-iii-agentos"
 cargo build --workspace --release
 
-# optional additions
+# optional addition
 git -C "$HOME/unitb-stack/unitb-iii-memworkr" pull --ff-only
 bash scripts/memworkr-sync.sh sync ../unitb-iii-memworkr
-
-git -C "$HOME/unitb-stack/Clawith" pull --ff-only
-cd "$HOME/unitb-stack/Clawith"
-COMPOSE_RUNTIME="${COMPOSE_RUNTIME:-podman}"
-if [[ "$COMPOSE_RUNTIME" == "podman" ]]; then
-  export CONTAINER_SOCKET="$(podman info --format '{{.Host.RemoteSocket.Path}}')"
-fi
-"$COMPOSE_RUNTIME" compose up -d --build
 ```
 
-Back up AgentOS `data/memworkr`, Clawith's database, and `Clawith/backend/agent_data/` before production
-upgrades. See the memworkr `OPERATIONS.md` for schema migration, backup verification, rollback, and
-memory-pressure settings.
+An upgrade from a release tarball is `bash scripts/install.sh` again; see "Upgrading an existing install"
+above for what it governs and what it deliberately leaves alone.
+
+Back up AgentOS `data/memworkr` before production upgrades. See the memworkr `OPERATIONS.md` for schema
+migration, backup verification, rollback, and memory-pressure settings.
