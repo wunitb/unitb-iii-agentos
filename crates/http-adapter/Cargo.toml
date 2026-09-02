@@ -5,7 +5,15 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Compiles the in-memory bus test double. Enabled through dev-dependencies so it
+# never reaches a release binary.
+fake-bus = []
+
 [dependencies]
 iii-sdk.workspace = true
 serde_json.workspace = true
 subtle.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

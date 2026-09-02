@@ -9,6 +9,14 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
+pub mod bus;
+pub mod policy;
+
+#[cfg(any(test, feature = "fake-bus"))]
+pub mod fake;
+
+pub use bus::{BusFuture, CHAT_TIMEOUT_MS, TriggerBus};
+
 /// Registers an HTTP trigger through a local adapter function.
 ///
 /// iii 0.22 HTTP handlers return an HTTP response envelope. AgentOS functions
