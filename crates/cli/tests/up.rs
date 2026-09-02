@@ -134,14 +134,24 @@ impl Fixture {
         }
     }
 
-    /// Installs a fake TUI beside a copy of the CLI, mirroring an installed
-    /// release layout where `up` finds the TUI next to itself.
-    fn with_tui(&self, exit_code: i32) -> PathBuf {
+    /// A copy of the CLI inside the fixture, so `current_exe().parent()` is the
+    /// fixture's own bin directory. `up` resolves `agentos-tui` and
+    /// `agentos-bus-authd` next to the CLI first — product behaviour — and
+    /// running the workspace copy would otherwise pick up the real binaries
+    /// `cargo test --workspace` builds in `target/debug`.
+    fn cli(&self) -> PathBuf {
         let cli = self.bin.join("agentos");
         fs::copy(env!("CARGO_BIN_EXE_agentos"), &cli).expect("copy agentos binary");
         let mut permissions = fs::metadata(&cli).expect("read cli metadata").permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&cli, permissions).expect("make cli executable");
+        cli
+    }
+
+    /// Installs a fake TUI beside a copy of the CLI, mirroring an installed
+    /// release layout where `up` finds the TUI next to itself.
+    fn with_tui(&self, exit_code: i32) -> PathBuf {
+        let cli = self.cli();
         write_executable(
             &self.bin.join("agentos-tui"),
             &format!(
@@ -265,15 +275,40 @@ impl Fixture {
         let _ = fs::remove_file(&self.worker_pid);
     }
 
-    fn cleanup(self) {
+    /// Every process a fixture can leave behind. `up` detaches what it starts,
+    /// so a daemon that survives a failed assertion holds its port and breaks
+    /// every later run on the machine.
+    fn stop_processes(&self) {
         self.stop_worker();
         if let Ok(pid) = fs::read_to_string(&self.bus_auth_pid)
             && let Ok(pid) = pid.trim().parse::<i32>()
         {
             terminate(pid);
         }
+    }
+
+    fn cleanup(self) {
+        self.stop_processes();
         fs::remove_dir_all(&self.root).expect("remove temporary directory");
     }
+}
+
+impl Drop for Fixture {
+    /// Runs on the panic path too, which `cleanup()` cannot: a failed
+    /// assertion must not leak a detached daemon.
+    fn drop(&mut self) {
+        self.stop_processes();
+    }
+}
+
+/// A loopback port nothing is listening on right now. Fixed ports are shared
+/// machine state: two runs, or a leaked process from an earlier one, make the
+/// daemon assertions test the wrong thing.
+fn free_loopback_addr() -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind an ephemeral port");
+    let addr = listener.local_addr().expect("read ephemeral port");
+    drop(listener);
+    addr.to_string()
 }
 
 /// `kill -TERM` without pulling in a dependency for one call.
@@ -615,10 +650,14 @@ fn up_starts_the_bus_auth_daemon_with_the_generated_key() {
         return;
     }
     fixture.with_empty_api_key();
-    let addr = "127.0.0.1:49529";
+    let addr = free_loopback_addr();
+    let addr = addr.as_str();
     fixture.with_bus_auth(addr);
 
-    let cli = PathBuf::from(env!("CARGO_BIN_EXE_agentos"));
+    // Run the copy inside the fixture: `up` looks for the daemon next to the
+    // CLI first, and `cargo test --workspace` puts a real one beside the
+    // workspace binary.
+    let cli = fixture.cli();
     let output = Command::new(&cli)
         .args(["up", "--no-tui", "--timeout", "5"])
         .env("PATH", fixture.path_with_engine())
@@ -661,11 +700,14 @@ fn up_starts_the_bus_auth_daemon_with_the_generated_key() {
 #[test]
 fn up_refuses_an_armed_gate_without_the_daemon_binary() {
     let fixture = Fixture::new("bus-auth-missing");
-    let addr = "127.0.0.1:49531";
+    let addr = free_loopback_addr();
+    let addr = addr.as_str();
     fixture.with_bus_auth(addr);
     fs::remove_file(fixture.release.join("agentos-bus-authd")).expect("remove fake daemon");
 
-    let cli = PathBuf::from(env!("CARGO_BIN_EXE_agentos"));
+    // The fixture CLI copy has no daemon beside it either, so "not built"
+    // really means not built.
+    let cli = fixture.cli();
     let output = Command::new(&cli)
         .args(["up", "--no-tui", "--timeout", "2"])
         .env("PATH", fixture.path_with_engine())
