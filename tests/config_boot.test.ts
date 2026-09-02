@@ -167,6 +167,37 @@ async function waitForOurEngine(logPath: string, markers: string[]): Promise<voi
   throw new Error(`engine did not reach ${missing.join(", ")} within 30s:\n${log.slice(-2000)}`);
 }
 
+/**
+ * SIGINT to the engine does not take its external workers with it: `iii-worker`
+ * children are reparented to init and survive, which leaks a `shell`,
+ * `console`, `state`, ... process per run. The engine records each child as
+ * `pid: Some(N)`, so the ones this test caused are known exactly and are the
+ * only ones it touches.
+ */
+async function reapExternalWorkers(log: string): Promise<void> {
+  const pids = [...log.matchAll(/^ *[├└] pid: Some\((\d+)\)$/gm)].map((match) => Number(match[1]));
+  for (const pid of new Set(pids)) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // already gone
+    }
+  }
+  if (pids.length === 0) return;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const alive = [...new Set(pids)].filter((pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (alive.length === 0) return;
+    await Bun.sleep(50);
+  }
+}
+
 describe(`iii ${expectedVersion} boot compatibility`, () => {
   liveEngineTest(
     "boots the checkout config on its own ports with queue and configuration workers",
@@ -231,6 +262,7 @@ describe(`iii ${expectedVersion} boot compatibility`, () => {
 
       const exitCode = await engine.exited;
       const logs = await Bun.file(logPath).text();
+      await reapExternalWorkers(logs);
       expect([0, 130]).toContain(exitCode);
       expect(logs).not.toContain("is already in use");
       expect(logs).not.toContain("Duplicate worker configurations");
