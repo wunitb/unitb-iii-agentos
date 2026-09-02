@@ -424,14 +424,48 @@ async fn set_capabilities(iii: &IIIClient, input: Value) -> Result<Value, Error>
 
 async fn list_capabilities(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     require_auth(&input)?;
-    iii.trigger(TriggerRequest {
-        function_id: "state::list".to_string(),
-        payload: json!({ "scope": "capabilities" }),
-        action: None,
-        timeout_ms: None,
-    })
-    .await
-    .map_err(|error| Error::Handler(error.to_string()))
+    let entries = iii
+        .trigger(TriggerRequest {
+            function_id: "state::list".to_string(),
+            payload: json!({ "scope": "capabilities" }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|error| Error::Handler(error.to_string()))?;
+    Ok(labelled_capabilities(entries))
+}
+
+/// Keep the outer bare-array shape but guarantee every row carries an
+/// `agentId` field, because `state::list` drops the key and the canonical I1
+/// value does not repeat it. Rows written by `security::set_capabilities`
+/// already carry it; rows written elsewhere get an explicit `null` so the TUI
+/// Security pane can tell "unknown agent" from "field missing".
+fn labelled_capabilities(entries: Value) -> Value {
+    let Value::Array(entries) = entries else {
+        return entries;
+    };
+    Value::Array(
+        entries
+            .into_iter()
+            .map(|entry| {
+                let mut entry = match entry {
+                    Value::Object(fields) => fields,
+                    other => return other,
+                };
+                let agent_id = entry
+                    .get("agentId")
+                    .or_else(|| entry.get("agent_id"))
+                    .or_else(|| entry.get("key"))
+                    .or_else(|| entry.get("id"))
+                    .cloned()
+                    .filter(Value::is_string)
+                    .unwrap_or(Value::Null);
+                entry.insert("agentId".to_string(), agent_id);
+                Value::Object(entry)
+            })
+            .collect(),
+    )
 }
 
 async fn check_capability(iii: &IIIClient, input: Value) -> Result<Value, Error> {
@@ -877,6 +911,28 @@ mod tests {
     }
 
     // --- capability matching
+
+    #[test]
+    fn list_capabilities_labels_every_row_with_an_agent_id() {
+        let listed = labelled_capabilities(json!([
+            { "agentId": "a1", "tools": ["memory::*"], "updatedAt": 1 },
+            { "tools": ["workflow::run"], "updatedAt": 2 },
+            { "key": "a3", "tools": [], "updatedAt": 3 },
+        ]));
+        let rows = listed.as_array().expect("bare array is preserved");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["agentId"], "a1");
+        assert_eq!(rows[0]["tools"], json!(["memory::*"]));
+        assert!(
+            rows[1]["agentId"].is_null(),
+            "an unlabelled row must say so explicitly"
+        );
+        assert!(rows[1].get("agentId").is_some());
+        assert_eq!(rows[2]["agentId"], "a3");
+        // non-array and non-object payloads pass through untouched
+        assert_eq!(labelled_capabilities(json!(null)), json!(null));
+        assert_eq!(labelled_capabilities(json!(["x"])), json!(["x"]));
+    }
 
     #[test]
     fn audit_chain_reads_the_bare_state_list_shape() {

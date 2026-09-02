@@ -15,8 +15,96 @@ const IDLE_TIMEOUT_MS: i64 = 5 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 const BRIDGE_SCRIPT: &str = r#"
-import sys, json
+import ipaddress, json, socket, sys
+from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
+
+# In-page SSRF guard.
+#
+# The Rust side validates the URL it is asked to open, but `page.goto` follows
+# redirects and a page issues sub-resource requests, so a public URL can still
+# reach 169.254.169.254 or 127.0.0.1 one hop later. Every request the browser
+# makes is therefore re-checked here, at request time, and aborted before it
+# leaves the machine. Anything we cannot positively prove is public is aborted.
+
+_RESOLVED = {}
+_BLOCKED_NAMES = {
+    "localhost",
+    "metadata",
+    "metadata.google.internal",
+    "ip6-localhost",
+    "ip6-loopback",
+}
+_BLOCKED_SUFFIXES = (".localhost", ".internal", ".local")
+
+
+def _blocked_ip(text):
+    try:
+        ip = ipaddress.ip_address(text.split("%")[0].strip("[]"))
+    except ValueError:
+        return True
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    ):
+        return True
+    if ip.version == 4:
+        octets = ip.packed
+        if octets[0] == 100 and 64 <= octets[1] <= 127:
+            return True
+    return not getattr(ip, "is_global", False)
+
+
+def _addresses(host):
+    if host not in _RESOLVED:
+        try:
+            _RESOLVED[host] = [info[4][0] for info in socket.getaddrinfo(host, None)]
+        except OSError:
+            _RESOLVED[host] = []
+    return _RESOLVED[host]
+
+
+def _allowed(url):
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    lower = host.rstrip(".").lower()
+    if lower in _BLOCKED_NAMES or lower.endswith(_BLOCKED_SUFFIXES):
+        return False
+    try:
+        ipaddress.ip_address(lower.strip("[]"))
+    except ValueError:
+        addresses = _addresses(host)
+        return bool(addresses) and not any(_blocked_ip(a) for a in addresses)
+    return not _blocked_ip(lower)
+
+
+def _guard(route):
+    try:
+        allowed = _allowed(route.request.url)
+    except Exception:
+        allowed = False
+    try:
+        if allowed:
+            route.continue_()
+        else:
+            route.abort("blockedbyclient")
+    except Exception:
+        pass
+
 
 def main():
     params = json.loads(sys.argv[1])
@@ -30,6 +118,7 @@ def main():
         browser = p.chromium.launch(headless=headless)
         page = browser.new_page(viewport={"width": vw, "height": vh})
         page.set_default_timeout(timeout)
+        page.route("**/*", _guard)
 
         result = {}
 
@@ -72,7 +161,126 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-fn assert_no_ssrf(url_str: &str) -> Result<(), Error> {
+/// Address ranges a fetched URL must never reach.
+///
+/// `Ipv4Addr::is_global` / `Ipv6Addr::is_global` are still unstable on the
+/// pinned 1.90 toolchain, so the ranges are spelled out. Everything that is not
+/// globally routable is refused, which covers the cloud metadata endpoints
+/// (169.254.169.254, fd00:ec2::254), RFC1918, CGNAT, loopback and the reserved
+/// blocks an attacker can use to reach a service on this host or its network.
+fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => is_blocked_ipv4(ip),
+        std::net::IpAddr::V6(ip) => is_blocked_ipv6(ip),
+    }
+}
+
+fn is_blocked_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        || a == 0                                   // 0.0.0.0/8 "this network"
+        || (a == 100 && (64..=127).contains(&b))    // 100.64.0.0/10 CGNAT
+        || (a == 192 && b == 0 && c == 0)           // 192.0.0.0/24 IETF protocol assignments
+        || (a == 192 && b == 88 && c == 99)         // 192.88.99.0/24 6to4 relay anycast
+        || (a == 198 && (b == 18 || b == 19))       // 198.18.0.0/15 benchmarking
+        || a >= 240 // 240.0.0.0/4 reserved
+}
+
+fn is_blocked_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return true;
+    }
+    let segments = ip.segments();
+    // fc00::/7 unique local
+    if (segments[0] & 0xfe00) == 0xfc00 {
+        return true;
+    }
+    // fe80::/10 link-local
+    if (segments[0] & 0xffc0) == 0xfe80 {
+        return true;
+    }
+    // 2001:db8::/32 documentation
+    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        return true;
+    }
+    // 100::/64 discard-only
+    if segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0 {
+        return true;
+    }
+    // ::ffff:0:0/96 (IPv4-mapped) and 64:ff9b::/96 (NAT64) both carry the v4
+    // address in the last two groups; 2002::/16 (6to4) carries it in groups 1-2.
+    let ipv4_mapped = segments[..5] == [0, 0, 0, 0, 0] && segments[5] == 0xffff;
+    let nat64 = segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6] == [0, 0, 0, 0];
+    let embedded_v4 = if ipv4_mapped || nat64 {
+        Some(embedded_ipv4(segments[6], segments[7]))
+    } else if segments[0] == 0x2002 {
+        Some(embedded_ipv4(segments[1], segments[2]))
+    } else {
+        None
+    };
+    embedded_v4.is_some_and(is_blocked_ipv4)
+}
+
+fn embedded_ipv4(high: u16, low: u16) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::new(
+        (high >> 8) as u8,
+        (high & 0xff) as u8,
+        (low >> 8) as u8,
+        (low & 0xff) as u8,
+    )
+}
+
+/// Host names that must be refused without asking a resolver at all.
+fn is_blocked_host_name(host: &str) -> bool {
+    let lower = host.trim_end_matches('.').to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "localhost" | "metadata" | "metadata.google.internal" | "ip6-localhost" | "ip6-loopback"
+    ) || lower.ends_with(".localhost")
+        || lower.ends_with(".internal")
+        || lower.ends_with(".local")
+}
+
+/// Verify a resolved address set. Pure, so the whole range table is testable
+/// without touching a resolver.
+fn assert_addresses_allowed(host: &str, addresses: &[std::net::IpAddr]) -> Result<(), Error> {
+    if addresses.is_empty() {
+        return Err(Error::Handler(format!(
+            "blocked host: {host} did not resolve"
+        )));
+    }
+    for address in addresses {
+        if is_blocked_ip(*address) {
+            return Err(Error::Handler(format!(
+                "blocked host: {host} resolves to {address}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a name and check every address it answers with.
+///
+/// A name that string-matching alone accepts (`whatever.example.com`) can
+/// still point at 169.254.169.254 or 127.0.0.1, and a rebinding resolver can
+/// answer differently per lookup, so resolution has to happen here. A
+/// resolution failure is treated as a block: fail closed.
+async fn assert_resolved_host_allowed(host: &str, port: u16) -> Result<(), Error> {
+    let addresses: Vec<std::net::IpAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| Error::Handler(format!("blocked host: {host} did not resolve: {e}")))?
+        .map(|socket_addr| socket_addr.ip())
+        .collect();
+    assert_addresses_allowed(host, &addresses)
+}
+
+async fn assert_no_ssrf(url_str: &str) -> Result<(), Error> {
     let parsed =
         url::Url::parse(url_str).map_err(|e| Error::Handler(format!("invalid url: {e}")))?;
     let scheme = parsed.scheme();
@@ -81,62 +289,21 @@ fn assert_no_ssrf(url_str: &str) -> Result<(), Error> {
     }
     match parsed.host() {
         Some(url::Host::Ipv4(ip)) => {
-            if ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified() {
-                return Err(Error::Handler(format!("blocked host: {ip}")));
-            }
-            // Block link-local AWS/GCP metadata 169.254.x.x (covered by is_link_local)
-            // and broadcast / multicast as defense-in-depth.
-            if ip.is_broadcast() || ip.is_multicast() {
+            if is_blocked_ipv4(ip) {
                 return Err(Error::Handler(format!("blocked host: {ip}")));
             }
         }
         Some(url::Host::Ipv6(ip)) => {
-            if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+            if is_blocked_ipv6(ip) {
                 return Err(Error::Handler(format!("blocked host: {ip}")));
-            }
-            // is_unique_local / is_unicast_link_local are unstable on stable Rust;
-            // match on the segments directly.
-            let segs = ip.segments();
-            // fc00::/7 unique local
-            if (segs[0] & 0xfe00) == 0xfc00 {
-                return Err(Error::Handler(format!("blocked host: {ip}")));
-            }
-            // fe80::/10 link-local
-            if (segs[0] & 0xffc0) == 0xfe80 {
-                return Err(Error::Handler(format!("blocked host: {ip}")));
-            }
-            // ::ffff:0:0/96 IPv4-mapped — re-check the embedded v4 address
-            if segs[0] == 0
-                && segs[1] == 0
-                && segs[2] == 0
-                && segs[3] == 0
-                && segs[4] == 0
-                && segs[5] == 0xffff
-            {
-                let v4 = std::net::Ipv4Addr::new(
-                    (segs[6] >> 8) as u8,
-                    (segs[6] & 0xff) as u8,
-                    (segs[7] >> 8) as u8,
-                    (segs[7] & 0xff) as u8,
-                );
-                if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-                {
-                    return Err(Error::Handler(format!("blocked host: {v4}")));
-                }
             }
         }
         Some(url::Host::Domain(host)) => {
-            let lower = host.to_ascii_lowercase();
-            if matches!(
-                lower.as_str(),
-                "localhost" | "metadata.google.internal" | "metadata"
-            ) {
+            if is_blocked_host_name(host) {
                 return Err(Error::Handler(format!("blocked host: {host}")));
             }
-            // Reject common loopback aliases that bypass IP parsing.
-            if lower.ends_with(".localhost") || lower == "ip6-localhost" {
-                return Err(Error::Handler(format!("blocked host: {host}")));
-            }
+            let port = parsed.port_or_known_default().unwrap_or(80);
+            assert_resolved_host_allowed(host, port).await?;
         }
         None => return Err(Error::Handler("missing host".into())),
     }
@@ -555,7 +722,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let url_str = body["url"]
                     .as_str()
                     .ok_or_else(|| Error::Handler("missing url".into()))?;
-                assert_no_ssrf(url_str)?;
+                assert_no_ssrf(url_str).await?;
                 let mut session = load_session(&iii, agent_id).await.ok_or_else(|| {
                     Error::Handler(format!("No browser session for agent: {agent_id}"))
                 })?;
@@ -566,7 +733,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let new_url = result["url"].as_str().unwrap_or(url_str).to_string();
                 // Re-validate the post-navigation URL to block redirects to internal hosts.
                 if new_url != url_str {
-                    assert_no_ssrf(&new_url)?;
+                    assert_no_ssrf(&new_url).await?;
                 }
                 session.current_url = new_url.clone();
                 save_session(&iii, &session).await?;
@@ -600,7 +767,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 touch_session(&iii, &mut session).await?;
 
                 // Re-validate the stored URL before reusing it as a navigation target.
-                assert_no_ssrf(&session.current_url)?;
+                assert_no_ssrf(&session.current_url).await?;
                 let result = run_browser_script(
                     &session,
                     "click",
@@ -610,7 +777,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(u) = result["url"].as_str() {
                     let new_url = u.to_string();
                     if new_url != session.current_url {
-                        assert_no_ssrf(&new_url)?;
+                        assert_no_ssrf(&new_url).await?;
                     }
                     session.current_url = new_url;
                     save_session(&iii, &session).await?;
@@ -643,7 +810,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 touch_session(&iii, &mut session).await?;
 
                 // Re-validate the stored URL before reusing it as a navigation target.
-                assert_no_ssrf(&session.current_url)?;
+                assert_no_ssrf(&session.current_url).await?;
                 run_browser_script(
                 &session,
                 "type",
@@ -682,7 +849,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let save_path_str = save_path.to_string_lossy().to_string();
 
                 // Re-validate the stored URL before reusing it as a navigation target.
-                assert_no_ssrf(&session.current_url)?;
+                assert_no_ssrf(&session.current_url).await?;
                 run_browser_script(
                     &session,
                     "screenshot",
@@ -716,7 +883,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 touch_session(&iii, &mut session).await?;
 
                 // Re-validate the stored URL before reusing it as a navigation target.
-                assert_no_ssrf(&session.current_url)?;
+                assert_no_ssrf(&session.current_url).await?;
                 let result = run_browser_script(
                     &session,
                     "read",
@@ -851,5 +1018,216 @@ mod state_protocol_tests {
     fn reserved_ids_rejects_a_list_without_our_reservation() {
         let reply = json!({ "new_value": { "ids": ["someone-else"] } });
         assert_eq!(reserved_ids(&reply, "agent-1"), None);
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::{
+        BRIDGE_SCRIPT, assert_addresses_allowed, assert_no_ssrf, assert_resolved_host_allowed,
+        is_blocked_host_name, is_blocked_ip,
+    };
+    use std::net::IpAddr;
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().expect("test address")
+    }
+
+    #[test]
+    fn blocks_every_non_global_v4_range() {
+        for address in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "0.0.0.0",
+            "0.1.2.3",
+            "10.0.0.5",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.1",
+            "169.254.169.254",
+            "169.254.0.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.88.99.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+        ] {
+            assert!(is_blocked_ip(ip(address)), "{address} must be blocked");
+        }
+    }
+
+    #[test]
+    fn allows_ordinary_public_v4() {
+        for address in [
+            "93.184.215.14",
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.32.0.1",
+            "100.128.0.1",
+        ] {
+            assert!(!is_blocked_ip(ip(address)), "{address} must be allowed");
+        }
+    }
+
+    #[test]
+    fn blocks_every_non_global_v6_range() {
+        for address in [
+            "::1",
+            "::",
+            "fc00::1",
+            "fd00:ec2::254",
+            "fe80::1",
+            "ff02::1",
+            "2001:db8::1",
+            "100::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "64:ff9b::7f00:1",
+            "2002:7f00:1::",
+        ] {
+            assert!(is_blocked_ip(ip(address)), "{address} must be blocked");
+        }
+    }
+
+    #[test]
+    fn allows_ordinary_public_v6() {
+        for address in [
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(!is_blocked_ip(ip(address)), "{address} must be allowed");
+        }
+    }
+
+    #[test]
+    fn resolved_set_is_rejected_if_any_address_is_internal() {
+        // This is the DNS-rebinding / split-horizon case the old string check
+        // could not see: the name looks ordinary, the answer does not.
+        let error = assert_addresses_allowed(
+            "attacker.example.com",
+            &[ip("93.184.215.14"), ip("169.254.169.254")],
+        )
+        .expect_err("a mixed answer must be refused")
+        .to_string();
+        assert!(error.contains("169.254.169.254"), "{error}");
+
+        assert!(
+            assert_addresses_allowed("attacker.example.com", &[ip("169.254.169.254")]).is_err()
+        );
+        assert!(assert_addresses_allowed("ok.example.com", &[ip("93.184.215.14")]).is_ok());
+    }
+
+    #[test]
+    fn an_empty_answer_fails_closed() {
+        let error = assert_addresses_allowed("nothing.example.com", &[])
+            .expect_err("no answer must be a block")
+            .to_string();
+        assert!(error.contains("did not resolve"), "{error}");
+    }
+
+    #[test]
+    fn internal_name_suffixes_are_refused_without_a_resolver() {
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            "localhost.",
+            "api.localhost",
+            "metadata",
+            "metadata.google.internal",
+            "ip6-localhost",
+            "printer.local",
+            "db.internal",
+        ] {
+            assert!(is_blocked_host_name(host), "{host} must be blocked");
+        }
+        for host in [
+            "example.com",
+            "api.example.org",
+            "internal-tools.example.com",
+        ] {
+            assert!(!is_blocked_host_name(host), "{host} must be allowed");
+        }
+    }
+
+    #[tokio::test]
+    async fn ip_literals_are_blocked_without_dns() {
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:3111/api/security",
+            "http://[::1]/",
+            "http://10.0.0.1/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://0.0.0.0/",
+        ] {
+            assert!(assert_no_ssrf(url).await.is_err(), "{url} must be refused");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_http_schemes_are_blocked() {
+        for url in [
+            "file:///etc/passwd",
+            "ftp://example.com/",
+            "gopher://example.com/",
+        ] {
+            let error = assert_no_ssrf(url)
+                .await
+                .expect_err("must be refused")
+                .to_string();
+            assert!(
+                error.contains("blocked scheme") || error.contains("invalid url"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn known_internal_names_are_blocked() {
+        for url in [
+            "http://localhost:3111/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://api.localhost/",
+        ] {
+            assert!(assert_no_ssrf(url).await.is_err(), "{url} must be refused");
+        }
+    }
+
+    /// Exercises the real resolver on a name that the static list does not
+    /// cover, proving resolution actually happens. `localhost` is in every
+    /// host's `/etc/hosts`, so this needs no network.
+    #[tokio::test]
+    async fn the_resolver_path_blocks_a_name_that_maps_to_loopback() {
+        let error = assert_resolved_host_allowed("localhost", 80)
+            .await
+            .expect_err("localhost resolves to a loopback address")
+            .to_string();
+        assert!(error.contains("blocked host"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_name_that_does_not_resolve_fails_closed() {
+        assert!(
+            assert_no_ssrf("http://no-such-host-9c3a.invalid/")
+                .await
+                .is_err(),
+            "an unresolvable name must be refused, not allowed"
+        );
+    }
+
+    #[test]
+    fn the_bridge_script_installs_the_request_guard() {
+        // Redirects and sub-resources are only checked inside the browser, so
+        // losing this line silently reopens post-redirect SSRF.
+        assert!(BRIDGE_SCRIPT.contains(r#"page.route("**/*", _guard)"#));
+        assert!(BRIDGE_SCRIPT.contains(r#"route.abort("blockedbyclient")"#));
+        assert!(BRIDGE_SCRIPT.contains("def _allowed(url):"));
     }
 }
