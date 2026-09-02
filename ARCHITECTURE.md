@@ -131,6 +131,12 @@ concurrent callers from crossing the per-channel post limit.
 
 `council::activity` retains its manual hash-chain on `state::list + state::set` because ordering and previous-hash validation are the protocol itself; replacing it requires compare-and-swap semantics, not an unguarded append.
 
+## The chat path — one pipeline, buffered transport
+
+`agent::chat` is the only chat pipeline. `stream::chat`, `stream::completion` and `stream::sse` in the `streaming` worker delegate to it rather than running a second implementation of their own, so an HTTP caller gets the same tool loop, prompt-injection scan, memory recall and metering the TUI gets. There is no "streaming path" with different semantics.
+
+The transport is **buffered, not token streaming**. `stream::sse` frames an answer that is already complete, and responses label themselves `x-agentos-stream: buffered`. Incremental delivery needs a streaming provider driver in `llm-router`, which does not exist yet; until it does, no document here should describe AgentOS as streaming tokens.
+
 ## Surfaces (cli, tui)
 
 `crates/cli` and `crates/tui` are clients, not workers. They speak HTTP to `iii-http` on port 3111. They register no functions. HTTP routes fail closed: protected routes require a non-empty `AGENTOS_API_KEY`; only triggers explicitly declaring `auth: false` bypass authentication, and there is no process-wide disable switch. Future work moves them onto the iii client SDK so they call workers via `iii.trigger` directly.

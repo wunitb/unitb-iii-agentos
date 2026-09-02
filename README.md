@@ -44,6 +44,13 @@ AgentOS isn't another agent framework. It's *what's left* when the runtime becom
 | **Function** | A named handler registered by a Worker. | `agent::chat`, `agentos::llm::route`, `memory::search` |
 | **Trigger** | Binds a Function to HTTP, cron, or pub/sub. | `POST /v1/chat/completions → stream::completion` |
 
+There is exactly one chat pipeline. `stream::chat`, `stream::completion` and
+`stream::sse` all delegate to `agent::chat`, so every HTTP caller gets the same
+tool loop, injection scan, memory and metering the TUI gets. The transport is
+**buffered, not token streaming**: `stream::sse` frames a completed answer and
+every response carries `x-agentos-stream: buffered`. Incremental delivery needs
+a streaming provider driver, which does not exist yet.
+
 That's the whole protocol. Workers stay narrow; everything else lives in the engine.
 
 ## § 03 · Quickstart
