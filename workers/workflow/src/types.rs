@@ -105,6 +105,16 @@ pub struct Workflow {
     pub id: String,
     pub name: String,
     pub description: String,
+    /// The principal that registered this definition. It is the last-resort
+    /// identity for a step that declares no `agentId` and is run without one;
+    /// a workflow with none refuses to dispatch such a step.
+    #[serde(
+        default,
+        rename = "createdBy",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_sanitized_id_opt"
+    )]
+    pub created_by: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",

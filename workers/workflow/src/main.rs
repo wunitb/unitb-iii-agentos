@@ -3,6 +3,7 @@ use iii_sdk::{
     IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
 };
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 mod types;
@@ -265,15 +266,237 @@ fn step_payload(
     Ok(Value::Object(payload))
 }
 
+/// Function families a wildcard capability may never grant (contract I1).
+///
+/// Duplicated here on purpose: `agentos_http_adapter::policy` does not exist on
+/// this branch and `crates/http-adapter` belongs to another work package. The
+/// list is byte-for-byte contract I1 so it can be replaced by one `use` at
+/// integration.
+const DENY_BY_DEFAULT_FAMILIES: [&str; 12] = [
+    "shell", "bridge", "mcp", "hook", "cron", "vault", "state", "engine", "code", "harness",
+    "browser", "wasm",
+];
+
+/// Exact function ids that also need an approval decision but whose family is
+/// not one of the twelve in contract I1. Kept separate so the list above stays
+/// identical to the shared definition.
+const EXTRA_APPROVAL_REQUIRED_IDS: [&str; 1] = ["security::docker_exec"];
+
+fn function_family(function_id: &str) -> &str {
+    function_id.split("::").next().unwrap_or(function_id)
+}
+
+/// Whether dispatching `function_id` needs a blocking approval decision.
+fn requires_approval(function_id: &str) -> bool {
+    if function_id.is_empty() {
+        return false;
+    }
+    DENY_BY_DEFAULT_FAMILIES.contains(&function_family(function_id))
+        || EXTRA_APPROVAL_REQUIRED_IDS.contains(&function_id)
+}
+
+/// The principal a step runs as.
+///
+/// A step is never exempt: the step's own `agentId`, else the `agentId` of the
+/// run, else the workflow's recorded `createdBy`. `workflow.agents` is
+/// deliberately NOT consulted - it is self-declared by whoever wrote the
+/// definition, so honouring it would let a workflow name its own principal.
+fn step_principal<'a>(
+    step: &'a WorkflowStep,
+    workflow: &'a Workflow,
+    fallback_agent_id: Option<&'a str>,
+) -> Option<&'a str> {
+    step.agent_id
+        .as_deref()
+        .or(fallback_agent_id)
+        .or(workflow.created_by.as_deref())
+        .filter(|id| !id.is_empty())
+}
+
+fn missing_principal_reason(step: &WorkflowStep, workflow: &Workflow) -> String {
+    format!(
+        "step {} cannot run: {} needs a principal, but the step declares no agentId, \
+         the run supplied none and workflow {} records no createdBy",
+        step.name, step.function_id, workflow.id
+    )
+}
+
+fn missing_principal_error(step: &WorkflowStep, workflow: &Workflow) -> Error {
+    Error::Handler(missing_principal_reason(step, workflow))
+}
+
+fn payload_digest(payload: &Value) -> String {
+    let canonical = serde_json::to_string(payload).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// `security::check_capability` answers `{"allowed": bool, "reason": string}`.
+/// Anything that is not an explicit `true` is a denial, and so is an error.
+fn capability_denial(result: &Value) -> Option<String> {
+    if result.get("allowed").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    Some(
+        result
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("capability denied")
+            .to_string(),
+    )
+}
+
+/// `approval::check` answers `{"decision": "approved"|"denied"|"required", ...}`.
+/// Only an explicit `approved` may dispatch.
+fn approval_denial(result: &Value) -> Option<String> {
+    let decision = result
+        .get("decision")
+        .and_then(Value::as_str)
+        .unwrap_or("required");
+    if decision == "approved" {
+        return None;
+    }
+    let reason = result
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("approval not granted");
+    let request_id = result
+        .get("requestId")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    Some(format!("{decision}: {reason} (requestId {request_id})"))
+}
+
+async fn check_capability(iii: &IIIClient, agent_id: &str, function_id: &str) -> Result<(), Error> {
+    let result = iii
+        .trigger(TriggerRequest {
+            function_id: "security::check_capability".to_string(),
+            payload: json!({
+                "agentId": agent_id,
+                "functionId": function_id,
+                "capability": function_family(function_id),
+                "resource": function_id,
+            }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        // Fail closed: an unreachable capability worker is a denial.
+        .map_err(|error| {
+            Error::Handler(format!(
+                "capability check for {agent_id} -> {function_id} failed: {error}"
+            ))
+        })?;
+    match capability_denial(&result) {
+        None => Ok(()),
+        Some(reason) => Err(Error::Handler(format!(
+            "{agent_id} is not allowed to call {function_id}: {reason}"
+        ))),
+    }
+}
+
+/// What the gate decided about a step before any remote check is made.
+#[derive(Debug, PartialEq, Eq)]
+enum StepAuthorization<'a> {
+    /// No principal could be resolved, so the step must not be dispatched.
+    Refused(String),
+    /// The step runs as `agent_id`, subject to the capability check and, when
+    /// `needs_approval` is set, a blocking approval decision.
+    Checked {
+        agent_id: &'a str,
+        needs_approval: bool,
+    },
+}
+
+/// The local half of the authorization decision, with no remote calls, so the
+/// rule "a step is never exempt" is testable on its own.
+fn plan_step_authorization<'a>(
+    step: &'a WorkflowStep,
+    workflow: &'a Workflow,
+    fallback_agent_id: Option<&'a str>,
+) -> StepAuthorization<'a> {
+    match step_principal(step, workflow, fallback_agent_id) {
+        None => StepAuthorization::Refused(missing_principal_reason(step, workflow)),
+        Some(agent_id) => StepAuthorization::Checked {
+            agent_id,
+            needs_approval: requires_approval(&step.function_id),
+        },
+    }
+}
+
+/// Authorize one step immediately before it is dispatched.
+///
+/// The workflow worker holds a trusted engine session, so a step id reaches the
+/// bus with the worker's own authority. Every dispatch site must pass through
+/// here, or the definition itself becomes the authorization.
+async fn authorize_step(
+    iii: &IIIClient,
+    workflow: &Workflow,
+    step: &WorkflowStep,
+    fallback_agent_id: Option<&str>,
+    payload: &Value,
+) -> Result<(), Error> {
+    let (agent_id, needs_approval) =
+        match plan_step_authorization(step, workflow, fallback_agent_id) {
+            StepAuthorization::Refused(reason) => return Err(Error::Handler(reason)),
+            StepAuthorization::Checked {
+                agent_id,
+                needs_approval,
+            } => (agent_id, needs_approval),
+        };
+
+    check_capability(iii, agent_id, &step.function_id).await?;
+
+    if !needs_approval {
+        return Ok(());
+    }
+
+    let result = iii
+        .trigger(TriggerRequest {
+            function_id: "approval::check".to_string(),
+            payload: json!({
+                "agentId": agent_id,
+                "functionId": step.function_id,
+                "payloadDigest": payload_digest(payload),
+                "reason": format!(
+                    "workflow {} step {} calls {}",
+                    workflow.id, step.name, step.function_id
+                ),
+            }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        // Fail closed: an unreachable approval worker is a denial.
+        .map_err(|error| {
+            Error::Handler(format!(
+                "approval check for {agent_id} -> {} failed: {error}",
+                step.function_id
+            ))
+        })?;
+
+    match approval_denial(&result) {
+        None => Ok(()),
+        Some(reason) => Err(Error::Handler(format!(
+            "{agent_id} needs approval to call {}: {reason}",
+            step.function_id
+        ))),
+    }
+}
+
 async fn trigger_step(
     iii: &IIIClient,
+    workflow: &Workflow,
     step: &WorkflowStep,
     vars: &Map<String, Value>,
     fallback_agent_id: Option<&str>,
 ) -> Result<Value, Error> {
+    let payload = step_payload(step, vars, fallback_agent_id)?;
+    authorize_step(iii, workflow, step, fallback_agent_id, &payload).await?;
     iii.trigger(TriggerRequest {
         function_id: step.function_id.clone(),
-        payload: step_payload(step, vars, fallback_agent_id)?,
+        payload,
         action: None,
         timeout_ms: Some(step.timeout_ms),
     })
@@ -375,6 +598,22 @@ async fn create_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> 
         );
     }
 
+    // Record the creator when the caller names one. It is the last-resort
+    // principal for a step that declares no agentId; without it such a step is
+    // refused rather than dispatched with the worker's own authority.
+    if object
+        .get("createdBy")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+        && let Some(agent_id) = object
+            .get("agentId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    {
+        object.insert("createdBy".to_string(), Value::String(agent_id));
+    }
+
     let workflow: Workflow = serde_json::from_value(workflow_value)
         .map_err(|error| Error::Handler(format!("invalid workflow definition: {error}")))?;
     validate_workflow(&workflow).map_err(Error::Handler)?;
@@ -447,7 +686,7 @@ async fn run_step(
 ) -> Result<(), Error> {
     match step.mode {
         StepMode::Sequential => {
-            let output = trigger_step(iii, step, vars, fallback_agent_id).await?;
+            let output = trigger_step(iii, workflow, step, vars, fallback_agent_id).await?;
             record_step_result(step, output, vars, results, start_ms);
         }
         StepMode::Parallel | StepMode::Fanout => {
@@ -456,6 +695,9 @@ async fn run_step(
             let mut handles = Vec::with_capacity(concurrent_steps.len());
             for concurrent_step in concurrent_steps {
                 let payload = step_payload(concurrent_step, vars, fallback_agent_id)?;
+                // This branch dispatches without going through `trigger_step`,
+                // so it has to authorize the step itself.
+                authorize_step(iii, workflow, concurrent_step, fallback_agent_id, &payload).await?;
                 let iii = iii.clone();
                 let function_id = concurrent_step.function_id.clone();
                 let timeout_ms = concurrent_step.timeout_ms;
@@ -508,7 +750,8 @@ async fn run_step(
                 "fanoutResults".to_string(),
                 vars.get("__fanout").cloned().unwrap_or(Value::Null),
             );
-            let output = trigger_step(iii, step, &collect_vars, fallback_agent_id).await?;
+            let output =
+                trigger_step(iii, workflow, step, &collect_vars, fallback_agent_id).await?;
             record_step_result(step, output, vars, results, start_ms);
         }
         StepMode::Conditional => {
@@ -532,7 +775,7 @@ async fn run_step(
                 });
                 return Ok(());
             }
-            let output = trigger_step(iii, step, vars, fallback_agent_id).await?;
+            let output = trigger_step(iii, workflow, step, vars, fallback_agent_id).await?;
             record_step_result(step, output, vars, results, start_ms);
         }
         StepMode::Loop => {
@@ -540,7 +783,8 @@ async fn run_step(
             for iteration in 0..step.max_iterations.unwrap_or(10) {
                 let mut iteration_vars = vars.clone();
                 iteration_vars.insert("iteration".to_string(), json!(iteration));
-                loop_output = trigger_step(iii, step, &iteration_vars, fallback_agent_id).await?;
+                loop_output =
+                    trigger_step(iii, workflow, step, &iteration_vars, fallback_agent_id).await?;
                 if let Some(var) = &step.output_var {
                     vars.insert(var.clone(), loop_output.clone());
                 }
@@ -562,6 +806,12 @@ async fn run_step(
     Ok(())
 }
 
+/// Pre-flight authorization for a whole run, so a definition that cannot be
+/// authorized is refused before a run row is written.
+///
+/// This does NOT replace `authorize_step`: the approval decision depends on the
+/// resolved payload, which only exists at dispatch time, and a step reached by
+/// any other path must still be checked.
 async fn authorize_workflow(
     iii: &IIIClient,
     workflow: &Workflow,
@@ -569,36 +819,24 @@ async fn authorize_workflow(
 ) -> Result<(), Error> {
     let mut checked = HashSet::new();
     for step in &workflow.steps {
-        let agent_id = step.agent_id.as_deref().or(fallback_agent_id);
-        if step.function_id == "agent::chat" && agent_id.is_none() {
+        if step.function_id == "agent::chat"
+            && step.agent_id.as_deref().or(fallback_agent_id).is_none()
+        {
             return Err(Error::Handler(format!(
                 "step {} requires agentId for agent::chat",
                 step.name
             )));
         }
-        let Some(agent_id) = agent_id else {
-            continue;
+        // A step without a resolvable principal is refused, never skipped: the
+        // workflow worker dispatches from its own trusted session, so an
+        // unchecked step would run with the worker's authority.
+        let Some(agent_id) = step_principal(step, workflow, fallback_agent_id) else {
+            return Err(missing_principal_error(step, workflow));
         };
-        let capability = step
-            .function_id
-            .split("::")
-            .next()
-            .unwrap_or(&step.function_id);
-        if !checked.insert((agent_id, capability, step.function_id.as_str())) {
+        if !checked.insert((agent_id, step.function_id.as_str())) {
             continue;
         }
-        iii.trigger(TriggerRequest {
-            function_id: "security::check_capability".to_string(),
-            payload: json!({
-                "agentId": agent_id,
-                "capability": capability,
-                "resource": step.function_id,
-            }),
-            action: None,
-            timeout_ms: None,
-        })
-        .await
-        .map_err(|error| Error::Handler(error.to_string()))?;
+        check_capability(iii, agent_id, &step.function_id).await?;
     }
     Ok(())
 }
@@ -1395,5 +1633,204 @@ mod tests {
         let (page, total) = workflow_run_page(enveloped, "wf-1", 10, 0);
         assert_eq!(total, 0);
         assert!(page.is_empty());
+    }
+
+    // --- bus authorization (review finding H-5) ---
+
+    fn step_with(name: &str, function_id: &str, agent_id: Option<&str>) -> WorkflowStep {
+        serde_json::from_value(json!({
+            "name": name,
+            "functionId": function_id,
+            "agentId": agent_id,
+            "mode": "sequential",
+            "errorMode": "fail",
+            "timeoutMs": 1000,
+        }))
+        .expect("step fixture")
+    }
+
+    fn workflow_with(steps: Vec<WorkflowStep>, created_by: Option<&str>) -> Workflow {
+        Workflow {
+            id: "wf-1".into(),
+            name: "wf".into(),
+            description: "d".into(),
+            created_by: created_by.map(str::to_string),
+            agents: vec![],
+            steps,
+        }
+    }
+
+    #[test]
+    fn a_step_without_any_principal_is_refused_not_exempt() {
+        let step = step_with("Escalate", "mcp::connect", None);
+        let workflow = workflow_with(vec![step.clone()], None);
+
+        match plan_step_authorization(&step, &workflow, None) {
+            StepAuthorization::Refused(reason) => {
+                assert!(reason.contains("mcp::connect"), "{reason}");
+                assert!(reason.contains("needs a principal"), "{reason}");
+                assert!(reason.contains("wf-1"), "{reason}");
+            }
+            other => panic!("a step with no principal must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_workflow_may_not_name_its_own_principal_through_agents() {
+        // `agents` is self-declared by whoever wrote the definition, so it must
+        // not satisfy the principal requirement.
+        let step = step_with("Escalate", "shell::exec", None);
+        let mut workflow = workflow_with(vec![step.clone()], None);
+        workflow.agents = vec!["admin".into()];
+
+        assert!(matches!(
+            plan_step_authorization(&step, &workflow, None),
+            StepAuthorization::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn the_principal_falls_back_step_then_run_then_creator() {
+        let bare = step_with("A", "memory::store", None);
+        let owned = step_with("B", "memory::store", Some("step-agent"));
+
+        let no_creator = workflow_with(vec![bare.clone()], None);
+        let with_creator = workflow_with(vec![bare.clone()], Some("creator"));
+
+        assert_eq!(
+            step_principal(&owned, &no_creator, Some("run")),
+            Some("step-agent")
+        );
+        assert_eq!(step_principal(&bare, &no_creator, Some("run")), Some("run"));
+        assert_eq!(step_principal(&bare, &with_creator, None), Some("creator"));
+        assert_eq!(step_principal(&bare, &no_creator, None), None);
+    }
+
+    #[test]
+    fn a_deny_by_default_step_needs_an_approval_decision() {
+        for function_id in [
+            "shell::exec",
+            "bridge::invoke",
+            "mcp::connect",
+            "hook::register",
+            "cron::create",
+            "vault::read",
+            "state::set",
+            "engine::functions::list",
+            "code::run",
+            "harness::spawn",
+            "browser::navigate",
+            "wasm::run",
+            "security::docker_exec",
+        ] {
+            let step = step_with("Escalate", function_id, Some("agent-1"));
+            let workflow = workflow_with(vec![step.clone()], None);
+            assert_eq!(
+                plan_step_authorization(&step, &workflow, None),
+                StepAuthorization::Checked {
+                    agent_id: "agent-1",
+                    needs_approval: true,
+                },
+                "{function_id} must require approval"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_allowed_step_still_runs() {
+        let step = step_with("Remember", "memory::store", Some("agent-1"));
+        let workflow = workflow_with(vec![step.clone()], None);
+
+        assert_eq!(
+            plan_step_authorization(&step, &workflow, None),
+            StepAuthorization::Checked {
+                agent_id: "agent-1",
+                needs_approval: false,
+            }
+        );
+        // and the two remote verdicts let it through
+        assert_eq!(capability_denial(&json!({ "allowed": true })), None);
+    }
+
+    #[test]
+    fn every_shipped_workflow_still_authorizes() {
+        // Every shipped definition names an agentId on every step, so
+        // fail-closed does not strand any of them.
+        for path in [
+            "../../workflows/feature-build.yaml",
+            "../../workflows/incident-response.yaml",
+            "../../workflows/mvp-sprint.yaml",
+            "../../examples/crew-blog-writer.yaml",
+        ] {
+            let raw = std::fs::read_to_string(path).expect(path);
+            let value: Value = serde_yaml::from_str(&raw).expect(path);
+            let workflow: Workflow = serde_json::from_value(value).expect(path);
+            for step in &workflow.steps {
+                assert!(
+                    matches!(
+                        plan_step_authorization(step, &workflow, None),
+                        StepAuthorization::Checked { .. }
+                    ),
+                    "{path}: step {} lost its principal",
+                    step.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_capability_verdict_that_is_not_true_is_a_denial() {
+        // The old code discarded this response entirely.
+        assert_eq!(
+            capability_denial(&json!({ "allowed": false, "reason": "no such capability" })),
+            Some("no such capability".to_string())
+        );
+        assert_eq!(
+            capability_denial(&json!({})),
+            Some("capability denied".to_string())
+        );
+        assert_eq!(
+            capability_denial(&json!({ "allowed": "true" })),
+            Some("capability denied".to_string())
+        );
+        assert_eq!(capability_denial(&json!({ "allowed": true })), None);
+    }
+
+    #[test]
+    fn only_an_explicit_approval_may_dispatch() {
+        assert_eq!(approval_denial(&json!({ "decision": "approved" })), None);
+        for decision in ["denied", "required", "queued", ""] {
+            let result = json!({ "decision": decision, "reason": "r", "requestId": "req-1" });
+            let denial =
+                approval_denial(&result).unwrap_or_else(|| panic!("{decision} must not dispatch"));
+            assert!(denial.contains("req-1"), "{denial}");
+        }
+        // A response with no decision at all is not an approval.
+        assert!(approval_denial(&json!({})).is_some());
+    }
+
+    #[test]
+    fn the_deny_by_default_list_is_contract_i1_verbatim() {
+        assert_eq!(
+            DENY_BY_DEFAULT_FAMILIES,
+            [
+                "shell", "bridge", "mcp", "hook", "cron", "vault", "state", "engine", "code",
+                "harness", "browser", "wasm"
+            ]
+        );
+        assert!(!requires_approval("memory::store"));
+        assert!(!requires_approval("agent::chat"));
+        assert!(!requires_approval(""));
+        assert!(requires_approval("shell::exec"));
+    }
+
+    #[test]
+    fn the_payload_digest_binds_the_approval_to_one_payload() {
+        let a = payload_digest(&json!({ "cmd": "ls" }));
+        let b = payload_digest(&json!({ "cmd": "rm -rf /" }));
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        assert_eq!(a, payload_digest(&json!({ "cmd": "ls" })));
     }
 }
