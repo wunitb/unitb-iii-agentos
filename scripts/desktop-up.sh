@@ -27,8 +27,14 @@ if [[ "$initial_probe" =~ ^30[1278]\ .*/workers/?$ ]]; then
 fi
 
 cd "$ROOT"
+# `verify --strict` checks config.yaml and iii.lock agree for this platform.
+# The install step must be plain `sync`: it installs the registry workers
+# exactly as iii.lock pins them, and (unlike `iii worker update`) it does not
+# rewrite config.yaml or iii.lock. `sync --frozen` only *verifies* the lockfile
+# "without mutating local files" (iii 0.22.1 `worker sync --help`), so on a host
+# without the console artifacts it can never install anything.
 iii worker verify --strict
-iii worker sync --frozen
+iii worker sync
 
 for _ in {1..60}; do
     if [[ "$(probe_console)" == 200\ * ]]; then

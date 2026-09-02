@@ -20,6 +20,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALLER="${INSTALLER:-$SCRIPT_DIR/install.sh}"
 ORIG_PATH="$PATH"
+# The engine version the release bundle pins, taken from the same file the real
+# bundle ships (release.yml copies .iii-version into runtime/).
+III_PINNED_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/.iii-version")"
 
 TESTS_RUN=0
 TESTS_FAILED=0
@@ -214,6 +217,10 @@ make_release() {
   printf 'release = "%s"\n' "$tag" > "$stage/runtime/config/default.toml"
   printf 'name: echo\nruntime: rust\n' > "$stage/runtime/workers/echo/iii.worker.yaml"
   printf '%s\n' "$tag" > "$stage/runtime/RELEASE"
+  # The installed runtime pins the engine version; resolve_iii_version() refuses
+  # to continue without it, so the release fixture must ship it like the real
+  # bundle does (.iii-version at the repository root).
+  printf '%s\n' "$III_PINNED_VERSION" > "$stage/runtime/.iii-version"
 
   for extra in "$@"; do
     mkdir -p "$stage/runtime/$(dirname "$extra")"

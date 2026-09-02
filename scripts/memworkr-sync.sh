@@ -11,10 +11,40 @@ usage() {
     exit 2
 }
 
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        echo "sha256sum or shasum is required to record and verify memworkr binaries" >&2
+        return 1
+    fi
+}
+
+# The recorded digest is what binds a version directory to the binary the gate
+# actually verified. scripts/dev-up.sh re-checks it before every exec, so a
+# write into the runtime root cannot become the next process.
+verify_digest() {
+    local version="$1" binary="$VERSIONS/$1/memworkr" recorded="$VERSIONS/$1/SHA256"
+    local expected actual
+    [[ -f "$recorded" ]] || {
+        echo "memworkr $version has no recorded digest; re-run: $0 sync SOURCE_DIR" >&2
+        return 1
+    }
+    expected="$(tr -d '\r\n' < "$recorded")"
+    actual="$(sha256_of "$binary")" || return 1
+    [[ "$expected" == "$actual" ]] || {
+        echo "memworkr $version digest mismatch (recorded $expected, found $actual)" >&2
+        return 1
+    }
+}
+
 activate() {
     local version="$1"
     [[ "$version" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid memworkr commit: $version" >&2; exit 1; }
     [[ -x "$VERSIONS/$version/memworkr" ]] || { echo "memworkr version is not installed: $version" >&2; exit 1; }
+    verify_digest "$version" || exit 1
     mkdir -p "$RUNTIME_ROOT"
     printf '%s\n' "$version" > "$CURRENT.tmp"
     mv -f "$CURRENT.tmp" "$CURRENT"
@@ -31,7 +61,7 @@ case "${1:-}" in
         VERSION="$(git -C "$SOURCE" rev-parse --verify HEAD)"
         [[ "$VERSION" =~ ^[0-9a-f]{40}$ ]] || { echo "unable to resolve memworkr commit" >&2; exit 1; }
         mkdir -p "$VERSIONS"
-        if [[ ! -x "$VERSIONS/$VERSION/memworkr" ]]; then
+        if [[ ! -x "$VERSIONS/$VERSION/memworkr" ]] || ! verify_digest "$VERSION" 2>/dev/null; then
             echo "▸ verifying memworkr $VERSION"
             (cd "$SOURCE" && scripts/release-gate.sh)
             STAGE="$(mktemp -d "$RUNTIME_ROOT/.sync.XXXXXX")"
@@ -39,6 +69,13 @@ case "${1:-}" in
             trap cleanup EXIT
             install -m 0755 "$SOURCE/target/release/memworkr" "$STAGE/memworkr"
             printf '%s\n' "$VERSION" > "$STAGE/VERSION"
+            sha256_of "$STAGE/memworkr" > "$STAGE/SHA256"
+            # A previous run can leave a directory that exists but holds no
+            # usable binary (interrupted install, ENOSPC, a manual chmod).
+            # POSIX `mv` would then move the staging directory *inside* it and
+            # wedge this version forever, so replace it outright. $VERSION is a
+            # validated 40-character commit, never an operator-supplied path.
+            rm -rf "${VERSIONS:?}/${VERSION:?}"
             mv "$STAGE" "$VERSIONS/$VERSION"
             trap - EXIT
         fi
@@ -53,6 +90,9 @@ case "${1:-}" in
         if [[ -f "$CURRENT" ]]; then
             VERSION="$(tr -d '\r\n' < "$CURRENT")"
             if [[ "$VERSION" =~ ^[0-9a-f]{40}$ && -x "$VERSIONS/$VERSION/memworkr" ]]; then
+                # Reporting "active" for a binary that dev-up.sh will refuse to
+                # execute would make this useless as a precondition check.
+                verify_digest "$VERSION" || exit 1
                 echo "memworkr active: $VERSION"
                 exit 0
             fi
