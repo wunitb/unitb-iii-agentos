@@ -22,6 +22,12 @@ use std::io::stdout;
 use crate::palette::PaletteItem;
 
 const API_BASE: &str = "http://localhost:3111";
+/// Longer than the 300 s bus budget for a chat turn, so a slow turn ends as the
+/// worker's real error instead of a client-side timeout that hides it.
+const CHAT_REQUEST_TIMEOUT_SECS: u64 = 330;
+/// How much of a provider/worker error the chat pane shows. 160 chars used to
+/// cut the message off before the part that says what went wrong.
+const CHAT_ERROR_DETAIL_CHARS: usize = 600;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS: u64 = 80;
 
@@ -226,9 +232,26 @@ struct App {
     slash_selected: usize,
     registry_fns: Vec<String>,
     chat_realm: String,
+    /// Stable identity for this conversation. Without it every turn was a new
+    /// session on the server, so nothing could be recalled from the last one.
+    chat_session: String,
     worker_count: usize,
     worker_catalog: Vec<worker_picker::WorkerCard>,
     worker_picker_selected: usize,
+}
+
+/// Session identity for one TUI conversation: unique per process and per
+/// `/clear`, stable across every message in between. The counter is what makes
+/// two sessions started inside the same millisecond distinct.
+static SESSION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn new_session_id() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or_default();
+    let sequence = SESSION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("tui-{}-{millis}-{sequence}", std::process::id())
 }
 
 impl App {
@@ -292,6 +315,7 @@ impl App {
             slash_selected: 0,
             registry_fns: vec![],
             chat_realm: "default".into(),
+            chat_session: new_session_id(),
             worker_count: 0,
             worker_catalog: vec![],
             worker_picker_selected: 0,
@@ -749,7 +773,9 @@ impl App {
                 let body = serde_json::json!({
                     "content": args,
                     "userId": self.chat_realm,
-                    "sessionId": "tui-session",
+                    // The same session as the conversation, not a constant that
+                    // every TUI on every machine shared.
+                    "sessionId": self.chat_session,
                 });
                 match client
                     .post(format!("{}/agentmemory/remember", API_BASE))
@@ -850,7 +876,10 @@ impl App {
                 }
             }
             "clear" => {
+                // A cleared transcript is a new conversation: rotate the
+                // session so the server does not keep recalling the old one.
                 self.chat_messages.clear();
+                self.chat_session = new_session_id();
             }
             "help" => {
                 self.show_help = true;
@@ -893,12 +922,12 @@ impl App {
         };
 
         let client = Self::client();
-        let body = chat_request_body(&msg, &agent_id, &self.chat_realm);
+        let body = chat_request_body(&msg, &agent_id, &self.chat_realm, &self.chat_session);
 
         let send_result = client
             .post(format!("{}/api/chat/stream", API_BASE))
             .json(&body)
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(CHAT_REQUEST_TIMEOUT_SECS))
             .send()
             .await;
 
@@ -914,22 +943,8 @@ impl App {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let body = resp.text().await.unwrap_or_default();
-                let hint = match status {
-                    401 | 403 => {
-                        "Anthropic rejected the request. Check ANTHROPIC_API_KEY in agentos/.env."
-                    }
-                    404 => "Endpoint not registered. Is the streaming worker running?",
-                    500..=599 => {
-                        "Engine returned a server error. Check llm-router + streaming worker logs."
-                    }
-                    _ => "Unexpected response.",
-                };
-                let snippet = body.chars().take(160).collect::<String>();
                 if let Some(last) = self.chat_messages.last_mut() {
-                    *last = (
-                        "system".into(),
-                        format!("HTTP {}: {} ({})", status, hint, snippet),
-                    );
+                    *last = ("system".into(), chat_error_message(status, &body));
                 }
             }
             Err(e) => {
@@ -1037,12 +1052,101 @@ impl App {
     }
 }
 
-fn chat_request_body(message: &str, agent_id: &str, realm: &str) -> Value {
+fn chat_request_body(message: &str, agent_id: &str, realm: &str, session_id: &str) -> Value {
     serde_json::json!({
         "message": message,
         "agentId": agent_id,
         "realm": realm,
+        "sessionId": session_id,
     })
+}
+
+/// Dig the provider's own words out of an error body. Workers return their
+/// failures as a bus error, so the body may be a JSON envelope, a plain string,
+/// or already-flat text.
+fn provider_error_detail(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return Some(trimmed.to_string());
+    };
+    fn first_text(value: &Value, depth: usize) -> Option<String> {
+        if depth > 4 {
+            return None;
+        }
+        match value {
+            Value::String(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
+            Value::Object(fields) => ["message", "error", "detail", "reason", "description"]
+                .iter()
+                .find_map(|key| {
+                    fields
+                        .get(*key)
+                        .and_then(|value| first_text(value, depth + 1))
+                }),
+            _ => None,
+        }
+    }
+    first_text(&value, 0).or_else(|| Some(trimmed.to_string()))
+}
+
+/// What the user sees when a chat request fails. The old version guessed from
+/// the status code alone and told every 401 to check `ANTHROPIC_API_KEY`, which
+/// was both unreachable (provider failures arrive as HTTP 500) and wrong (a 401
+/// here is the AgentOS bearer, not the provider's).
+fn chat_error_message(status: u16, body: &str) -> String {
+    let detail = provider_error_detail(body);
+    let haystack = detail.clone().unwrap_or_default();
+    let hint = if haystack.contains("provider_credential_missing") {
+        "No provider credential is configured. Set the variable named below in agentos/.env."
+    } else if haystack.contains("provider_timeout") {
+        "The provider did not answer in time. Retry, or route to a faster model."
+    } else if haystack.contains("provider_unreachable") {
+        "The provider could not be reached. Check the base URL and your network."
+    } else if haystack.contains("provider_error") {
+        "The provider rejected the request; its own message is below."
+    } else {
+        match status {
+            401 | 403 => {
+                "AgentOS rejected the request. Check AGENTOS_API_KEY in agentos/.env (the TUI sends it as a bearer token)."
+            }
+            404 => "Endpoint not registered. Is the streaming worker running?",
+            408 | 504 => "The turn exceeded its budget. Check llm-router and the provider.",
+            500..=599 => {
+                "The worker failed this turn. Its message is below; the full trace is in the llm-router and streaming logs."
+            }
+            _ => "Unexpected response.",
+        }
+    };
+
+    match detail {
+        Some(detail) => {
+            let snippet: String = detail.chars().take(CHAT_ERROR_DETAIL_CHARS).collect();
+            let ellipsis = if detail.chars().count() > CHAT_ERROR_DETAIL_CHARS {
+                "…"
+            } else {
+                ""
+            };
+            format!("HTTP {status}: {hint}\n{snippet}{ellipsis}")
+        }
+        None => format!("HTTP {status}: {hint}"),
+    }
+}
+
+/// Tool calls the agent reported for this turn. The streaming worker used to
+/// drop them, so a turn that answered with a tool call showed an empty bubble.
+fn tool_call_summary(response: &Value) -> Option<String> {
+    let calls = response["toolCalls"].as_array()?;
+    let names: Vec<&str> = calls
+        .iter()
+        .filter_map(|call| call["id"].as_str().or_else(|| call["name"].as_str()))
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!("(tool calls: {})", names.join(", ")))
 }
 
 fn parse_chat_response(body: &str) -> String {
@@ -1052,7 +1156,11 @@ fn parse_chat_response(body: &str) -> String {
             .or_else(|| json["response"].as_str())
             .or_else(|| json["message"].as_str())
     {
-        return s.to_string();
+        return match tool_call_summary(&json) {
+            Some(summary) if s.trim().is_empty() => summary,
+            Some(summary) => format!("{s}\n\n{summary}"),
+            None => s.to_string(),
+        };
     }
     let mut out = String::new();
     for line in body.split('\n') {
@@ -3718,12 +3826,102 @@ mod tests {
 
     #[test]
     fn test_chat_request_body_matches_stream_chat_contract() {
-        let body = chat_request_body("Reply with READY only.", "agent-7", "realm-3");
+        let body = chat_request_body("Reply with READY only.", "agent-7", "realm-3", "tui-1-2");
 
         assert_eq!(body["message"], "Reply with READY only.");
         assert_eq!(body["agentId"], "agent-7");
         assert_eq!(body["realm"], "realm-3");
+        assert_eq!(body["sessionId"], "tui-1-2");
         assert!(body.get("messages").is_none());
+    }
+
+    #[test]
+    fn chat_session_id_is_present_stable_and_rotates_only_on_clear() {
+        let mut app = App::new();
+        assert!(app.chat_session.starts_with("tui-"), "{}", app.chat_session);
+
+        let first = app.chat_session.clone();
+        let one = chat_request_body("one", "agent-1", "default", &app.chat_session);
+        let two = chat_request_body("two", "agent-1", "default", &app.chat_session);
+        assert_eq!(one["sessionId"], two["sessionId"]);
+        assert_eq!(one["sessionId"], serde_json::json!(first));
+
+        app.chat_messages.clear();
+        app.chat_session = new_session_id();
+        assert_ne!(app.chat_session, first);
+        assert!(!app.chat_session.is_empty());
+    }
+
+    #[test]
+    fn chat_errors_surface_the_worker_message_not_a_guess() {
+        let body =
+            r#"{"error":"provider_error: openai returned HTTP 402: insufficient credit balance"}"#;
+        let message = chat_error_message(500, body);
+        assert!(message.contains("insufficient credit balance"), "{message}");
+        assert!(message.contains("rejected the request"), "{message}");
+        assert!(
+            !message.contains("Check llm-router + streaming worker logs"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn chat_errors_name_the_missing_credential_variable() {
+        let body = r#"{"error":{"message":"provider_credential_missing: no provider credential is configured; set one of ANTHROPIC_API_KEY, OPENAI_API_KEY in the active .env"}}"#;
+        let message = chat_error_message(500, body);
+        assert!(message.contains("ANTHROPIC_API_KEY"), "{message}");
+        assert!(message.contains("OPENAI_API_KEY"), "{message}");
+        assert!(message.contains("No provider credential"), "{message}");
+    }
+
+    #[test]
+    fn chat_401_blames_the_agentos_key_not_the_provider() {
+        // A 401 here comes from the http-adapter bearer check, so the old hint
+        // ("Check ANTHROPIC_API_KEY") pointed at the wrong file.
+        let message = chat_error_message(401, "");
+        assert!(message.contains("AGENTOS_API_KEY"), "{message}");
+        assert!(!message.contains("ANTHROPIC_API_KEY"), "{message}");
+    }
+
+    #[test]
+    fn chat_error_detail_is_bounded_and_survives_plain_text_bodies() {
+        let plain = chat_error_message(502, "upstream closed the connection");
+        assert!(plain.contains("upstream closed the connection"), "{plain}");
+
+        let long = format!(
+            "{{\"error\":\"{}\"}}",
+            "x".repeat(CHAT_ERROR_DETAIL_CHARS * 2)
+        );
+        let bounded = chat_error_message(500, &long);
+        assert!(
+            bounded.chars().count() < CHAT_ERROR_DETAIL_CHARS * 2,
+            "{bounded}"
+        );
+        assert!(bounded.ends_with('…'), "{bounded}");
+
+        let empty = chat_error_message(404, "");
+        assert!(empty.starts_with("HTTP 404:"), "{empty}");
+        assert!(!empty.contains('\n'), "{empty}");
+    }
+
+    #[test]
+    fn chat_response_reports_tool_calls_instead_of_an_empty_bubble() {
+        let only_tools = parse_chat_response(
+            r#"{"content":"","toolCalls":[{"callId":"c1","id":"memory::recall"}]}"#,
+        );
+        assert_eq!(only_tools, "(tool calls: memory::recall)");
+
+        let both = parse_chat_response(
+            r#"{"content":"done","toolCalls":[{"callId":"c1","id":"memory::recall"},{"callId":"c2","id":"workflow::run"}]}"#,
+        );
+        assert!(both.starts_with("done"), "{both}");
+        assert!(
+            both.contains("(tool calls: memory::recall, workflow::run)"),
+            "{both}"
+        );
+
+        let plain = parse_chat_response(r#"{"content":"done","toolCalls":[]}"#);
+        assert_eq!(plain, "done");
     }
 
     #[test]
