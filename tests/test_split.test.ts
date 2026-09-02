@@ -40,11 +40,17 @@ function targetsOf(script: string): string[] {
   return match[1]!.split(/\s+/);
 }
 
-/** Reproduce bun's selection for the two argument shapes these scripts use. */
+/** Reproduce selection for the argument shapes these scripts use: a directory, an
+ *  exact file, or a non-recursive `dir/*.suffix` glob. */
 function selects(target: string, file: string): boolean {
-  if (target.endsWith("/*.test.ts")) {
-    const directory = target.slice(0, -"/*.test.ts".length);
-    return file.startsWith(`${directory}/`) && !file.slice(directory.length + 1).includes("/");
+  const glob = /^(.*)\/\*(\.[A-Za-z.]+)$/.exec(target);
+  if (glob) {
+    const directory = glob[1]!;
+    return (
+      file.startsWith(`${directory}/`) &&
+      !file.slice(directory.length + 1).includes("/") &&
+      file.endsWith(glob[2]!)
+    );
   }
   return file === target || file.startsWith(`${target}/`);
 }
@@ -98,6 +104,20 @@ describe("test suite split", () => {
     ]) {
       expect(unit, `${expected} must stay in test:unit`).toContain(expected);
     }
+  });
+
+  it("typechecks every file it executes", () => {
+    // scripts/desktop-up.test.ts, memworkr-sync.test.ts and env-contract.test.ts
+    // were executed by `bun test` for a while but invisible to `typecheck:scripts`,
+    // which named one file. A test that runs but is never type-checked is a
+    // silently weaker gate, so the two lists are tied together here.
+    const typecheckTargets = Object.entries(manifest.scripts as Record<string, string>)
+      .filter(([name]) => name.startsWith("typecheck:"))
+      .flatMap(([, script]) => script.split(/\s+/).filter((token) => /\.(ts|tsx)$/.test(token)));
+    expect(typecheckTargets.length, "no typecheck script names any file").toBeGreaterThan(0);
+
+    const untyped = files.filter((file) => !typecheckTargets.some((target) => selects(target, file)));
+    expect(untyped, "these test files run in CI but are never type-checked").toEqual([]);
   });
 
   it("runs both suites in CI as separate, non-optional steps", async () => {

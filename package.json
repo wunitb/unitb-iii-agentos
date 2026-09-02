@@ -17,7 +17,7 @@
     "counts:write": "bun scripts/counts.ts --write",
     "typecheck": "bun run typecheck:examples && bun run typecheck:scripts && bun run typecheck:counts && bun run typecheck:tests",
     "typecheck:examples": "tsc --ignoreConfig --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck examples/*.ts",
-    "typecheck:scripts": "tsc --ignoreConfig --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --types node --strict --skipLibCheck scripts/dev-up.test.ts",
+    "typecheck:scripts": "tsc --ignoreConfig --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --types node --strict --skipLibCheck scripts/*.test.ts",
     "typecheck:counts": "tsc --ignoreConfig --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --types node --strict --skipLibCheck scripts/counts.ts",
     "typecheck:tests": "tsc --ignoreConfig --noEmit --target ES2022 --module ESNext --moduleResolution bundler --types bun,node --strict --skipLibCheck tests/*.test.ts tests/governance/*.test.ts",
     "build:website": "bash -lc 'cd website && npm run build'",
