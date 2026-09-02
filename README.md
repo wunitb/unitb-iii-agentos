@@ -77,11 +77,18 @@ cargo build --workspace --release
 Step 3 is about the **model** credential only. You never write
 `AGENTOS_API_KEY` by hand.
 
-Quickstart uses the local Codex proxy at `http://127.0.0.1:8317/v1`.
-Anthropic is optional and selected only by an explicit provider/model or when
-no configured local default exists. Every HTTP route is authenticated except
-routes explicitly registered with `auth: false` such as `/api/health`. There is
-no global auth-disable switch.
+Quickstart uses the local Codex proxy at `http://127.0.0.1:8317/v1`, which is
+just the credential that happens to be easiest to get. A request that names no
+provider and no model is routed automatically: `llm-router` walks a fixed
+preference order — `anthropic`, `openai`, `google`, `codex`, `groq`, `deepseek`,
+`mistral`, `together`, `fireworks`, `openrouter` — and takes the **first
+provider whose credential is present**. If none is present it refuses with
+`provider_credential_missing`, naming the variables you could set, instead of
+sending a request that would come back as somebody else's 401. Naming a provider
+and model explicitly always wins over the automatic choice.
+
+Every HTTP route is authenticated except routes explicitly registered with
+`auth: false` such as `/api/health`. There is no global auth-disable switch.
 
 ### First run — what generates what
 
@@ -91,10 +98,10 @@ creates it for you:
 
 | you run | it does |
 |---|---|
-| `agentos up`, `agentos onboard` | If `AGENTOS_API_KEY` is absent or empty in the active `.env`, generate a fresh 32-byte random key, append it to that `.env`, set the file to mode `0600`, and print the path it wrote to. An existing non-empty value is never overwritten. |
+| `agentos up`, `agentos onboard`, `agentos start` | If `AGENTOS_API_KEY` is absent or empty in the active `.env`, generate a fresh 32-byte random key, write it into that `.env` — filling an existing empty `AGENTOS_API_KEY=` line **in place**, appending the line only when the name is absent — set the file to mode `0600`, and print the path it wrote to. An existing non-empty value is never overwritten. Writing in place matters: `.env.example` ships `AGENTOS_API_KEY=` already declared, so appending would produce two assignments of one name and `scripts/dev-up.sh` would then refuse to start with `duplicate dotenv variable`. |
 | any command | **Never** invents a provider credential. `CODEX_PROXY_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and friends are yours to supply; AgentOS only reads them. |
-| `agentos doctor` | Reports, explicitly and separately: (a) whether `AGENTOS_API_KEY` is present, (b) which provider credential is present, (c) the default route that results. A missing `AGENTOS_API_KEY` is reported as *the cause*, not as "missing identities". |
-| `agentos start` | Loads the same active `.env` as `agentos up`. There is exactly one configuration path. |
+| `agentos doctor` | Reports, explicitly and separately: (a) whether `AGENTOS_API_KEY` is present, (b) which provider credential is present, (c) the default route that results — the first provider in the preference order above whose credential is present, or `provider_credential_missing` when none is. A missing `AGENTOS_API_KEY` is reported as *the cause*, not as "missing identities". |
+| `agentos start` | Loads the same active `.env` as `agentos up` and generates the key the same way. There is exactly one configuration path. |
 
 So the shortest honest first run is: install iii, put one model credential in
 `.env`, `cargo build --workspace --release`, `agentos up`. The bearer token
