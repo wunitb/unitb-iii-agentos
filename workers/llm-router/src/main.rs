@@ -612,6 +612,12 @@ fn select_model(complexity: u32, preferred: Option<&str>) -> (&'static str, &'st
     }
 }
 
+/// Name resolution: which provider and model does this request mean? An
+/// explicitly requested provider/model is resolved as asked even when its
+/// credential is absent, so `agentos::llm::route` stays a catalogue query;
+/// `resolve_complete_route` is where a call is refused. Automatic selection is
+/// the exception: choosing *for* the caller has to consider which credential
+/// exists, or the answer is a guess.
 fn resolve_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
     let explicit_provider = route_field(input, "provider")?;
     let requested_model = route_field(input, "model")?;
@@ -633,9 +639,6 @@ fn resolve_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
                 "model {model} is not registered for provider {provider}"
             )));
         }
-        if !config.is_available() {
-            return Err(credential_missing_error(provider, &config.env_key));
-        }
         return Ok(Route {
             provider: provider.into(),
             model: model.into(),
@@ -650,13 +653,10 @@ fn resolve_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
             .map(|entry| entry.key().clone())
             .collect();
         return match owners.as_slice() {
-            [provider] => {
-                state.ensure_credential(provider)?;
-                Ok(Route {
-                    provider: provider.clone(),
-                    model: model.into(),
-                })
-            }
+            [provider] => Ok(Route {
+                provider: provider.clone(),
+                model: model.into(),
+            }),
             [] => Err(Error::Handler(format!("unknown model: {model}"))),
             _ => Err(Error::Handler(format!("ambiguous model: {model}"))),
         };
@@ -678,9 +678,6 @@ fn resolve_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
                 "model {} is not registered for provider {}",
                 route.model, route.provider
             )));
-        }
-        if !config.is_available() {
-            return Err(credential_missing_error(&route.provider, &config.env_key));
         }
         return Ok(Route {
             provider: route.provider.clone(),
@@ -721,20 +718,26 @@ fn has_explicit_route(input: &Value) -> bool {
     provider_explicit || model_explicit
 }
 
+/// Route a call that is about to be made: resolve the name, then refuse it here
+/// if the provider has no credential, naming the variable to set. The old code
+/// sent the request anyway with an empty key and reported the provider's 401.
 fn resolve_complete_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
-    if state.default_route.is_none()
+    let route = if state.default_route.is_none()
         && !has_explicit_route(input)
         && state.provider_is_available("anthropic")
     {
-        return resolve_route(
+        resolve_route(
             state,
             &json!({
                 "provider": "anthropic",
                 "model": "claude-sonnet-4-20250514",
             }),
-        );
-    }
-    resolve_route(state, input)
+        )?
+    } else {
+        resolve_route(state, input)?
+    };
+    state.ensure_credential(&route.provider)?;
+    Ok(route)
 }
 
 fn client_for_provider<'a>(
@@ -3798,10 +3801,10 @@ mod tests {
     }
 
     #[test]
-    fn an_unconfigured_provider_is_refused_by_variable_name() {
+    fn a_call_to_an_unconfigured_provider_is_refused_by_variable_name() {
         let openai_only = state_with_credentials(None, Some(&["openai"]));
 
-        let explicit = resolve_route(
+        let explicit = resolve_complete_route(
             &openai_only,
             &json!({ "provider": "anthropic", "model": "claude-sonnet-4-20250514" }),
         )
@@ -3813,9 +3816,10 @@ mod tests {
         );
         assert!(explicit.contains("ANTHROPIC_API_KEY"), "{explicit}");
 
-        let by_model = resolve_route(&openai_only, &json!({ "model": "gemini-2.0-flash" }))
-            .expect_err("model-only routing must check the owner's credential")
-            .to_string();
+        let by_model =
+            resolve_complete_route(&openai_only, &json!({ "model": "gemini-2.0-flash" }))
+                .expect_err("model-only routing must check the owner's credential")
+                .to_string();
         assert!(by_model.contains("GOOGLE_API_KEY"), "{by_model}");
 
         let pinned_default = state_with_credentials(
@@ -3825,13 +3829,31 @@ mod tests {
             }),
             Some(&["openai"]),
         );
-        let default_error = resolve_route(&pinned_default, &json!({}))
+        let default_error = resolve_complete_route(&pinned_default, &json!({}))
             .expect_err("a pinned default without a credential must be refused")
             .to_string();
         assert!(
             default_error.contains("ANTHROPIC_API_KEY"),
             "{default_error}"
         );
+    }
+
+    #[test]
+    fn naming_a_model_stays_a_catalogue_query_even_without_a_credential() {
+        // `agentos::llm::route` answers "where would this go?"; it must not
+        // start failing for callers that only want the mapping.
+        let nothing = state_with_credentials(None, Some(&[]));
+        let explicit = resolve_route(
+            &nothing,
+            &json!({ "provider": "anthropic", "model": "claude-sonnet-4-20250514" }),
+        )
+        .expect("explicit naming resolves without a credential");
+        assert_eq!(explicit.provider, "anthropic");
+
+        let by_model = resolve_route(&nothing, &json!({ "model": "haiku" }))
+            .expect("alias naming resolves without a credential");
+        assert_eq!(by_model.provider, "anthropic");
+        assert!(by_model.model.contains("haiku"), "{}", by_model.model);
     }
 
     #[test]

@@ -2593,10 +2593,15 @@ fn security_lines(capabilities: &Value) -> Vec<Line<'static>> {
         }
         Value::Array(entries) if !entries.is_empty() => {
             for (index, entry) in entries.iter().enumerate() {
+                // `state::list` answers with a bare array of stored VALUES —
+                // no `{key, value}` envelope — so the identity has to come out
+                // of the value itself when the producer put one there.
                 let title = entry
                     .get("key")
                     .or_else(|| entry.get("name"))
                     .or_else(|| entry.get("agentId"))
+                    .or_else(|| entry.get("agent_id"))
+                    .or_else(|| entry.get("id"))
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("Capability {}", index + 1));
@@ -3713,6 +3718,52 @@ mod tests {
             assert!(rendered.contains(expected), "{rendered}");
             assert!(!rendered.contains(unexpected), "{rendered}");
         }
+    }
+
+    #[test]
+    fn security_screen_renders_the_real_bare_state_list_shape() {
+        // `state::list` returns the stored values with no `{key, value}`
+        // envelope (verified against iii 0.22.1 by the chat-core WP), and the
+        // capability value in contract I1 is `{tools, updatedAt}`. The pane has
+        // to stay readable for that shape; the agent id is simply not on the
+        // wire, which is filed as a request against the security worker.
+        let mut app = App::new();
+        app.security_caps = serde_json::json!([
+            { "tools": ["memory::recall", "workflow::run"], "updatedAt": 1_759_000_000_000_u64 },
+            { "agentId": "agent-7", "tools": ["memory::store"] },
+        ]);
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_security(frame, &app, Block::default(), area);
+            })
+            .expect("draw security surface");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        for expected in [
+            "Capability 1",
+            "memory::recall",
+            "workflow::run",
+            "agent-7",
+            "memory::store",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}: {rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("No capabilities configured"),
+            "{rendered}"
+        );
     }
 
     #[test]
