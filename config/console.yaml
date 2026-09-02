@@ -1,0 +1,16 @@
+id: console
+name: Console
+description: >-
+  Console server settings. The worker is NOT in the default ./config.yaml worker
+  list; this file exists so the port is declared in this repo instead of being
+  inherited from an unreviewed registry default. IMPORTANT: console v1.9.16
+  exposes exactly one server key, `http_port` — its embedded configuration
+  schema has no bind-host key — and the shipped binary listens on 0.0.0.0. A
+  live run was observed as `LISTEN 0 128 0.0.0.0:3113 users:(("console",...))`.
+  The console also proxies /ws to the engine bridge, which has no
+  authentication, so on any host with a routable or tailnet address this port is
+  a remote gateway to the bus. If you boot the console, block 3113 at the
+  firewall or reach it over an SSH tunnel; there is no in-repo way to bind it to
+  loopback until upstream adds a host key.
+value:
+  http_port: 3113

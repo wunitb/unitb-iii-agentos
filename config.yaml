@@ -21,12 +21,13 @@ workers:
   - name: provider-openai-codex
   - name: queue
   - name: session-manager
-  - name: shell
-    config:
-      fs:
-        host_roots:
-          - ${III_COMPOSE_DIR:.}
-        allow_unjailed: false
+  # `shell` is deliberately NOT booted by default. Its function surface
+  # (shell::exec, shell::exec_bg, shell::pty::open, shell::fs::write,
+  # shell::fs::rm, coder::*) lands on the engine bus, which has no
+  # authentication, and `fs.host_roots` jails only the shell::fs::* half — it
+  # does not constrain the program shell::exec runs. Opt in by adding
+  # `- name: shell` here; ./config/shell.yaml holds the hardened settings that
+  # then apply. See config/shell.yaml for what that does and does not buy you.
   - name: harness
   - name: configuration
     config:
@@ -35,4 +36,12 @@ workers:
         config:
           directory: ./config
       ttl_seconds: 0
-  - name: console
+  # `console` is deliberately NOT booted by default. Its worker configuration
+  # (v1.9.16, pinned in iii.lock) exposes exactly one server key, `http_port` —
+  # there is no bind-host key — and the shipped binary listens on 0.0.0.0, so
+  # the console (which also proxies /ws to the unauthenticated engine bus)
+  # cannot be confined to loopback from this repo. It was observed live as
+  # `LISTEN 0 128 0.0.0.0:3113 users:(("console",...))` on a tailnet-attached
+  # host. Opt in by adding `- name: console` here AND blocking 3113 at the
+  # firewall, or reach it through an SSH tunnel. ./config/console.yaml pins the
+  # port so the value is declared in-tree rather than inherited.
