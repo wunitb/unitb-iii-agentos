@@ -2,7 +2,7 @@ import SectionHeader from "./SectionHeader";
 
 const groups = [
   { label: "Reasoning", workers: ["agent-core", "llm-router", "council", "swarm", "directive", "mission"] },
-  { label: "State", workers: ["realm", "memory", "ledger", "vault", "context-manager", "context-cache"] },
+  { label: "State", workers: ["realm", "memory", "ledger", "vault", "context-manager", "context-cache", "context-monitor"] },
   { label: "Coordination", workers: ["orchestrator", "workflow", "hierarchy", "coordination", "task-decomposer"] },
   { label: "Execution", workers: ["wasm-sandbox", "browser", "code-agent", "hand-runner", "lsp-tools"] },
   { label: "Safety", workers: ["security", "security-headers", "security-map", "security-zeroize", "skill-security", "approval", "approval-tiers", "rate-limiter", "loop-guard"] },

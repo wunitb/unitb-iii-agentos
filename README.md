@@ -9,8 +9,8 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-apache_2.0-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Apache 2.0"></a>
   <img src="https://img.shields.io/badge/workers-63-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Workers">
-  <img src="https://img.shields.io/badge/functions-267-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Functions">
-  <img src="https://img.shields.io/badge/rust_tests-1413_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="1,413 Rust tests">
+  <img src="https://img.shields.io/badge/functions-293-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Functions">
+  <img src="https://img.shields.io/badge/rust_tests-1500_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="1,500 Rust tests">
   <img src="https://img.shields.io/badge/iii--sdk-0.22.1-d96e2e?style=flat-square&labelColor=f2ede1" alt="iii-sdk 0.22.1">
 </p>
 
@@ -56,7 +56,7 @@ git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos
 #    (iii-init is installed only on Linux; upstream macOS assets are Linux binaries)
 bash scripts/install-iii.sh
 
-# 3. configure the local model proxy
+# 3. configure a model credential
 install -m 600 .env.example .env
 $EDITOR .env   # set CODEX_PROXY_API_KEY for http://127.0.0.1:8317/v1
 
@@ -67,11 +67,32 @@ cargo build --workspace --release
 ./target/release/agentos up
 ```
 
+Step 3 is about the **model** credential only. You never write
+`AGENTOS_API_KEY` by hand.
+
 Quickstart uses the local Codex proxy at `http://127.0.0.1:8317/v1`.
 Anthropic is optional and selected only by an explicit provider/model or when
-no configured local default exists. Set `AGENTOS_API_KEY` in the mode-600 `.env`;
-every HTTP route is authenticated except routes explicitly registered with
-`auth: false` such as `/api/health`. There is no global auth-disable switch.
+no configured local default exists. Every HTTP route is authenticated except
+routes explicitly registered with `auth: false` such as `/api/health`. There is
+no global auth-disable switch.
+
+### First run — what generates what
+
+`AGENTOS_API_KEY` is AgentOS's own bearer token between the TUI/CLI and the
+engine's HTTP routes. It is **not** a model credential, and the first run
+creates it for you:
+
+| you run | it does |
+|---|---|
+| `agentos up`, `agentos onboard` | If `AGENTOS_API_KEY` is absent or empty in the active `.env`, generate a fresh 32-byte random key, append it to that `.env`, set the file to mode `0600`, and print the path it wrote to. An existing non-empty value is never overwritten. |
+| any command | **Never** invents a provider credential. `CODEX_PROXY_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and friends are yours to supply; AgentOS only reads them. |
+| `agentos doctor` | Reports, explicitly and separately: (a) whether `AGENTOS_API_KEY` is present, (b) which provider credential is present, (c) the default route that results. A missing `AGENTOS_API_KEY` is reported as *the cause*, not as "missing identities". |
+| `agentos start` | Loads the same active `.env` as `agentos up`. There is exactly one configuration path. |
+
+So the shortest honest first run is: install iii, put one model credential in
+`.env`, `cargo build --workspace --release`, `agentos up`. The bearer token
+appears in `.env` on its own, mode `0600`, and `agentos doctor` tells you which
+of the three things above is missing when something does not work.
 
 `agentos up` runs one ordered policy and never builds or installs anything: it
 resolves the config, verifies the iii binary (missing → `bash scripts/install-iii.sh`),
@@ -93,11 +114,13 @@ agentos doctor        # readiness report; diagnostic only, changes nothing
 
 `agentos doctor` prints the iii binary path and version, engine health, the
 connected worker count and any missing canonical identities, worker and TUI
-binary readiness, and which config discovery mode is in effect.
+binary readiness, which config discovery mode is in effect, and the three
+first-run facts above: `AGENTOS_API_KEY` presence, the provider credential in
+use, and the resulting default route.
 `scripts/dev-up.sh` still starts only the workers against an engine you booted
 yourself.
 
-Engine boots on port 49134. `agentos up` starts the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source declares 267 literal function registrations. The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
+Engine boots on port 49134. `agentos up` starts the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source registers 294 literal function ids, which resolve to 293 distinct function ids (`bun run counts`). The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
 
 Prefer driving by HTTP? Same thing without the TUI:
 
@@ -164,8 +187,8 @@ Rust format checks and cached Cargo builds/tests can run offline; Cargo still
 needs the locked registry and source artifacts in its cache. Installing iii,
 installing the release, installing Bun/npm/Python dependencies, and live
 engine or chat E2E checks are connected or credential-dependent operations.
-Local verification on one host does not prove the other three release targets;
-the release workflow builds and inspects all four target bundles.
+Local verification on one host does not prove the other two release targets;
+the release workflow builds and inspects all three target bundles.
 
 ## § 04 · Calling a function
 
@@ -217,7 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Group | Workers |
 |---|---|
 | Reasoning | `agent-core` `llm-router` `council` `swarm` `directive` `mission` |
-| State | `realm` `memory` `ledger` `vault` `context-manager` `context-cache` |
+| State | `realm` `memory` `ledger` `vault` `context-manager` `context-cache` `context-monitor` |
 | Coordination | `orchestrator` `workflow` `hierarchy` `coordination` `task-decomposer` |
 | Execution | `wasm-sandbox` `browser` `code-agent` `hand-runner` `lsp-tools` |
 | Safety | `security` `security-headers` `security-map` `security-zeroize` `skill-security` `approval` `approval-tiers` `rate-limiter` `loop-guard` |
@@ -263,7 +286,7 @@ agents/          agent templates
 workflows/       workflow definitions (YAML)
 plugin/          reusable agent/command/skill/hook bundles
 config.yaml      iii v0.22.1 engine and configuration-worker boot list
-config/           committed values for the seven built-in iii workers
+config/           committed values for the eight built-in iii workers
 website/         agentsos.sh — design.md aesthetic, three themes
 ```
 
@@ -299,14 +322,25 @@ If the engine is offline or no workers are connected, the TUI shows a first-run 
 
 ## § 11 · Build and test
 
+`rust-toolchain.toml` pins the channel to `1.90`, so a plain `cargo` in this
+checkout is the same compiler and the same linter CI runs. No `rustup run`
+prefix is needed, and `cargo clippy` cannot be clean locally and red in CI.
+
 ```bash
-rustup run 1.90 cargo fmt --all -- --check
-rustup run 1.90 cargo clippy --workspace --all-targets --locked -- -D warnings
-rustup run 1.90 cargo test --workspace --release --locked
-bun run check                                                        # strict TS + source-only contracts + website build
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked                                      # dev profile, same tests CI runs
+cargo deny check                                                     # advisories + duplicates + licences + sources
+bun run check                                                        # strict TS + unit + governance + counts + website build
 python -m pytest workers/embedding/test_main.py -q
 bun run test:e2e                                                     # live engine + workers; model credentials required
 ```
+
+`bun run check` chains the four Node gates individually available as
+`bun run typecheck`, `bun run test:unit` (tests of the software),
+`bun run test:governance` (build-evidence and documentation contracts) and
+`bun run counts:check` (every published number recomputed from the tree —
+`bun run counts` prints them, `bun run counts:write` fixes the numeric ones).
 
 The Rust commands are offline only when the Rust toolchain and all locked
 registry/source artifacts are already cached. `uv run` may download pytest and

@@ -1,13 +1,13 @@
 {
   "name": "agentos",
-  "description": "Agent Operating System — self-evolving agents, multi-agent orchestration, 25-screen TUI, 25 LLM providers. Built on iii-engine.",
+  "description": "Agent Operating System — self-evolving agents, multi-agent orchestration, 25-screen TUI, 11 LLM providers. Built on iii-engine.",
   "version": "0.1.0",
   "author": {
-    "name": "iii-hq",
-    "url": "https://github.com/iii-hq"
+    "name": "UnitB",
+    "url": "https://github.com/wunitb"
   },
-  "homepage": "https://agentsos.sh",
-  "repository": "https://github.com/iii-hq/agentos",
+  "homepage": "https://www.agentsos.sh",
+  "repository": "https://github.com/wunitb/unitb-iii-agentos",
   "license": "Apache-2.0",
   "keywords": ["agent-os", "multi-agent", "orchestration", "self-evolving", "iii-engine", "mcp", "tui"],
   "categories": ["Development", "AI Agents", "Workflow Automation", "DevOps"],
