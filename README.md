@@ -300,7 +300,7 @@ agents/          agent templates
 workflows/       workflow definitions (YAML)
 plugin/          reusable agent/command/skill/hook bundles
 config.yaml      iii v0.22.1 engine and configuration-worker boot list
-config/           committed values for the eight built-in iii workers
+config/           committed values for eight iii worker configurations
 website/         agentsos.sh — design.md aesthetic, three themes
 ```
 

@@ -148,7 +148,9 @@ describe(`iii ${expectedVersion} boot compatibility`, () => {
         const provider = await waitForQueueProvider(binary);
         expect(provider.function_id).toBe("engine::queue::enqueue");
         expect(queueProviderNames.has(provider.worker_name)).toBe(true);
-        await waitForFunction(binary, "shell::list");
+        // `shell` is no longer booted by default (sec-perimeter, 2026-09-02),
+        // so this waits on a function the default stack really registers.
+        await waitForFunction(binary, "configuration::get");
       } finally {
         engine.kill("SIGINT");
       }
