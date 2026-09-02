@@ -60,6 +60,67 @@ pub const FUNCTION_REGISTRATION_HOOK_ID: &str = "agentos::bus_on_register";
 /// (`rbac.on_trigger_registration_function_id`).
 pub const TRIGGER_REGISTRATION_HOOK_ID: &str = "agentos::bus_on_trigger";
 
+/// Engine-side id of the trigger-TYPE registration hook
+/// (`rbac.on_trigger_type_registration_function_id`).
+///
+/// Registering a trigger type is a privilege, not bookkeeping. Measured live on
+/// 0.22.1 against an armed gate with this hook still unset: an unauthenticated
+/// local socket sent `registertriggertype {"id": "http"}` and the engine
+/// * handed it every existing binding of that type — 7 `registertrigger` frames
+///   carrying api_path, http_method and function id, and for `cron` the three
+///   job ids with their cron expressions; and
+/// * made it the registrator, so a NEW route registered afterwards by a TRUSTED
+///   worker returned 404 while a route bound before the hijack still answered.
+///
+/// `TriggerRegistry::register_trigger_type` inserts unconditionally and then
+/// replays every matching trigger to the newcomer, which is exactly that
+/// behaviour in source.
+pub const TRIGGER_TYPE_REGISTRATION_HOOK_ID: &str = "agentos::bus_on_trigger_type";
+
+/// Every engine-side id this daemon serves, and the `rbac` key that must name
+/// it. The armed `config.yaml`/overlay is checked against this table, because
+/// the nested `rbac` struct is NOT `deny_unknown_fields`: a misspelled key or a
+/// misspelled id is accepted silently and the gate is disarmed with no error
+/// anywhere (verified on 0.22.1 and 0.23.0).
+pub const ARMED_HOOKS: &[(&str, &str)] = &[
+    ("auth_function_id", AUTH_FUNCTION_ID),
+    (
+        "on_function_registration_function_id",
+        FUNCTION_REGISTRATION_HOOK_ID,
+    ),
+    (
+        "on_trigger_registration_function_id",
+        TRIGGER_REGISTRATION_HOOK_ID,
+    ),
+    (
+        "on_trigger_type_registration_function_id",
+        TRIGGER_TYPE_REGISTRATION_HOOK_ID,
+    ),
+];
+
+/// Every key the engine's `RbacConfig` accepts, in declaration order
+/// (`engine/src/workers/worker/rbac_config.rs`). Nothing else means anything to
+/// the engine, and — because the struct is not `deny_unknown_fields` — nothing
+/// else produces an error either, which is why this list exists as data.
+pub const RBAC_CONFIG_KEYS: &[&str] = &[
+    "auth_function_id",
+    "expose_functions",
+    "on_trigger_registration_function_id",
+    "on_trigger_type_registration_function_id",
+    "on_function_registration_function_id",
+];
+
+/// The one function id on the OUTER `WorkerManagerConfig` that this policy
+/// deliberately leaves unset: `middleware_function_id`.
+///
+/// It is not a gate. The engine REPLACES the invocation with the middleware's
+/// return value (`engine/src/engine/mod.rs`, the `InvokeFunction` arm), so the
+/// middleware worker would have to re-issue every call itself — over the same
+/// bus, through its own session, which re-enters the middleware. One process
+/// would sit on the path of every invocation in the stack. Named here so
+/// "we arm every hook" stays a checkable claim rather than a hope.
+pub const UNARMED_OUTER_FUNCTION_ID: &str = "middleware_function_id";
+
 /// Key the auth function writes into the session `context`, and that the engine
 /// echoes back to both registration hooks.
 pub const TIER_CONTEXT_KEY: &str = "agentosBusTier";
@@ -237,6 +298,7 @@ pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
     AUTH_FUNCTION_ID,
     FUNCTION_REGISTRATION_HOOK_ID,
     TRIGGER_REGISTRATION_HOOK_ID,
+    TRIGGER_TYPE_REGISTRATION_HOOK_ID,
 ];
 /// Id prefixes a credential-less session may register a function under, or point
 /// a trigger at: exactly the surfaces the engine's own registry workers own.
@@ -283,6 +345,49 @@ pub const UNTRUSTED_REGISTRATION_PREFIXES: &[&str] = &[
     "stream",
     "worker",
 ];
+/// Trigger type ids a credential-less session may register.
+///
+/// Captured live the same way `registry_surface.txt` is (see
+/// `tests/trigger_type_surface.txt`). The list matters because the hook only
+/// sees WebSocket sessions: every trigger type an IN-PROCESS engine worker
+/// registers — `http`, `stream`, `stream:join`, `stream:leave`, `subscribe`,
+/// `log`, `trace`, `configuration`, `engine::*` — is registered without a
+/// session and therefore cannot be claimed through this path at all once the
+/// hook is armed.
+///
+/// What it stops: an unauthenticated socket claiming `http` (7 route bindings
+/// disclosed and every later route 404) or any type the stack does not already
+/// own. What it does NOT stop: the same socket claiming `state`, `cron` or
+/// `queue`, which the engine's own unauthenticatable registry workers register
+/// — the identical residual risk as the function-id policy, and stated in the
+/// module docs.
+/// `cron` and `queue` are in the list but were NOT in the capture: the `cron`
+/// registry worker on the capture host connects without ever registering its
+/// type (which is why the engine logs `[PENDING] ... trigger type cron is not
+/// registered` for our scheduled jobs), and `queue` provides `durable:subscriber`
+/// instead. They stay listed because a healthy worker of either kind registers
+/// them, and refusing that would take down scheduling for an unverified saving.
+pub const UNTRUSTED_TRIGGER_TYPE_IDS: &[&str] = &[
+    "cron",
+    "directory::agents::on-change",
+    "directory::skills::on-change",
+    "directory::system-prompts::on-change",
+    "durable:subscriber",
+    "queue",
+    "router::models::changed",
+    "router::provider::changed",
+    "router::ready",
+    "session::created",
+    "session::deleted",
+    "session::message-added",
+    "session::message-updated",
+    "session::meta-updated",
+    "session::status-changed",
+    "session::store::events",
+    "state",
+    "worker",
+];
+
 /// The bus credential from the environment, rejecting an empty value.
 ///
 /// There is no default and no fallback: a daemon without a key must refuse to
@@ -429,6 +534,22 @@ pub fn function_registration_allowed(function_id: &str, context: &Value) -> bool
         return true;
     }
     prefix_is_untrusted_owned(function_id)
+}
+
+/// May this session register the trigger TYPE `trigger_type_id`?
+///
+/// Trusted sessions may register any type. A credential-less session is confined
+/// to the types the engine's own registry workers really register, so it can
+/// neither claim an in-process type (`http`, `stream`, `subscribe`, `log`) nor
+/// squat a name the stack has not defined yet.
+pub fn trigger_type_registration_allowed(trigger_type_id: &str, context: &Value) -> bool {
+    if trigger_type_id.is_empty() {
+        return false;
+    }
+    if tier_of_context(context) == TIER_TRUSTED {
+        return true;
+    }
+    UNTRUSTED_TRIGGER_TYPE_IDS.contains(&trigger_type_id)
 }
 
 /// May this session bind a trigger to `function_id`?
@@ -704,6 +825,7 @@ mod tests {
             AUTH_FUNCTION_ID,
             FUNCTION_REGISTRATION_HOOK_ID,
             TRIGGER_REGISTRATION_HOOK_ID,
+            TRIGGER_TYPE_REGISTRATION_HOOK_ID,
         ];
         for id in UNTRUSTED_FORBIDDEN_FUNCTIONS {
             let family = id.split("::").next().unwrap_or_default();

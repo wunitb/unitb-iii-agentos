@@ -31,8 +31,14 @@ pub(crate) const BUS_AUTH_BINARY: &str = "agentos-bus-authd";
 /// `iii-bridge` `url` in `config.yaml`.
 pub(crate) const BUS_AUTH_ADDR_VARIABLE: &str = "AGENTOS_BUS_AUTH_ADDR";
 const DEFAULT_BUS_AUTH_ADDR: &str = "127.0.0.1:49129";
-/// The key in `config.yaml` that arms the gate. `WorkerManagerConfig` is
-/// `deny_unknown_fields`, so its presence is a reliable signal.
+/// The key in `config.yaml` that arms the gate.
+///
+/// Presence of this string means someone MEANT to arm the gate; it does not mean
+/// the gate is armed correctly. The nested `rbac` struct is NOT
+/// `deny_unknown_fields` (only the outer `WorkerManagerConfig` is), so a
+/// misspelled key or a hook id nothing serves is accepted silently by the engine
+/// and the gate stays off. `agentos-bus-authd` therefore re-reads the same file
+/// and refuses to start on a mismatch — see `agentos_bus_auth::config`.
 const BUS_RBAC_MARKER: &str = "auth_function_id";
 
 pub(crate) const ENGINE_INSTALL_HINT: &str =
@@ -1048,7 +1054,15 @@ pub(crate) fn start_bus_auth_for_foreground(
             config_path.display()
         );
     };
-    let daemon = crate::spawn_bus_auth(&binary, addr, runtime_dir, log_path, launch_env, false)?;
+    let daemon = crate::spawn_bus_auth(
+        &binary,
+        addr,
+        config_path,
+        runtime_dir,
+        log_path,
+        launch_env,
+        false,
+    )?;
     println!(
         "{} bus-auth daemon listening on {addr} (pid {})",
         "✓".green(),
@@ -1850,6 +1864,7 @@ impl Bootstrap for SystemEffects {
         let daemon = crate::spawn_bus_auth(
             binary,
             addr,
+            &self.config_path,
             &self.runtime_dir,
             &self.worker_log(),
             &self.launch_env,

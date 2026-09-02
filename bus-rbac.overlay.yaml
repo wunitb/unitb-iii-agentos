@@ -17,6 +17,16 @@
 #   4. `agentos doctor` reports whether the gate is armed and whether the daemon is
 #      listening on the address `iii-bridge.url` names.
 #
+# READ THIS BEFORE YOU EDIT THE BLOCK BELOW. The OUTER `iii-worker-manager`
+# config is `deny_unknown_fields`, so a typo THERE fails the boot. The nested
+# `rbac:` mapping is NOT: the engine ignores any key it does not know, without a
+# word. A misspelled `auth_function_id`, or an id `agentos-bus-authd` does not
+# serve, therefore does not fail anything — it SILENTLY DISARMS THE GATE and
+# every bus connection is admitted (verified live on 0.22.1 and 0.23.0). Because
+# a comment cannot catch that, the daemon reads this file at startup and refuses
+# to run when the two disagree, and `crates/bus-auth/src/config.rs` checks the
+# shipped copy in CI. Change a hook id here and the daemon will tell you.
+#
 # What it buys, and what it does not: the engine's own registry workers cannot
 # present a credential and are indistinguishable from a local attacker, so the
 # policy is TIERED. A credential-less session is admitted but cannot read the
@@ -24,6 +34,13 @@
 # grant capabilities, or claim an id another worker owns — including while that
 # worker is dead. It does NOT stop a local process from doing anything a registry
 # worker may do. See crates/bus-auth/src/policy.rs.
+#
+# `middleware_function_id`, the fifth function id `iii-worker-manager` accepts, is
+# deliberately left unset: the engine REPLACES the invocation with the
+# middleware's return value, so the middleware worker would have to re-issue every
+# call over the same bus, through its own session, re-entering itself. It is a
+# proxy, not a gate. `UNARMED_OUTER_FUNCTION_ID` in policy.rs records that choice
+# so "every hook is armed" stays checkable.
 
 workers:
   - name: iii-worker-manager
@@ -43,6 +60,14 @@ workers:
         auth_function_id: agentos::bus_auth
         on_function_registration_function_id: agentos::bus_on_register
         on_trigger_registration_function_id: agentos::bus_on_trigger
+        # Registering a trigger TYPE is a privilege, not bookkeeping: the engine
+        # replaces the previous registrator and replays every existing binding of
+        # that type to the newcomer. Measured on an armed stack with this hook
+        # unset: an unauthenticated local socket claimed `http`, received all 7
+        # route bindings (path, method, function id), and a route registered
+        # afterwards by a trusted worker returned 404. Left unset, that surface is
+        # ungated.
+        on_trigger_type_registration_function_id: agentos::bus_on_trigger_type
         # 0.22.1's `expose_functions` is GLOBAL to every session, so it cannot be the
         # per-tier control; a session can only be NARROWED afterwards with an exact-id
         # `forbidden_functions` list. The wildcard therefore stays open here and the
@@ -50,7 +75,7 @@ workers:
         # (UNTRUSTED_FORBIDDEN_FUNCTIONS).
         expose_functions:
           - match("*")
-  # Client of the bus-auth daemon. `forward:` registers the three RBAC functions with
+  # Client of the bus-auth daemon. `forward:` registers the four RBAC functions with
   # `engine.register_function_handler` inside `register_functions`, which the engine
   # runs for every worker during the build loop — before `serve()` calls
   # `start_background_tasks` and the bus listener binds. That is what makes the gate
@@ -69,4 +94,7 @@ workers:
           timeout_ms: 5000
         - local_function: agentos::bus_on_trigger
           remote_function: agentos::bus_on_trigger
+          timeout_ms: 5000
+        - local_function: agentos::bus_on_trigger_type
+          remote_function: agentos::bus_on_trigger_type
           timeout_ms: 5000

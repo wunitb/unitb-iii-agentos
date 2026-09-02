@@ -73,6 +73,11 @@ pub fn append_op(path: &str, value: Value) -> Value {
 }
 
 /// A `state::update` `increment` operation. The amount field is `by`.
+///
+/// The engine coerces an ABSENT path to 0, so `increment` on a fresh counter
+/// yields `by`. Only a STORED null is rejected (`increment.not_number`, value
+/// left as null) — so a counter must be left absent rather than pre-written as
+/// null. Re-verified against 0.22.1 and 0.23.0.
 pub fn increment_op(path: &str, by: i64) -> Value {
     json!({ "type": "increment", "path": path, "by": by })
 }

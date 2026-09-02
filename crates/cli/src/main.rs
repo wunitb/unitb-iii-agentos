@@ -950,6 +950,7 @@ pub(crate) fn launch_workers(
 pub(crate) fn spawn_bus_auth(
     binary: &Path,
     addr: std::net::SocketAddr,
+    config_path: &Path,
     runtime_dir: &Path,
     log_path: &Path,
     env: &BTreeMap<String, String>,
@@ -967,6 +968,10 @@ pub(crate) fn spawn_bus_auth(
     let mut command = Command::new(binary);
     command
         .arg(format!("--listen={addr}"))
+        // The daemon re-reads the config the ENGINE is about to boot and refuses
+        // to gate one that names hooks it does not serve. Passed explicitly so
+        // the check follows `--config`, not the working directory.
+        .arg(format!("--config={}", config_path.display()))
         .current_dir(runtime_dir)
         .envs(env)
         .stdout(Stdio::from(log_file))
