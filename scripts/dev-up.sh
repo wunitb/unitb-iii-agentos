@@ -50,37 +50,46 @@ if [[ -e "$env_file" || -L "$env_file" ]]; then
         exit 1
     fi
 
+    # The allowlist is derived, never hand-maintained: every name declared in
+    # `.env.example` plus every env key declared by an integration manifest.
+    # A credential the workers read is therefore accepted the moment it is
+    # documented, and a name nobody declares is still refused.
     allowed_names=$'\n'
+    allow_name() {
+        local candidate="$1"
+        [[ "$candidate" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 0
+        case "$allowed_names" in
+            *$'\n'"$candidate"$'\n'*) ;;
+            *) allowed_names="${allowed_names}${candidate}"$'\n' ;;
+        esac
+    }
+
     while IFS= read -r example_line || [[ -n "$example_line" ]]; do
         case "$example_line" in
             ''|'#'*) continue ;;
-            *=*) example_name="${example_line%%=*}" ;;
+            *=*) allow_name "${example_line%%=*}" ;;
             *) continue ;;
         esac
-        if [[ "$example_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-            case "$allowed_names" in
-                *$'\n'"$example_name"$'\n'*) ;;
-                *) allowed_names="${allowed_names}${example_name}"$'\n' ;;
-            esac
-        fi
     done < "$ROOT/.env.example"
 
-    # Runtime-only memworkr settings are deliberately accepted without putting
-    # production values in the distributable dotenv template.
-    trusted_runtime_names=(
-        III_WS_URL MEMWORKR_RUNTIME_ROOT MEMWORKR_PRODUCTION
-        MEMWORKR_REQUIRE_CALLER MEMWORKR_INSTANCE_ID MEMWORKR_DB
-        MEMWORKR_MAX_IN_FLIGHT MEMWORKR_EXPENSIVE_MAX_IN_FLIGHT
-        MEMWORKR_MEMORY_SOFT_LIMIT_MIB MEMWORKR_REQUEST_TIMEOUT_MS
-        MEMWORKR_SHUTDOWN_GRACE_MS MEMWORKR_CANDIDATE_RECONCILE_MAX
-        MEMWORKR_AUTH_TRIGGER
-    )
-    for runtime_name in "${trusted_runtime_names[@]}"; do
-        case "$allowed_names" in
-            *$'\n'"$runtime_name"$'\n'*) ;;
-            *) allowed_names="${allowed_names}${runtime_name}"$'\n' ;;
-        esac
-    done
+    # `integrations/*.toml` declares its own required env keys under
+    # `[integration.env]`; workers/mcp-client passes them to the integration.
+    if [[ -d "$ROOT/integrations" ]]; then
+        for manifest in "$ROOT/integrations"/*.toml; do
+            [[ -f "$manifest" ]] || continue
+            in_env_section=0
+            while IFS= read -r manifest_line || [[ -n "$manifest_line" ]]; do
+                case "$manifest_line" in
+                    '[integration.env]'*) in_env_section=1; continue ;;
+                    '['*) in_env_section=0; continue ;;
+                esac
+                [[ $in_env_section -eq 1 ]] || continue
+                case "$manifest_line" in
+                    *=*) allow_name "$(printf '%s' "${manifest_line%%=*}" | tr -d '[:space:]')" ;;
+                esac
+            done < "$manifest"
+        done
+    fi
 
     seen_names=$'\n'
     line_number=0
@@ -187,6 +196,11 @@ done
 
 # memworkr runs from an immutable version explicitly installed by
 # scripts/memworkr-sync.sh. Never execute a development checkout directly.
+#
+# memworkr is an OPTIONAL capability: no AgentOS code path calls
+# memory::assert/as_of/provenance today, so every failure below degrades this
+# one process and leaves the rest of the stack running. Only an explicit sync
+# makes it a participant, and only a matching digest makes it executable.
 MEMWORKR_RUNTIME_ROOT="${MEMWORKR_RUNTIME_ROOT:-$ROOT/.agentos-runtime/memworkr}"
 memworkr_current="$MEMWORKR_RUNTIME_ROOT/current"
 memworkr_version=""
@@ -194,50 +208,101 @@ if [[ -f "$memworkr_current" ]]; then
     memworkr_version="$(tr -d '\r\n' < "$memworkr_current")"
 fi
 if [[ "$memworkr_version" =~ ^[0-9a-f]{40}$ ]]; then
-    memworkr_bin="$MEMWORKR_RUNTIME_ROOT/versions/$memworkr_version/memworkr"
+    memworkr_dir="$MEMWORKR_RUNTIME_ROOT/versions/$memworkr_version"
+    memworkr_bin="$memworkr_dir/memworkr"
 else
+    memworkr_dir=""
     memworkr_bin=""
 fi
 
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        return 1
+    fi
+}
+
+memworkr_degraded() {
+    echo "warning: memworkr disabled: $1" >&2
+    echo "         the rest of the stack keeps running; no AgentOS code path calls memory::assert/as_of/provenance" >&2
+}
+
+memworkr_started=0
 if [[ -n "$memworkr_bin" && -x "$memworkr_bin" ]]; then
-    if [[ "${MEMWORKR_PRODUCTION:-0}" == "1" ]] &&
-       [[ "${MEMWORKR_REQUIRE_CALLER:-0}" != "1" || -z "${MEMWORKR_INSTANCE_ID:-}" ]]; then
-        echo "production memworkr requires MEMWORKR_REQUIRE_CALLER=1 and MEMWORKR_INSTANCE_ID" >&2
-        stop_workers
-        exit 1
-    fi
-    if ! command -v iii >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
-        echo "iii CLI and jq are required for memworkr readiness checks" >&2
-        stop_workers
-        exit 1
-    fi
-
-    MEMWORKR_COMPAT='' \
-    MEMWORKR_DB="${MEMWORKR_DB:-surrealkv://$ROOT/data/memworkr}" \
-        "$memworkr_bin" >> "$ROOT/.agentos-memworkr.log" 2>&1 &
-    echo $! >> "$PIDFILE"
-    spawned=$((spawned + 1))
-
-    memworkr_ready=0
-    for _ in {1..30}; do
-        if health="$(iii trigger memory::health --json '{}' 2>/dev/null)" &&
-           jq -e --arg production "${MEMWORKR_PRODUCTION:-0}" \
-             '.status == "ok" and .schemaVersion == 6 and
-              ($production != "1" or
-               (.callerEnforced == true and .instanceClaimed == true))' \
-             >/dev/null <<< "$health"; then
-            memworkr_ready=1
-            break
+    memworkr_ok=1
+    # The runtime root sits inside the shell worker's jail, so a confined write
+    # could replace this binary. Refuse to execute anything that does not match
+    # the digest recorded by scripts/memworkr-sync.sh at sync time.
+    if [[ ! -f "$memworkr_dir/SHA256" ]]; then
+        memworkr_degraded "no recorded digest in $memworkr_dir/SHA256; re-run scripts/memworkr-sync.sh sync"
+        memworkr_ok=0
+    elif ! memworkr_actual="$(sha256_of "$memworkr_bin")"; then
+        memworkr_degraded "no sha256sum or shasum on PATH to verify $memworkr_bin"
+        memworkr_ok=0
+    else
+        memworkr_expected="$(tr -d '\r\n' < "$memworkr_dir/SHA256")"
+        if [[ "$memworkr_actual" != "$memworkr_expected" ]]; then
+            memworkr_degraded "digest mismatch for $memworkr_bin (recorded $memworkr_expected, found $memworkr_actual)"
+            memworkr_ok=0
         fi
-        sleep 1
-    done
-    if [[ $memworkr_ready -ne 1 ]]; then
-        echo "memworkr failed memory::health readiness check" >&2
-        stop_workers
-        exit 1
     fi
-    echo "▸ memworkr $memworkr_version ready"
-else
+
+    if [[ $memworkr_ok -eq 1 ]] && [[ "${MEMWORKR_PRODUCTION:-0}" == "1" ]] &&
+       [[ "${MEMWORKR_REQUIRE_CALLER:-0}" != "1" || -z "${MEMWORKR_INSTANCE_ID:-}" ]]; then
+        memworkr_degraded "production memworkr requires MEMWORKR_REQUIRE_CALLER=1 and MEMWORKR_INSTANCE_ID"
+        memworkr_ok=0
+    fi
+    if [[ $memworkr_ok -eq 1 ]] &&
+       { ! command -v iii >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; }; then
+        memworkr_degraded "iii CLI and jq are required for memworkr readiness checks"
+        memworkr_ok=0
+    fi
+
+    if [[ $memworkr_ok -eq 1 ]]; then
+        MEMWORKR_COMPAT='' \
+        MEMWORKR_DB="${MEMWORKR_DB:-surrealkv://$ROOT/data/memworkr}" \
+            "$memworkr_bin" >> "$ROOT/.agentos-memworkr.log" 2>&1 &
+        memworkr_pid=$!
+        echo $memworkr_pid >> "$PIDFILE"
+        spawned=$((spawned + 1))
+        memworkr_started=1
+
+        # Attempts are fixed at 30 in normal use; the override is a test seam,
+        # read from the process environment only (never from the dotenv gate).
+        memworkr_attempts="${MEMWORKR_READY_ATTEMPTS:-30}"
+        [[ "$memworkr_attempts" =~ ^[0-9]+$ ]] || memworkr_attempts=30
+        memworkr_ready=0
+        for ((memworkr_attempt = 0; memworkr_attempt < memworkr_attempts; memworkr_attempt++)); do
+            if health="$(iii trigger memory::health --json '{}' 2>/dev/null)" &&
+               jq -e --arg production "${MEMWORKR_PRODUCTION:-0}" \
+                 '.status == "ok" and .schemaVersion == 6 and
+                  ($production != "1" or
+                   (.callerEnforced == true and .instanceClaimed == true))' \
+                 >/dev/null <<< "$health"; then
+                memworkr_ready=1
+                break
+            fi
+            sleep 1
+        done
+        if [[ $memworkr_ready -ne 1 ]]; then
+            memworkr_degraded "memworkr failed the memory::health readiness check; see $ROOT/.agentos-memworkr.log"
+            kill "$memworkr_pid" 2>/dev/null || true
+            spawned=$((spawned - 1))
+            memworkr_started=0
+        else
+            echo "▸ memworkr $memworkr_version ready"
+        fi
+    fi
+elif [[ -n "$memworkr_version" && -z "$memworkr_bin" ]]; then
+    memworkr_degraded "current points at '$memworkr_version', which is not a 40-character commit"
+elif [[ -n "$memworkr_bin" ]]; then
+    memworkr_degraded "no executable at $memworkr_bin"
+fi
+
+if [[ $memworkr_started -eq 0 && -z "$memworkr_version" ]]; then
     echo "note: memworkr is not synced — memory::assert/as_of/provenance unavailable"
     echo "      run: bash scripts/memworkr-sync.sh sync /path/to/unitb-iii-memworkr"
 fi

@@ -20,6 +20,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALLER="${INSTALLER:-$SCRIPT_DIR/install.sh}"
 ORIG_PATH="$PATH"
+# The engine version the release bundle pins, taken from the same file the real
+# bundle ships (release.yml copies .iii-version into runtime/).
+III_PINNED_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/.iii-version")"
 
 TESTS_RUN=0
 TESTS_FAILED=0
@@ -80,6 +83,18 @@ assert_file_content() {
   actual="$(cat "$path")"
   if [ "$actual" != "$expected" ]; then
     fail "$label: content changed: $path"
+  fi
+}
+
+# Substring form, for files where only one line is under test.
+assert_file_contains() {
+  local path="$1" expected="$2" label="$3"
+  if [ ! -f "$path" ]; then
+    fail "$label: expected file is missing: $path"
+    return
+  fi
+  if ! grep -qF -e "$expected" "$path"; then
+    fail "$label: $path does not contain: $expected"
   fi
 }
 
@@ -214,6 +229,10 @@ make_release() {
   printf 'release = "%s"\n' "$tag" > "$stage/runtime/config/default.toml"
   printf 'name: echo\nruntime: rust\n' > "$stage/runtime/workers/echo/iii.worker.yaml"
   printf '%s\n' "$tag" > "$stage/runtime/RELEASE"
+  # The installed runtime pins the engine version; resolve_iii_version() refuses
+  # to continue without it, so the release fixture must ship it like the real
+  # bundle does (.iii-version at the repository root).
+  printf '%s\n' "$III_PINNED_VERSION" > "$stage/runtime/.iii-version"
 
   for extra in "$@"; do
     mkdir -p "$stage/runtime/$(dirname "$extra")"
@@ -295,6 +314,75 @@ test_upgrade_preserves_user_config() {
 # Regression: the runtime state directory written by the running engine must
 # survive an upgrade byte-for-byte. A prior installer replaced the whole runtime
 # tree and destroyed $AGENTOS_HOME/runtime/data/**.
+# Regression: an upgrade must be able to close a security hole on a box that was
+# installed before the fix. Release-governed policy files are refreshed, and the
+# worker entries the release stopped booting are removed from an adopted
+# config.yaml with the operator's original kept beside it.
+test_upgrade_applies_release_security_defaults() {
+  make_release v1.0.0 config/shell.yaml config/iii-stream.yaml config/console.yaml
+  run_installer v1.0.0 || return
+
+  printf 'allow_unjailed: true\n' > "$AGENTOS_HOME/runtime/config/shell.yaml"
+  printf 'host: 0.0.0.0\nauth_function: null\n' > "$AGENTOS_HOME/runtime/config/iii-stream.yaml"
+  rm -f "$AGENTOS_HOME/runtime/config/console.yaml"
+
+  make_release v2.0.0 config/shell.yaml config/iii-stream.yaml config/console.yaml
+  run_installer v2.0.0 || return
+
+  assert_file_contains "$AGENTOS_HOME/runtime/config/shell.yaml" "payload from 2.0.0" security_defaults
+  assert_file_contains "$AGENTOS_HOME/runtime/config/iii-stream.yaml" "payload from 2.0.0" security_defaults
+  assert_file_contains "$AGENTOS_HOME/runtime/config/console.yaml" "payload from 2.0.0" security_defaults
+}
+
+test_upgrade_removes_unsafe_worker_entries_from_adopted_config() {
+  make_release v1.0.0
+  run_installer v1.0.0 || return
+
+  cat > "$AGENTOS_HOME/runtime/config.yaml" <<'OPERATOR'
+workers:
+  - name: state
+  - name: shell
+    config:
+      host_roots:
+        - ${III_COMPOSE_DIR:.}
+      allow_unjailed: true
+  - name: console
+  - name: operator-worker
+user: true
+OPERATOR
+
+  make_release v2.0.0
+  run_installer v2.0.0 || return
+
+  local config="$AGENTOS_HOME/runtime/config.yaml"
+  if grep -Eq '^[[:space:]]*-[[:space:]]*name:[[:space:]]*shell[[:space:]]*$' "$config"; then
+    fail "unsafe_entries: the shell worker entry survived the upgrade"
+  fi
+  if grep -Eq '^[[:space:]]*-[[:space:]]*name:[[:space:]]*console[[:space:]]*$' "$config"; then
+    fail "unsafe_entries: the console worker entry survived the upgrade"
+  fi
+  if grep -q 'allow_unjailed: true' "$config"; then
+    fail "unsafe_entries: the shell entry's inline block survived the upgrade"
+  fi
+  assert_file_contains "$config" "operator-worker" unsafe_entries
+  assert_file_contains "$config" "user: true" unsafe_entries
+  assert_file_contains "$config" "- name: state" unsafe_entries
+  assert_file_contains "$config.bak" "allow_unjailed: true" unsafe_entries
+}
+
+test_upgrade_keeps_a_clean_config_untouched() {
+  make_release v1.0.0
+  run_installer v1.0.0 || return
+
+  printf 'workers:\n  - name: state\nuser: true\n' > "$AGENTOS_HOME/runtime/config.yaml"
+
+  make_release v2.0.0
+  run_installer v2.0.0 || return
+
+  assert_file_contains "$AGENTOS_HOME/runtime/config.yaml" "user: true" clean_config
+  assert_absent "$AGENTOS_HOME/runtime/config.yaml.bak" clean_config
+}
+
 test_upgrade_preserves_runtime_data() {
   make_release v1.0.0
   run_installer v1.0.0 || return
@@ -417,6 +505,9 @@ ALL_TESTS=(
   test_fresh_install_places_binaries_and_runtime
   test_fresh_install_resolves_latest_release
   test_upgrade_preserves_user_config
+  test_upgrade_applies_release_security_defaults
+  test_upgrade_removes_unsafe_worker_entries_from_adopted_config
+  test_upgrade_keeps_a_clean_config_untouched
   test_upgrade_preserves_runtime_data
   test_upgrade_preserves_runtime_dotenv
   test_upgrade_drops_stale_release_payload
