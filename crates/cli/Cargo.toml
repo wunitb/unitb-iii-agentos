@@ -3,6 +3,7 @@ name = "agentos-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "agentos"
@@ -18,11 +19,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
 colored = "2"
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+reqwest = { workspace = true, features = ["json", "stream"] }
 dialoguer = "0.12"
 indicatif = "0.18.6"
 dirs = "6"
-toml = "0.8"
+toml.workspace = true
 urlencoding = "2"
 clap_complete = "4"
 futures-util = "0.3"
