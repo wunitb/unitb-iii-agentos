@@ -171,7 +171,7 @@ Workflow definitions live under the `workflows` state scope. Runs live under `wo
 
 ## Development control plane
 
-Development is coordinated outside this repository: **unitb-control-room** owns the record of intent (directives with verbatim goals and acceptance criteria) and **sweafax** executes builds (implementation → verification → artifact gate → cross-vendor audit). Each build produces a result branch `issue/<id>-…` and a governed artifact directory under `docs/builds/`. Delivery is a pull request opened by the maintainer; `main` accepts no direct pushes. This repository holds no scheduler, ledger, credentials, or agent sessions of its own.
+Development is coordinated outside this repository. Work is split into packages that run in parallel git worktrees under a file-ownership contract, integrated into a single branch, and only then measured: the complete gate set runs on the *merged* tree, because per-package green is not evidence that the combination works. Delivery is a pull request opened by the maintainer; `main` accepts no direct pushes and requires its CI checks to pass. This repository holds no scheduler, ledger, credentials, or agent sessions of its own.
 
 ## Versioning
 
