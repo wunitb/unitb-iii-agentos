@@ -102,6 +102,15 @@ fn no_worker_joins_the_bus_without_the_credential() {
 /// — so a function added to one of contract I1's deny-by-default families is
 /// callable by any local process until it is listed in the policy. This test
 /// makes that omission a build failure.
+///
+/// It scans REGISTRATION SITES, not string literals. The first version read
+/// every quoted `a::b` in the tree and reported `vault::read` and `code::run`
+/// from `workers/workflow`'s `a_deny_by_default_step_needs_an_approval_decision`
+/// fixture — two ids that do not exist anywhere. A guard that flags
+/// documentation and test data is a guard someone eventually weakens, so this
+/// one derives its input the same way `scripts/counts.ts` derives the published
+/// function count: blank `#[cfg(test)]` modules, then take the literal first
+/// argument of `register_function(`.
 #[test]
 fn deny_set_covers_the_tree() {
     // `state::*` and `engine::*` are I1 families that are deliberately NOT
@@ -110,8 +119,8 @@ fn deny_set_covers_the_tree() {
     const SCANNED_FAMILIES: [&str; 10] = [
         "shell", "bridge", "mcp", "hook", "cron", "vault", "code", "harness", "browser", "wasm",
     ];
-    // The four cron job targets the registry `cron` worker fires through its own
-    // untrusted session. Denying them would stop every scheduled job.
+    // Cron job targets the registry `cron` worker fires through its own
+    // untrusted session. Denying them would stop the schedule.
     const CALLABLE_BY_THE_CRON_WORKER: [&str; 4] = [
         "cron::aggregate_daily_costs",
         "cron::cleanup_stale_sessions",
@@ -125,7 +134,7 @@ fn deny_set_covers_the_tree() {
 
     for path in worker_sources(&root, "workers") {
         let source = std::fs::read_to_string(&path).expect("read worker source");
-        for candidate in quoted_function_ids(&source) {
+        for candidate in registered_function_ids(&source) {
             let family = candidate.split("::").next().unwrap_or_default();
             if !SCANNED_FAMILIES.contains(&family) {
                 continue;
@@ -142,12 +151,12 @@ fn deny_set_covers_the_tree() {
 
     assert!(
         scanned > 30,
-        "the scan found only {scanned} privileged ids — it is not looking at the tree"
+        "the scan found only {scanned} privileged registrations — it is not looking at the tree"
     );
     assert!(
         unlisted.is_empty(),
-        "these privileged function ids are reachable from a credential-less bus session; \
-         add them to UNTRUSTED_FORBIDDEN_FUNCTIONS or justify them here:\n{}",
+        "these privileged function ids are registered by a worker and are reachable from a \
+         credential-less bus session; add them to UNTRUSTED_FORBIDDEN_FUNCTIONS or justify them:\n{}",
         unlisted
             .iter()
             .map(|(id, path)| format!("  {id}  ({path})"))
@@ -156,21 +165,125 @@ fn deny_set_covers_the_tree() {
     );
 }
 
-/// Quoted `namespace::id` literals, skipping capability globs (`vault::*`).
-fn quoted_function_ids(source: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    for chunk in source.split('"').skip(1).step_by(2) {
-        if !chunk.contains("::") || chunk.contains('*') || chunk.contains(' ') {
-            continue;
+/// The scan reads what the shipped binary registers, and nothing else.
+///
+/// Both halves matter: a `#[cfg(test)]` fixture id must not be reported (the
+/// false positive this test exists to pin), and a real `register_function(` call
+/// must be.
+#[test]
+fn the_registration_scan_reads_shipped_code_only() {
+    let source = r#"
+        fn main() {
+            iii.register_function(
+                "vault::get",
+                RegisterFunction::new_async(|input| async move { Ok(input) }),
+            );
         }
-        if chunk
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-' | '.'))
-        {
-            ids.push(chunk.to_string());
+
+        #[cfg(test)]
+        mod tests {
+            #[test]
+            fn a_deny_by_default_step_needs_an_approval_decision() {
+                for function_id in ["vault::read", "code::run"] {
+                    assert!(is_denied(function_id));
+                }
+            }
+
+            #[test]
+            fn registrations_inside_a_test_module_are_not_shipped() {
+                iii.register_function("vault::not_shipped", handler());
+            }
+        }
+    "#;
+
+    let ids = registered_function_ids(source);
+    assert_eq!(
+        ids,
+        vec!["vault::get".to_string()],
+        "only the shipped registration may be reported"
+    );
+    for fixture in ["vault::read", "code::run", "vault::not_shipped"] {
+        assert!(
+            !ids.iter().any(|id| id == fixture),
+            "{fixture} is test data, not a registration"
+        );
+    }
+}
+
+/// Literal ids of `register_function("id", ...)` call sites in shipped code.
+///
+/// Same derivation as `scripts/counts.ts::collectRegistrations`, so the two
+/// agree on what "a function this repository registers" means. Call sites that
+/// build their id at runtime (`workers/hand-runner`, `crates/http-adapter`) have
+/// no literal and are not reported — they also cannot be exact deny entries.
+fn registered_function_ids(source: &str) -> Vec<String> {
+    let shipped = without_test_modules(source);
+    let mut ids = Vec::new();
+    for (index, _) in shipped.match_indices("register_function(") {
+        let rest = shipped[index + "register_function(".len()..].trim_start();
+        let Some(literal) = rest.strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = literal.find('"') else {
+            continue;
+        };
+        let id = &literal[..end];
+        if id.contains("::") {
+            ids.push(id.to_string());
         }
     }
     ids
+}
+
+/// Blank every `#[cfg(test)]` block, preserving newlines so nothing shifts.
+///
+/// Ported from `scripts/counts.ts::withoutTestModules`, including its handling
+/// of `#[cfg(test)] use ...;`, which annotates an item with no block.
+fn without_test_modules(source: &str) -> String {
+    const ATTRIBUTE: &str = "#[cfg(test)]";
+    let mut result = source.to_string();
+    loop {
+        let Some(attribute) = result.find(ATTRIBUTE) else {
+            break;
+        };
+        let open = result[attribute..].find('{').map(|at| attribute + at);
+        let terminator = result[attribute..].find(';').map(|at| attribute + at);
+        let Some(open) = open else {
+            result.replace_range(
+                attribute..attribute + ATTRIBUTE.len(),
+                &" ".repeat(ATTRIBUTE.len()),
+            );
+            continue;
+        };
+        if terminator.is_some_and(|end| end < open) {
+            result.replace_range(
+                attribute..attribute + ATTRIBUTE.len(),
+                &" ".repeat(ATTRIBUTE.len()),
+            );
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut close = result.len() - 1;
+        for (index, character) in result[open..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = open + index;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let blanked: String = result[attribute..=close]
+            .chars()
+            .map(|c| if c == '\n' { '\n' } else { ' ' })
+            .collect();
+        result.replace_range(attribute..=close, &blanked);
+    }
+    result
 }
 
 /// A denied id that is also a trigger TARGET is a silently broken schedule.
@@ -187,7 +300,10 @@ fn no_denied_id_is_fired_by_a_registry_worker_trigger() {
     let mut targets: BTreeMap<String, String> = BTreeMap::new();
 
     for path in worker_sources(&root, "workers") {
-        let source = std::fs::read_to_string(&path).expect("read worker source");
+        // Test modules describe triggers they never register; blank them for
+        // the same reason the registration scan does.
+        let source =
+            without_test_modules(&std::fs::read_to_string(&path).expect("read worker source"));
         let origin = relative(&root, &path);
         for target in cron_trigger_targets(&source) {
             targets.insert(target, origin.clone());
