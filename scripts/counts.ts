@@ -57,6 +57,99 @@ function countMatches(haystack: string, pattern: RegExp): number {
 }
 
 /**
+ * Blanks every Rust comment, preserving byte offsets and line numbers.
+ *
+ * Reference documentation is the natural place to write the WRONG shape down
+ * ("the engine wants `ops`, not `operations`"), so a scanner that reads comments
+ * flags the very documentation that exists to prevent the mistake — and the
+ * cheapest way to make it green is to delete the documentation. It also must not
+ * mistake the `//` in `"ws://localhost:49134"` for a comment, or it would blank
+ * real code and miss real defects, so this walks strings, char literals and raw
+ * strings rather than pattern-matching.
+ */
+export function withoutComments(source: string): string {
+  const out = source.split("");
+  const blank = (from: number, to: number): void => {
+    for (let index = from; index < to && index < out.length; index += 1) {
+      if (out[index] !== "\n") out[index] = " ";
+    }
+  };
+
+  let index = 0;
+  while (index < source.length) {
+    const two = source.slice(index, index + 2);
+
+    if (two === "//") {
+      const end = source.indexOf("\n", index);
+      const stop = end < 0 ? source.length : end;
+      blank(index, stop);
+      index = stop;
+      continue;
+    }
+
+    if (two === "/*") {
+      let depth = 0;
+      let cursor = index;
+      while (cursor < source.length) {
+        if (source.startsWith("/*", cursor)) {
+          depth += 1;
+          cursor += 2;
+          continue;
+        }
+        if (source.startsWith("*/", cursor)) {
+          depth -= 1;
+          cursor += 2;
+          if (depth === 0) break;
+          continue;
+        }
+        cursor += 1;
+      }
+      blank(index, cursor);
+      index = cursor;
+      continue;
+    }
+
+    // Raw string: r"..." / r#"..."# / br##"..."## — no escapes inside.
+    const raw = /^b?r(#*)"/.exec(source.slice(index, index + 16));
+    if (raw) {
+      const hashes = raw[1]!;
+      const open = index + raw[0].length;
+      const close = source.indexOf(`"${hashes}`, open);
+      index = close < 0 ? source.length : close + 1 + hashes.length;
+      continue;
+    }
+
+    if (source[index] === '"') {
+      let cursor = index + 1;
+      while (cursor < source.length) {
+        if (source[cursor] === "\\") {
+          cursor += 2;
+          continue;
+        }
+        if (source[cursor] === '"') {
+          cursor += 1;
+          break;
+        }
+        cursor += 1;
+      }
+      index = cursor;
+      continue;
+    }
+
+    // A char literal, but not a lifetime: 'a' and '\n' are literals, 'a is not.
+    const char = /^'(\\.|[^\\'])'/.exec(source.slice(index, index + 8));
+    if (char) {
+      index += char[0].length;
+      continue;
+    }
+
+    index += 1;
+  }
+
+  return out.join("");
+}
+
+/**
  * Blank out every `#[cfg(test)] mod ... { ... }` block, preserving byte offsets
  * and line numbers. Registrations and routes are a property of the shipped
  * binary; a `json!` literal inside a unit test is not one.
@@ -186,7 +279,7 @@ export function collectWorkers(): WorkerRecord[] {
 export function collectRegistrations(): RegistrationSite[] {
   const sites: RegistrationSite[] = [];
   for (const file of listRustSources()) {
-    const text = withoutTestModules(read(file));
+    const text = withoutComments(withoutTestModules(read(file)));
     for (const match of text.matchAll(/register_function\(\s*"([^"]+)"/g)) {
       sites.push({ id: match[1]!, file, line: lineOf(text, match.index) });
     }
@@ -198,7 +291,7 @@ export function collectRegistrations(): RegistrationSite[] {
 export function collectHttpRoutes(): RouteSite[] {
   const routes: RouteSite[] = [];
   for (const file of listRustSources()) {
-    const text = withoutTestModules(read(file));
+    const text = withoutComments(withoutTestModules(read(file)));
     for (const match of text.matchAll(/json!\(\{[^}]*"api_path"[^}]*\}\)/g)) {
       const body = match[0];
       const path = /"api_path"\s*:\s*"([^"]*)"/.exec(body)?.[1];
