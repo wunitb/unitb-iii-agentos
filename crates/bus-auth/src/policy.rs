@@ -72,22 +72,38 @@ pub const TIER_UNTRUSTED: &str = "untrusted";
 /// Exact function ids a credential-less session may never invoke.
 ///
 /// The engine compares `forbidden_functions` with `==` (no globs), so this list
-/// is exact ids, and `deny_set_covers_the_tree` in the tests fails when a new id
-/// appears in one of these families without being listed here.
+/// is exact ids. Two tests keep it honest: `deny_set_covers_the_tree` fails when
+/// a new id appears in a contract I1 family without being listed here, and
+/// `no_denied_id_is_fired_by_a_registry_worker_trigger` fails if an entry here is
+/// also a cron or queue trigger TARGET — because those are fired by an
+/// engine-spawned worker through its own untrusted session, and denying one
+/// silently stops a scheduled job.
 ///
-/// Two deny-by-default families from contract I1 are deliberately ABSENT:
+/// # What is deliberately NOT here, and why
 ///
-/// * `state::*` and `engine::*` — the engine's own registry workers call them
-///   and cannot authenticate (see the module docs). Forbidding them would break
-///   the boot, so they stay reachable and that is stated as a residual risk.
-/// * `cron::cleanup_stale_sessions`, `cron::aggregate_daily_costs`,
-///   `cron::reset_rate_limits` and `workflow::run` — these are the four cron job
-///   TARGETS that sec-perimeter's mint allowlist permits. The registry `cron`
-///   worker fires them through its own (untrusted) session, so denying them
-///   would stop every scheduled job. `cron::create|patch|delete`, the factory
-///   half, IS denied.
+/// * `state::*` and `engine::*` (contract I1 families) — the engine's own
+///   registry workers call them and cannot authenticate. Forbidding them breaks
+///   the boot.
+/// * The registry-fired trigger targets: `cron::cleanup_stale_sessions`,
+///   `cron::aggregate_daily_costs`, `cron::reset_rate_limits`, `workflow::run`,
+///   `memory::consolidate`, `memory::evict`, `feedback::auto_review`,
+///   `lifecycle::check_all`, `pulse::tick`, `hand::run::<id>` (cron) and
+///   `agent::chat` (queue). The factory halves — `cron::create|patch|delete`,
+///   `workflow::create` — ARE denied, which is what closes the composition
+///   route without stopping the schedule. `memory::consolidate` and
+///   `memory::evict` are destructive and still reachable; that is the price of
+///   an unauthenticatable cron worker and it is recorded as a residual risk.
+///
+/// # What earns an entry
+///
+/// (A) executes code or spawns a process, (B) mutates security or authorization
+/// state, (C) reads or destroys stored content across tenants, or (D) is a
+/// factory that composes (A)-(C) from a trusted session. `workflow::create` is
+/// the (D) case that a whole-tree review found: `workers/workflow` dispatches
+/// `step.function_id` verbatim from its OWN trusted session, so an untrusted
+/// `workflow::create` + an allowed `workflow::run` reaches every id on this list.
 pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
-    // vault — the credential store itself.
+    // vault — the credential store itself. (C)
     "vault::backup",
     "vault::delete",
     "vault::get",
@@ -96,22 +112,22 @@ pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
     "vault::restore",
     "vault::rotate",
     "vault::set",
-    // shell / coder — arbitrary execution. Not booted by default; listed so an
-    // operator who opts in does not silently open it to every local process.
+    // shell / coder — arbitrary execution. (A) Not booted by default; listed so
+    // an operator who opts in does not silently open it to every local process.
     "shell::exec",
     "shell::exec_bg",
     "shell::pty::open",
     "shell::fs::write",
     "shell::fs::rm",
     "coder::apply",
-    // harness — autonomous agent turns and filesystem grants. Also opt-in.
+    // harness — autonomous agent turns and filesystem grants. (A)(B) Opt-in.
     "harness::spawn",
     "harness::send",
     "harness::function::trigger",
     "harness::filesystem::grant",
     "harness::filesystem::revoke",
     "harness::bindings::store",
-    // mcp — spawns external servers with a caller-supplied command.
+    // mcp — spawns external servers with a caller-supplied command. (A)
     "mcp::call_tool",
     "mcp::connect",
     "mcp::disconnect",
@@ -120,15 +136,15 @@ pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
     "mcp::serve",
     "mcp::serve_handler",
     "mcp::unserve",
-    // hooks — arbitrary function ids fired on lifecycle events.
+    // hooks — arbitrary function ids fired on lifecycle events. (D)
     "hook::fire",
     "hook::list",
     "hook::register",
     "hook::toggle",
     "hook::unregister",
     "hook::update_priority",
-    // trigger / cron factory — the `POST /api/triggers` route factory, one layer
-    // down. The four cron job targets stay callable (see above).
+    // trigger / cron / workflow factories — the `POST /api/triggers` route
+    // factory one layer down, and the workflow step dispatcher. (D)
     "cron::create",
     "cron::delete",
     "cron::list",
@@ -137,8 +153,9 @@ pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
     "trigger::delete",
     "trigger::list",
     "control::rehydrate",
+    "workflow::create",
     // bridge — invoke-anything proxies, including the engine's own `iii-bridge`
-    // builtin (dotted ids), which is the transport this policy rides on.
+    // builtin (dotted ids), which is the transport this policy rides on. (D)
     "bridge::cancel",
     "bridge::invoke",
     "bridge::list",
@@ -146,7 +163,8 @@ pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
     "bridge::run",
     "bridge.invoke",
     "bridge.invoke_async",
-    // code / wasm / browser — execution and outbound fetch surfaces.
+    // code / wasm / browser / orchestrator — execution, host file writes and
+    // outbound fetch. (A)
     "code::write",
     "wasm::execute",
     "wasm::list_modules",
@@ -160,48 +178,111 @@ pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
     "browser::read_page",
     "browser::screenshot",
     "browser::type",
-    // authorization store and signing oracle.
-    "security::set_capabilities",
+    "agent::code_execute",
+    "orchestrator::execute",
+    "orchestrator::workspace_write",
+    "skillkit::install",
+    "skillkit::run",
+    "skillkit::uninstall",
+    "security::docker_exec",
+    "hand::trigger",
+    "task::spawn_workers",
+    // authorization, approval and audit state. (B) `agent::create` is the second
+    // writer of the contract I1 capability document; denying only
+    // `security::set_capabilities` would leave the door next to it open. An
+    // approval a caller can grant itself is not a gate.
+    "agent::create",
+    "agent::delete",
+    "approval::decide",
+    "approval::decide_tier",
+    "approval::decide_tier_request",
+    "approval::set_policy",
+    "council::override",
+    "policy::set_rules",
+    "realm::import",
+    "security::audit",
     "security::list_capabilities",
     "security::map_respond",
+    "security::set_capabilities",
     "security::sign_manifest",
+    "taint::declassify",
+    // stored content across every agent — no tenancy on these ids. (C)
+    // `memory::consolidate` and `memory::evict` are absent on purpose: both are
+    // cron targets fired by the untrusted registry worker.
+    "memory::kg::add",
+    "memory::kg::query",
+    "memory::kv::delete",
+    "memory::kv::get",
+    "memory::kv::list",
+    "memory::kv::set",
+    "memory::list",
+    "memory::recall",
+    "memory::session::compact",
+    "memory::session::delete",
+    "memory::session::history",
+    "memory::session::list",
+    "memory::session::repair",
+    "memory::store",
+    // worker management — `worker::add` + `worker::start` make the engine fetch
+    // and run a registry binary, which is process spawn by another name. (A)
+    // The read half (list/status/logs/schema/validate) stays reachable: it is
+    // how the untrusted tier's own supervisor works.
+    "worker::add",
+    "worker::clear",
+    "worker::remove",
+    "worker::start",
+    "worker::stop",
+    "worker::update",
     // this policy's own surface: answering it is a credential oracle.
     AUTH_FUNCTION_ID,
     FUNCTION_REGISTRATION_HOOK_ID,
     TRIGGER_REGISTRATION_HOOK_ID,
 ];
-
 /// Id prefixes a credential-less session may register a function under, or point
 /// a trigger at: exactly the surfaces the engine's own registry workers own.
 ///
 /// An entry matches its own namespace and everything below it, on a `::`
 /// boundary — `engine::queue` allows `engine::queue::enqueue` and nothing else
 /// under `engine::`. That precision is the point: the shipped `queue` worker
-/// really does register `engine::queue::*` and `iii::queue::*` (observed live on
-/// a booting stack), while `engine::log::info` — an id every worker's logging
-/// goes through — must stay unclaimable by a credential-less session.
+/// really does register `engine::queue::*` and `iii::queue::*`, while
+/// `engine::log::info` — an id every worker's logging goes through — must stay
+/// unclaimable by a credential-less session.
 ///
-/// Anything outside this list — `vault::get`, `agent::chat`, `memory::store` —
-/// is refused, so a local process cannot wait for a real worker to drop and
-/// claim its ids.
+/// # These are FUNCTION-ID namespaces, not worker names
+///
+/// The first version of this list held worker names (`llm-router`,
+/// `session-manager`, `iii-directory`, `context-manager`, `provider-anthropic`).
+/// The engine's registration hook receives the FUNCTION id, whose namespace is
+/// different — `router::`, `session::`, `directory::`, `context::`,
+/// `provider::anthropic::` — so an armed stack refused 107 registrations and
+/// came up with 36 functions and no LLM routing at all. `registry_surface.txt`
+/// and the test that reads it exist so that can never be a review finding again.
+///
+/// # What this costs, stated plainly
+///
+/// Admitting these namespaces means a credential-less local process can also
+/// CLAIM ids in them: it can impersonate the LLM router (seeing every prompt and
+/// answering with a poisoned completion), the session store, the directory, or
+/// the worker-management surface, in the same way it can already impersonate
+/// `state::*`. At 0.22.1 there is no way to tell those workers from an attacker
+/// — the measured alternative is a stack with no routing, no sessions, no
+/// directory and no context assembly.
 pub const UNTRUSTED_REGISTRATION_PREFIXES: &[&str] = &[
     "configuration",
-    "context-manager",
+    "context",
     "cron",
+    "directory",
     "engine::queue",
-    "iii-directory",
     "iii::durable",
     "iii::queue",
-    "llm-router",
-    "provider-anthropic",
-    "provider-openai",
-    "provider-openai-codex",
+    "provider",
     "queue",
-    "session-manager",
+    "router",
+    "session",
     "state",
     "stream",
+    "worker",
 ];
-
 /// The bus credential from the environment, rejecting an empty value.
 ///
 /// There is no default and no fallback: a daemon without a key must refuse to
@@ -296,6 +377,24 @@ pub fn tier_of_context(context: &Value) -> &'static str {
     }
 }
 
+/// Console-UI asset handlers, which the registry workers register under their
+/// WORKER name rather than their function namespace: `state::ui-content` but
+/// also `llm-router::ui-content`, `context-manager::ui-content`,
+/// `iii-directory::ui-content`, `provider-openai-codex::ui-content` — the four
+/// that a live armed boot refused after the namespace fix. Exactly two segments,
+/// the second `ui-content`, so this cannot admit anything else.
+///
+/// A claim on one of these serves an asset into the console UI, which is opt-in
+/// and off by default in `config.yaml`; the alternative is admitting five more
+/// worker-name prefixes wholesale.
+fn is_console_ui_asset(function_id: &str) -> bool {
+    let mut segments = function_id.split("::");
+    let Some(namespace) = segments.next() else {
+        return false;
+    };
+    !namespace.is_empty() && segments.next() == Some("ui-content") && segments.next().is_none()
+}
+
 /// True when `function_id` sits under a prefix a credential-less session owns.
 ///
 /// Matching is on whole `::` segments. An un-namespaced id (`publish`,
@@ -304,6 +403,9 @@ pub fn tier_of_context(context: &Value) -> &'static str {
 fn prefix_is_untrusted_owned(function_id: &str) -> bool {
     if !function_id.contains("::") {
         return false;
+    }
+    if is_console_ui_asset(function_id) {
+        return true;
     }
     UNTRUSTED_REGISTRATION_PREFIXES.iter().any(|prefix| {
         function_id
@@ -432,6 +534,15 @@ mod tests {
             "cron::aggregate_daily_costs",
             "cron::reset_rate_limits",
             "workflow::run",
+            // Fired by the same untrusted cron worker (workers/memory,
+            // workers/feedback, workers/session-lifecycle, workers/pulse).
+            "memory::consolidate",
+            "memory::evict",
+            "feedback::auto_review",
+            "lifecycle::check_all",
+            "pulse::tick",
+            // Fired by the untrusted queue worker (workers/agent-core).
+            "agent::chat",
         ] {
             assert!(
                 !UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&id),
@@ -468,17 +579,50 @@ mod tests {
         for id in [
             "state::set",
             "state::ui-content",
-            "queue::send",
-            "llm-router::route",
-            "provider-openai::chat",
+            "queue::define",
             "engine::queue::enqueue",
             "engine::queue::dlq_messages",
             "iii::queue::redrive",
             "iii::durable::publish",
+            // The five workers an armed stack refused when this list held
+            // worker names instead of id namespaces.
+            "router::chat",
+            "router::models::list",
+            "session::create",
+            "directory::skills::list",
+            "context::assemble",
+            "provider::anthropic::chat",
+            "worker::list",
         ] {
             assert!(
                 function_registration_allowed(id, &untrusted),
                 "{id} is registered by an engine-spawned worker"
+            );
+        }
+    }
+
+    #[test]
+    fn console_ui_assets_are_registrable_under_the_worker_name() {
+        let untrusted = json!({ TIER_CONTEXT_KEY: TIER_UNTRUSTED });
+        for id in [
+            "state::ui-content",
+            "llm-router::ui-content",
+            "context-manager::ui-content",
+            "iii-directory::ui-content",
+            "provider-openai-codex::ui-content",
+        ] {
+            assert!(function_registration_allowed(id, &untrusted), "{id}");
+        }
+        for id in [
+            "vault::ui-content::extra",
+            "::ui-content",
+            "ui-content",
+            "vault::ui-contentx",
+            "vault::get",
+        ] {
+            assert!(
+                !function_registration_allowed(id, &untrusted),
+                "{id} is not a console asset id"
             );
         }
     }
@@ -529,29 +673,67 @@ mod tests {
     }
 
     #[test]
-    fn every_denied_agentos_id_is_deny_by_default_or_justified() {
-        // Ids outside contract I1's deny-by-default families need a reason to be
-        // here; these are the four that have one, spelled out in the constant.
-        const JUSTIFIED: &[&str] = &[
+    fn every_denied_id_is_a_contract_i1_family_or_a_named_exception() {
+        // Families outside contract I1's deny-by-default set need a reason to be
+        // here. Each one below maps to a clause of the "what earns an entry"
+        // rule in the constant's docs; a new family cannot be added silently.
+        const JUSTIFIED_FAMILIES: &[&str] = &[
+            "agent",        // (A) code_execute, (B) create/delete write the I1 document
+            "approval",     // (B) an approval a caller grants itself is not a gate
+            "control",      // (D) rehydrate replays the trigger factory
+            "coder",        // (A) the second surface of the shell binary
+            "council",      // (B) override rewrites a decision
+            "hand",         // (A) trigger runs an automation on demand
+            "memory",       // (C) no tenancy on any of these ids
+            "orchestrator", // (A) executes a plan and writes host files
+            "policy",       // (B) set_rules rewrites the rule set
+            "realm",        // (B) import overwrites a realm document
+            "security",     // (B) capabilities, audit chain, signing oracle
+            "skillkit",     // (A) install/run spawn npx
+            "taint",        // (B) declassify removes a label
+            "task",         // (A) spawn_workers starts work
+            "trigger",      // (D) the mint factory
+            "worker",       // (A) add + start fetch and run a registry binary
+            "workflow",     // (D) create dispatches step ids from a trusted session
+        ];
+        const JUSTIFIED_IDS: &[&str] = &[
+            // The engine's builtin bridge registers dotted ids, which have no
+            // `::` family at all.
             "bridge.invoke",
             "bridge.invoke_async",
-            "coder::apply",
-            "trigger::create",
-            "trigger::delete",
-            "trigger::list",
-            "control::rehydrate",
-            "security::set_capabilities",
-            "security::list_capabilities",
-            "security::map_respond",
-            "security::sign_manifest",
             AUTH_FUNCTION_ID,
             FUNCTION_REGISTRATION_HOOK_ID,
             TRIGGER_REGISTRATION_HOOK_ID,
         ];
         for id in UNTRUSTED_FORBIDDEN_FUNCTIONS {
+            let family = id.split("::").next().unwrap_or_default();
             assert!(
-                agentos_http_adapter::policy::is_deny_by_default(id) || JUSTIFIED.contains(id),
+                agentos_http_adapter::policy::is_deny_by_default(id)
+                    || JUSTIFIED_FAMILIES.contains(&family)
+                    || JUSTIFIED_IDS.contains(id),
                 "{id} is neither a contract I1 family nor a justified exception"
+            );
+        }
+    }
+
+    /// The bypass a whole-tree review found: `workflow::run` is allowed because
+    /// the cron worker fires it, and `workers/workflow` dispatches each step id
+    /// from its own TRUSTED session. If `workflow::create` ever leaves the deny
+    /// list, every id on it becomes reachable through a two-call composition.
+    #[test]
+    fn the_workflow_factory_is_denied_while_its_runner_stays_allowed() {
+        assert!(
+            UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&"workflow::create"),
+            "workflow::create composes every other denied id from a trusted session"
+        );
+        assert!(
+            !UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&"workflow::run"),
+            "workflow::run is a cron target; denying it stops scheduled workflows"
+        );
+        for factory in ["cron::create", "trigger::create", "hook::register"] {
+            assert!(
+                UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&factory),
+                "{factory} is the same class of factory"
             );
         }
     }
