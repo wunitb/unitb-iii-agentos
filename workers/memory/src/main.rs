@@ -254,6 +254,97 @@ fn memory_key(input: &Value) -> Result<&str, Error> {
         .ok_or_else(|| Error::Handler("key is required".to_string()))
 }
 
+/// Extracts the stored value from one `state::list` element.
+///
+/// iii 0.22.1 answers `state::list` with a bare array of the stored values —
+/// verified with `iii trigger state::list scope=...` against the engine this
+/// repo pins. The `{ key, value }` envelope this worker used to assume never
+/// arrives, which is why every list-driven code path read nothing. Both shapes
+/// are accepted so a future envelope does not break it again.
+fn state_value(entry: &Value) -> &Value {
+    match entry.as_object() {
+        Some(object)
+            if object.contains_key("value")
+                && object.keys().all(|key| key == "value" || key == "key") =>
+        {
+            &object["value"]
+        }
+        _ => entry,
+    }
+}
+
+/// The stored values of a `state::list` response.
+fn state_values(response: &Value) -> Vec<&Value> {
+    response
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(state_value)
+        .collect()
+}
+
+/// The scope names of a `state::list_groups` response.
+///
+/// The engine answers `{ "groups": [...] }`; a bare array is accepted too.
+fn state_groups(response: &Value) -> Vec<&str> {
+    response
+        .get("groups")
+        .and_then(Value::as_array)
+        .or_else(|| response.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
+}
+
+/// A `state::update` `set` operation.
+fn set_op(path: &str, value: Value) -> Value {
+    json!({ "type": "set", "path": path, "value": value })
+}
+
+/// A `state::update` `append` operation.
+///
+/// `append` takes the element itself: passing an array appends the array as one
+/// nested element. `merge` cannot be used for a list — the engine rejects a
+/// non-object merge value with `merge.value.not_an_object`.
+fn append_op(path: &str, value: Value) -> Value {
+    json!({ "type": "append", "path": path, "value": value })
+}
+
+/// A `state::update` `increment` operation. The amount field is `by`.
+fn increment_op(path: &str, by: i64) -> Value {
+    json!({ "type": "increment", "path": path, "by": by })
+}
+
+/// A `state::update` payload. The operation list field is `ops`.
+fn state_update_payload(scope: String, key: &str, ops: Vec<Value>) -> Value {
+    json!({ "scope": scope, "key": key, "ops": ops })
+}
+
+/// The per-operation errors a `state::update` reports inside a 200 response.
+///
+/// A rejected operation does not fail the invocation, so the only way to notice
+/// is to read `errors`.
+fn update_errors(response: &Value) -> Option<String> {
+    let errors = response.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    Some(
+        errors
+            .iter()
+            .map(|error| {
+                error
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
 async fn call_state(
     iii: &dyn TriggerBus,
     function_id: &str,
@@ -320,11 +411,8 @@ async fn list_memories(iii: &dyn TriggerBus, input: Value) -> Result<Value, Erro
         json!({ "scope": format!("memory:{}", memory_agent(&input)) }),
     )
     .await?;
-    let memories = entries
-        .as_array()
+    let memories = state_values(&entries)
         .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.get("value"))
         .filter(|value| value.get("content").is_some())
         .cloned()
         .collect::<Vec<_>>();
@@ -342,17 +430,9 @@ async fn session_agents(iii: &dyn TriggerBus, input: &Value) -> Result<Vec<Strin
     }
 
     let agents = call_state(iii, "state::list", json!({ "scope": "agents" })).await?;
-    let mut agent_ids = agents
-        .as_array()
+    let mut agent_ids = state_values(&agents)
         .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            entry
-                .get("key")
-                .or_else(|| entry.get("id"))
-                .or_else(|| entry.get("value").and_then(|value| value.get("id")))
-                .and_then(Value::as_str)
-        })
+        .filter_map(|value| value.get("id").and_then(Value::as_str))
         .filter(|agent| !agent.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
@@ -374,15 +454,23 @@ async fn list_sessions(iii: &dyn TriggerBus, input: Value) -> Result<Value, Erro
         )
         .await?;
         for entry in entries.as_array().into_iter().flatten() {
-            let Some(id) = entry.get("key").and_then(Value::as_str) else {
+            let value = state_value(entry);
+            // `state::list` returns no keys, so the id has to come from the
+            // session document that `append_session_message` maintains.
+            let Some(id) = entry
+                .get("key")
+                .or_else(|| value.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
                 continue;
             };
-            let mut session = entry.get("value").cloned().unwrap_or_else(|| json!({}));
+            let mut session = value.clone();
             if !session.is_object() {
                 session = json!({ "value": session });
             }
             if let Some(object) = session.as_object_mut() {
-                object.entry("id".to_string()).or_insert_with(|| json!(id));
+                object.entry("id".to_string()).or_insert_with(|| json!(&id));
                 object
                     .entry("agent".to_string())
                     .or_insert_with(|| json!(agent));
@@ -417,18 +505,16 @@ async fn delete_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Err
         .ok_or_else(|| Error::Handler("id is required".to_string()))?;
     let mut deleted = false;
     for agent in session_agents(iii, &input).await? {
-        let entries = call_state(
+        // `state::list` returns no keys, so existence is checked by reading the
+        // key directly; a miss reads back as null.
+        let existing = call_state(
             iii,
-            "state::list",
-            json!({ "scope": format!("sessions:{agent}") }),
+            "state::get",
+            json!({ "scope": format!("sessions:{agent}"), "key": id }),
         )
-        .await?;
-        if entries
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|entry| entry.get("key").and_then(Value::as_str) == Some(id))
-        {
+        .await
+        .unwrap_or(Value::Null);
+        if !existing.is_null() {
             call_state(
                 iii,
                 "state::delete",
@@ -579,25 +665,40 @@ async fn append_session_message(
     let result = iii
         .trigger(TriggerRequest {
             function_id: "state::update".to_string(),
-            payload: json!({
-                "scope": format!("sessions:{agent_id}"),
-                "key": session_id,
-                "operations": [
-                    {
-                        "type": "merge",
-                        "path": "messages",
-                        "value": [{ "id": message_id, "role": role, "timestamp": now }],
-                    },
-                    { "type": "set", "path": "updatedAt", "value": now },
+            payload: state_update_payload(
+                format!("sessions:{agent_id}"),
+                session_id,
+                vec![
+                    append_op(
+                        "messages",
+                        json!({ "id": message_id, "role": role, "timestamp": now }),
+                    ),
+                    set_op("updatedAt", json!(now)),
+                    // The engine's `state::list` does not return keys, so the
+                    // session has to carry its own identity for `session::list`.
+                    set_op("id", json!(session_id)),
+                    set_op("agent", json!(agent_id)),
                 ],
-            }),
+            ),
             action: None,
             timeout_ms: None,
         })
         .await;
 
     match result {
-        Ok(_) => true,
+        Ok(response) => match update_errors(&response) {
+            None => true,
+            Some(codes) => {
+                tracing::warn!(
+                    agent_id,
+                    session_id,
+                    message_id,
+                    codes,
+                    "session index update was rejected; this turn will be missing from history"
+                );
+                false
+            }
+        },
         Err(error) => {
             tracing::warn!(
                 agent_id,
@@ -674,17 +775,13 @@ async fn session_history(iii: &dyn TriggerBus, input: Value) -> Result<Value, Er
     )
     .await
     .unwrap_or(json!([]));
-    // Keyed by the state key, not by `value.id`: the dedup records stored under
-    // the content hash carry the same `id` and would otherwise shadow the entry.
-    let by_id: HashMap<&str, &Value> = entries
-        .as_array()
+    // Only entries with content: the dedup records stored under the content
+    // hash carry the same `id` and would otherwise shadow the real entry.
+    let by_id: HashMap<&str, &Value> = state_values(&entries)
         .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            let key = entry.get("key")?.as_str()?;
-            let value = entry.get("value")?;
+        .filter_map(|value| {
             value.get("content")?;
-            Some((key, value))
+            Some((value.get("id")?.as_str()?, value))
         })
         .collect();
 
@@ -725,12 +822,9 @@ async fn recall_memory(iii: &dyn TriggerBus, input: Value) -> Result<Value, Erro
         .await
         .unwrap_or(json!([]));
 
-    let memories: Vec<MemoryEntry> = entries
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|e| {
-            let val = e.get("value")?;
+    let memories: Vec<MemoryEntry> = state_values(&entries)
+        .into_iter()
+        .filter_map(|val| {
             if val.get("content").is_none() || val.get("role").is_none() {
                 return None;
             }
@@ -801,14 +895,14 @@ async fn recall_memory(iii: &dyn TriggerBus, input: Value) -> Result<Value, Erro
         if let Err(error) = iii
             .trigger(TriggerRequest {
                 function_id: "state::update".to_string(),
-                payload: json!({
-                    "scope": format!("memory:{}", m.agent_id),
-                    "key": &m.id,
-                    "operations": [
-                        { "type": "increment", "path": "accessCount", "value": 1 },
-                        { "type": "set", "path": "lastAccessed", "value": now_ms() },
+                payload: state_update_payload(
+                    format!("memory:{}", m.agent_id),
+                    &m.id,
+                    vec![
+                        increment_op("accessCount", 1),
+                        set_op("lastAccessed", json!(now_ms())),
                     ],
-                }),
+                ),
                 action: None,
                 timeout_ms: None,
             })
@@ -876,16 +970,21 @@ async fn kg_add(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
                     back_refs.push(
                         json!({ "target": entity_id, "type": format!("inverse:{}", rel_type) }),
                     );
-                    let _ = iii.trigger(TriggerRequest {
-                        function_id: "state::update".to_string(),
-                        payload: json!({
-                        "scope": format!("kg:{}", agent_id),
-                        "key": target_id,
-                        "operations": [{ "type": "set", "path": "relations", "value": back_refs }],
-                    }),
-                        action: None,
-                        timeout_ms: None,
-                    }).await;
+                    if let Err(error) = iii
+                        .trigger(TriggerRequest {
+                            function_id: "state::update".to_string(),
+                            payload: state_update_payload(
+                                format!("kg:{agent_id}"),
+                                target_id,
+                                vec![set_op("relations", json!(back_refs))],
+                            ),
+                            action: None,
+                            timeout_ms: None,
+                        })
+                        .await
+                    {
+                        tracing::warn!(target_id, %error, "back-reference update failed");
+                    }
                 }
             }
         }
@@ -950,12 +1049,9 @@ async fn evict_memories(iii: &dyn TriggerBus, input: Value) -> Result<Value, Err
         .await
         .unwrap_or(json!([]));
 
-    let memory_scopes: Vec<String> = scopes
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|s| s.as_str())
-        .filter(|s| s.starts_with("memory:"))
+    let memory_scopes: Vec<String> = state_groups(&scopes)
+        .into_iter()
+        .filter(|scope| scope.starts_with("memory:"))
         .map(String::from)
         .collect();
 
@@ -973,14 +1069,9 @@ async fn evict_memories(iii: &dyn TriggerBus, input: Value) -> Result<Value, Err
             .await
             .unwrap_or(json!([]));
 
-        let memories: Vec<MemoryEntry> = entries
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .filter_map(|e| {
-                let val = e.get("value")?;
-                serde_json::from_value(val.clone()).ok()
-            })
+        let memories: Vec<MemoryEntry> = state_values(&entries)
+            .into_iter()
+            .filter_map(|val| serde_json::from_value(val.clone()).ok())
             .collect();
 
         let mut scope_evicted = 0_u64;
@@ -1063,12 +1154,9 @@ async fn consolidate(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error>
         .await
         .unwrap_or(json!([]));
 
-    let memory_scopes: Vec<String> = scopes
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|s| s.as_str())
-        .filter(|s| s.starts_with("memory:"))
+    let memory_scopes: Vec<String> = state_groups(&scopes)
+        .into_iter()
+        .filter(|scope| scope.starts_with("memory:"))
         .map(String::from)
         .collect();
 
@@ -1087,12 +1175,7 @@ async fn consolidate(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error>
             .await
             .unwrap_or(json!([]));
 
-        for entry in entries.as_array().unwrap_or(&vec![]) {
-            let val = match entry.get("value") {
-                Some(v) => v,
-                None => continue,
-            };
-
+        for val in state_values(&entries) {
             let last_accessed = val["lastAccessed"].as_u64().unwrap_or(0);
             let confidence = val["confidence"].as_f64().unwrap_or(1.0);
             let id = match val["id"].as_str() {
@@ -1105,13 +1188,11 @@ async fn consolidate(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error>
                 let _ = iii
                     .trigger(TriggerRequest {
                         function_id: "state::update".to_string(),
-                        payload: json!({
-                            "scope": scope,
-                            "key": id,
-                            "operations": [
-                                { "type": "set", "path": "confidence", "value": new_confidence },
-                            ],
-                        }),
+                        payload: state_update_payload(
+                            scope.clone(),
+                            id,
+                            vec![set_op("confidence", json!(new_confidence))],
+                        ),
                         action: None,
                         timeout_ms: None,
                     })
@@ -1242,14 +1323,14 @@ async fn compact_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Er
 
     iii.trigger(TriggerRequest {
         function_id: "state::update".to_string(),
-        payload: json!({
-            "scope": format!("sessions:{}", agent_id),
-            "key": session_id,
-            "operations": [
-                { "type": "set", "path": "messages", "value": new_messages },
-                { "type": "set", "path": "compactedAt", "value": now },
+        payload: state_update_payload(
+            format!("sessions:{agent_id}"),
+            session_id,
+            vec![
+                set_op("messages", json!(new_messages)),
+                set_op("compactedAt", json!(now)),
             ],
-        }),
+        ),
         action: None,
         timeout_ms: None,
     })
@@ -1382,15 +1463,15 @@ async fn repair_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Err
     if total_repairs > 0 {
         iii.trigger(TriggerRequest {
             function_id: "state::update".to_string(),
-            payload: json!({
-                "scope": format!("sessions:{}", agent_id),
-                "key": session_id,
-                "operations": [
-                    { "type": "set", "path": "messages", "value": repaired },
-                    { "type": "set", "path": "repairedAt", "value": now_ms() },
-                    { "type": "set", "path": "repairStats", "value": stats },
+            payload: state_update_payload(
+                format!("sessions:{agent_id}"),
+                session_id,
+                vec![
+                    set_op("messages", json!(repaired)),
+                    set_op("repairedAt", json!(now_ms())),
+                    set_op("repairStats", json!(stats)),
                 ],
-            }),
+            ),
             action: None,
             timeout_ms: None,
         })
@@ -2838,7 +2919,15 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
-    /// Minimal in-memory stand-in for the engine's `state::*` functions.
+    /// In-memory stand-in for the engine's `state::*` functions.
+    ///
+    /// The shapes below were verified against the pinned engine (iii 0.22.1)
+    /// with `iii trigger state::<fn> --help` and real invocations:
+    /// `state::list` answers a bare array of values with no keys,
+    /// `state::list_groups` answers `{ "groups": [...] }`, `state::update`
+    /// takes `ops` (not `operations`) where `increment` carries `by`, `append`
+    /// takes the element itself, and a rejected operation comes back as a 200
+    /// with an `errors` array.
     #[derive(Default)]
     struct StateStore {
         scopes: Mutex<BTreeMap<String, BTreeMap<String, Value>>>,
@@ -2859,7 +2948,7 @@ mod tests {
             input["key"].as_str().unwrap_or_default().to_string()
         }
 
-        /// A missing key reads back as `null`, like a key-value store miss.
+        /// A missing key reads back as `null`.
         fn get(&self, input: &Value) -> Value {
             self.lock()
                 .get(&Self::scope_of(input))
@@ -2881,26 +2970,22 @@ mod tests {
             }
         }
 
+        /// A bare array of values: the engine does not return keys.
         fn list(&self, input: &Value) -> Value {
             let entries = self
                 .lock()
                 .get(&Self::scope_of(input))
-                .map(|scope| {
-                    scope
-                        .iter()
-                        .map(|(key, value)| json!({ "key": key, "value": value }))
-                        .collect::<Vec<_>>()
-                })
+                .map(|scope| scope.values().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
             Value::Array(entries)
         }
 
         fn groups(&self) -> Value {
-            Value::Array(self.lock().keys().map(|scope| json!(scope)).collect())
+            json!({ "groups": self.lock().keys().collect::<Vec<_>>() })
         }
 
-        /// Supports the three operation types the memory worker emits.
-        fn update(&self, input: &Value) {
+        /// Applies `ops`, reporting rejected operations the way the engine does.
+        fn update(&self, input: &Value) -> Value {
             let mut scopes = self.lock();
             let entry = scopes
                 .entry(Self::scope_of(input))
@@ -2910,36 +2995,51 @@ mod tests {
             if !entry.is_object() {
                 *entry = json!({});
             }
-            let operations = input
-                .get("operations")
-                .or_else(|| input.get("ops"))
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            for operation in operations {
-                let path = operation["path"].as_str().unwrap_or_default().to_string();
-                let value = operation["value"].clone();
+            // `operations` is not a field the engine knows: it fails the whole
+            // invocation with `missing field ops`.
+            let Some(ops) = input.get("ops").and_then(Value::as_array).cloned() else {
+                return Value::Null;
+            };
+            let mut errors = Vec::new();
+            for (index, op) in ops.iter().enumerate() {
+                let path = op["path"].as_str().unwrap_or_default().to_string();
                 let object = entry.as_object_mut().expect("entry is an object");
-                match operation["type"].as_str().unwrap_or_default() {
+                match op["type"].as_str().unwrap_or_default() {
                     "set" => {
-                        object.insert(path, value);
+                        object.insert(path, op["value"].clone());
                     }
-                    "merge" => {
+                    "append" => {
                         let target = object.entry(path).or_insert_with(|| json!([]));
-                        if let (Some(target), Some(added)) =
-                            (target.as_array_mut(), value.as_array())
-                        {
-                            target.extend(added.iter().cloned());
+                        match target.as_array_mut() {
+                            Some(target) => target.push(op["value"].clone()),
+                            None => errors.push(json!({
+                                "code": "append.target_not_object",
+                                "op_index": index,
+                            })),
                         }
                     }
-                    "increment" => {
-                        let current = object.get(&path).and_then(Value::as_i64).unwrap_or(0);
-                        let added = value.as_i64().unwrap_or(0);
-                        object.insert(path, json!(current + added));
+                    "merge" => {
+                        if !op["value"].is_object() {
+                            errors.push(json!({
+                                "code": "merge.value.not_an_object",
+                                "op_index": index,
+                            }));
+                        }
                     }
+                    "increment" => match op.get("by").and_then(Value::as_i64) {
+                        Some(by) => {
+                            let current = object.get(&path).and_then(Value::as_i64).unwrap_or(0);
+                            object.insert(path, json!(current + by));
+                        }
+                        None => errors.push(json!({
+                            "code": "increment.missing_by",
+                            "op_index": index,
+                        })),
+                    },
                     _ => {}
                 }
             }
+            json!({ "errors": errors })
         }
     }
 
@@ -2966,8 +3066,13 @@ mod tests {
         bus.on("state::list_groups", move |_| Ok(state.groups()));
         let state = store.clone();
         bus.on("state::update", move |input| {
-            state.update(&input);
-            Ok(json!({ "updated": true }))
+            // The engine rejects the whole invocation when `ops` is missing.
+            if input.get("ops").and_then(Value::as_array).is_none() {
+                return Err(Error::Handler(
+                    "serialization error: missing field `ops`".to_string(),
+                ));
+            }
+            Ok(state.update(&input))
         });
         // No embedding worker in these tests: recall must still work on keyword
         // and recency alone.
@@ -3162,5 +3267,90 @@ mod tests {
             stored["sessionIndexed"], false,
             "a dropped index write must be visible, not silent"
         );
+    }
+
+    #[tokio::test]
+    async fn session_index_write_uses_the_engine_update_contract() {
+        let (bus, _store) = state_bus();
+        store(&bus, "a-9", "s-1", "user", "contract check").await;
+
+        let calls = bus.calls_to("state::update");
+        let update = &calls
+            .iter()
+            .find(|call| call.payload["scope"] == "sessions:a-9")
+            .expect("the session index is updated")
+            .payload;
+
+        assert!(
+            update.get("operations").is_none(),
+            "the engine field is `ops`; `operations` fails with missing field `ops`"
+        );
+        let ops = update["ops"].as_array().expect("ops array");
+        let append = &ops[0];
+        assert_eq!(append["type"], "append", "a list needs append, not merge");
+        assert!(
+            append["value"].is_object(),
+            "append takes the element itself; an array would nest"
+        );
+        assert_eq!(append["value"]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn recall_access_counter_uses_the_increment_amount_field() {
+        let (bus, _store) = state_bus();
+        store(&bus, "a-10", "s-1", "user", "counter contract").await;
+
+        recall_memory(&bus, json!({ "agentId": "a-10", "query": "counter" }))
+            .await
+            .expect("recall_memory failed");
+
+        let increment = bus
+            .calls_to("state::update")
+            .into_iter()
+            .find(|call| call.payload["scope"] == "memory:a-10")
+            .expect("the access counter is updated")
+            .payload["ops"][0]
+            .clone();
+        assert_eq!(increment["type"], "increment");
+        assert_eq!(increment["by"], 1, "the engine field is `by`, not `value`");
+    }
+
+    #[tokio::test]
+    async fn store_reports_a_rejected_session_index_operation() {
+        let (bus, _store) = state_bus();
+        // A rejected operation arrives as a 200 with an `errors` array.
+        bus.on("state::update", |_| {
+            Ok(json!({ "errors": [{ "code": "append.target_not_object" }] }))
+        });
+
+        let stored = store(&bus, "a-11", "s-1", "user", "rejected index write").await;
+
+        assert_eq!(stored["stored"], true);
+        assert_eq!(stored["sessionIndexed"], false);
+    }
+
+    #[test]
+    fn state_list_values_are_read_without_a_key_value_envelope() {
+        // What the engine really answers.
+        let bare = json!([{ "id": "m-1", "content": "hi" }]);
+        assert_eq!(state_values(&bare)[0]["id"], "m-1");
+
+        // And the envelope shape stays readable.
+        let enveloped = json!([{ "key": "m-1", "value": { "id": "m-1", "content": "hi" } }]);
+        assert_eq!(state_values(&enveloped)[0]["id"], "m-1");
+
+        // A stored document that merely has a `value` field is not an envelope.
+        let ambiguous = json!([{ "id": "m-1", "value": 7 }]);
+        assert_eq!(state_values(&ambiguous)[0]["id"], "m-1");
+    }
+
+    #[test]
+    fn state_groups_reads_the_engine_envelope() {
+        assert_eq!(
+            state_groups(&json!({ "groups": ["memory:a", "sessions:a"] })),
+            vec!["memory:a", "sessions:a"]
+        );
+        assert_eq!(state_groups(&json!(["memory:a"])), vec!["memory:a"]);
+        assert!(state_groups(&Value::Null).is_empty());
     }
 }
