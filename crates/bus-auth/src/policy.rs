@@ -171,16 +171,27 @@ pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
     TRIGGER_REGISTRATION_HOOK_ID,
 ];
 
-/// First segments a credential-less session may register a function or point a
-/// trigger at: exactly the surfaces the engine's own registry workers own.
+/// Id prefixes a credential-less session may register a function under, or point
+/// a trigger at: exactly the surfaces the engine's own registry workers own.
 ///
-/// Anything else — `vault::get`, `agent::chat`, `memory::store` — is refused, so
-/// a local process cannot wait for a real worker to drop and claim its ids.
-pub const UNTRUSTED_REGISTRATION_NAMESPACES: &[&str] = &[
+/// An entry matches its own namespace and everything below it, on a `::`
+/// boundary — `engine::queue` allows `engine::queue::enqueue` and nothing else
+/// under `engine::`. That precision is the point: the shipped `queue` worker
+/// really does register `engine::queue::*` and `iii::queue::*` (observed live on
+/// a booting stack), while `engine::log::info` — an id every worker's logging
+/// goes through — must stay unclaimable by a credential-less session.
+///
+/// Anything outside this list — `vault::get`, `agent::chat`, `memory::store` —
+/// is refused, so a local process cannot wait for a real worker to drop and
+/// claim its ids.
+pub const UNTRUSTED_REGISTRATION_PREFIXES: &[&str] = &[
     "configuration",
     "context-manager",
     "cron",
+    "engine::queue",
     "iii-directory",
+    "iii::durable",
+    "iii::queue",
     "llm-router",
     "provider-anthropic",
     "provider-openai",
@@ -190,6 +201,7 @@ pub const UNTRUSTED_REGISTRATION_NAMESPACES: &[&str] = &[
     "state",
     "stream",
 ];
+
 
 /// The bus credential from the environment, rejecting an empty value.
 ///
@@ -285,17 +297,20 @@ pub fn tier_of_context(context: &Value) -> &'static str {
     }
 }
 
-/// True when `function_id` is inside a namespace a credential-less session owns.
-fn namespace_is_untrusted_owned(function_id: &str) -> bool {
-    let mut segments = function_id.split("::");
-    let Some(namespace) = segments.next() else {
-        return false;
-    };
-    if namespace.is_empty() || segments.next().is_none() {
-        // Un-namespaced ids (`publish`, `bridge.invoke`) are never claimable.
+/// True when `function_id` sits under a prefix a credential-less session owns.
+///
+/// Matching is on whole `::` segments. An un-namespaced id (`publish`,
+/// `bridge.invoke`) is never claimable, and a prefix never matches a longer
+/// segment that merely starts with it (`engine::queuex`).
+fn prefix_is_untrusted_owned(function_id: &str) -> bool {
+    if !function_id.contains("::") {
         return false;
     }
-    UNTRUSTED_REGISTRATION_NAMESPACES.contains(&namespace)
+    UNTRUSTED_REGISTRATION_PREFIXES.iter().any(|prefix| {
+        function_id
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with("::") && rest.len() > 2)
+    })
 }
 
 /// May this session register (or re-register) `function_id`?
@@ -312,7 +327,7 @@ pub fn function_registration_allowed(function_id: &str, context: &Value) -> bool
     if tier_of_context(context) == TIER_TRUSTED {
         return true;
     }
-    namespace_is_untrusted_owned(function_id)
+    prefix_is_untrusted_owned(function_id)
 }
 
 /// May this session bind a trigger to `function_id`?
@@ -449,16 +464,42 @@ mod tests {
     #[test]
     fn untrusted_sessions_keep_their_own_namespaces() {
         let untrusted = json!({ TIER_CONTEXT_KEY: TIER_UNTRUSTED });
+        // Every one of these was observed being registered by an engine-spawned
+        // registry worker on a live 0.22.1 stack.
         for id in [
             "state::set",
             "state::ui-content",
             "queue::send",
             "llm-router::route",
             "provider-openai::chat",
+            "engine::queue::enqueue",
+            "engine::queue::dlq_messages",
+            "iii::queue::redrive",
+            "iii::durable::publish",
         ] {
             assert!(
                 function_registration_allowed(id, &untrusted),
                 "{id} is registered by an engine-spawned worker"
+            );
+        }
+    }
+
+    /// The `engine::queue` carve-out must not become "the engine namespace".
+    #[test]
+    fn the_queue_carve_out_does_not_open_the_engine_namespace() {
+        let untrusted = json!({ TIER_CONTEXT_KEY: TIER_UNTRUSTED });
+        for id in [
+            "engine::log::info",
+            "engine::workers::register",
+            "engine::channels::create",
+            "engine::queuex::enqueue",
+            "engine::queue",
+            "iii::durable",
+            "statex::set",
+        ] {
+            assert!(
+                !function_registration_allowed(id, &untrusted),
+                "{id} must not be claimable by a credential-less session"
             );
         }
     }
