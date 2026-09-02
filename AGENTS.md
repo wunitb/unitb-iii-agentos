@@ -25,14 +25,20 @@ AgentOS is UnitB's independent continuation of `iii-experimental/agentos`, migra
 
 Run every command from the stated directory. A command below is offline only when its executable and all locked dependencies/artifacts are already installed or cached; `--offline` prevents fetching but does not create a cache.
 
+`rust-toolchain.toml` pins the channel to **1.90**, so a plain `cargo` in this checkout is the compiler and
+linter CI runs. Do not prefix commands with `rustup run`; if you change the pin, change it in
+`rust-toolchain.toml`, `Cargo.toml` `rust-version`, `ci.yml` and `release.yml` together —
+`tests/toolchain_pin.test.ts` fails the build otherwise.
+
 | Purpose | Command | Offline/cache prerequisites and boundary |
 | --- | --- | --- |
-| Rust format check | root: `rustup run 1.90 cargo fmt --all -- --check` | Rust **1.90** toolchain with `rustfmt`; no dependency download. |
-| Rust lint | root: `rustup run 1.90 cargo clippy --workspace --all-targets --locked -- -D warnings` | Rust 1.90 with `clippy` and the locked Cargo sources already available. |
-| Rust metadata | root: `rustup run 1.90 cargo metadata --offline --format-version 1 --locked` | Rust 1.90 plus Cargo registry/index and crate sources from `Cargo.lock` must already be cached. |
-| Rust build | root: `rustup run 1.90 cargo build --workspace --release --offline --locked` | Rust 1.90 and the same Cargo cache prerequisite; produces `target/` artifacts. |
-| Rust tests | root: `rustup run 1.90 cargo test --workspace --release --offline --locked` | Rust 1.90 and the same Cargo cache prerequisite. Live-engine tests are ignored by default. Target one package with `cargo test -p <workspace-package> --offline --locked`; do not broaden unrelated packages. |
-| Root TypeScript checks | root: `bun run check` | Bun and root `node_modules` must match `bun.lock`; source-contract tests exclude generated/dependency trees and the command also builds the npm-locked website. `bun install --frozen-lockfile` is connected setup, not an offline guarantee. |
+| Rust format check | root: `cargo fmt --all -- --check` | Rust **1.90** toolchain with `rustfmt`; no dependency download. |
+| Rust lint | root: `cargo clippy --workspace --all-targets --locked -- -D warnings` | Rust 1.90 with `clippy` and the locked Cargo sources already available. This is the lint bar; CI runs exactly this command. |
+| Rust metadata | root: `cargo metadata --offline --format-version 1 --locked` | Rust 1.90 plus Cargo registry/index and crate sources from `Cargo.lock` must already be cached. |
+| Rust build | root: `cargo build --workspace --release --offline --locked` | Rust 1.90 and the same Cargo cache prerequisite; produces `target/` artifacts. |
+| Rust tests | root: `cargo test --workspace --offline --locked` | Dev profile — the same profile CI runs; the release build exists for the shipped binaries, not for tests. Live-engine tests are ignored by default. Target one package with `cargo test -p <workspace-package> --offline --locked`; do not broaden unrelated packages. |
+| Supply-chain policy | root: `cargo deny check` | **Not offline.** Needs `cargo-deny` (CI pins 0.20.2) and fetches the RustSec advisory database. Policy and every dated exception live in `deny.toml`; a new duplicate version, licence or registry fails the build. |
+| Root TypeScript checks | root: `bun run check` | Bun and root `node_modules` must match `bun.lock`. Chains `typecheck`, `test:unit` (tests of the software), `test:governance` (build-evidence and documentation contracts), `counts:check` (every published number recomputed from the tree) and the npm-locked website build. `bun install --frozen-lockfile` is connected setup, not an offline guarantee. |
 | Live TypeScript e2e | root: `bun run test:e2e` | **Not offline.** Requires installed root dependencies, `AGENTOS_E2E=1` (set by the script), a running iii engine and workers at `AGENTOS_BASE_URL`/`III_URL`, and model credentials for the chat assertion (`AGENTOS_API_KEY` or configured provider). The smoke name only selects health/chat tests; it still needs the live stack. |
 | Website build | `website/`: `npm run build` | Node/npm and a **writable** `website/node_modules` installed from `website/package-lock.json`; produces `website/dist/`. `npm ci --no-audit --no-fund` is connected setup unless the complete npm cache is intentionally used offline. |
 | Python embedding tests | `workers/embedding/`: `python -m pytest test_main.py -q` | Python >=3.11 and pytest already installed. CI installs only pytest, so the test's mocked iii and absent `sentence_transformers` use the fallback path. This is not an offline guarantee if a locally installed `sentence_transformers` tries to download its model; remove it or ensure that model is cached. |
@@ -42,7 +48,8 @@ From root, `bash scripts/install-iii.sh` reads `.iii-version`, rejects prereleas
 ## Portability and release boundaries
 
 Released bundles are built natively for Linux `x86_64`/`aarch64` and macOS
-`x86_64`/`aarch64`, then checksum-inspected with an SPDX SBOM and verified
+`aarch64` — the three targets `.github/workflows/release.yml` actually builds —
+then checksum-inspected with an SPDX SBOM and verified
 GitHub build-provenance attestation before publication. The bundle contains the CLI, TUI, runtime configuration,
 Rust worker binaries, and embedding-worker source; it must not require the
 source checkout at runtime. The installer keeps the operator-owned
@@ -66,21 +73,24 @@ network, service, or credential prerequisites. The embedding worker requires
 Python >=3.11 with `venv` and `ensurepip`; SentenceTransformers is optional
 for its hash fallback when the package is unavailable. Local builds validate
 only the host architecture; the release CI matrix is the evidence for all
-four supported targets.
+three supported targets.
 
 ## Conventions
 
-- Rust uses edition 2024 and workspace dependency versions. Format with `cargo fmt`; treat the clippy command above, including `-D warnings`, as the lint bar. Target a workspace package with `-p`; preserve the worker-per-process/function-registration design and the reserved `sandbox::*` namespace.
+- Rust uses edition 2024 and workspace dependency versions. Format with `cargo fmt`; treat the clippy command above, including `-D warnings`, as the lint bar — CI runs that exact command on the pinned 1.90 toolchain and there is no `continue-on-error` anywhere in `.github/workflows/`. Target a workspace package with `-p`; preserve the worker-per-process/function-registration design and the reserved `sandbox::*` namespace.
+- Two workers may not register the same function id and two triggers may not bind the same HTTP route; `tests/registration_uniqueness.test.ts` enforces this against a dated allowlist that may only shrink.
+- `state::update` takes `ops` (not `operations`), `increment` takes `by` (not `value`), and `merge` takes an object (appending an element is `append`); `tests/state_protocol.test.ts` scans every Rust source for these three.
+- Every number this repository publishes — workers, function ids, tests, providers, CI jobs, engine workers, release targets and the worker tables — is generated by `scripts/counts.ts`. Change the tree, then run `bun run counts:write`; never hand-edit a published count.
+- New dependencies must satisfy `deny.toml`. A new duplicate version needs a dated, justified `[bans] skip` entry, never a blanket allow.
 - Root TypeScript is strict and NodeNext for examples and script tests; Bun is the root package manager and `bun.lock` is authoritative. The website is independently npm-locked and has its own strict TypeScript/Vite configuration.
 - Python embedding code requires Python >=3.11; tests use pytest. Keep dependency changes lockfile-driven rather than editing generated locks.
 - Every `workers/<name>/iii.worker.yaml` must name its containing directory, declare a `rust` or `python` runtime, and have a string `scripts.start`; CI validates this.
 - Never edit generated, runtime, credential, vendor, or lock artifacts by hand. Do not change vendored `.upstream-iii/` while working on root AgentOS behavior unless that subtree's guidance and task explicitly require it.
 
-## Managed UNITB OMPAX fleet
+## Delivery path
 
-These rules apply to managed fleet work, in addition to the repository rules above:
-
-1. The managed Planner is read-only. A durable Work Item has exactly one Writer, an explicit owned-path contract, and an isolated worktree.
-2. An independent Reviewer evaluates the exact commit submitted by that Writer. Review findings return to the same Writer; do not substitute another writer or a different commit.
-3. Publication uses `fleet_handoff`; protected integration uses `fleet_merge`. Agents must not directly edit outside their owned paths, push, approve, merge, or bypass protections outside their assigned role.
-4. Do not infer or document fleet checkout/storage layouts beyond verified Dispatcher facts. In particular, do not claim Worker and Reviewer checkouts share a `worktrees/<work-id>/<identity>/` layout.
+Repository changes enter as **control-room directives** and are built by the **sweafax** factory; nothing
+in this repository launches an agent session of its own. `main` is protected and accepts pull requests only.
+The managed UNITB OMPAX fleet was withdrawn on 2026-08-22 and no longer governs work here; if you find a
+document that still describes `fleet_handoff`, `fleet_merge`, a managed Planner or a Dispatcher checkout
+layout, that document is stale.
