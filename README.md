@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/functions-295-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Functions">
 <<<<<<< HEAD
 =======
-  <img src="https://img.shields.io/badge/rust_tests-1744_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="1,744 Rust tests">
+  <img src="https://img.shields.io/badge/rust_tests-1748_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="1,748 Rust tests">
 >>>>>>> wp/manifest-parity
   <img src="https://img.shields.io/badge/iii--sdk-0.22.1-d96e2e?style=flat-square&labelColor=f2ede1" alt="iii-sdk 0.22.1">
 </p>
