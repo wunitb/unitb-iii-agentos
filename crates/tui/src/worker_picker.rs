@@ -51,36 +51,43 @@ pub fn parse_catalog(api_response: &Value, installed: &[String]) -> Vec<WorkerCa
 }
 
 pub fn builtin_catalog() -> Vec<WorkerCard> {
+    // Every function id below is registered by that worker in `workers/<name>`.
+    // The table is hardcoded, so `builtin_catalog_only_advertises_registered_functions`
+    // re-derives the real ids from `workers/**` and fails when a row drifts.
     const ENTRIES: &[(&str, &str, &[&str])] = &[
         (
             "memory",
             "Persistent recall, durable session memory",
-            &["memory::remember", "memory::recall", "memory::search"],
+            &["memory::store", "memory::recall", "memory::session::list"],
         ),
         (
             "browser",
             "Headless browser automation",
-            &["browser::navigate", "browser::click", "browser::read"],
+            &["browser::navigate", "browser::click", "browser::read_page"],
         ),
         (
             "llm-router",
             "LLM provider routing + retries",
-            &["agentos::llm::route"],
+            &[
+                "agentos::llm::route",
+                "agentos::llm::complete",
+                "agentos::llm::providers",
+            ],
         ),
         (
             "agent-core",
             "Agent lifecycle + chat orchestration",
-            &["agent::chat", "agent::create"],
+            &["agent::chat", "agent::create", "agent::list_functions"],
         ),
         (
             "approval",
             "Permission gating for sensitive ops",
-            &["approval::decide", "approval::pending"],
+            &["approval::check", "approval::decide", "approval::list"],
         ),
         (
             "council",
             "Multi-agent governance + voting",
-            &["council::propose", "council::decide"],
+            &["council::submit", "council::decide", "council::proposals"],
         ),
         (
             "realm",
@@ -90,7 +97,7 @@ pub fn builtin_catalog() -> Vec<WorkerCard> {
         (
             "evolve",
             "Function lineage + version evolution",
-            &["evolve::propose", "evolve::lineage"],
+            &["evolve::generate", "evolve::fork", "evolve::lineage"],
         ),
         (
             "workflow",
@@ -100,220 +107,296 @@ pub fn builtin_catalog() -> Vec<WorkerCard> {
         (
             "orchestrator",
             "Cross-agent task coordination",
-            &["orchestrator::status"],
+            &[
+                "orchestrator::plan",
+                "orchestrator::execute",
+                "orchestrator::status",
+            ],
         ),
         (
             "task-decomposer",
             "Break complex tasks into subtasks",
-            &["task::spawn", "task::status"],
+            &["task::decompose", "task::spawn_workers", "task::list"],
         ),
         (
             "hashline",
-            "Structured logging + audit trail",
-            &["audit::log"],
+            "Hash-anchored line edits with content-hash checks",
+            &["hashline::read", "hashline::edit", "hashline::diff"],
         ),
-        ("hooks", "Pre/post tool-call hooks", &["hooks::register"]),
+        (
+            "hooks",
+            "Pre/post tool-call hooks",
+            &["hook::register", "hook::fire", "hook::list"],
+        ),
         (
             "vault",
             "Encrypted secret storage",
-            &["vault::get", "vault::set"],
+            &["vault::get", "vault::set", "vault::rotate"],
         ),
         (
             "rate-limiter",
             "Per-tenant request throttling",
-            &["rate::check"],
+            &["rate::check", "rate::get_status"],
         ),
         (
             "mcp-client",
             "Model Context Protocol bridge",
-            &["mcp::list", "mcp::tools"],
+            &["mcp::connect", "mcp::list_tools", "mcp::call_tool"],
         ),
         (
             "skillkit-bridge",
             "External skill registry sync",
-            &["skill::list", "skill::run"],
+            &["skillkit::search", "skillkit::install", "skillkit::run"],
         ),
         (
             "hand-runner",
             "Persona-bundled function dispatch",
-            &["hand::list", "hand::run"],
+            &["hand::list", "hand::trigger"],
         ),
         (
             "a2a-cards",
             "Agent-to-agent capability cards",
-            &["a2a::send", "a2a::cards"],
+            &["a2a::generate_card", "a2a::list_cards", "a2a::well_known"],
         ),
         (
             "a2a",
             "Agent-to-agent transport",
-            &["a2a::handle_task", "a2a::get_task"],
+            &["a2a::send_task", "a2a::get_task", "a2a::handle_task"],
         ),
-        ("bridge", "External runtime invocation", &["bridge::invoke"]),
+        (
+            "bridge",
+            "External runtime invocation",
+            &["bridge::register", "bridge::invoke"],
+        ),
         (
             "channel-slack",
             "Slack channel I/O",
-            &["channel::slack::send"],
+            &["channel::slack::events", "channel::slack::send"],
         ),
         (
             "channel-discord",
             "Discord channel I/O",
-            &["channel::discord::send"],
+            &["channel::discord::webhook"],
         ),
         (
             "channel-email",
             "Email send/receive",
-            &["channel::email::send"],
+            &["channel::email::webhook"],
         ),
         (
             "channel-bluesky",
             "Bluesky channel I/O",
-            &["channel::bluesky::send"],
+            &["channel::bluesky::webhook"],
         ),
         (
             "channel-mastodon",
             "Mastodon channel I/O",
-            &["channel::mastodon::send"],
+            &["channel::mastodon::webhook"],
         ),
         (
             "channel-matrix",
             "Matrix channel I/O",
-            &["channel::matrix::send"],
+            &["channel::matrix::webhook"],
         ),
         (
             "channel-reddit",
             "Reddit channel I/O",
-            &["channel::reddit::send"],
+            &["channel::reddit::webhook"],
         ),
         (
             "channel-signal",
             "Signal channel I/O",
-            &["channel::signal::send"],
+            &["channel::signal::webhook"],
         ),
         (
             "channel-teams",
             "Teams channel I/O",
-            &["channel::teams::send"],
+            &["channel::teams::webhook"],
         ),
         (
             "channel-telegram",
             "Telegram channel I/O",
-            &["channel::telegram::send"],
+            &["channel::telegram::webhook"],
         ),
         (
             "channel-twitch",
             "Twitch channel I/O",
-            &["channel::twitch::send"],
+            &["channel::twitch::webhook"],
         ),
         (
             "channel-webex",
             "Webex channel I/O",
-            &["channel::webex::send"],
+            &["channel::webex::webhook"],
         ),
         (
             "channel-whatsapp",
             "WhatsApp channel I/O",
-            &["channel::whatsapp::send"],
+            &["channel::whatsapp::webhook"],
         ),
         (
             "channel-linkedin",
             "LinkedIn channel I/O",
-            &["channel::linkedin::send"],
+            &["channel::linkedin::webhook"],
         ),
         (
             "security",
             "RBAC + taint tracking + signing",
-            &["security::check"],
+            &[
+                "security::check_capability",
+                "security::scan_injection",
+                "security::audit",
+            ],
         ),
         (
             "wasm-sandbox",
             "Sandboxed wasm function exec",
-            &["wasm::run"],
+            &["wasm::execute", "wasm::validate", "wasm::list_modules"],
         ),
-        ("ledger", "Immutable action ledger", &["ledger::record"]),
-        ("session-replay", "Time-travel debugging", &["replay::load"]),
+        (
+            "ledger",
+            "Budget + spend tracking",
+            &["ledger::set_budget", "ledger::spend", "ledger::summary"],
+        ),
+        (
+            "session-replay",
+            "Time-travel debugging",
+            &["replay::record", "replay::search", "replay::summary"],
+        ),
         (
             "session-lifecycle",
             "Session start/end hooks",
-            &["lifecycle::state"],
+            &["lifecycle::transition", "lifecycle::get_state"],
         ),
         (
             "context-manager",
             "Context window budget control",
-            &["context::build", "context::trim"],
+            &["context::budget", "context::trim", "context::build_prompt"],
         ),
         (
             "context-cache",
             "LLM response caching",
-            &["context-cache::fetch"],
+            &[
+                "context_cache::get_or_fetch",
+                "context_cache::invalidate",
+                "context_cache::stats",
+            ],
         ),
         (
             "telemetry",
             "Engine + worker observability",
-            &["metrics::summary"],
+            &["telemetry::summary", "telemetry::dashboard"],
         ),
         (
             "mission",
             "Long-running mission tracking",
-            &["mission::list"],
+            &["mission::create", "mission::transition", "mission::list"],
         ),
         (
             "directive",
-            "Realm-level operating rules",
-            &["directive::create"],
+            "Task routing directives + ancestry",
+            &[
+                "directive::create",
+                "directive::list",
+                "directive::ancestry",
+            ],
         ),
         (
             "hierarchy",
             "Agent reporting structure",
-            &["hierarchy::tree"],
+            &["hierarchy::set", "hierarchy::tree", "hierarchy::chain"],
         ),
-        ("loop-guard", "Detect runaway agent loops", &["loop::check"]),
-        ("pulse", "Agent heartbeat + presence", &["pulse::ping"]),
+        (
+            "loop-guard",
+            "Detect runaway agent loops",
+            &["guard::check", "guard::stats"],
+        ),
+        (
+            "pulse",
+            "Scheduled function invocation",
+            &["pulse::register", "pulse::tick", "pulse::status"],
+        ),
         (
             "feedback",
-            "User feedback collection",
-            &["feedback::record"],
+            "Evolved-function review + promotion",
+            &["feedback::review", "feedback::improve", "feedback::promote"],
         ),
-        ("eval", "Function evaluation history", &["eval::history"]),
-        ("coordination", "Channel-based coord", &["coord::post"]),
-        ("swarm", "Multi-agent swarm runs", &["swarm::start"]),
-        ("code-agent", "Code generation agent", &["code::run"]),
+        (
+            "eval",
+            "Function evaluation history",
+            &["eval::run", "eval::history", "eval::compare"],
+        ),
+        (
+            "coordination",
+            "Channel-based coord",
+            &["coord::create_channel", "coord::post", "coord::read"],
+        ),
+        (
+            "swarm",
+            "Multi-agent swarm runs",
+            &["swarm::create", "swarm::broadcast", "swarm::consensus"],
+        ),
+        (
+            "code-agent",
+            "Detect + sandbox-execute agent-written code",
+            &["agent::code_detect", "agent::code_execute"],
+        ),
         (
             "lsp-tools",
             "Language server primitives",
-            &["lsp::definition"],
+            &["lsp::diagnostics", "lsp::symbols", "lsp::goto_definition"],
         ),
         (
             "approval-tiers",
             "Tiered approval policies",
-            &["approval-tiers::policy"],
+            &["approval::classify", "approval::decide_tier"],
         ),
         (
             "security-headers",
             "HTTP header policy",
-            &["security-headers::check"],
+            &["security::headers_apply", "security::headers_check"],
         ),
-        ("security-map", "Capability map", &["security-map::query"]),
+        (
+            "security-map",
+            "Mutual auth protocol (HMAC challenge/response)",
+            &[
+                "security::map_challenge",
+                "security::map_respond",
+                "security::map_verify",
+            ],
+        ),
         (
             "security-zeroize",
             "Memory zeroization",
-            &["security-zeroize::wipe"],
+            &["security::zeroize_wrap", "security::zeroize_check"],
         ),
         (
             "skill-security",
             "Skill permission gating",
-            &["skill-security::check"],
+            &[
+                "skill::verify_signature",
+                "skill::scan_content",
+                "skill::sandbox_test",
+            ],
         ),
         (
             "context-monitor",
             "Context-window watchdog",
-            &["context-monitor::watch"],
+            &["context::health", "context::compress", "context::prune"],
         ),
-        ("cron", "Scheduled triggers", &["cron::register"]),
-        ("streaming", "SSE chat streaming", &["stream::chat"]),
+        (
+            "cron",
+            "Scheduled triggers",
+            &["cron::create", "cron::list", "trigger::create"],
+        ),
+        (
+            "streaming",
+            "Chat transport — HTTP + buffered SSE framing",
+            &["stream::chat", "stream::completion", "stream::sse"],
+        ),
         (
             "embedding",
             "Vector embeddings (Python)",
-            &["embedding::embed"],
+            &["embedding::generate", "embedding::similarity"],
         ),
     ];
     ENTRIES
@@ -392,5 +475,152 @@ mod tests {
             binary_path: Some("/opt/memory".into()),
         };
         assert_eq!(install_command(&card), "$ /opt/memory");
+    }
+
+    /// The catalogue is hardcoded, so it drifts. Re-derive the real ids from
+    /// `workers/**` and fail on any row that advertises a function nobody
+    /// registers — `code-agent` used to claim `code::run`, while the worker
+    /// registers `agent::code_detect` and `agent::code_execute`.
+    fn workers_directory() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workers")
+    }
+
+    fn worker_sources(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(directory)
+            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if matches!(
+                    name.as_str(),
+                    "target" | "node_modules" | "__pycache__" | ".venv"
+                ) {
+                    continue;
+                }
+                worker_sources(&path, found);
+            } else if matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("rs") | Some("py")
+            ) {
+                found.push(path);
+            }
+        }
+    }
+
+    /// Everything from the first `#[cfg(test)]` on is fixture code. No worker in
+    /// this tree registers a function after that marker, so cutting there keeps
+    /// the id set to what production actually registers.
+    fn production_source(source: &str) -> &str {
+        match source.find("#[cfg(test)]") {
+            Some(index) => &source[..index],
+            None => source,
+        }
+    }
+
+    /// `const NAME: &str = "value";` / `static NAME: &str = "value";`
+    fn string_constants(source: &str) -> std::collections::HashMap<String, String> {
+        let mut constants = std::collections::HashMap::new();
+        for line in source.lines() {
+            let line = line.trim();
+            let Some(rest) = line
+                .strip_prefix("const ")
+                .or_else(|| line.strip_prefix("static "))
+            else {
+                continue;
+            };
+            let Some((name, value)) = rest.split_once(':') else {
+                continue;
+            };
+            if !value.contains("str") {
+                continue;
+            }
+            let Some(literal) = value
+                .split_once('"')
+                .and_then(|(_, tail)| tail.split_once('"').map(|(literal, _)| literal.to_string()))
+            else {
+                continue;
+            };
+            constants.insert(name.trim().to_string(), literal);
+        }
+        constants
+    }
+
+    fn registered_function_ids() -> std::collections::BTreeSet<String> {
+        let mut sources = Vec::new();
+        worker_sources(&workers_directory(), &mut sources);
+        assert!(
+            !sources.is_empty(),
+            "no worker sources under {}",
+            workers_directory().display()
+        );
+
+        let mut ids = std::collections::BTreeSet::new();
+        for path in sources {
+            let text =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            let text = production_source(&text);
+            let constants = string_constants(text);
+            for (index, _) in text.match_indices("register_function(") {
+                let argument = text[index + "register_function(".len()..]
+                    .split(',')
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if let Some(literal) = argument
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.split('"').next())
+                {
+                    ids.insert(literal.to_string());
+                } else if let Some(resolved) = constants.get(argument) {
+                    ids.insert(resolved.clone());
+                }
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn builtin_catalog_only_advertises_registered_functions() {
+        let registered = registered_function_ids();
+        assert!(
+            registered.len() > 200,
+            "only {} ids extracted; the extractor is broken, not the catalogue",
+            registered.len()
+        );
+        assert!(registered.contains("agent::code_execute"));
+
+        let mut unknown = Vec::new();
+        for card in builtin_catalog() {
+            for function in &card.functions {
+                if !registered.contains(function) {
+                    unknown.push(format!("{}: {function}", card.name));
+                }
+            }
+        }
+        assert!(
+            unknown.is_empty(),
+            "worker_picker advertises function ids that no worker registers: {unknown:#?}"
+        );
+    }
+
+    #[test]
+    fn builtin_catalog_rows_match_worker_directories() {
+        let workers = workers_directory();
+        let mut missing = Vec::new();
+        for card in builtin_catalog() {
+            if !workers.join(&card.name).is_dir() {
+                missing.push(card.name.clone());
+            }
+            assert!(
+                !card.functions.is_empty(),
+                "{} advertises no functions",
+                card.name
+            );
+        }
+        assert!(
+            missing.is_empty(),
+            "worker_picker lists workers that do not exist: {missing:?}"
+        );
     }
 }
