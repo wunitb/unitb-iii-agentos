@@ -564,6 +564,9 @@ pub(crate) trait Diagnostics {
     /// Stable names of connected non-engine workers, `None` when the engine
     /// cannot answer `engine::functions::list`.
     fn connected_worker_ids(&self) -> Option<BTreeSet<String>>;
+    /// The keys stored in a state scope, `None` when the engine cannot answer
+    /// `state::list_keys`. Read-only: `doctor` never writes state.
+    fn state_keys(&self, scope: &str) -> Option<Vec<String>>;
     /// Worker manifests plus the release binary resolved for each of them.
     fn worker_specs(&self) -> Result<Vec<WorkerSpec>>;
     /// The `agentos-tui` binary, when it is installed or built.
@@ -865,6 +868,8 @@ pub(crate) fn readiness(
         ),
     });
 
+    items.push(capability_item(probes));
+
     items.push(match probes.tui_binary() {
         Some(path) => ReadinessItem::ok("TUI", path.display().to_string()),
         None => ReadinessItem::failed(
@@ -900,6 +905,76 @@ pub(crate) fn readiness(
     });
 
     Readiness { items }
+}
+
+/// The agent id the TUI falls back to when no agent exists
+/// (`crates/tui/src/main.rs:889,1966,1724`).
+const FALLBACK_AGENT_ID: &str = "default";
+/// State scope holding one capability document per agent (CONTRACT I1:
+/// scope `capabilities`, key `<agent_id>`, value `{"tools": [...], ...}`).
+const CAPABILITY_SCOPE: &str = "capabilities";
+/// State scope holding the agent records themselves
+/// (`workers/agent-core/src/main.rs:271,296,459`).
+const AGENT_SCOPE: &str = "agents";
+
+/// Read-only report on capability documents. An agent without one has every
+/// tool call denied, which is invisible from the outside: chat simply refuses
+/// to use tools and says nothing about why.
+fn capability_item(probes: &dyn Diagnostics) -> ReadinessItem {
+    let (Some(agents), Some(capabilities)) = (
+        probes.state_keys(AGENT_SCOPE),
+        probes.state_keys(CAPABILITY_SCOPE),
+    ) else {
+        return ReadinessItem::failed(
+            "Capabilities",
+            "the engine did not answer state::list_keys",
+            "start the stack with `agentos up`, then re-run `agentos doctor`",
+        );
+    };
+
+    if agents.is_empty() {
+        return if capabilities.iter().any(|key| key == FALLBACK_AGENT_ID) {
+            ReadinessItem::ok(
+                "Capabilities",
+                format!("no agent records yet; '{FALLBACK_AGENT_ID}' has a capability document"),
+            )
+        } else {
+            ReadinessItem::failed(
+                "Capabilities",
+                format!(
+                    "no agent has a capability document; the TUI falls back to '{FALLBACK_AGENT_ID}', so every tool call for it is denied"
+                ),
+                "create an agent with `agentos agent new`, then re-run `agentos doctor`",
+            )
+        };
+    }
+
+    let missing = agents
+        .iter()
+        .filter(|agent| !capabilities.contains(agent))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        ReadinessItem::ok(
+            "Capabilities",
+            format!(
+                "{} of {} agent(s) have a capability document",
+                agents.len(),
+                agents.len()
+            ),
+        )
+    } else {
+        ReadinessItem::failed(
+            "Capabilities",
+            format!(
+                "{} of {} agent(s) have no capability document: {}; every tool call for them is denied",
+                missing.len(),
+                agents.len(),
+                missing.join(", ")
+            ),
+            "recreate them with `agentos agent new`, which writes the capability document",
+        )
+    }
 }
 
 /// Workers `up` launches and therefore expects to see on the bus: every Rust
@@ -1334,6 +1409,22 @@ fn reported_worker_ids(registry: &Value) -> Option<BTreeSet<String>> {
     )
 }
 
+/// `state::list_keys` answers `{"keys": [...]}` on iii 0.22.1 (verified against
+/// the pinned engine). `state::list` returns a bare array of *values* with no
+/// key, so it cannot answer "which agent has a document" and is not used here.
+fn reported_state_keys(response: &Value) -> Option<Vec<String>> {
+    Some(
+        response
+            .get("keys")?
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
 fn parse_registry_output(output: &[u8]) -> Option<Value> {
     serde_json::from_slice(output).ok().or_else(|| {
         let text = String::from_utf8_lossy(output);
@@ -1382,6 +1473,27 @@ impl Diagnostics for SystemEffects {
             return None;
         }
         reported_worker_ids(&parse_registry_output(&output.stdout)?)
+    }
+
+    fn state_keys(&self, scope: &str) -> Option<Vec<String>> {
+        let binary = self.engine_binary().ok()?;
+        let payload = json!({ "scope": scope }).to_string();
+        let output = std::process::Command::new(binary)
+            .args([
+                "trigger",
+                "state::list_keys",
+                "--json",
+                &payload,
+                "--timeout-ms",
+                "1000",
+            ])
+            .envs(&self.launch_env)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        reported_state_keys(&parse_registry_output(&output.stdout)?)
     }
 
     fn worker_specs(&self) -> Result<Vec<WorkerSpec>> {
@@ -1532,6 +1644,10 @@ mod tests {
         engine_start_error: Option<String>,
         /// Stable worker identities the engine reports; `None` when silent.
         connected: RefCell<Option<BTreeSet<String>>>,
+        /// Keys in state scope `agents`; `None` when the engine cannot answer.
+        agent_keys: Option<Vec<String>>,
+        /// Keys in state scope `capabilities`.
+        capability_keys: Option<Vec<String>>,
         identity_probes: Cell<usize>,
         /// Overrides `connected` from this zero-based identity probe onwards.
         connected_from_probe: Option<(usize, BTreeSet<String>)>,
@@ -1562,6 +1678,8 @@ mod tests {
                 stop_checks: Cell::new(0),
                 engine_start_error: None,
                 connected: RefCell::new(Some(ids(&["core", "memory"]))),
+                agent_keys: Some(vec!["default".to_string()]),
+                capability_keys: Some(vec!["default".to_string()]),
                 identity_probes: Cell::new(0),
                 connected_from_probe: None,
                 connected_after_start: Some(ids(&["core", "memory"])),
@@ -1633,6 +1751,14 @@ mod tests {
                 return Some(connected.clone());
             }
             None
+        }
+
+        fn state_keys(&self, scope: &str) -> Option<Vec<String>> {
+            match scope {
+                AGENT_SCOPE => self.agent_keys.clone(),
+                CAPABILITY_SCOPE => self.capability_keys.clone(),
+                other => panic!("unexpected state scope probed by doctor: {other}"),
+            }
         }
 
         fn worker_specs(&self) -> Result<Vec<WorkerSpec>> {
@@ -3030,6 +3156,102 @@ mod tests {
             connected.hint.as_deref(),
             Some("start them with `agentos up --no-tui`")
         );
+    }
+
+    #[test]
+    fn state_list_keys_shape_matches_iii_0_22_1() {
+        // Verified against the pinned engine: `state::list_keys` answers
+        // {"keys": [...]}, `state::list` answers a bare array of values, and
+        // `state::list_groups` answers {"groups": [...]}.
+        assert_eq!(
+            reported_state_keys(&json!({ "keys": ["default", "researcher"] })),
+            Some(vec!["default".to_string(), "researcher".to_string()])
+        );
+        assert_eq!(
+            reported_state_keys(&json!({ "keys": [] })),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            reported_state_keys(&json!({ "keys": ["", 7, "kept"] })),
+            Some(vec!["kept".to_string()]),
+            "non-string and empty keys must not become agent ids"
+        );
+        // The bare-array shape belongs to `state::list`; reading it as keys
+        // would silently report every agent as unprovisioned.
+        assert_eq!(reported_state_keys(&json!(["default"])), None);
+        assert_eq!(
+            reported_state_keys(&json!({ "groups": ["capabilities"] })),
+            None
+        );
+    }
+
+    #[test]
+    fn doctor_names_agents_without_a_capability_document() {
+        let config = existing_config();
+        let fake = Fake {
+            agent_keys: Some(vec!["default".to_string(), "researcher".to_string()]),
+            capability_keys: Some(vec!["default".to_string()]),
+            ..Fake::default()
+        };
+        let (report, output) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Capabilities").expect("capabilities item");
+        assert!(!item.passed);
+        assert!(item.detail.contains("researcher"), "{}", item.detail);
+        assert!(
+            item.detail.contains("every tool call for them is denied"),
+            "{}",
+            item.detail
+        );
+        assert!(output.contains("researcher"), "{output}");
+    }
+
+    #[test]
+    fn doctor_flags_the_tui_fallback_agent_when_nothing_is_provisioned() {
+        let config = existing_config();
+        let fake = Fake {
+            agent_keys: Some(Vec::new()),
+            capability_keys: Some(Vec::new()),
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Capabilities").expect("capabilities item");
+        assert!(!item.passed);
+        assert!(
+            item.detail.contains(FALLBACK_AGENT_ID),
+            "the fresh-install case must name the agent the TUI would use: {}",
+            item.detail
+        );
+        assert_eq!(
+            item.hint.as_deref(),
+            Some("create an agent with `agentos agent new`, then re-run `agentos doctor`")
+        );
+    }
+
+    #[test]
+    fn doctor_accepts_a_provisioned_fallback_agent_without_agent_records() {
+        let config = existing_config();
+        let fake = Fake {
+            agent_keys: Some(Vec::new()),
+            capability_keys: Some(vec![FALLBACK_AGENT_ID.to_string()]),
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Capabilities").expect("capabilities item");
+        assert!(item.passed, "{}", item.detail);
+    }
+
+    #[test]
+    fn doctor_reports_capabilities_as_unknown_when_the_engine_is_silent() {
+        let config = existing_config();
+        let fake = Fake {
+            agent_keys: None,
+            capability_keys: None,
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Capabilities").expect("capabilities item");
+        assert!(!item.passed);
+        assert_eq!(item.detail, "the engine did not answer state::list_keys");
     }
 
     #[test]
