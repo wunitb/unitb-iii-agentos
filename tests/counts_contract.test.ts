@@ -1,5 +1,15 @@
 import { describe, expect, it } from "bun:test";
-import { collectCounts, findDrift, publishedNumbers, workerTableSites } from "../scripts/counts";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import {
+  collectCounts,
+  collectUnresolvedRegistrations,
+  findDrift,
+  publishedNumbers,
+  rustRegistrationIds,
+  rustStringConstants,
+  workerTableSites,
+} from "../scripts/counts";
 
 /**
  * On 2026-09-02 the repository advertised 267 functions (really 293), 1,413 /
@@ -73,5 +83,77 @@ describe("published counts", () => {
     for (const site of workerTableSites()) {
       expect(site.parse(), `${site.file} still omits context-monitor`).toContain("context-monitor");
     }
+  });
+});
+
+describe("registration extractor", () => {
+  const ids = new Set(counts.functionRegistrations.map((site) => site.id));
+  const root = fileURLToPath(new URL("../", import.meta.url));
+  const read = (file: string): string => {
+    try {
+      return readFileSync(`${root}${file}`, "utf8");
+    } catch {
+      return "";
+    }
+  };
+
+  it("resolves an id declared as a Rust const or static", () => {
+    // The capability, proven without depending on which branch is checked out.
+    const source = [
+      'const STREAM_JOIN_FUNCTION: &str = "stream::authorize_join";',
+      'static TRIM_MICRO_FUNCTION_ID: &\'static str = "context::trim_micro";',
+      "fn main() {",
+      "    iii.register_function(STREAM_JOIN_FUNCTION, handler);",
+      "    iii.register_function(&TRIM_MICRO_FUNCTION_ID, handler);",
+      '    iii.register_function("agent::chat", handler);',
+      "    iii.register_function(SOME_UNKNOWN_CONST, handler);",
+      "}",
+    ].join("\n");
+
+    const constants = rustStringConstants(source);
+    expect(constants.get("STREAM_JOIN_FUNCTION")).toBe("stream::authorize_join");
+    expect(constants.get("TRIM_MICRO_FUNCTION_ID")).toBe("context::trim_micro");
+
+    expect(rustRegistrationIds(source, constants).map((found) => found.id)).toEqual([
+      "stream::authorize_join",
+      "context::trim_micro",
+      "agent::chat",
+    ]);
+  });
+
+  it("counts a const-declared id wherever the tree actually has one", () => {
+    // Bidirectional: the extractor must find what the source declares, and must
+    // not invent what it does not. Green on a branch with the worker and without.
+    for (const [file, constant, id] of [
+      ["workers/streaming/src/main.rs", "STREAM_JOIN_FUNCTION", "stream::authorize_join"],
+      ["workers/context-monitor/src/main.rs", "TRIM_MICRO_FUNCTION_ID", "context::trim_micro"],
+    ] as const) {
+      const source = read(file);
+      const registersConstant =
+        source.includes(`${constant}: &str`) && new RegExp(`register_function\\(\\s*&?${constant}`).test(source);
+      expect(ids.has(id), `${file} ${registersConstant ? "registers" : "does not register"} ${id}`).toBe(
+        registersConstant,
+      );
+    }
+  });
+
+  it("counts the Python worker's registrations", () => {
+    expect(ids, "workers/embedding/main.py registers embedding::generate").toContain("embedding::generate");
+    expect(ids, "workers/embedding/main.py registers embedding::similarity").toContain("embedding::similarity");
+    expect(
+      counts.functionRegistrations.filter((site) => site.file.endsWith(".py")).map((site) => site.file),
+    ).toEqual(["workers/embedding/main.py", "workers/embedding/main.py"]);
+  });
+
+  it("does not scan the Python worker's test file", () => {
+    expect(counts.functionRegistrations.some((site) => site.file.includes("test_"))).toBe(false);
+  });
+
+  it("leaves exactly the two runtime-built ids unresolved", () => {
+    // A new unresolved shape must fail here rather than silently shrink the count.
+    expect(collectUnresolvedRegistrations().map((site) => `${site.file}: ${site.argument}`).sort()).toEqual([
+      "crates/http-adapter/src/lib.rs: adapter_id.clone()",
+      'workers/hand-runner/src/main.rs: format!("hand::run::{hand_id}")',
+    ]);
   });
 });

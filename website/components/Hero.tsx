@@ -57,7 +57,7 @@ export default function Hero() {
             <div className="mt-12 flex items-center gap-8 text-[12px] font-mono text-fg-3">
               <span>63 workers</span>
               <span className="opacity-50">·</span>
-              <span>293 functions</span>
+              <span>295 functions</span>
               <span className="opacity-50">·</span>
               <span>1500 tests</span>
               <span className="opacity-50">·</span>
