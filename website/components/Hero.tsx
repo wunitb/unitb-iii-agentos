@@ -59,10 +59,7 @@ export default function Hero() {
               <span className="opacity-50">·</span>
               <span>295 functions</span>
               <span className="opacity-50">·</span>
-<<<<<<< HEAD
-=======
               <span>1748 tests</span>
->>>>>>> wp/manifest-parity
               <span className="opacity-50">·</span>
               <span>iii-sdk 0.22.1</span>
             </div>

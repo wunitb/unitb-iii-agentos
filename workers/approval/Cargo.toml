@@ -10,21 +10,6 @@ name = "agentos-approval"
 path = "src/main.rs"
 
 [dependencies]
-<<<<<<< HEAD
-agentos-http-adapter = { path = "../../crates/http-adapter" }
-iii-sdk = "=0.22.1"
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-chrono = { version = "0.4", features = ["serde"] }
-
-[dev-dependencies]
-agentos-http-adapter = { path = "../../crates/http-adapter", features = ["fake-bus"] }
-=======
 agentos-http-adapter.workspace = true
 iii-sdk.workspace = true
 tokio.workspace = true
@@ -35,4 +20,6 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
->>>>>>> wp/manifest-parity
+
+[dev-dependencies]
+agentos-http-adapter = { workspace = true, features = ["fake-bus"] }
