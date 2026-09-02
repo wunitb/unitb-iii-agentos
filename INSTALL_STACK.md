@@ -240,6 +240,29 @@ COMPOSE_RUNTIME="${COMPOSE_RUNTIME:-podman}"
 With Clawith running, open `http://127.0.0.1:3008`, sign in, create/select an agent, and send a chat
 message. Do not accept `[object Object]` or `COULD NOT CREATE THE SESSION` as a successful smoke test.
 
+## Upgrading an existing install
+
+`bash scripts/install.sh` (or the `curl … | bash` one-liner) adopts your `config/`, `config.yaml`, `data/`
+and `.env`, and then re-applies the parts of the configuration the release governs, so a security fix
+reaches a box that was installed before it:
+
+- `config/shell.yaml`, `config/iii-stream.yaml` and `config/console.yaml` are replaced with the release
+  copies. An operator edit to those three files does not survive an upgrade, by design.
+- `- name: shell`, `- name: harness` and `- name: console` are removed from your `config.yaml` if present,
+  with their indented blocks. The installer prints what it removed and keeps your original at
+  `config.yaml.bak`. Every other entry, including workers you added, is left untouched.
+- `- name: iii-worker-manager` is added, or its `host` forced to `127.0.0.1`, keeping any other keys you set
+  on it. Without that entry the engine appends the worker itself with a `0.0.0.0` bind, which exposes the
+  bus to the LAN and the tailnet.
+- Nothing is rewritten when your `config.yaml` already satisfies all of the above, and a `config.yaml` with
+  no `workers:` roster is not touched at all.
+
+**Bus RBAC is not armed for you.** The `rbac:` block and the `iii-bridge` entry are additions to
+`config.yaml`, not corrections to it, and inserting a nested block into a file the operator owns is not
+something the installer will guess at. An upgraded install keeps the pre-RBAC behaviour until you copy both
+blocks from the release's `config.yaml` yourself. `./target/release/agentos doctor` tells you which state
+you are in on its `Bus auth` line, and `agentos up` starts the daemon as soon as the gate is armed.
+
 ## Updates
 
 ```bash

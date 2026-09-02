@@ -346,6 +346,7 @@ workers:
       host_roots:
         - ${III_COMPOSE_DIR:.}
       allow_unjailed: true
+  - name: harness
   - name: console
   - name: operator-worker
 user: true
@@ -360,6 +361,9 @@ OPERATOR
   fi
   if grep -Eq '^[[:space:]]*-[[:space:]]*name:[[:space:]]*console[[:space:]]*$' "$config"; then
     fail "unsafe_entries: the console worker entry survived the upgrade"
+  fi
+  if grep -Eq '^[[:space:]]*-[[:space:]]*name:[[:space:]]*harness[[:space:]]*$' "$config"; then
+    fail "unsafe_entries: the harness worker entry survived the upgrade"
   fi
   if grep -q 'allow_unjailed: true' "$config"; then
     fail "unsafe_entries: the shell entry's inline block survived the upgrade"

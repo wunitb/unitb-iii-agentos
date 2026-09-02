@@ -75,10 +75,12 @@ adopt_runtime_state() {
 RELEASE_GOVERNED_PATHS=(config/shell.yaml config/iii-stream.yaml config/console.yaml)
 
 # Worker entries the release stopped booting on purpose. `shell` puts
-# shell::exec/coder::* on the bus; `console` (1.9.16) has no host key, so it
-# binds 0.0.0.0 and proxies /ws to that same unauthenticated bus. An adopted
-# config.yaml that still lists them would carry the hole across the upgrade.
-UNSAFE_WORKER_ENTRIES=(shell console)
+# shell::exec/coder::* on the bus; `harness` starts autonomous agent turns
+# (harness::send/spawn) and drives coder::*/shell::* through the same bus;
+# `console` (1.9.16) has no host key, so it binds 0.0.0.0 and proxies /ws to
+# that bus. An adopted config.yaml that still lists them would carry the hole
+# across the upgrade.
+UNSAFE_WORKER_ENTRIES=(shell harness console)
 
 # Drops one `- name: <worker>` list entry and the block indented under it,
 # leaving every other line untouched.
