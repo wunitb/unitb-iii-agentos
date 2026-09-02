@@ -12,9 +12,9 @@ function git(...args: string[]) {
 }
 
 const reconciledArtifacts = [
-  {
-    path: "docs/builds/10013-reconcile-feat-herdr-omp-fleet-with-main-so-that/INVARIANTS.md",
-  },
+  // The build-artifact directories that used to be asserted here moved out of this
+  // public repository on 2026-09-02: they are a record of how work was produced,
+  // not of what the product does. The delivered CONTENT is still pinned below.
   { path: "docs/decisions/2026-08-22-salvage-batch.md" },
   { path: "workers/llm-router/src/main.rs", requiredContent: "agentos::llm" },
   { path: "crates/cli/src/bootstrap.rs", requiredContent: "connected_worker_ids" },

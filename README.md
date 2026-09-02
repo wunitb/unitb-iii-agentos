@@ -306,13 +306,14 @@ website/         agentsos.sh — design.md aesthetic, three themes
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full primitive flow and worker manifest spec.
 
-## § 09 · Development control plane
+## § 09 · How changes reach this repository
 
-Repository changes enter as **control-room directives** and are built by the **sweafax** factory; nothing in this repository launches an agent session itself.
+Nothing in this repository launches an agent session of its own, and no work is merged that the repository's own gates have not passed.
 
-1. Intent: a directive records the verbatim request and its acceptance criteria (ISC) in `unitb-control-room` (`cr new --from-sweafax <intake.json>`).
-2. Execution: `cr dispatch <directive> --engine sweafax --spec <intake.json>` registers a sweafax build from the intake's `base_branch`; sweafax runs implementation, verification, the artifact gate (`docs/builds/<build>-<slug>/{INVARIANTS,TRACES,DECISIONS,ATTACK_SURFACE}.md`, `bunx tsc --noEmit`, `bun test`) and a cross-vendor audit. `cr sync` follows the build's state.
-3. Delivery: after audit approval the result branch (`issue/<id>-…`) is pushed by the maintainer and merged through a pull request. `main` is protected; there is no direct push path.
+1. **Intent** is recorded by the maintainer.
+2. **Execution** is fanned out to parallel git worktrees — one branch per work package, with a written file-ownership contract so two packages never edit the same file. A package that needs a change in someone else's file files a request instead of editing it. Each package runs the gates for the crates it touched before it reports.
+3. **Integration** merges the packages into one branch and re-runs the complete gate set on the merged tree: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo build --workspace --release`, `bun run test:unit`, `bun run test:governance`, `bun run counts:check`, `bun run typecheck`. Per-package green is not evidence; the merged tree is.
+4. **Delivery** is a pull request. `main` is protected, takes no direct push, and requires the CI checks to pass before a merge.
 
 ## § 10 · TUI
 

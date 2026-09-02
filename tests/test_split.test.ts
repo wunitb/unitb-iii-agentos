@@ -5,7 +5,8 @@ import { join } from "node:path";
 /**
  * `test:unit` used to run 76 tests, 37 of which asserted on markdown under
  * `docs/builds/` and on README prose. That made a green suite look like product
- * coverage it did not have. The suites are now split: `test:unit` is tests of the
+ * coverage it did not have. (`docs/builds/` itself left this repository on
+ * 2026-09-02 — it recorded how work was produced, not what the product does.) The suites are now split: `test:unit` is tests of the
  * software, `test:governance` is build-evidence and documentation contracts, and
  * CI runs both as separate steps.
  *
@@ -83,7 +84,6 @@ describe("test suite split", () => {
 
   it("routes governance evidence out of the software suite", () => {
     const governance = files.filter((file) => covers(governanceScript, file));
-    expect(governance).toContain("tests/governance/artifact_contract.test.ts");
     expect(governance).toContain("tests/governance/reconciliation_contract.test.ts");
     expect(governance).toContain("tests/governance/quickstart.test.ts");
     for (const file of governance) {

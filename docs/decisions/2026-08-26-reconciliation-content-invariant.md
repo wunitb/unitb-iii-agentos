@@ -16,8 +16,6 @@ again on the delivered result branch.
 
 The contract now reads the following committed blobs directly from `HEAD`:
 
-- non-empty
-  `docs/builds/10013-reconcile-feat-herdr-omp-fleet-with-main-so-that/INVARIANTS.md`;
 - non-empty `docs/decisions/2026-08-22-salvage-batch.md`;
 - `workers/llm-router/src/main.rs`, containing `agentos::llm`; and
 - `crates/cli/src/bootstrap.rs`, containing `connected_worker_ids`.
@@ -26,3 +24,12 @@ These checks enforce the old invariant's intent by testing the delivered
 salvage evidence, namespace migration, and fail-closed startup implementation.
 Unlike branch names and pre-squash ancestry, those committed contents disappear
 when the reconciled work is removed, causing the contract to fail.
+
+
+## Amendment 2026-09-02
+
+The `docs/builds/…/INVARIANTS.md` entry was dropped when `docs/builds/` left this
+repository. Those directories recorded how work was produced, not what the product
+does, and a public product repository is the wrong home for them; they are archived
+outside the repo. The remaining three checks still enforce the invariant's intent —
+delivered content, not reachable history — so the contract is unchanged in substance.

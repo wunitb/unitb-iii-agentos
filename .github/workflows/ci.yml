@@ -115,8 +115,8 @@ jobs:
       - name: run Node unit suite
         run: bun run test:unit
 
-      # Governance evidence (docs/builds artifact contracts, README bootstrap
-      # contract, reconciled-history contract) is real, but it is not a test of
+      # Governance evidence (README bootstrap contract, reconciled-history
+      # contract, removed-dependency guard) is real, but it is not a test of
       # the software. It runs as its own gate so `test:unit` keeps meaning
       # "tests of the product".
       - name: run governance evidence suite
