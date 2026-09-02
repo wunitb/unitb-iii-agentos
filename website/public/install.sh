@@ -103,6 +103,96 @@ strip_worker_entry() {
   '
 }
 
+# The engine's own WebSocket bus. It is mandatory: when config.yaml does not
+# declare it the engine appends it with the default config, whose host is
+# 0.0.0.0, so the bus - which carries every AgentOS function and has no
+# authentication of its own - becomes reachable from the LAN and the tailnet.
+# Pinning it to loopback is what keeps the HTTP perimeter meaningful.
+BUS_WORKER=iii-worker-manager
+BUS_HOST=127.0.0.1
+
+# Forces `host: <BUS_HOST>` on the bus worker entry, preserving every other key
+# in its config block. Idempotent: adds the entry, the `config:` mapping, or the
+# `host:` key only when that piece is missing.
+ensure_bus_binding() {
+  local item_indent="$1"
+  local has_entry="$2"
+  awk -v worker="$BUS_WORKER" -v host="$BUS_HOST" -v item_indent="$item_indent" \
+      -v inserted="$has_entry" '
+    function pad(width,   out) { out = ""; while (length(out) < width) out = out " "; return out }
+    function close_entry(   child) {
+      if (state == 1) {
+        print pad(entry_indent + 2) "config:"
+        print pad(entry_indent + 4) "host: " host
+      } else if (state == 2 && !host_seen) {
+        child = (config_child_indent > 0) ? config_child_indent : config_indent + 2
+        print pad(child) "host: " host
+      }
+      state = 0
+      host_seen = 0
+      config_child_indent = 0
+    }
+    BEGIN { state = 0; host_seen = 0; config_child_indent = 0 }
+    {
+      line = $0
+      match(line, /^[ \t]*/)
+      indent = RLENGTH
+      if (state > 0 && line !~ /^[ \t]*$/ && indent <= entry_indent) close_entry()
+
+      if (state == 2 && line !~ /^[ \t]*$/) {
+        if (indent > config_indent) {
+          if (config_child_indent == 0) config_child_indent = indent
+          if (line ~ /^[ \t]*host[ \t]*:/) {
+            print pad(indent) "host: " host
+            host_seen = 1
+            next
+          }
+        } else {
+          if (!host_seen) print pad(config_child_indent > 0 ? config_child_indent : config_indent + 2) "host: " host
+          host_seen = 1
+          state = 1
+        }
+      }
+
+      if (state == 1 && line ~ /^[ \t]*config[ \t]*:[ \t]*$/ && indent > entry_indent) {
+        state = 2
+        config_indent = indent
+        print line
+        next
+      }
+
+      if (line ~ "^[ \t]*-[ \t]*name:[ \t]*" worker "[ \t]*$") {
+        state = 1
+        entry_indent = indent
+        print line
+        next
+      }
+
+      print line
+
+      if (!inserted && line ~ /^[ \t]*workers[ \t]*:[ \t]*$/) {
+        print pad(item_indent) "- name: " worker
+        print pad(item_indent + 2) "config:"
+        print pad(item_indent + 4) "host: " host
+        inserted = 1
+      }
+      next
+    }
+    END { close_entry() }
+  '
+}
+
+# Indentation of the first `- ` item under `workers:`, so an inserted entry
+# joins the existing sequence instead of starting a second, invalid one.
+workers_item_indent() {
+  awk '
+    BEGIN { in_workers = 0 }
+    /^[ \t]*workers[ \t]*:[ \t]*$/ { in_workers = 1; next }
+    in_workers && /^[ \t]*-/ { match($0, /^[ \t]*/); print RLENGTH; exit }
+    in_workers && /^[^ \t]/ { exit }
+  '
+}
+
 apply_release_security_defaults() {
     local release_runtime="$1"
     local installed_runtime="$2"
@@ -110,7 +200,8 @@ apply_release_security_defaults() {
     local worker
     local config="$installed_runtime/config.yaml"
     local removed=""
-    local stripped
+    local item_indent
+    local updated
 
     for relative_path in "${RELEASE_GOVERNED_PATHS[@]}"; do
         if [ -f "$release_runtime/$relative_path" ]; then
@@ -120,20 +211,44 @@ apply_release_security_defaults() {
     done
 
     [ -f "$config" ] || return 0
+    # Only a file that really declares a worker roster is an engine config; an
+    # unrelated operator YAML is left byte-for-byte alone.
+    grep -Eq '^[[:space:]]*workers[[:space:]]*:[[:space:]]*$' "$config" || return 0
+
+    if grep -Eq "^[[:space:]]*-[[:space:]]*name:[[:space:]]*${BUS_WORKER}[[:space:]]*$" "$config" &&
+        grep -Eq "^[[:space:]]*config[[:space:]]*:[[:space:]]*[^[:space:]]" "$config"; then
+        warn "${config}: ${BUS_WORKER} uses an inline config mapping; leaving it untouched"
+        warn "  set 'host: ${BUS_HOST}' on it by hand, or the engine bus binds 0.0.0.0"
+    fi
+
+    updated="$(cat "$config")"
     for worker in "${UNSAFE_WORKER_ENTRIES[@]}"; do
         if grep -Eq "^[[:space:]]*-[[:space:]]*name:[[:space:]]*${worker}[[:space:]]*$" "$config"; then
             removed="${removed}${removed:+, }${worker}"
         fi
+        updated="$(printf '%s\n' "$updated" | strip_worker_entry "$worker")"
     done
-    [ -n "$removed" ] || return 0
+    item_indent="$(printf '%s\n' "$updated" | workers_item_indent)"
+    [ -n "$item_indent" ] || item_indent=2
+    if printf '%s\n' "$updated" |
+        grep -Eq "^[[:space:]]*-[[:space:]]*name:[[:space:]]*${BUS_WORKER}[[:space:]]*$"; then
+        updated="$(printf '%s\n' "$updated" | ensure_bus_binding "$item_indent" 1)"
+    else
+        updated="$(printf '%s\n' "$updated" | ensure_bus_binding "$item_indent" 0)"
+    fi
+
+    if [ "$updated" = "$(cat "$config")" ]; then
+        return 0
+    fi
 
     cp "$config" "$config.bak"
-    for worker in "${UNSAFE_WORKER_ENTRIES[@]}"; do
-        stripped="$(strip_worker_entry "$worker" < "$config")" || return 1
-        printf '%s\n' "$stripped" > "$config"
-    done
-    warn "Removed release-governed worker entries from ${config}: ${removed}"
-    warn "  they expose an arbitrary-command sink and a 0.0.0.0 web console on an unauthenticated bus"
+    printf '%s\n' "$updated" > "$config"
+    if [ -n "$removed" ]; then
+        warn "Removed release-governed worker entries from ${config}: ${removed}"
+        warn "  they expose an arbitrary-command sink and a 0.0.0.0 web console on an unauthenticated bus"
+    fi
+    warn "Pinned ${BUS_WORKER} to host ${BUS_HOST} in ${config}"
+    warn "  an undeclared or unpinned bus worker binds 0.0.0.0, which is a remote unauthenticated bus"
     warn "  your previous file is kept at ${config}.bak; every other entry was left untouched"
 }
 
