@@ -213,15 +213,39 @@ suite("AgentOS full-stack E2E", () => {
   });
 
   it("agentos::llm::route — resolves default and explicit model contracts", async () => {
-    const automatic = await call<{ provider: string; model: string }>(
-      "agentos::llm::route",
-      {
+    // Automatic routing now answers with a provider whose credential is really
+    // present, or refuses with `provider_credential_missing`. It must never do
+    // what it used to: name Anthropic on a stack with no credential at all and
+    // let the caller discover the truth as a 401 from the provider.
+    const providers = await call<
+      { providers: { name: string; env_key: string; configured: boolean }[] }
+    >("agentos::llm::providers", {});
+    // Keyless providers (ollama) report `configured` but are never selected
+    // automatically: they also need a server running on this machine.
+    const available = providers.providers.filter(
+      (provider) => provider.configured && provider.env_key.length > 0,
+    );
+
+    let automatic: { provider: string; model: string } | null = null;
+    let refusal = "";
+    try {
+      automatic = await call<{ provider: string; model: string }>("agentos::llm::route", {
         messages: [{ role: "user", content: "hi" }],
         tools: [],
-      },
-    );
-    expect(automatic.provider.length).toBeGreaterThan(0);
-    expect(automatic.model.length).toBeGreaterThan(0);
+      });
+    } catch (error) {
+      refusal = error instanceof Error ? error.message : String(error);
+    }
+
+    if (available.length === 0) {
+      expect(automatic).toBeNull();
+      expect(refusal).toContain("provider_credential_missing");
+      expect(refusal).toContain("in the active .env");
+    } else {
+      expect(automatic).not.toBeNull();
+      expect(automatic?.model.length).toBeGreaterThan(0);
+      expect(available.map((provider) => provider.name)).toContain(automatic?.provider);
+    }
 
     const haiku = await call<{ provider: string; model: string }>("agentos::llm::route", {
       messages: [{ role: "user", content: "x" }],

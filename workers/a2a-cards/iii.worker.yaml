@@ -5,4 +5,4 @@ scripts:
 name: a2a-cards
 runtime:
   kind: rust
-description: A2A agent card discovery — generate, list, and serve agent cards for the .well-known/agent.json protocol
+description: A2A agent card discovery — generate and list agent cards, and serve a catalogue copy of the discovery document at GET /api/a2a/agent-card (the spec path /.well-known/agent.json belongs to the a2a worker)

@@ -50,6 +50,7 @@ dependencies = [
 name = "agentos-a2a"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -68,6 +69,7 @@ dependencies = [
 name = "agentos-a2a-cards"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -84,6 +86,7 @@ dependencies = [
 name = "agentos-approval"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -100,6 +103,7 @@ dependencies = [
 name = "agentos-approval-tiers"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -116,6 +120,7 @@ dependencies = [
 name = "agentos-bridge"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -133,6 +138,7 @@ dependencies = [
 name = "agentos-browser"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -147,9 +153,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentos-bus-auth"
+version = "0.1.0"
+dependencies = [
+ "agentos-http-adapter",
+ "anyhow",
+ "futures-util",
+ "iii-sdk",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "agentos-channel-bluesky"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -166,6 +190,7 @@ dependencies = [
 name = "agentos-channel-discord"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
@@ -181,6 +206,7 @@ dependencies = [
 name = "agentos-channel-email"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "hex",
@@ -198,6 +224,7 @@ dependencies = [
 name = "agentos-channel-linkedin"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "hex",
@@ -216,6 +243,7 @@ dependencies = [
 name = "agentos-channel-mastodon"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
@@ -231,6 +259,7 @@ dependencies = [
 name = "agentos-channel-matrix"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
@@ -247,6 +276,7 @@ dependencies = [
 name = "agentos-channel-reddit"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
@@ -262,6 +292,7 @@ dependencies = [
 name = "agentos-channel-signal"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
@@ -277,6 +308,7 @@ dependencies = [
 name = "agentos-channel-slack"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "hex",
@@ -295,6 +327,7 @@ dependencies = [
 name = "agentos-channel-teams"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
@@ -310,6 +343,7 @@ dependencies = [
 name = "agentos-channel-telegram"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
@@ -325,6 +359,7 @@ dependencies = [
 name = "agentos-channel-twitch"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "hex",
@@ -343,6 +378,7 @@ dependencies = [
 name = "agentos-channel-webex"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
@@ -358,6 +394,7 @@ dependencies = [
 name = "agentos-channel-whatsapp"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "hex",
@@ -400,6 +437,7 @@ dependencies = [
 name = "agentos-code-agent"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "anyhow",
  "iii-sdk",
  "regex",
@@ -415,6 +453,7 @@ dependencies = [
 name = "agentos-context-cache"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -432,6 +471,7 @@ dependencies = [
 name = "agentos-context-manager"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -448,6 +488,7 @@ dependencies = [
 name = "agentos-context-monitor"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -464,6 +505,7 @@ dependencies = [
 name = "agentos-coordination"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -480,6 +522,7 @@ dependencies = [
 name = "agentos-core"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
@@ -495,6 +538,7 @@ dependencies = [
 name = "agentos-council"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -515,6 +559,7 @@ dependencies = [
 name = "agentos-cron"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -531,6 +576,7 @@ dependencies = [
 name = "agentos-directive"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -547,6 +593,7 @@ dependencies = [
 name = "agentos-eval"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -563,6 +610,7 @@ dependencies = [
 name = "agentos-evolve"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -579,6 +627,7 @@ dependencies = [
 name = "agentos-feedback"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -595,6 +644,7 @@ dependencies = [
 name = "agentos-hand-runner"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -611,6 +661,7 @@ dependencies = [
 name = "agentos-hashline"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -627,6 +678,7 @@ dependencies = [
 name = "agentos-hierarchy"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
@@ -642,6 +694,7 @@ dependencies = [
 name = "agentos-hooks"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -661,12 +714,14 @@ dependencies = [
  "iii-sdk",
  "serde_json",
  "subtle",
+ "tokio",
 ]
 
 [[package]]
 name = "agentos-ledger"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -683,6 +738,7 @@ dependencies = [
 name = "agentos-llm-router"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "dashmap",
@@ -699,6 +755,7 @@ dependencies = [
 name = "agentos-loop-guard"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "anyhow",
  "chrono",
  "hex",
@@ -715,6 +772,7 @@ dependencies = [
 name = "agentos-lsp-tools"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
@@ -730,6 +788,7 @@ dependencies = [
 name = "agentos-mcp-client"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -748,6 +807,7 @@ dependencies = [
 name = "agentos-memory"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
@@ -764,6 +824,7 @@ dependencies = [
 name = "agentos-mission"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -782,6 +843,7 @@ dependencies = [
 name = "agentos-orchestrator"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -798,6 +860,7 @@ dependencies = [
 name = "agentos-pulse"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -814,6 +877,7 @@ dependencies = [
 name = "agentos-rate-limiter"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -829,6 +893,7 @@ dependencies = [
 name = "agentos-realm"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -845,6 +910,7 @@ dependencies = [
 name = "agentos-security"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "dashmap",
@@ -866,6 +932,7 @@ dependencies = [
 name = "agentos-security-headers"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
@@ -882,6 +949,7 @@ dependencies = [
 name = "agentos-security-map"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "ed25519-dalek",
@@ -902,6 +970,7 @@ dependencies = [
 name = "agentos-security-zeroize"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "anyhow",
  "dashmap",
  "iii-sdk",
@@ -918,6 +987,7 @@ dependencies = [
 name = "agentos-session-lifecycle"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -934,6 +1004,7 @@ dependencies = [
 name = "agentos-session-replay"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -950,6 +1021,7 @@ dependencies = [
 name = "agentos-skill-security"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "base64 0.23.1",
@@ -968,6 +1040,7 @@ dependencies = [
 name = "agentos-skillkit-bridge"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
@@ -982,6 +1055,7 @@ dependencies = [
 name = "agentos-streaming"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -998,6 +1072,7 @@ dependencies = [
 name = "agentos-swarm"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -1014,6 +1089,7 @@ dependencies = [
 name = "agentos-task-decomposer"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -1030,6 +1106,7 @@ dependencies = [
 name = "agentos-telemetry"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
@@ -1064,6 +1141,7 @@ name = "agentos-vault"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "base64 0.23.1",
@@ -1083,6 +1161,7 @@ dependencies = [
 name = "agentos-wasm-sandbox"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "dashmap",
@@ -1099,13 +1178,16 @@ dependencies = [
 name = "agentos-workflow"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
  "chrono",
+ "hex",
  "iii-sdk",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "tracing-subscriber",

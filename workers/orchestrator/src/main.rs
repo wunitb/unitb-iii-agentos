@@ -1,7 +1,5 @@
 use iii_sdk::errors::Error;
-use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
-};
+use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -96,6 +94,10 @@ async fn state_set(iii: &IIIClient, scope: &str, key: &str, value: Value) -> Res
     .map_err(|e| Error::Handler(e.to_string()))
 }
 
+/// `state::list` answers a bare array of the stored values themselves: there
+/// is no `{key, value}` envelope, so the entries are used as they arrive.
+/// Unwrapping a `value` field here would truncate any document that carries
+/// one - which the workspace entries below do.
 async fn state_list(iii: &IIIClient, scope: &str) -> Vec<Value> {
     iii.trigger(TriggerRequest {
         function_id: "state::list".into(),
@@ -107,6 +109,42 @@ async fn state_list(iii: &IIIClient, scope: &str) -> Vec<Value> {
     .ok()
     .and_then(|v| v.as_array().cloned())
     .unwrap_or_default()
+}
+
+/// One workspace entry as it is stored. It carries a literal `value` field,
+/// which is exactly why the list reader must not unwrap one.
+fn workspace_entry(key: &str, value: Value, written_by: &str, written_at: i64) -> Value {
+    json!({
+        "key": key,
+        "value": value,
+        "writtenBy": written_by,
+        "writtenAt": written_at,
+    })
+}
+
+fn workspace_read_response(plan_id: &str, entries: Vec<Value>) -> Value {
+    json!({
+        "planId": plan_id,
+        "count": entries.len(),
+        "entries": entries,
+    })
+}
+
+fn plan_summary(plan: &Value) -> Value {
+    json!({
+        "id": plan.get("id"),
+        "status": plan.get("status"),
+        "complexity": plan.get("complexity"),
+        "createdAt": plan.get("createdAt"),
+    })
+}
+
+fn task_progress(tasks: &[Value]) -> (usize, usize, usize) {
+    let status_is =
+        |task: &Value, wanted: &str| task.get("status").and_then(|v| v.as_str()) == Some(wanted);
+    let completed = tasks.iter().filter(|t| status_is(t, "complete")).count();
+    let failed = tasks.iter().filter(|t| status_is(t, "failed")).count();
+    (tasks.len(), completed, failed)
 }
 
 async fn plan_handler(iii: &IIIClient, input: Value) -> Result<Value, Error> {
@@ -330,18 +368,7 @@ async fn status_handler(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
     let Some(plan_id) = plan_id else {
         let plans = state_list(iii, "orchestrator_plans").await;
-        let summaries: Vec<Value> = plans
-            .into_iter()
-            .map(|p| {
-                let p = p.get("value").cloned().unwrap_or(p);
-                json!({
-                    "id": p.get("id"),
-                    "status": p.get("status"),
-                    "complexity": p.get("complexity"),
-                    "createdAt": p.get("createdAt"),
-                })
-            })
-            .collect();
+        let summaries: Vec<Value> = plans.iter().map(plan_summary).collect();
         let count = summaries.len();
         return Ok(json!({ "count": count, "plans": summaries }));
     };
@@ -360,20 +387,8 @@ async fn status_handler(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
     let root_id = run.get("rootId").and_then(|v| v.as_str()).unwrap_or("");
     let task_scope = format!("tasks:{root_id}");
-    let task_entries = state_list(iii, &task_scope).await;
-    let tasks: Vec<Value> = task_entries
-        .into_iter()
-        .map(|e| e.get("value").cloned().unwrap_or(e))
-        .collect();
-    let total = tasks.len();
-    let completed = tasks
-        .iter()
-        .filter(|t| t.get("status").and_then(|v| v.as_str()) == Some("complete"))
-        .count();
-    let failed = tasks
-        .iter()
-        .filter(|t| t.get("status").and_then(|v| v.as_str()) == Some("failed"))
-        .count();
+    let tasks = state_list(iii, &task_scope).await;
+    let (total, completed, failed) = task_progress(&tasks);
     let percentage = if total > 0 {
         (completed as f64 / total as f64 * 100.0).round() as i64
     } else {
@@ -556,12 +571,7 @@ async fn workspace_write_handler(iii: &IIIClient, input: Value) -> Result<Value,
         None => "system".to_string(),
     };
 
-    let entry = json!({
-        "key": &safe_key,
-        "value": value,
-        "writtenBy": written_by,
-        "writtenAt": now_ms(),
-    });
+    let entry = workspace_entry(&safe_key, value, &written_by, now_ms());
 
     let scope = format!("workspace:{safe_plan_id}");
     state_set(iii, &scope, &safe_key, entry).await?;
@@ -586,18 +596,13 @@ async fn workspace_read_handler(iii: &IIIClient, input: Value) -> Result<Value, 
         return Ok(entry);
     }
 
+    // Each workspace entry is stored as `{key, value, writtenBy, writtenAt}`.
+    // `state::list` returns those documents verbatim, so unwrapping a `value`
+    // field would drop the key and the provenance and would disagree with the
+    // single-key read above, which returns the whole entry.
     let entries = state_list(iii, &scope).await;
-    let count = entries.len();
-    let mapped: Vec<Value> = entries
-        .into_iter()
-        .map(|e| e.get("value").cloned().unwrap_or(e))
-        .collect();
 
-    Ok(json!({
-        "planId": safe_plan_id,
-        "count": count,
-        "entries": mapped,
-    }))
+    Ok(workspace_read_response(&safe_plan_id, entries))
 }
 
 #[tokio::main]
@@ -605,7 +610,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let iii_clone = iii.clone();
     iii.register_function(
@@ -726,5 +731,71 @@ mod tests {
             "workspace:abc-123"
         );
         assert_eq!(validate_id("plan_1.0").unwrap(), "plan_1.0");
+    }
+
+    // --- state::list protocol (verified against iii 0.22.1) ---
+
+    #[test]
+    fn a_workspace_entry_survives_the_round_trip_through_state_list() {
+        // `state::list` answers a bare array of the stored documents. A
+        // workspace entry has a literal `value` field, so the old
+        // `entry["value"]` unwrap threw away the key and the provenance and
+        // disagreed with the single-key read, which returns the whole entry.
+        let stored = workspace_entry(
+            "notes",
+            json!({ "text": "hi" }),
+            "agent-1",
+            1_700_000_000_000,
+        );
+        let response = workspace_read_response("plan-1", vec![stored.clone()]);
+
+        assert_eq!(response["count"], 1);
+        assert_eq!(response["entries"][0], stored);
+        assert_eq!(response["entries"][0]["key"], "notes");
+        assert_eq!(response["entries"][0]["writtenBy"], "agent-1");
+        assert_eq!(response["entries"][0]["writtenAt"], 1_700_000_000_000i64);
+        assert_eq!(response["entries"][0]["value"], json!({ "text": "hi" }));
+    }
+
+    #[test]
+    fn the_old_unwrap_would_have_dropped_the_workspace_provenance() {
+        let stored = workspace_entry("notes", json!({ "text": "hi" }), "agent-1", 1);
+        let old_read = stored.get("value").cloned().unwrap_or(stored.clone());
+        assert_eq!(old_read, json!({ "text": "hi" }));
+        assert!(old_read.get("writtenBy").is_none());
+    }
+
+    #[test]
+    fn plan_summaries_are_read_from_bare_list_entries() {
+        let plan = json!({
+            "id": "plan-1",
+            "status": "running",
+            "complexity": "high",
+            "createdAt": 42,
+            "steps": ["a"],
+        });
+        let summary = plan_summary(&plan);
+        assert_eq!(summary["id"], "plan-1");
+        assert_eq!(summary["status"], "running");
+        assert_eq!(summary["complexity"], "high");
+        assert_eq!(summary["createdAt"], 42);
+        assert!(summary.get("steps").is_none());
+    }
+
+    #[test]
+    fn task_progress_counts_bare_list_entries() {
+        let tasks = vec![
+            json!({ "status": "complete" }),
+            json!({ "status": "failed" }),
+            json!({ "status": "pending" }),
+        ];
+        assert_eq!(task_progress(&tasks), (3, 1, 1));
+        assert_eq!(task_progress(&[]), (0, 0, 0));
+    }
+
+    #[test]
+    fn task_progress_sees_nothing_in_the_envelope_this_worker_used_to_expect() {
+        let enveloped = vec![json!({ "key": "t1", "value": { "status": "complete" } })];
+        assert_eq!(task_progress(&enveloped), (1, 0, 0));
     }
 }

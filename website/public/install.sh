@@ -70,17 +70,188 @@ adopt_runtime_state() {
   done
 }
 
+# Security policy files are release-governed, not operator overrides: an upgrade
+# must be able to close a hole on a box that was installed before the fix.
+RELEASE_GOVERNED_PATHS=(config/shell.yaml config/iii-stream.yaml config/console.yaml)
+
+# Worker entries the release stopped booting on purpose. `shell` puts
+# shell::exec/coder::* on the bus; `harness` starts autonomous agent turns
+# (harness::send/spawn) and drives coder::*/shell::* through the same bus;
+# `console` (1.9.16) has no host key, so it binds 0.0.0.0 and proxies /ws to
+# that bus. An adopted config.yaml that still lists them would carry the hole
+# across the upgrade.
+UNSAFE_WORKER_ENTRIES=(shell harness console)
+
+# Drops one `- name: <worker>` list entry and the block indented under it,
+# leaving every other line untouched.
+strip_worker_entry() {
+  awk -v worker="$1" '
+    BEGIN { skip = 0; entry_indent = 0 }
+    {
+      if (skip) {
+        if ($0 ~ /^[ \t]*$/) { print; next }
+        match($0, /^[ \t]*/)
+        if (RLENGTH > entry_indent) { next }
+        skip = 0
+      }
+      if ($0 ~ "^[ \t]*-[ \t]*name:[ \t]*" worker "[ \t]*$") {
+        match($0, /^[ \t]*/)
+        entry_indent = RLENGTH
+        skip = 1
+        next
+      }
+      print
+    }
+  '
+}
+
+# The engine's own WebSocket bus. It is mandatory: when config.yaml does not
+# declare it the engine appends it with the default config, whose host is
+# 0.0.0.0, so the bus - which carries every AgentOS function and has no
+# authentication of its own - becomes reachable from the LAN and the tailnet.
+# Pinning it to loopback is what keeps the HTTP perimeter meaningful.
+BUS_WORKER=iii-worker-manager
+BUS_HOST=127.0.0.1
+
+# Forces `host: <BUS_HOST>` on the bus worker entry, preserving every other key
+# in its config block. Idempotent: adds the entry, the `config:` mapping, or the
+# `host:` key only when that piece is missing.
+ensure_bus_binding() {
+  local item_indent="$1"
+  local has_entry="$2"
+  awk -v worker="$BUS_WORKER" -v host="$BUS_HOST" -v item_indent="$item_indent" \
+      -v inserted="$has_entry" '
+    function pad(width,   out) { out = ""; while (length(out) < width) out = out " "; return out }
+    function close_entry(   child) {
+      if (state == 1) {
+        print pad(entry_indent + 2) "config:"
+        print pad(entry_indent + 4) "host: " host
+      } else if (state == 2 && !host_seen) {
+        child = (config_child_indent > 0) ? config_child_indent : config_indent + 2
+        print pad(child) "host: " host
+      }
+      state = 0
+      host_seen = 0
+      config_child_indent = 0
+    }
+    BEGIN { state = 0; host_seen = 0; config_child_indent = 0 }
+    {
+      line = $0
+      match(line, /^[ \t]*/)
+      indent = RLENGTH
+      if (state > 0 && line !~ /^[ \t]*$/ && indent <= entry_indent) close_entry()
+
+      if (state == 2 && line !~ /^[ \t]*$/) {
+        if (indent > config_indent) {
+          if (config_child_indent == 0) config_child_indent = indent
+          if (line ~ /^[ \t]*host[ \t]*:/) {
+            print pad(indent) "host: " host
+            host_seen = 1
+            next
+          }
+        } else {
+          if (!host_seen) print pad(config_child_indent > 0 ? config_child_indent : config_indent + 2) "host: " host
+          host_seen = 1
+          state = 1
+        }
+      }
+
+      if (state == 1 && line ~ /^[ \t]*config[ \t]*:[ \t]*$/ && indent > entry_indent) {
+        state = 2
+        config_indent = indent
+        print line
+        next
+      }
+
+      if (line ~ "^[ \t]*-[ \t]*name:[ \t]*" worker "[ \t]*$") {
+        state = 1
+        entry_indent = indent
+        print line
+        next
+      }
+
+      print line
+
+      if (!inserted && line ~ /^[ \t]*workers[ \t]*:[ \t]*$/) {
+        print pad(item_indent) "- name: " worker
+        print pad(item_indent + 2) "config:"
+        print pad(item_indent + 4) "host: " host
+        inserted = 1
+      }
+      next
+    }
+    END { close_entry() }
+  '
+}
+
+# Indentation of the first `- ` item under `workers:`, so an inserted entry
+# joins the existing sequence instead of starting a second, invalid one.
+workers_item_indent() {
+  awk '
+    BEGIN { in_workers = 0 }
+    /^[ \t]*workers[ \t]*:[ \t]*$/ { in_workers = 1; next }
+    in_workers && /^[ \t]*-/ { match($0, /^[ \t]*/); print RLENGTH; exit }
+    in_workers && /^[^ \t]/ { exit }
+  '
+}
+
 apply_release_security_defaults() {
     local release_runtime="$1"
     local installed_runtime="$2"
-    local relative_path="config/shell.yaml"
+    local relative_path
+    local worker
+    local config="$installed_runtime/config.yaml"
+    local removed=""
+    local item_indent
+    local updated
 
-    # Security policy files are release-governed, not operator overrides. Apply
-    # them after adopting state so upgrades cannot retain an unjailed shell.
-    if [ -f "$release_runtime/$relative_path" ]; then
-        mkdir -p "$(dirname "$installed_runtime/$relative_path")"
-        cp "$release_runtime/$relative_path" "$installed_runtime/$relative_path"
+    for relative_path in "${RELEASE_GOVERNED_PATHS[@]}"; do
+        if [ -f "$release_runtime/$relative_path" ]; then
+            mkdir -p "$(dirname "$installed_runtime/$relative_path")"
+            cp "$release_runtime/$relative_path" "$installed_runtime/$relative_path"
+        fi
+    done
+
+    [ -f "$config" ] || return 0
+    # Only a file that really declares a worker roster is an engine config; an
+    # unrelated operator YAML is left byte-for-byte alone.
+    grep -Eq '^[[:space:]]*workers[[:space:]]*:[[:space:]]*$' "$config" || return 0
+
+    if grep -Eq "^[[:space:]]*-[[:space:]]*name:[[:space:]]*${BUS_WORKER}[[:space:]]*$" "$config" &&
+        grep -Eq "^[[:space:]]*config[[:space:]]*:[[:space:]]*[^[:space:]]" "$config"; then
+        warn "${config}: ${BUS_WORKER} uses an inline config mapping; leaving it untouched"
+        warn "  set 'host: ${BUS_HOST}' on it by hand, or the engine bus binds 0.0.0.0"
     fi
+
+    updated="$(cat "$config")"
+    for worker in "${UNSAFE_WORKER_ENTRIES[@]}"; do
+        if grep -Eq "^[[:space:]]*-[[:space:]]*name:[[:space:]]*${worker}[[:space:]]*$" "$config"; then
+            removed="${removed}${removed:+, }${worker}"
+        fi
+        updated="$(printf '%s\n' "$updated" | strip_worker_entry "$worker")"
+    done
+    item_indent="$(printf '%s\n' "$updated" | workers_item_indent)"
+    [ -n "$item_indent" ] || item_indent=2
+    if printf '%s\n' "$updated" |
+        grep -Eq "^[[:space:]]*-[[:space:]]*name:[[:space:]]*${BUS_WORKER}[[:space:]]*$"; then
+        updated="$(printf '%s\n' "$updated" | ensure_bus_binding "$item_indent" 1)"
+    else
+        updated="$(printf '%s\n' "$updated" | ensure_bus_binding "$item_indent" 0)"
+    fi
+
+    if [ "$updated" = "$(cat "$config")" ]; then
+        return 0
+    fi
+
+    cp "$config" "$config.bak"
+    printf '%s\n' "$updated" > "$config"
+    if [ -n "$removed" ]; then
+        warn "Removed release-governed worker entries from ${config}: ${removed}"
+        warn "  they expose an arbitrary-command sink and a 0.0.0.0 web console on an unauthenticated bus"
+    fi
+    warn "Pinned ${BUS_WORKER} to host ${BUS_HOST} in ${config}"
+    warn "  an undeclared or unpinned bus worker binds 0.0.0.0, which is a remote unauthenticated bus"
+    warn "  your previous file is kept at ${config}.bak; every other entry was left untouched"
 }
 
 download_and_install() {
@@ -332,10 +503,13 @@ main() {
   printf "\n"
   printf "  Get started:\n"
   printf "\n"
-  printf "    ${CYAN}agentos init --quick${RESET}                          Scaffold a project\n"
-  printf "    ${CYAN}agentos config set-key anthropic \$API_KEY${RESET}     Set LLM key\n"
-  printf "    ${CYAN}agentos start${RESET}                                 Start the engine\n"
-  printf "    ${CYAN}agentos chat default${RESET}                          Chat with an agent\n"
+  printf "    ${CYAN}agentos config set-key anthropic \$ANTHROPIC_API_KEY${RESET}   Provider key\n"
+  printf "    ${CYAN}agentos up${RESET}                                            Start engine, workers, TUI\n"
+  printf "    ${CYAN}agentos doctor${RESET}                                        Report what is ready\n"
+  printf "\n"
+  printf "  ${DIM}The provider key is written to %s/runtime/.env (mode 600), which is\n" "$AGENTOS_HOME"
+  printf "  the file the workers read. ${CYAN}agentos up${RESET}${DIM} generates AGENTOS_API_KEY there on\n"
+  printf "  first run; without it the workers cannot register their HTTP routes.${RESET}\n"
   printf "\n"
   printf "  ${DIM}Docs: https://github.com/wunitb/unitb-iii-agentos${RESET}\n"
   printf "\n"

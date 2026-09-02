@@ -14,35 +14,35 @@ import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const artifactDirectory = new URL(
-  "../docs/builds/10000-salvage-the-five-surviving-agentos-work-items-fr/",
+  "../../docs/builds/10000-salvage-the-five-surviving-agentos-work-items-fr/",
   import.meta.url,
 );
 const build10003ArtifactDirectory = new URL(
-  "../docs/builds/10003-salvage-the-five-surviving-agentos-work-items-fr/",
+  "../../docs/builds/10003-salvage-the-five-surviving-agentos-work-items-fr/",
   import.meta.url,
 );
 const build10005ArtifactDirectory = new URL(
-  "../docs/builds/10005-salvage-the-five-surviving-agentos-work-items-fr/",
+  "../../docs/builds/10005-salvage-the-five-surviving-agentos-work-items-fr/",
   import.meta.url,
 );
 const build10010ArtifactDirectory = new URL(
-  "../docs/builds/10010-reconcile-feat-herdr-omp-fleet-with-main-so-that/",
+  "../../docs/builds/10010-reconcile-feat-herdr-omp-fleet-with-main-so-that/",
   import.meta.url,
 );
 const build10011ArtifactDirectory = new URL(
-  "../docs/builds/10011-reconcile-feat-herdr-omp-fleet-with-main-so-that/",
+  "../../docs/builds/10011-reconcile-feat-herdr-omp-fleet-with-main-so-that/",
   import.meta.url,
 );
 const build10013ArtifactDirectory = new URL(
-  "../docs/builds/10013-reconcile-feat-herdr-omp-fleet-with-main-so-that/",
+  "../../docs/builds/10013-reconcile-feat-herdr-omp-fleet-with-main-so-that/",
   import.meta.url,
 );
 const build10014ArtifactDirectory = new URL(
-  "../docs/builds/10014-provider-adapters-must-not-forward-an-assistant/",
+  "../../docs/builds/10014-provider-adapters-must-not-forward-an-assistant/",
   import.meta.url,
 );
 const build10008ArtifactDirectory = new URL(
-  "../docs/builds/10008-fix-agentos-up-so-a-failed-worker-identity-query/",
+  "../../docs/builds/10008-fix-agentos-up-so-a-failed-worker-identity-query/",
   import.meta.url,
 );
 const requiredArtifacts = [

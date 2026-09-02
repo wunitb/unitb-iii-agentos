@@ -17,9 +17,9 @@ const cases = [
     body: "Realms isolate state. Hierarchy declares who reports to whom. Directives propagate goals. Ledger enforces spend. Council records decisions.",
   },
   {
-    title: "Streaming completions to a browser",
-    flow: ["streaming", "llm-router", "iii-stream"],
-    body: "The streaming worker fans tokens out over iii-stream's WebSocket lane. Same Function shape; the engine handles the wire.",
+    title: "Chat completions over HTTP",
+    flow: ["streaming", "agent-core", "llm-router", "memory"],
+    body: "POST /v1/chat/completions is one pipeline: the streaming worker delegates to agent::chat, so tools, injection scanning, memory and metering apply. The reply is buffered, not incremental — responses say so with x-agentos-stream: buffered.",
   },
 ];
 

@@ -1,7 +1,5 @@
 use iii_sdk::errors::Error;
-use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
-};
+use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
 
 mod types;
@@ -65,18 +63,19 @@ async fn state_get(iii: &IIIClient, scope: &str, key: &str) -> Option<Value> {
     safe_trigger(iii, "state::get", json!({ "scope": scope, "key": key })).await
 }
 
-async fn state_list(iii: &IIIClient, scope: &str) -> Vec<Value> {
+async fn state_list(iii: &IIIClient, scope: &str) -> Value {
     safe_trigger(iii, "state::list", json!({ "scope": scope }))
         .await
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default()
+        .unwrap_or(Value::Null)
 }
 
-fn entries_to_records(entries: Vec<Value>) -> Vec<Value> {
-    entries
-        .into_iter()
-        .map(|e| e.get("value").cloned().unwrap_or(e))
-        .collect()
+/// Records from a `state::list` response.
+///
+/// The engine answers a bare array of the stored values themselves: there is
+/// no `{key, value}` envelope. Unwrapping a `value` field would replace any
+/// record that carries one with just that field.
+fn entries_to_records(list: &Value) -> Vec<Value> {
+    list.as_array().cloned().unwrap_or_default()
 }
 
 fn parse_version_suffix(function_id: &str) -> Option<u32> {
@@ -170,7 +169,7 @@ async fn evolve_generate(iii: &IIIClient, input: Value) -> Result<Value, Error> 
     let extra_meta = body.get("metadata").cloned().unwrap_or(json!({}));
 
     let entries = state_list(iii, "evolved_functions").await;
-    let records = entries_to_records(entries);
+    let records = entries_to_records(&entries);
     let prefix = format!("evolved::{safe_name}_v");
     let next_version = next_version_for(&prefix, &records);
     let function_id = format!("evolved::{safe_name}_v{next_version}");
@@ -384,7 +383,7 @@ async fn evolve_list(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     };
 
     let entries = state_list(iii, "evolved_functions").await;
-    let mut functions = entries_to_records(entries);
+    let mut functions = entries_to_records(&entries);
 
     if let Some(status) = body.get("status").and_then(|v| v.as_str()) {
         functions.retain(|f| f.get("status").and_then(|s| s.as_str()) == Some(status));
@@ -449,7 +448,7 @@ async fn evolve_fork(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let safe_name = sanitize_id(&base_name)?;
 
     let entries = state_list(iii, "evolved_functions").await;
-    let records = entries_to_records(entries);
+    let records = entries_to_records(&entries);
     let prefix = format!("evolved::{safe_name}_v");
     let next_version = next_version_for(&prefix, &records);
     let function_id = format!("evolved::{safe_name}_v{next_version}");
@@ -515,7 +514,7 @@ async fn evolve_leaves(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     };
 
     let entries = state_list(iii, "evolved_functions").await;
-    let mut functions = entries_to_records(entries);
+    let mut functions = entries_to_records(&entries);
 
     if let Some(name) = body.get("name").and_then(|v| v.as_str()) {
         let safe_name = sanitize_id(name)?;
@@ -620,7 +619,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let iii_clone = iii.clone();
     iii.register_function(
@@ -854,5 +853,34 @@ mod tests {
         assert_eq!(v["version"], json!(1));
         assert_eq!(v["metadata"]["status"], json!("production"));
         assert_eq!(v["metadata"]["tag"], json!("x"));
+    }
+
+    // --- state::list protocol (verified against iii 0.22.1) ---
+
+    #[test]
+    fn records_are_read_from_a_bare_list() {
+        let list = json!([
+            { "functionId": "fn_a_v1", "score": 1 },
+            { "functionId": "fn_a_v2", "score": 2 }
+        ]);
+        let records = entries_to_records(&list);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["functionId"], "fn_a_v1");
+        assert_eq!(records[1]["score"], 2);
+    }
+
+    #[test]
+    fn a_record_carrying_its_own_value_field_survives_intact() {
+        // The old reader unwrapped `entry["value"]` when present, so a record
+        // with a `value` field was replaced by that field alone.
+        let list = json!([{ "functionId": "fn_a_v1", "value": { "functionId": "wrong" } }]);
+        let records = entries_to_records(&list);
+        assert_eq!(records[0]["functionId"], "fn_a_v1");
+    }
+
+    #[test]
+    fn a_non_array_list_response_yields_no_records() {
+        assert!(entries_to_records(&Value::Null).is_empty());
+        assert!(entries_to_records(&json!({ "entries": [] })).is_empty());
     }
 }

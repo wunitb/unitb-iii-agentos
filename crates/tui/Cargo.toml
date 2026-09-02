@@ -3,6 +3,7 @@ name = "agentos-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "agentos-tui"
@@ -16,7 +17,7 @@ anyhow.workspace = true
 tracing.workspace = true
 ratatui = "0.30.2"
 crossterm = "0.28"
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
-futures-util = "0.3"
+reqwest = { workspace = true, features = ["json", "stream"] }
+futures-util.workspace = true
 
 urlencoding = "2"

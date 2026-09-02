@@ -1,7 +1,5 @@
 use iii_sdk::errors::Error;
-use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
-};
+use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -115,6 +113,59 @@ async fn state_set(iii: &IIIClient, scope: &str, key: &str, value: Value) -> Res
     Ok(())
 }
 
+/// `state::update` payload for an atomic counter step.
+///
+/// The engine names the operation list `ops` (an `operations` key fails the
+/// whole invocation with "missing field `ops`") and an `increment` carries the
+/// step in `by`, not `value`.
+fn increment_payload(scope: &str, key: &str, delta: i64) -> Value {
+    json!({
+        "scope": scope,
+        "key": key,
+        "ops": [
+            { "type": "increment", "path": "", "by": delta },
+        ],
+    })
+}
+
+/// A rejected operation still answers success at the transport level: the
+/// engine reports it inside an `errors` array of an otherwise normal result.
+fn update_rejection(result: &Value) -> Option<String> {
+    let errors = result.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    Some(Value::Array(errors.clone()).to_string())
+}
+
+/// The post-update counter, read from the `new_value` the engine returns.
+fn counter_from_update(result: &Value) -> Option<i64> {
+    result.get("new_value")?.as_i64()
+}
+
+/// Atomic step on the concurrency counter at `rate_concurrent/<agent>`.
+async fn step_concurrent(iii: &IIIClient, agent_id: &str, delta: i64) -> Result<i64, Error> {
+    let updated = iii
+        .trigger(TriggerRequest {
+            function_id: "state::update".to_string(),
+            payload: increment_payload("rate_concurrent", agent_id, delta),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|e| Error::Handler(e.to_string()))?;
+    if let Some(rejection) = update_rejection(&updated) {
+        return Err(Error::Handler(format!(
+            "concurrency counter update rejected for {agent_id}: {rejection}"
+        )));
+    }
+    counter_from_update(&updated).ok_or_else(|| {
+        Error::Handler(format!(
+            "concurrency counter update for {agent_id} returned no numeric new_value"
+        ))
+    })
+}
+
 fn gcra_compute(
     state: Option<&GcraState>,
     cost: f64,
@@ -208,7 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let iii_ref = iii.clone();
     iii.register_function(
@@ -423,43 +474,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or(DEFAULT_AGENT_MAX_CONCURRENT);
 
                 // Atomic increment via state::update.
-                let updated = iii
-                    .trigger(TriggerRequest {
-                        function_id: "state::update".to_string(),
-                        payload: json!({
-                            "scope": "rate_concurrent",
-                            "key": &agent_id,
-                            "operations": [
-                                { "type": "increment", "path": "", "value": 1 },
-                            ],
-                        }),
-                        action: None,
-                        timeout_ms: None,
-                    })
-                    .await
-                    .map_err(|e| Error::Handler(e.to_string()))?;
-
-                let new_count = updated
-                    .as_i64()
-                    .or_else(|| updated.get("value").and_then(|v| v.as_i64()))
-                    .unwrap_or(0);
+                let new_count = step_concurrent(&iii, &agent_id, 1).await?;
 
                 if new_count > limit {
-                    // Roll back the speculative increment.
-                    let _ = iii
-                        .trigger(TriggerRequest {
-                            function_id: "state::update".to_string(),
-                            payload: json!({
-                                "scope": "rate_concurrent",
-                                "key": &agent_id,
-                                "operations": [
-                                    { "type": "increment", "path": "", "value": -1 },
-                                ],
-                            }),
-                            action: None,
-                            timeout_ms: None,
-                        })
-                        .await;
+                    // Roll back the speculative increment. A failed rollback
+                    // leaks a slot, so it must not be swallowed.
+                    if let Err(e) = step_concurrent(&iii, &agent_id, -1).await {
+                        tracing::error!(
+                            agent_id = %agent_id,
+                            error = %e,
+                            "failed to roll back a rejected concurrency slot"
+                        );
+                    }
                     return Ok::<Value, Error>(json!({
                         "acquired": false,
                         "current": new_count - 1,
@@ -486,26 +512,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let agent_id = input["agentId"].as_str().unwrap_or("").to_string();
 
                 // Atomic decrement via state::update; clamp to zero afterwards.
-                let updated = iii
-                    .trigger(TriggerRequest {
-                        function_id: "state::update".to_string(),
-                        payload: json!({
-                            "scope": "rate_concurrent",
-                            "key": &agent_id,
-                            "operations": [
-                                { "type": "increment", "path": "", "value": -1 },
-                            ],
-                        }),
-                        action: None,
-                        timeout_ms: None,
-                    })
-                    .await
-                    .map_err(|e| Error::Handler(e.to_string()))?;
-
-                let new_count = updated
-                    .as_i64()
-                    .or_else(|| updated.get("value").and_then(|v| v.as_i64()))
-                    .unwrap_or(0);
+                let new_count = step_concurrent(&iii, &agent_id, -1).await?;
 
                 if new_count < 0 {
                     // Counter underflow — clamp by setting to zero.
@@ -757,5 +764,64 @@ mod tests {
         state = None;
         let r = check(&mut state, 1.0, 1000.0);
         assert_eq!(r.remaining, (BURST_LIMIT as i64) - 1);
+    }
+
+    // --- state::update protocol (verified against iii 0.22.1) ---
+
+    #[test]
+    fn concurrency_payload_uses_ops_not_operations() {
+        let payload = increment_payload("rate_concurrent", "agent-1", 1);
+        assert!(
+            payload.get("operations").is_none(),
+            "`operations` fails the whole invocation with `missing field ops`"
+        );
+        assert_eq!(payload["scope"], "rate_concurrent");
+        assert_eq!(payload["key"], "agent-1");
+        assert!(payload["ops"].is_array());
+    }
+
+    #[test]
+    fn concurrency_payload_carries_the_step_in_by() {
+        let acquire = increment_payload("rate_concurrent", "agent-1", 1);
+        assert_eq!(acquire["ops"][0]["type"], "increment");
+        assert_eq!(acquire["ops"][0]["by"], json!(1));
+        assert!(
+            acquire["ops"][0].get("value").is_none(),
+            "`value` fails the whole invocation with `missing field by`"
+        );
+
+        let release = increment_payload("rate_concurrent", "agent-1", -1);
+        assert_eq!(release["ops"][0]["by"], json!(-1));
+    }
+
+    #[test]
+    fn concurrency_counter_reads_new_value() {
+        let engine_result = json!({ "new_value": 4, "old_value": 3 });
+        assert_eq!(counter_from_update(&engine_result), Some(4));
+    }
+
+    #[test]
+    fn concurrency_counter_rejects_the_shapes_this_worker_used_to_assume() {
+        assert_eq!(counter_from_update(&json!(4)), None);
+        assert_eq!(counter_from_update(&json!({ "value": 4 })), None);
+    }
+
+    #[test]
+    fn a_rejected_step_is_detected_inside_a_successful_response() {
+        let engine_result = json!({
+            "errors": [{ "code": "increment.not_number", "op_index": 0 }],
+            "new_value": null,
+            "old_value": null,
+        });
+        assert!(
+            update_rejection(&engine_result)
+                .expect("rejection must be reported")
+                .contains("increment.not_number")
+        );
+        assert_eq!(update_rejection(&json!({ "new_value": 1 })), None);
+        assert_eq!(
+            update_rejection(&json!({ "new_value": 1, "errors": [] })),
+            None
+        );
     }
 }

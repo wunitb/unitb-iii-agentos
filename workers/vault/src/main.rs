@@ -3,9 +3,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use iii_sdk::errors::Error;
-use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
-};
+use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use rand::RngExt;
 use scrypt::{Params, scrypt};
 use serde::{Deserialize, Serialize};
@@ -376,9 +374,10 @@ async fn vault_set(state: SharedState, iii: &IIIClient, input: Value) -> Result<
 }
 
 async fn vault_get(state: SharedState, iii: &IIIClient, input: Value) -> Result<Value, Error> {
-    if input.get("headers").is_some() {
-        require_auth(&input)?;
-    }
+    // Unconditional: a bus caller never carries a `headers` object, so gating the
+    // check on its presence made every plaintext read reachable from the
+    // unauthenticated engine bus. Matches vault::init/set/delete/rotate.
+    require_auth(&input)?;
     let body = body_or_self(&input);
     let key = body
         .get("key")
@@ -423,9 +422,9 @@ async fn vault_get(state: SharedState, iii: &IIIClient, input: Value) -> Result<
 }
 
 async fn vault_list(state: SharedState, iii: &IIIClient, input: Value) -> Result<Value, Error> {
-    if input.get("headers").is_some() {
-        require_auth(&input)?;
-    }
+    // Unconditional, for the same reason as vault_get: key names are themselves
+    // sensitive and the bus is unauthenticated.
+    require_auth(&input)?;
     let mut st = state.lock().await;
     st.check_auto_lock();
     if !st.unlocked() {
@@ -774,7 +773,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let state: SharedState = Arc::new(Mutex::new(VaultState {
         auto_lock_ms: DEFAULT_AUTO_LOCK_MS,
@@ -1198,6 +1197,82 @@ mod tests {
         });
         let result = with_api_key(Some("expected-et"), || require_auth(&req));
         assert!(result.is_err());
+    }
+
+    fn unlocked_state() -> SharedState {
+        Arc::new(tokio::sync::Mutex::new(VaultState {
+            crypto_key: Some(vec![7u8; 32]),
+            last_activity: Some(Instant::now()),
+            ..Default::default()
+        }))
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    /// A client that was never connected: `IIIClient::new` does not open a
+    /// socket, so any handler that reaches `iii.trigger` would block on the
+    /// SDK timeout. Every assertion below must therefore return before the
+    /// first state call, which is exactly what an auth gate does.
+    fn offline_client() -> IIIClient {
+        IIIClient::new("ws://127.0.0.1:1")
+    }
+
+    #[test]
+    fn vault_get_rejects_bus_caller_without_headers() {
+        let request = json!({ "key": "ANTHROPIC_API_KEY" });
+        let error = with_api_key(Some("bus-caller-get"), || {
+            block_on(vault_get(unlocked_state(), &offline_client(), request))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("Unauthorized"),
+            "bus caller must be rejected before the vault is read, got: {error}"
+        );
+    }
+
+    #[test]
+    fn vault_get_rejects_wrong_bearer() {
+        let request = json!({
+            "headers": { "authorization": "Bearer not-the-key" },
+            "body": { "key": "ANTHROPIC_API_KEY" },
+        });
+        let error = with_api_key(Some("vault-get-expected"), || {
+            block_on(vault_get(unlocked_state(), &offline_client(), request))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Unauthorized"), "got: {error}");
+    }
+
+    #[test]
+    fn vault_list_rejects_bus_caller_without_headers() {
+        let error = with_api_key(Some("vault-list-expected"), || {
+            block_on(vault_list(unlocked_state(), &offline_client(), json!({})))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("Unauthorized"),
+            "bus caller must be rejected before the key list is read, got: {error}"
+        );
+    }
+
+    #[test]
+    fn vault_list_rejects_wrong_bearer() {
+        let request = json!({ "headers": { "authorization": "Bearer nope" } });
+        let error = with_api_key(Some("vault-list-expected-2"), || {
+            block_on(vault_list(unlocked_state(), &offline_client(), request))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Unauthorized"), "got: {error}");
     }
 
     #[test]

@@ -22,6 +22,19 @@ use crate::{RunningWorker, RuntimePaths, WorkerLaunch, WorkerRuntime, WorkerSpec
 pub(crate) const ENGINE_HOST: Ipv4Addr = Ipv4Addr::LOCALHOST;
 pub(crate) const ENGINE_PORT: u16 = 49134;
 
+/// The bus-auth daemon: `crates/bus-auth`, binary `agentos-bus-authd`. It must
+/// be listening before the engine starts, because iii 0.22.1 calls the RBAC
+/// auth function for every bus connection — including the connection of any
+/// worker that could have provided it.
+pub(crate) const BUS_AUTH_BINARY: &str = "agentos-bus-authd";
+/// Must match `agentos_bus_auth::daemon::DEFAULT_LISTEN_ADDR` and the
+/// `iii-bridge` `url` in `config.yaml`.
+pub(crate) const BUS_AUTH_ADDR_VARIABLE: &str = "AGENTOS_BUS_AUTH_ADDR";
+const DEFAULT_BUS_AUTH_ADDR: &str = "127.0.0.1:49129";
+/// The key in `config.yaml` that arms the gate. `WorkerManagerConfig` is
+/// `deny_unknown_fields`, so its presence is a reliable signal.
+const BUS_RBAC_MARKER: &str = "auth_function_id";
+
 pub(crate) const ENGINE_INSTALL_HINT: &str =
     "install it with `bash scripts/install-iii.sh` (or reinstall AgentOS) and keep `iii` on PATH";
 pub(crate) const WORKSPACE_BUILD_HINT: &str = "run `cargo build --workspace --release`";
@@ -44,6 +57,17 @@ pub(crate) fn load_dotenv(runtime_dir: &Path) -> Result<BTreeMap<String, String>
 }
 
 fn parse_dotenv(source: &str, path: &Path) -> Result<BTreeMap<String, String>> {
+    let mut values = parse_dotenv_all(source, path)?;
+    // Explicit shell exports win: dropping them here keeps the exported value
+    // on the child process instead of overwriting it with the file value.
+    values.retain(|key, _| std::env::var_os(key).is_none());
+    Ok(values)
+}
+
+/// Every assignment in a dotenv file, ignoring what the current process
+/// exports. `agentos doctor` needs the file's own view to say where a
+/// credential comes from; `up` filters this down in [`parse_dotenv`].
+fn parse_dotenv_all(source: &str, path: &Path) -> Result<BTreeMap<String, String>> {
     let mut values = BTreeMap::new();
     for (index, raw_line) in source.lines().enumerate() {
         let mut line = raw_line.trim();
@@ -73,9 +97,9 @@ fn parse_dotenv(source: &str, path: &Path) -> Result<BTreeMap<String, String>> {
                 index + 1
             );
         }
-        // Explicit shell exports win. First assignment wins within `.env`,
-        // matching common dotenv behavior and avoiding surprising overrides.
-        if std::env::var_os(key).is_some() || values.contains_key(key) {
+        // First assignment wins within `.env`, matching common dotenv behavior
+        // and avoiding surprising overrides.
+        if values.contains_key(key) {
             continue;
         }
         let value = parse_dotenv_value(raw_value.trim(), path, index + 1)?;
@@ -121,8 +145,484 @@ fn parse_dotenv_value(value: &str, path: &Path, line: usize) -> Result<String> {
     Ok(value.trim_end().to_string())
 }
 
+// ---------------------------------------------------------------------------
+// first run: AGENTOS_API_KEY, provider credential, default route
+// ---------------------------------------------------------------------------
+
+/// Every protected HTTP route registered through `crates/http-adapter` refuses
+/// to register without this variable, so a clean machine loses almost every
+/// worker when it is unset.
+pub(crate) const API_KEY_VARIABLE: &str = "AGENTOS_API_KEY";
+/// 32 bytes, rendered as 64 lowercase hex characters.
+const API_KEY_BYTES: usize = 32;
+
+/// Provider credentials `workers/llm-router` resolves from the process
+/// environment, **in the router's automatic-routing preference order**
+/// (`AUTO_ROUTE_PREFERENCE` in `workers/llm-router/src/main.rs`). `ollama` is
+/// omitted: it has an empty `env_key` and needs no credential, and the router
+/// deliberately never selects it automatically. Duplicated because the router
+/// is a separate crate with no shared library; `default_route_*` tests pin the
+/// behaviour, and `scripts/env-contract.test.ts` pins the variable names
+/// against the router's own table.
+const PROVIDER_VARIABLES: [(&str, &str); 10] = [
+    ("anthropic", "ANTHROPIC_API_KEY"),
+    ("openai", "OPENAI_API_KEY"),
+    ("google", "GOOGLE_API_KEY"),
+    ("codex", "CODEX_PROXY_API_KEY"),
+    ("groq", "GROQ_API_KEY"),
+    ("deepseek", "DEEPSEEK_API_KEY"),
+    ("mistral", "MISTRAL_API_KEY"),
+    ("together", "TOGETHER_API_KEY"),
+    ("fireworks", "FIREWORKS_API_KEY"),
+    ("openrouter", "OPENROUTER_API_KEY"),
+];
+
+/// The provider assumed when `AGENTOS_DEFAULT_MODEL` is pinned without a
+/// provider (`workers/llm-router/src/main.rs`, `resolve_runtime_default`).
+const CODEX_PROVIDER: &str = "codex";
+const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
+
+/// Where a credential value comes from. The shell export wins at spawn time
+/// (see [`parse_dotenv`]), so the two are never confused in a report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialSource {
+    Environment,
+    Dotenv,
+}
+
+impl CredentialSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Environment => "process environment",
+            Self::Dotenv => ".env",
+        }
+    }
+}
+
+/// The provider credential the router can actually use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderCredential {
+    pub(crate) provider: &'static str,
+    pub(crate) variable: &'static str,
+    pub(crate) source: CredentialSource,
+}
+
+/// What an unqualified chat request resolves to today, mirroring
+/// `workers/llm-router`: a pinned default whose own credential is present,
+/// otherwise the first provider in `AUTO_ROUTE_PREFERENCE` that has one,
+/// otherwise a structured `provider_credential_missing` refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DefaultRoute {
+    /// `AGENTOS_DEFAULT_PROVIDER`/`AGENTOS_DEFAULT_MODEL` are pinned and the
+    /// credential that provider needs is present. `model` is `None` when the
+    /// router picks the provider's own default.
+    Pinned {
+        provider: String,
+        model: Option<String>,
+    },
+    /// No usable pinned default; the router routes to this provider.
+    Automatic { provider: &'static str },
+    /// No provider credential at all: unqualified requests are refused.
+    Unavailable,
+}
+
+impl DefaultRoute {
+    pub(crate) fn detail(&self) -> String {
+        match self {
+            Self::Pinned {
+                provider,
+                model: Some(model),
+            } => format!("{provider}/{model} (pinned by AGENTOS_DEFAULT_PROVIDER/MODEL)"),
+            Self::Pinned {
+                provider,
+                model: None,
+            } => format!("{provider} (pinned by AGENTOS_DEFAULT_PROVIDER; llm-router picks the model)"),
+            Self::Automatic { provider } => format!(
+                "{provider} — first provider with a credential in llm-router's preference order"
+            ),
+            Self::Unavailable => {
+                "no provider credential is set; unqualified chat requests are refused with provider_credential_missing".to_string()
+            }
+        }
+    }
+}
+
+/// Every credential variable an operator may set, in the router's preference
+/// order. Matches the list in llm-router's `provider_credential_missing`.
+fn credential_variables() -> String {
+    PROVIDER_VARIABLES
+        .iter()
+        .map(|(_, variable)| *variable)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The credential half of first-run readiness, resolved from the active `.env`
+/// plus this process's environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Credentials {
+    pub(crate) dotenv_path: PathBuf,
+    pub(crate) api_key: Option<CredentialSource>,
+    pub(crate) providers: Vec<ProviderCredential>,
+    pub(crate) route: DefaultRoute,
+    /// A pinned default provider whose own credential is absent, so the router
+    /// ignores it. Named separately because the route above is still usable.
+    pub(crate) disabled_default: Option<String>,
+}
+
+impl Credentials {
+    /// Reads the active `.env` (never writes) and pairs it with the process
+    /// environment. A missing file is not an error: everything is then
+    /// reported as absent.
+    pub(crate) fn inspect(runtime_dir: &Path) -> Result<Self> {
+        let path = dotenv_path(runtime_dir);
+        let values = read_dotenv_entries(&path)?;
+        Ok(Self::resolve(&path, &values, |name| {
+            std::env::var(name).ok()
+        }))
+    }
+
+    /// Pure resolution so both `doctor` and the tests can drive it without a
+    /// process environment.
+    pub(crate) fn resolve<F>(path: &Path, dotenv: &BTreeMap<String, String>, environment: F) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let lookup = |name: &str| -> Option<(String, CredentialSource)> {
+            if let Some(value) = environment(name).filter(|value| !value.trim().is_empty()) {
+                return Some((value, CredentialSource::Environment));
+            }
+            dotenv
+                .get(name)
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| (value.clone(), CredentialSource::Dotenv))
+        };
+
+        let api_key = lookup(API_KEY_VARIABLE).map(|(_, source)| source);
+        let providers = PROVIDER_VARIABLES
+            .iter()
+            .filter_map(|(provider, variable)| {
+                lookup(variable).map(|(_, source)| ProviderCredential {
+                    provider,
+                    variable,
+                    source,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let requested_provider = lookup("AGENTOS_DEFAULT_PROVIDER").map(|(value, _)| value);
+        let requested_model = lookup("AGENTOS_DEFAULT_MODEL").map(|(value, _)| value);
+        // A default is "requested" by either variable; a model on its own means
+        // the codex provider, exactly as the router resolves it.
+        let pinned = (requested_provider.is_some() || requested_model.is_some())
+            .then(|| requested_provider.unwrap_or_else(|| CODEX_PROVIDER.to_string()));
+        let pinned_is_usable = pinned.as_deref().is_some_and(|provider| {
+            providers
+                .iter()
+                .any(|credential| credential.provider == provider)
+        });
+
+        let (route, disabled_default) = match (&pinned, pinned_is_usable) {
+            (Some(provider), true) => {
+                let model = requested_model.or_else(|| {
+                    (provider == CODEX_PROVIDER).then(|| DEFAULT_CODEX_MODEL.to_string())
+                });
+                (
+                    DefaultRoute::Pinned {
+                        provider: provider.clone(),
+                        model,
+                    },
+                    None,
+                )
+            }
+            (pinned, _) => {
+                let automatic = providers
+                    .first()
+                    .map(|credential| DefaultRoute::Automatic {
+                        provider: credential.provider,
+                    })
+                    .unwrap_or(DefaultRoute::Unavailable);
+                (automatic, pinned.clone())
+            }
+        };
+
+        Self {
+            dotenv_path: path.to_path_buf(),
+            api_key,
+            providers,
+            route,
+            disabled_default,
+        }
+    }
+
+    fn provider_detail(&self) -> String {
+        if self.providers.is_empty() {
+            return "no provider credential is set".to_string();
+        }
+        self.providers
+            .iter()
+            .map(|credential| {
+                format!(
+                    "{} via {} ({})",
+                    credential.provider,
+                    credential.variable,
+                    credential.source.label()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+pub(crate) fn dotenv_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join(".env")
+}
+
+/// Every assignment in the active `.env`, or an empty map when there is none.
+fn read_dotenv_entries(path: &Path) -> Result<BTreeMap<String, String>> {
+    if !path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("Cannot read dotenv file {}", path.display()))?;
+    parse_dotenv_all(&source, path)
+}
+
+/// What [`ensure_api_key`] did, so the caller can print exactly one honest
+/// line about the machine's own key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ApiKeyOutcome {
+    /// The shell exports a value; the file is left alone because the export
+    /// wins at spawn time and a second value would be misleading.
+    Inherited,
+    /// The active `.env` already carries a value. Never overwritten.
+    AlreadyPresent(PathBuf),
+    /// A new 32-byte key was generated and written with mode 0600.
+    Generated(PathBuf),
+}
+
+impl ApiKeyOutcome {
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Inherited => format!(
+                "{API_KEY_VARIABLE} inherited from the process environment; .env left unchanged"
+            ),
+            Self::AlreadyPresent(path) => {
+                format!("{API_KEY_VARIABLE} already set in {}", path.display())
+            }
+            Self::Generated(path) => format!(
+                "generated a new 32-byte {API_KEY_VARIABLE} in {} (mode 0600)",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Guarantees the stack has an `AGENTOS_API_KEY` before it starts. Never
+/// overwrites an existing value and never invents a provider key.
+pub(crate) fn ensure_api_key(runtime_dir: &Path) -> Result<ApiKeyOutcome> {
+    ensure_api_key_with(
+        runtime_dir,
+        || std::env::var(API_KEY_VARIABLE).ok(),
+        random_api_key,
+    )
+}
+
+fn ensure_api_key_with<E, G>(
+    runtime_dir: &Path,
+    environment: E,
+    generate: G,
+) -> Result<ApiKeyOutcome>
+where
+    E: Fn() -> Option<String>,
+    G: Fn() -> Result<String>,
+{
+    if environment().is_some_and(|value| !value.trim().is_empty()) {
+        return Ok(ApiKeyOutcome::Inherited);
+    }
+    let path = dotenv_path(runtime_dir);
+    let source = if path.is_file() {
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("Cannot read dotenv file {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let Some(updated) = dotenv_with_api_key(&source, &path, &generate()?)? else {
+        return Ok(ApiKeyOutcome::AlreadyPresent(path));
+    };
+    write_dotenv_secret(&path, &updated)?;
+    Ok(ApiKeyOutcome::Generated(path))
+}
+
+/// The `.env` text carrying `key`, or `None` when a non-empty value is already
+/// assigned. An empty assignment is filled in place so the operator's own
+/// layout and comments survive.
+fn dotenv_with_api_key(source: &str, path: &Path, key: &str) -> Result<Option<String>> {
+    if read_dotenv_value(source, path, API_KEY_VARIABLE)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(dotenv_with_assignment(source, API_KEY_VARIABLE, key)))
+}
+
+/// `source` with `name=value` assigned exactly once: an existing assignment is
+/// replaced in place, otherwise the line is appended. Comments and unrelated
+/// lines are preserved.
+fn dotenv_with_assignment(source: &str, name: &str, value: &str) -> String {
+    let assignment = format!("{name}={value}");
+    let mut lines = source.split('\n').map(str::to_string).collect::<Vec<_>>();
+    let existing = lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        trimmed
+            .split_once('=')
+            .is_some_and(|(candidate, _)| candidate.trim() == name)
+    });
+    match existing {
+        Some(index) => lines[index] = assignment,
+        None => {
+            // `split('\n')` leaves a trailing empty element for a
+            // newline-terminated file; reuse it instead of adding a blank line.
+            match lines.last() {
+                Some(last) if last.is_empty() => {
+                    let index = lines.len() - 1;
+                    lines[index] = assignment;
+                    lines.push(String::new());
+                }
+                _ => {
+                    lines.push(assignment);
+                    lines.push(String::new());
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// The non-empty assignment of `name` in `source`, if any.
+fn read_dotenv_value(source: &str, path: &Path, name: &str) -> Result<Option<String>> {
+    Ok(parse_dotenv_all(source, path)?
+        .remove(name)
+        .filter(|value| !value.trim().is_empty()))
+}
+
+/// Assigns a credential in the active `.env` with mode 0600, replacing an
+/// existing assignment of the same name. Used by `agentos config set-key` and
+/// `agentos onboard`, which are explicit operator instructions to set a value.
+pub(crate) fn set_dotenv_value(runtime_dir: &Path, name: &str, value: &str) -> Result<PathBuf> {
+    let path = dotenv_path(runtime_dir);
+    let source = if path.is_file() {
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("Cannot read dotenv file {}", path.display()))?
+    } else {
+        String::new()
+    };
+    write_dotenv_secret(&path, &dotenv_with_assignment(&source, name, value))?;
+    Ok(path)
+}
+
+/// The environment variable `workers/llm-router` reads for `provider`, when it
+/// is one of the providers the router knows.
+pub(crate) fn provider_variable(provider: &str) -> Option<&'static str> {
+    PROVIDER_VARIABLES
+        .iter()
+        .find(|(name, _)| *name == provider)
+        .map(|(_, variable)| *variable)
+}
+
+/// 32 bytes from the kernel CSPRNG as lowercase hex.
+fn random_api_key() -> Result<String> {
+    #[cfg(unix)]
+    {
+        use std::io::Read as _;
+        let mut bytes = [0u8; API_KEY_BYTES];
+        std::fs::File::open("/dev/urandom")
+            .context("Cannot open /dev/urandom to generate AGENTOS_API_KEY")?
+            .read_exact(&mut bytes)
+            .context("Cannot read 32 random bytes for AGENTOS_API_KEY")?;
+        let mut key = String::with_capacity(API_KEY_BYTES * 2);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(key, "{byte:02x}");
+        }
+        Ok(key)
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!(
+            "cannot generate {API_KEY_VARIABLE} on this platform: set it manually in the active .env"
+        )
+    }
+}
+
+/// Writes secret-bearing dotenv text with mode 0600 through a temporary file in
+/// the same directory, so a crash cannot truncate an existing `.env` and the
+/// secret is never briefly world-readable.
+fn write_dotenv_secret(path: &Path, contents: &str) -> Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        anyhow::bail!(
+            "{} is a symlink; refusing to replace it. Write {API_KEY_VARIABLE} into the real file instead",
+            path.display()
+        );
+    }
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Invalid dotenv path {}", path.display()))?;
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("Cannot create {}", directory.display()))?;
+    let temporary = directory.join(format!(".env.agentos-{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&temporary);
+    let result = write_private_file(&temporary, contents)
+        .and_then(|()| std::fs::rename(&temporary, path).map_err(anyhow::Error::from));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.with_context(|| format!("Cannot write {}", path.display()))
+}
+
+fn write_private_file(path: &Path, contents: &str) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn engine_endpoint() -> SocketAddr {
     SocketAddr::from((ENGINE_HOST, ENGINE_PORT))
+}
+
+/// Where the bus-auth daemon listens: `AGENTOS_BUS_AUTH_ADDR` when set,
+/// otherwise the daemon's own default. A value that is not a socket address is
+/// an error, never a silent fallback: the engine would fail closed against the
+/// wrong port and refuse every worker.
+fn parse_bus_auth_addr(raw: Option<&str>) -> Result<SocketAddr> {
+    let raw = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_BUS_AUTH_ADDR);
+    raw.parse().map_err(|error| {
+        anyhow::anyhow!("{BUS_AUTH_ADDR_VARIABLE} is not a host:port address ({raw}): {error}")
+    })
+}
+
+/// The `host:port` an `iii-bridge` entry in `config.yaml` forwards the RBAC
+/// hooks to, so a mismatch with the daemon's address can be reported instead of
+/// silently failing every bus connection closed.
+fn bridge_url_endpoint(config: &str) -> Option<String> {
+    config.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("url:")?.trim();
+        let value = value.trim_matches(['"', '\''].as_slice());
+        let rest = value
+            .strip_prefix("ws://")
+            .or_else(|| value.strip_prefix("wss://"))?;
+        Some(rest.trim_end_matches('/').to_string())
+    })
 }
 
 /// Read-only probes. Nothing here changes machine state.
@@ -136,6 +636,18 @@ pub(crate) trait Diagnostics {
     /// Stable names of connected non-engine workers, `None` when the engine
     /// cannot answer `engine::functions::list`.
     fn connected_worker_ids(&self) -> Option<BTreeSet<String>>;
+    /// The keys stored in a state scope, `None` when the engine cannot answer
+    /// `state::list_keys`. Read-only: `doctor` never writes state.
+    fn state_keys(&self, scope: &str) -> Option<Vec<String>>;
+    /// The `agentos-bus-authd` binary, when it is installed or built.
+    fn bus_auth_binary(&self) -> Option<PathBuf>;
+    /// Where the bus-auth daemon should listen.
+    fn bus_auth_addr(&self) -> Result<SocketAddr>;
+    /// Whether something already accepts connections there.
+    fn bus_auth_healthy(&self) -> bool;
+    /// The active `config.yaml`, when it can be read: used to tell whether bus
+    /// RBAC is armed and which address `iii-bridge` forwards to.
+    fn engine_config(&self) -> Option<String>;
     /// Worker manifests plus the release binary resolved for each of them.
     fn worker_specs(&self) -> Result<Vec<WorkerSpec>>;
     /// The `agentos-tui` binary, when it is installed or built.
@@ -148,6 +660,12 @@ pub(crate) trait Diagnostics {
 
 /// Process control used by `agentos up` only.
 pub(crate) trait Bootstrap: Diagnostics {
+    /// Starts the bus-auth daemon detached on `addr` and returns its pid.
+    fn start_bus_auth(&mut self, binary: &Path, addr: SocketAddr) -> Result<u32>;
+    /// The exit status of a daemon started by this process, if it died. It
+    /// refuses to start without `AGENTOS_API_KEY`, which is a boot-stopping
+    /// condition once the gate is armed.
+    fn bus_auth_stopped(&mut self) -> Option<String>;
     /// Starts the engine detached and returns its pid.
     fn start_engine(&mut self, binary: &Path) -> Result<u32>;
     /// The exit status of an engine started by this process, if it died.
@@ -271,8 +789,65 @@ impl Readiness {
 }
 
 /// Builds the readiness report. Pure aggregation over read-only probes.
-pub(crate) fn readiness(probes: &dyn Diagnostics, paths: &RuntimePaths) -> Readiness {
+pub(crate) fn readiness(
+    probes: &dyn Diagnostics,
+    paths: &RuntimePaths,
+    credentials: &Credentials,
+) -> Readiness {
     let mut items = Vec::new();
+
+    // The API key comes first: without it `crates/http-adapter` refuses to
+    // register protected routes and almost every worker exits at startup, which
+    // otherwise surfaces as an unexplained pile of missing identities.
+    items.push(match credentials.api_key {
+        Some(source) => ReadinessItem::ok(
+            "API key",
+            format!("{API_KEY_VARIABLE} set ({})", source.label()),
+        ),
+        None => ReadinessItem::failed(
+            "API key",
+            format!(
+                "{API_KEY_VARIABLE} is not set in {} or the environment; workers with protected HTTP routes exit at startup",
+                credentials.dotenv_path.display()
+            ),
+            "run `agentos up`, which generates one into the active .env with mode 0600",
+        ),
+    });
+
+    items.push(if credentials.providers.is_empty() {
+        ReadinessItem::failed(
+            "Provider",
+            credentials.provider_detail(),
+            format!("set one of {} in the active .env", credential_variables()),
+        )
+    } else {
+        ReadinessItem::ok("Provider", credentials.provider_detail())
+    });
+
+    let route_detail = match &credentials.disabled_default {
+        Some(provider) => format!(
+            "{}; pinned default '{provider}' is disabled because {} is not set",
+            credentials.route.detail(),
+            provider_variable(provider).unwrap_or("its credential")
+        ),
+        None => credentials.route.detail(),
+    };
+    items.push(match &credentials.route {
+        DefaultRoute::Unavailable => ReadinessItem::failed(
+            "Route",
+            route_detail,
+            format!(
+                "set one of {} in the active .env, then re-run `agentos doctor`",
+                credential_variables()
+            ),
+        ),
+        _ if credentials.disabled_default.is_some() => ReadinessItem::failed(
+            "Route",
+            route_detail,
+            "set the pinned provider's credential, or clear AGENTOS_DEFAULT_PROVIDER/MODEL",
+        ),
+        _ => ReadinessItem::ok("Route", route_detail),
+    });
 
     let engine_binary = probes.engine_binary();
     match &engine_binary {
@@ -376,7 +951,7 @@ pub(crate) fn readiness(probes: &dyn Diagnostics, paths: &RuntimePaths) -> Readi
                             required.len(),
                             missing.join(", ")
                         ),
-                        "start them with `agentos up --no-tui`",
+                        missing_identity_hint(credentials.api_key.is_some()),
                     )
                 }
             }
@@ -395,6 +970,10 @@ pub(crate) fn readiness(probes: &dyn Diagnostics, paths: &RuntimePaths) -> Readi
             "start the stack with `agentos up`, then re-run `agentos doctor`",
         ),
     });
+
+    items.push(bus_auth_item(probes));
+
+    items.push(capability_item(probes));
 
     items.push(match probes.tui_binary() {
         Some(path) => ReadinessItem::ok("TUI", path.display().to_string()),
@@ -433,6 +1012,170 @@ pub(crate) fn readiness(probes: &dyn Diagnostics, paths: &RuntimePaths) -> Readi
     Readiness { items }
 }
 
+/// The foreground (`agentos start`) half of the bus-auth stage: reuse a daemon
+/// that is already listening, start one when the gate is armed, and refuse to
+/// continue when the gate is armed and the daemon is not built. Returns the
+/// child so the caller can stop it with the rest of the stack.
+pub(crate) fn start_bus_auth_for_foreground(
+    config_path: &Path,
+    runtime_dir: &Path,
+    log_path: &Path,
+    launch_env: &BTreeMap<String, String>,
+) -> Result<Option<std::process::Child>> {
+    let addr = parse_bus_auth_addr(
+        std::env::var(BUS_AUTH_ADDR_VARIABLE)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| launch_env.get(BUS_AUTH_ADDR_VARIABLE).cloned())
+            .as_deref(),
+    )?;
+    let config = std::fs::read_to_string(config_path).unwrap_or_default();
+    let armed = config.contains(BUS_RBAC_MARKER);
+
+    if TcpStream::connect_timeout(&addr, HEALTH_PROBE_TIMEOUT).is_ok() {
+        println!(
+            "{} bus-auth daemon already listening on {addr}",
+            "✓".green()
+        );
+        return Ok(None);
+    }
+    if !armed {
+        return Ok(None);
+    }
+    let Some(binary) = crate::find_sibling_binary(BUS_AUTH_BINARY, Some(runtime_dir)) else {
+        anyhow::bail!(
+            "{} arms bus RBAC ({BUS_RBAC_MARKER}) but {BUS_AUTH_BINARY} was not found: {WORKSPACE_BUILD_HINT}, or reinstall AgentOS",
+            config_path.display()
+        );
+    };
+    let daemon = crate::spawn_bus_auth(&binary, addr, runtime_dir, log_path, launch_env, false)?;
+    println!(
+        "{} bus-auth daemon listening on {addr} (pid {})",
+        "✓".green(),
+        daemon.id()
+    );
+    Ok(Some(daemon))
+}
+
+/// Read-only report on the bus-auth daemon. Bus RBAC is fail-closed: with the
+/// gate armed in `config.yaml` and no daemon listening, the engine refuses every
+/// worker connection, which otherwise looks like 62 workers that will not start.
+fn bus_auth_item(probes: &dyn Diagnostics) -> ReadinessItem {
+    let addr = match probes.bus_auth_addr() {
+        Ok(addr) => addr,
+        Err(error) => {
+            return ReadinessItem::failed(
+                "Bus auth",
+                error.to_string(),
+                format!("set {BUS_AUTH_ADDR_VARIABLE} to a host:port address, or unset it"),
+            );
+        }
+    };
+    let config = probes.engine_config();
+    let armed = config
+        .as_deref()
+        .is_some_and(|config| config.contains(BUS_RBAC_MARKER));
+    let bridge = config.as_deref().and_then(bridge_url_endpoint);
+    let mismatch = match &bridge {
+        Some(bridge) if *bridge != addr.to_string() => {
+            format!("; the iii-bridge url is {bridge}, which is a different address")
+        }
+        _ => String::new(),
+    };
+
+    match (probes.bus_auth_healthy(), armed) {
+        (true, _) => ReadinessItem::ok(
+            "Bus auth",
+            format!("bus-auth daemon: listening on {addr}{mismatch}"),
+        ),
+        (false, true) => ReadinessItem::failed(
+            "Bus auth",
+            format!(
+                "bus-auth daemon: not running on {addr} (bus RBAC is fail-closed — the engine will refuse every worker while it is down){mismatch}"
+            ),
+            format!(
+                "start the stack with `agentos up`, which starts {BUS_AUTH_BINARY} before the engine"
+            ),
+        ),
+        (false, false) => ReadinessItem::ok(
+            "Bus auth",
+            format!(
+                "bus-auth daemon: not running on {addr}; bus RBAC is not armed in the active config"
+            ),
+        ),
+    }
+}
+
+/// The agent id the TUI falls back to when no agent exists
+/// (`crates/tui/src/main.rs:889,1966,1724`).
+const FALLBACK_AGENT_ID: &str = "default";
+/// State scope holding one capability document per agent (CONTRACT I1:
+/// scope `capabilities`, key `<agent_id>`, value `{"tools": [...], ...}`).
+const CAPABILITY_SCOPE: &str = "capabilities";
+/// State scope holding the agent records themselves
+/// (`workers/agent-core/src/main.rs:271,296,459`).
+const AGENT_SCOPE: &str = "agents";
+
+/// Read-only report on capability documents. An agent without one has every
+/// tool call denied, which is invisible from the outside: chat simply refuses
+/// to use tools and says nothing about why.
+fn capability_item(probes: &dyn Diagnostics) -> ReadinessItem {
+    let (Some(agents), Some(capabilities)) = (
+        probes.state_keys(AGENT_SCOPE),
+        probes.state_keys(CAPABILITY_SCOPE),
+    ) else {
+        return ReadinessItem::failed(
+            "Capabilities",
+            "the engine did not answer state::list_keys",
+            "start the stack with `agentos up`, then re-run `agentos doctor`",
+        );
+    };
+
+    if agents.is_empty() {
+        return if capabilities.iter().any(|key| key == FALLBACK_AGENT_ID) {
+            ReadinessItem::ok(
+                "Capabilities",
+                format!("no agent records yet; '{FALLBACK_AGENT_ID}' has a capability document"),
+            )
+        } else {
+            ReadinessItem::failed(
+                "Capabilities",
+                format!(
+                    "no agent has a capability document; the TUI falls back to '{FALLBACK_AGENT_ID}', so every tool call for it is denied"
+                ),
+                "create an agent with `agentos agent new`, then re-run `agentos doctor`",
+            )
+        };
+    }
+
+    let missing = agents
+        .iter()
+        .filter(|agent| !capabilities.contains(agent))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        ReadinessItem::ok(
+            "Capabilities",
+            format!(
+                "{} of {} agent(s) have a capability document",
+                agents.len(),
+                agents.len()
+            ),
+        )
+    } else {
+        ReadinessItem::failed(
+            "Capabilities",
+            format!(
+                "{} of {} agent(s) have no capability document: {}; every tool call for them is denied",
+                missing.len(),
+                agents.len(),
+                missing.join(", ")
+            ),
+            "recreate them with `agentos agent new`, which writes the capability document",
+        )
+    }
+}
+
 /// Workers `up` launches and therefore expects to see on the bus: every Rust
 /// worker in the runtime. Python workers are started by their own tooling.
 fn required_worker_ids(workers: &[WorkerSpec]) -> BTreeSet<String> {
@@ -441,6 +1184,19 @@ fn required_worker_ids(workers: &[WorkerSpec]) -> BTreeSet<String> {
         .filter(|worker| worker.runtime == WorkerRuntime::Rust)
         .map(|worker| worker.name.clone())
         .collect()
+}
+
+/// The most likely cause of missing identities. Without `AGENTOS_API_KEY`
+/// almost every worker exits during route registration, so "start them" is the
+/// wrong advice and hides the real fault.
+fn missing_identity_hint(api_key_present: bool) -> String {
+    if api_key_present {
+        "start them with `agentos up --no-tui`".to_string()
+    } else {
+        format!(
+            "{API_KEY_VARIABLE} is unset: workers with protected HTTP routes exit before they connect. Run `agentos up`, which generates one, then re-run `agentos doctor`"
+        )
+    }
 }
 
 fn missing_worker_ids(required: &BTreeSet<String>, connected: &BTreeSet<String>) -> Vec<String> {
@@ -549,7 +1305,12 @@ fn up_stages(
         None
     };
 
-    // 4. engine: reuse a healthy one, otherwise start it detached and wait.
+    // 4. bus-auth daemon, before the engine: iii 0.22.1 calls the RBAC auth
+    //    function for every bus connection, so a daemon that is not listening
+    //    when the engine starts refuses every worker (fail-closed by design).
+    bus_auth_stage(effects, options, paths, out)?;
+
+    // 5. engine: reuse a healthy one, otherwise start it detached and wait.
     let endpoint = engine_endpoint();
     let reused_engine = effects.engine_healthy();
     if reused_engine {
@@ -561,7 +1322,7 @@ fn up_stages(
         stage_ok(out, "Bus", &format!("healthy on {endpoint} (pid {pid})"))?;
     }
 
-    // 5. worker binaries
+    // 6. worker binaries
     let workers = effects.worker_specs()?;
     let missing = crate::missing_worker_binaries(&workers);
     if !missing.is_empty() {
@@ -584,7 +1345,7 @@ fn up_stages(
         &format!("{} release binaries", required.len()),
     )?;
 
-    // 6. workers: compare canonical identities, never aggregate counts. On a
+    // 7. workers: compare canonical identities, never aggregate counts. On a
     //    partial stack only missing workers are launched, preserving the
     //    already-connected processes and avoiding duplicate registrations.
     let already_connected = await_worker_identity_report(effects, options)?;
@@ -636,7 +1397,7 @@ fn up_stages(
     // report success against a dead bus.
     ensure_engine_alive(effects)?;
 
-    // 7. TUI in the foreground.
+    // 8. TUI in the foreground.
     match tui_binary {
         Some(path) => {
             stage_run(out, "Starting agentos-tui...")?;
@@ -667,6 +1428,101 @@ fn up_stages(
             Ok(UpOutcome::Ready)
         }
     }
+}
+
+/// Starts (or reuses) the bus-auth daemon and reports what happened. A missing
+/// binary is fatal only when the active config arms the gate: an armed config
+/// without a daemon cannot boot at all, and failing here names the cause
+/// instead of leaving 62 workers refused by the bus.
+fn bus_auth_stage(
+    effects: &mut dyn Bootstrap,
+    options: &UpOptions,
+    paths: &RuntimePaths,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let addr = effects.bus_auth_addr()?;
+    let config = effects.engine_config();
+    let armed = config
+        .as_deref()
+        .is_some_and(|config| config.contains(BUS_RBAC_MARKER));
+
+    if let Some(bridge) = config.as_deref().and_then(bridge_url_endpoint)
+        && bridge != addr.to_string()
+    {
+        writeln!(
+            out,
+            "  {} bus-auth address {addr} does not match the iii-bridge url {bridge} in {}; the engine would forward the RBAC hooks somewhere else",
+            "!".yellow(),
+            paths.config_path.display()
+        )?;
+    }
+
+    if effects.bus_auth_healthy() {
+        stage_ok(out, "Bus auth", &format!("already listening on {addr}"))?;
+        return Ok(());
+    }
+
+    let Some(binary) = effects.bus_auth_binary() else {
+        if armed {
+            anyhow::bail!(
+                "{} arms bus RBAC ({BUS_RBAC_MARKER}) but {BUS_AUTH_BINARY} was not found: {WORKSPACE_BUILD_HINT}, or reinstall AgentOS. With the gate armed and no daemon listening on {addr}, the engine refuses every bus connection",
+                paths.config_path.display()
+            );
+        }
+        stage_ok(
+            out,
+            "Bus auth",
+            &format!("not started: {BUS_AUTH_BINARY} is not built and bus RBAC is not armed"),
+        )?;
+        return Ok(());
+    };
+
+    if !armed {
+        stage_ok(
+            out,
+            "Bus auth",
+            &format!(
+                "not started: bus RBAC is not armed in {}",
+                paths.config_path.display()
+            ),
+        )?;
+        return Ok(());
+    }
+
+    stage_run(out, &format!("Starting {BUS_AUTH_BINARY} on {addr}..."))?;
+    let pid = effects.start_bus_auth(&binary, addr)?;
+    await_bus_auth(effects, options, addr)?;
+    stage_ok(out, "Bus auth", &format!("listening on {addr} (pid {pid})"))?;
+    Ok(())
+}
+
+/// Waits for the daemon to accept connections, failing fast when it exited —
+/// which is what it does when `AGENTOS_API_KEY` is missing.
+fn await_bus_auth(
+    effects: &mut dyn Bootstrap,
+    options: &UpOptions,
+    addr: SocketAddr,
+) -> Result<()> {
+    let (poll, deadline) = poll_plan(options);
+    loop {
+        if let Some(status) = effects.bus_auth_stopped() {
+            anyhow::bail!(
+                "{BUS_AUTH_BINARY} exited with {status} before it listened on {addr}; it refuses to start without {API_KEY_VARIABLE}"
+            );
+        }
+        if effects.bus_auth_healthy() {
+            return Ok(());
+        }
+        let now = effects.now();
+        if now >= deadline {
+            break;
+        }
+        effects.sleep(poll.min(deadline.saturating_duration_since(now)));
+    }
+    anyhow::bail!(
+        "{BUS_AUTH_BINARY} did not accept connections on {addr} within {:?}",
+        options.stage_timeout
+    )
 }
 
 /// Builds a wall-clock polling budget for each readiness wait. A deadline caps
@@ -809,6 +1665,7 @@ pub(crate) struct SystemEffects {
     runtime_dir: PathBuf,
     launch_env: BTreeMap<String, String>,
     engine: Option<std::process::Child>,
+    bus_auth: Option<std::process::Child>,
     workers: Vec<RunningWorker>,
 }
 
@@ -820,8 +1677,23 @@ impl SystemEffects {
             runtime_dir: paths.runtime_dir.clone(),
             launch_env,
             engine: None,
+            bus_auth: None,
             workers: Vec::new(),
         }
+    }
+
+    /// Values this invocation would hand to a child process: the active `.env`
+    /// first, then whatever this process already exports.
+    fn launch_value(&self, name: &str) -> Option<String> {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                self.launch_env
+                    .get(name)
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+            })
     }
 }
 
@@ -847,6 +1719,22 @@ fn reported_worker_ids(registry: &Value) -> Option<BTreeSet<String>> {
             .filter(|worker| worker["status"].as_str() == Some("connected"))
             .filter(|worker| worker["runtime"].as_str() != Some("engine"))
             .filter_map(|worker| worker["name"].as_str())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// `state::list_keys` answers `{"keys": [...]}` on iii 0.22.1 (verified against
+/// the pinned engine). `state::list` returns a bare array of *values* with no
+/// key, so it cannot answer "which agent has a document" and is not used here.
+fn reported_state_keys(response: &Value) -> Option<Vec<String>> {
+    Some(
+        response
+            .get("keys")?
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|key| !key.is_empty())
             .map(str::to_owned)
             .collect(),
     )
@@ -902,6 +1790,44 @@ impl Diagnostics for SystemEffects {
         reported_worker_ids(&parse_registry_output(&output.stdout)?)
     }
 
+    fn state_keys(&self, scope: &str) -> Option<Vec<String>> {
+        let binary = self.engine_binary().ok()?;
+        let payload = json!({ "scope": scope }).to_string();
+        let output = std::process::Command::new(binary)
+            .args([
+                "trigger",
+                "state::list_keys",
+                "--json",
+                &payload,
+                "--timeout-ms",
+                "1000",
+            ])
+            .envs(&self.launch_env)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        reported_state_keys(&parse_registry_output(&output.stdout)?)
+    }
+
+    fn bus_auth_binary(&self) -> Option<PathBuf> {
+        crate::find_sibling_binary(BUS_AUTH_BINARY, Some(&self.runtime_dir))
+    }
+
+    fn bus_auth_addr(&self) -> Result<SocketAddr> {
+        parse_bus_auth_addr(self.launch_value(BUS_AUTH_ADDR_VARIABLE).as_deref())
+    }
+
+    fn bus_auth_healthy(&self) -> bool {
+        self.bus_auth_addr()
+            .is_ok_and(|addr| TcpStream::connect_timeout(&addr, HEALTH_PROBE_TIMEOUT).is_ok())
+    }
+
+    fn engine_config(&self) -> Option<String> {
+        std::fs::read_to_string(&self.config_path).ok()
+    }
+
     fn worker_specs(&self) -> Result<Vec<WorkerSpec>> {
         crate::collect_worker_specs(&self.runtime_dir)
     }
@@ -920,6 +1846,29 @@ impl Diagnostics for SystemEffects {
 }
 
 impl Bootstrap for SystemEffects {
+    fn start_bus_auth(&mut self, binary: &Path, addr: SocketAddr) -> Result<u32> {
+        let daemon = crate::spawn_bus_auth(
+            binary,
+            addr,
+            &self.runtime_dir,
+            &self.worker_log(),
+            &self.launch_env,
+            true,
+        )?;
+        let pid = daemon.id();
+        self.bus_auth = Some(daemon);
+        Ok(pid)
+    }
+
+    fn bus_auth_stopped(&mut self) -> Option<String> {
+        let daemon = self.bus_auth.as_mut()?;
+        daemon
+            .try_wait()
+            .ok()
+            .flatten()
+            .map(|status| status.to_string())
+    }
+
     fn start_engine(&mut self, binary: &Path) -> Result<u32> {
         let engine = crate::spawn_engine(
             binary,
@@ -977,6 +1926,13 @@ impl Bootstrap for SystemEffects {
             let _ = engine.wait();
         }
         self.engine = None;
+        // The daemon goes last: it is the gate the rest of the stack talks
+        // through, and killing it first would refuse their shutdown traffic.
+        if let Some(daemon) = self.bus_auth.as_mut() {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+        self.bus_auth = None;
     }
 
     fn run_tui(&mut self, binary: &Path) -> Result<i32> {
@@ -1050,6 +2006,19 @@ mod tests {
         engine_start_error: Option<String>,
         /// Stable worker identities the engine reports; `None` when silent.
         connected: RefCell<Option<BTreeSet<String>>>,
+        /// The bus-auth daemon binary, when it is built.
+        bus_auth_binary: Option<PathBuf>,
+        /// Listening from this probe onwards; `None` never listens.
+        bus_auth_healthy_from: Option<usize>,
+        bus_auth_probes: Cell<usize>,
+        /// The daemon this invocation started reports exited.
+        bus_auth_exits: bool,
+        /// Contents of the active `config.yaml`.
+        engine_config: Option<String>,
+        /// Keys in state scope `agents`; `None` when the engine cannot answer.
+        agent_keys: Option<Vec<String>>,
+        /// Keys in state scope `capabilities`.
+        capability_keys: Option<Vec<String>>,
         identity_probes: Cell<usize>,
         /// Overrides `connected` from this zero-based identity probe onwards.
         connected_from_probe: Option<(usize, BTreeSet<String>)>,
@@ -1080,6 +2049,16 @@ mod tests {
                 stop_checks: Cell::new(0),
                 engine_start_error: None,
                 connected: RefCell::new(Some(ids(&["core", "memory"]))),
+                bus_auth_binary: Some(PathBuf::from("/release/agentos-bus-authd")),
+                bus_auth_healthy_from: Some(0),
+                bus_auth_probes: Cell::new(0),
+                bus_auth_exits: false,
+                engine_config: Some(
+                    "workers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n      rbac:\n        auth_function_id: agentos::bus_auth\n  - name: iii-bridge\n    config:\n      url: ws://127.0.0.1:49129\n"
+                        .to_string(),
+                ),
+                agent_keys: Some(vec!["default".to_string()]),
+                capability_keys: Some(vec!["default".to_string()]),
                 identity_probes: Cell::new(0),
                 connected_from_probe: None,
                 connected_after_start: Some(ids(&["core", "memory"])),
@@ -1153,6 +2132,33 @@ mod tests {
             None
         }
 
+        fn bus_auth_binary(&self) -> Option<PathBuf> {
+            self.bus_auth_binary.clone()
+        }
+
+        fn bus_auth_addr(&self) -> Result<SocketAddr> {
+            parse_bus_auth_addr(None)
+        }
+
+        fn bus_auth_healthy(&self) -> bool {
+            let probe = self.bus_auth_probes.get();
+            self.bus_auth_probes.set(probe + 1);
+            self.bus_auth_healthy_from
+                .is_some_and(|threshold| probe >= threshold)
+        }
+
+        fn engine_config(&self) -> Option<String> {
+            self.engine_config.clone()
+        }
+
+        fn state_keys(&self, scope: &str) -> Option<Vec<String>> {
+            match scope {
+                AGENT_SCOPE => self.agent_keys.clone(),
+                CAPABILITY_SCOPE => self.capability_keys.clone(),
+                other => panic!("unexpected state scope probed by doctor: {other}"),
+            }
+        }
+
         fn worker_specs(&self) -> Result<Vec<WorkerSpec>> {
             match &self.workers {
                 Ok(workers) => Ok(workers
@@ -1177,6 +2183,15 @@ mod tests {
     }
 
     impl Bootstrap for Fake {
+        fn start_bus_auth(&mut self, _binary: &Path, addr: SocketAddr) -> Result<u32> {
+            self.record(&format!("start_bus_auth {addr}"));
+            Ok(4242)
+        }
+
+        fn bus_auth_stopped(&mut self) -> Option<String> {
+            self.bus_auth_exits.then(|| "exit status: 1".to_string())
+        }
+
         fn start_engine(&mut self, _binary: &Path) -> Result<u32> {
             self.record("start_engine");
             match &self.engine_start_error {
@@ -1792,9 +2807,27 @@ mod tests {
         assert!(!fake.events().contains(&"start_engine".to_string()));
     }
 
+    /// A fully configured machine: its own API key plus one provider
+    /// credential, both from the active `.env`.
+    fn configured_credentials() -> Credentials {
+        let mut values = BTreeMap::new();
+        values.insert(API_KEY_VARIABLE.to_string(), "machine-key".to_string());
+        values.insert("ANTHROPIC_API_KEY".to_string(), "cloud-key".to_string());
+        Credentials::resolve(Path::new("/runtime/.env"), &values, |_| None)
+    }
+
     fn diagnose(fake: &Fake, discovery: ConfigDiscovery, config: &Path) -> (Readiness, String) {
+        diagnose_with(fake, discovery, config, &configured_credentials())
+    }
+
+    fn diagnose_with(
+        fake: &Fake,
+        discovery: ConfigDiscovery,
+        config: &Path,
+        credentials: &Credentials,
+    ) -> (Readiness, String) {
         colored::control::set_override(false);
-        let report = readiness(fake, &paths(config, discovery));
+        let report = readiness(fake, &paths(config, discovery), credentials);
         let mut out = Vec::new();
         report.render(&mut out).expect("render report");
         (report, String::from_utf8(out).expect("utf-8 output"))
@@ -1839,7 +2872,7 @@ mod tests {
                 .to_path_buf(),
             discovery: ConfigDiscovery::Checkout,
         };
-        let report = readiness(&Fake::default(), &paths);
+        let report = readiness(&Fake::default(), &paths, &configured_credentials());
         assert!(
             report.passed(),
             "unexpected failures: {:?}",
@@ -2167,6 +3200,769 @@ mod tests {
             assert!(error.contains(expected), "{source:?}: {error}");
             assert!(error.contains("/runtime/.env:1"), "{source:?}: {error}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // first run: AGENTOS_API_KEY, provider credential, default route
+    // -----------------------------------------------------------------------
+
+    /// A private directory for dotenv tests. Nothing here touches the process
+    /// environment, so these run in parallel with everything else.
+    fn temporary_runtime(label: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "agentos-first-run-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create temporary runtime");
+        path
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .expect("stat file")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn fixed_key() -> Result<String> {
+        Ok("f".repeat(64))
+    }
+
+    #[test]
+    fn api_key_is_generated_into_an_absent_dotenv_with_mode_0600() {
+        let runtime = temporary_runtime("generate");
+        let outcome = ensure_api_key_with(&runtime, || None, fixed_key).expect("generate key");
+        let path = dotenv_path(&runtime);
+        assert_eq!(outcome, ApiKeyOutcome::Generated(path.clone()));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read dotenv"),
+            format!("{API_KEY_VARIABLE}={}\n", "f".repeat(64))
+        );
+        #[cfg(unix)]
+        assert_eq!(mode_of(&path), 0o600);
+        assert!(
+            outcome.describe().contains(&path.display().to_string()),
+            "the message must name the file it wrote: {}",
+            outcome.describe()
+        );
+        std::fs::remove_dir_all(&runtime).expect("clean up");
+    }
+
+    #[test]
+    fn api_key_generation_never_overwrites_an_existing_value() {
+        let runtime = temporary_runtime("keep");
+        let path = dotenv_path(&runtime);
+        std::fs::write(&path, "AGENTOS_API_KEY=operator-secret\n").expect("write dotenv");
+        let outcome = ensure_api_key_with(&runtime, || None, fixed_key).expect("inspect key");
+        assert_eq!(outcome, ApiKeyOutcome::AlreadyPresent(path.clone()));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read dotenv"),
+            "AGENTOS_API_KEY=operator-secret\n"
+        );
+        std::fs::remove_dir_all(&runtime).expect("clean up");
+    }
+
+    #[test]
+    fn api_key_generation_fills_an_empty_assignment_in_place() {
+        let runtime = temporary_runtime("fill");
+        let path = dotenv_path(&runtime);
+        // The shape `.env.example` ships: the key is declared and empty.
+        std::fs::write(
+            &path,
+            "# comment\nANTHROPIC_API_KEY=cloud\nAGENTOS_API_KEY=\nIII_URL=ws://localhost:49134\n",
+        )
+        .expect("write dotenv");
+        let outcome = ensure_api_key_with(&runtime, || None, fixed_key).expect("generate key");
+        assert_eq!(outcome, ApiKeyOutcome::Generated(path.clone()));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read dotenv"),
+            format!(
+                "# comment\nANTHROPIC_API_KEY=cloud\n{API_KEY_VARIABLE}={}\nIII_URL=ws://localhost:49134\n",
+                "f".repeat(64)
+            )
+        );
+        std::fs::remove_dir_all(&runtime).expect("clean up");
+    }
+
+    #[test]
+    fn api_key_generation_defers_to_an_exported_value() {
+        let runtime = temporary_runtime("inherited");
+        let outcome = ensure_api_key_with(
+            &runtime,
+            || Some("from-shell".to_string()),
+            || panic!("must not generate a key when the environment exports one"),
+        )
+        .expect("inherit key");
+        assert_eq!(outcome, ApiKeyOutcome::Inherited);
+        assert!(
+            !dotenv_path(&runtime).exists(),
+            "an exported key must not cause a second, inert value in .env"
+        );
+        std::fs::remove_dir_all(&runtime).expect("clean up");
+    }
+
+    #[test]
+    fn generated_api_keys_are_random_and_32_bytes_wide() {
+        let first = random_api_key().expect("first key");
+        let second = random_api_key().expect("second key");
+        assert_eq!(first.len(), API_KEY_BYTES * 2, "{first}");
+        assert!(
+            first
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn dotenv_writes_refuse_to_replace_a_symlink() {
+        let runtime = temporary_runtime("symlink");
+        let target = runtime.join("real.env");
+        std::fs::write(&target, "AGENTOS_API_KEY=\n").expect("write target");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, dotenv_path(&runtime)).expect("create symlink");
+        let error = ensure_api_key_with(&runtime, || None, fixed_key)
+            .expect_err("a symlinked .env must be refused")
+            .to_string();
+        assert!(error.contains("symlink"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "AGENTOS_API_KEY=\n",
+            "the symlink target must be left untouched"
+        );
+        std::fs::remove_dir_all(&runtime).expect("clean up");
+    }
+
+    #[test]
+    fn set_dotenv_value_replaces_one_assignment_and_keeps_the_rest() {
+        let runtime = temporary_runtime("set-value");
+        let path = dotenv_path(&runtime);
+        std::fs::write(
+            &path,
+            "ANTHROPIC_API_KEY=old\n# keep me\nOPENAI_API_KEY=other\n",
+        )
+        .expect("write dotenv");
+        let written = set_dotenv_value(&runtime, "ANTHROPIC_API_KEY", "new").expect("set value");
+        assert_eq!(written, path);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read dotenv"),
+            "ANTHROPIC_API_KEY=new\n# keep me\nOPENAI_API_KEY=other\n"
+        );
+        #[cfg(unix)]
+        assert_eq!(mode_of(&path), 0o600);
+        std::fs::remove_dir_all(&runtime).expect("clean up");
+    }
+
+    #[test]
+    fn provider_variables_match_the_llm_router_table() {
+        assert_eq!(provider_variable("anthropic"), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(provider_variable("codex"), Some("CODEX_PROXY_API_KEY"));
+        assert_eq!(provider_variable("openai"), Some("OPENAI_API_KEY"));
+        // `ollama` has an empty env_key in the router table, and an unknown
+        // provider must not be silently written into the environment.
+        assert_eq!(provider_variable("ollama"), None);
+        assert_eq!(provider_variable("not-a-provider"), None);
+    }
+
+    fn credentials_for(pairs: &[(&str, &str)]) -> Credentials {
+        let values = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect::<BTreeMap<_, _>>();
+        Credentials::resolve(Path::new("/runtime/.env"), &values, |_| None)
+    }
+
+    fn route_for(pairs: &[(&str, &str)]) -> DefaultRoute {
+        credentials_for(pairs).route
+    }
+
+    #[test]
+    fn default_route_mirrors_the_llm_router_resolution() {
+        // A pinned default is live when the credential *that provider* needs is
+        // present - not when CODEX_PROXY_API_KEY happens to be set.
+        assert_eq!(
+            route_for(&[
+                ("CODEX_PROXY_API_KEY", "proxy"),
+                ("AGENTOS_DEFAULT_PROVIDER", "codex"),
+                ("AGENTOS_DEFAULT_MODEL", "gpt-5.6-sol"),
+            ]),
+            DefaultRoute::Pinned {
+                provider: "codex".to_string(),
+                model: Some("gpt-5.6-sol".to_string()),
+            }
+        );
+        assert_eq!(
+            route_for(&[
+                ("OPENAI_API_KEY", "cloud"),
+                ("AGENTOS_DEFAULT_PROVIDER", "openai"),
+            ]),
+            DefaultRoute::Pinned {
+                provider: "openai".to_string(),
+                model: None,
+            },
+            "a pinned provider with its own credential must not need the codex proxy key"
+        );
+        // A model on its own means the codex provider, as the router resolves it.
+        assert_eq!(
+            route_for(&[("CODEX_PROXY_API_KEY", "proxy")]),
+            DefaultRoute::Automatic {
+                provider: CODEX_PROVIDER
+            },
+            "no default was requested, so routing is automatic"
+        );
+
+        // `.env.example`'s shipped shape: codex is pinned, its proxy key is
+        // empty, and the first credential in preference order takes over.
+        let disabled = credentials_for(&[
+            ("CODEX_PROXY_API_KEY", ""),
+            ("AGENTOS_DEFAULT_PROVIDER", "codex"),
+            ("AGENTOS_DEFAULT_MODEL", "gpt-5.6-sol"),
+            ("ANTHROPIC_API_KEY", "cloud"),
+        ]);
+        assert_eq!(
+            disabled.route,
+            DefaultRoute::Automatic {
+                provider: "anthropic"
+            }
+        );
+        assert_eq!(disabled.disabled_default.as_deref(), Some("codex"));
+
+        // Preference order decides, and it is llm-router's AUTO_ROUTE_PREFERENCE.
+        assert_eq!(
+            route_for(&[("OPENROUTER_API_KEY", "x"), ("OPENAI_API_KEY", "y")]),
+            DefaultRoute::Automatic { provider: "openai" }
+        );
+        assert_eq!(
+            route_for(&[("OPENROUTER_API_KEY", "x")]),
+            DefaultRoute::Automatic {
+                provider: "openrouter"
+            }
+        );
+
+        // Nothing configured at all: unqualified chat is refused, and doctor
+        // must say that instead of naming a provider that cannot answer.
+        assert_eq!(route_for(&[]), DefaultRoute::Unavailable);
+        let pinned_without_credential =
+            credentials_for(&[("AGENTOS_DEFAULT_MODEL", "gpt-5.6-sol")]);
+        assert_eq!(pinned_without_credential.route, DefaultRoute::Unavailable);
+        assert_eq!(
+            pinned_without_credential.disabled_default.as_deref(),
+            Some(CODEX_PROVIDER)
+        );
+        assert!(
+            pinned_without_credential
+                .route
+                .detail()
+                .contains("provider_credential_missing"),
+            "doctor must use llm-router's own refusal vocabulary: {}",
+            pinned_without_credential.route.detail()
+        );
+    }
+
+    #[test]
+    fn credential_variables_are_listed_in_router_preference_order() {
+        // llm-router's provider_credential_missing lists the same variables in
+        // the same order; a user who reads either message sees one contract.
+        assert_eq!(
+            credential_variables(),
+            "ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, CODEX_PROXY_API_KEY, GROQ_API_KEY, DEEPSEEK_API_KEY, MISTRAL_API_KEY, TOGETHER_API_KEY, FIREWORKS_API_KEY, OPENROUTER_API_KEY"
+        );
+    }
+
+    #[test]
+    fn credentials_prefer_the_process_environment_over_the_file() {
+        let mut values = BTreeMap::new();
+        values.insert(API_KEY_VARIABLE.to_string(), "from-file".to_string());
+        values.insert("ANTHROPIC_API_KEY".to_string(), "  ".to_string());
+        let credentials = Credentials::resolve(Path::new("/runtime/.env"), &values, |name| {
+            (name == "ANTHROPIC_API_KEY").then(|| "from-shell".to_string())
+        });
+        assert_eq!(credentials.api_key, Some(CredentialSource::Dotenv));
+        assert_eq!(
+            credentials.providers,
+            vec![ProviderCredential {
+                provider: "anthropic",
+                variable: "ANTHROPIC_API_KEY",
+                source: CredentialSource::Environment,
+            }],
+            "a blank file value must not mask the exported credential"
+        );
+    }
+
+    #[test]
+    fn dotenv_parsing_separates_the_file_view_from_the_process_view() {
+        let path = Path::new("/runtime/.env");
+        let source = "AGENTOS_API_KEY=from-file\nANTHROPIC_API_KEY=cloud\n";
+        let all = parse_dotenv_all(source, path).expect("parse every assignment");
+        assert_eq!(
+            all.get(API_KEY_VARIABLE).map(String::as_str),
+            Some("from-file")
+        );
+        // SAFETY: single-threaded assertion on a variable this crate owns.
+        unsafe { std::env::set_var("AGENTOS_TEST_DOTENV_VIEW", "exported") };
+        let exported = parse_dotenv(
+            "AGENTOS_TEST_DOTENV_VIEW=from-file\nANTHROPIC_API_KEY=cloud\n",
+            path,
+        )
+        .expect("parse spawn view");
+        unsafe { std::env::remove_var("AGENTOS_TEST_DOTENV_VIEW") };
+        assert!(
+            !exported.contains_key("AGENTOS_TEST_DOTENV_VIEW"),
+            "an exported key must keep its exported value at spawn time"
+        );
+        assert_eq!(
+            exported.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("cloud")
+        );
+    }
+
+    #[test]
+    fn doctor_reports_the_api_key_provider_and_route() {
+        let config = existing_config();
+        let mut values = BTreeMap::new();
+        values.insert(API_KEY_VARIABLE.to_string(), "machine-key".to_string());
+        values.insert("CODEX_PROXY_API_KEY".to_string(), "proxy".to_string());
+        values.insert(
+            "AGENTOS_DEFAULT_MODEL".to_string(),
+            "gpt-5.6-sol".to_string(),
+        );
+        let credentials = Credentials::resolve(Path::new("/runtime/.env"), &values, |_| None);
+        let (report, output) = diagnose_with(
+            &Fake::default(),
+            ConfigDiscovery::Checkout,
+            &config,
+            &credentials,
+        );
+
+        let key = report.item("API key").expect("API key item");
+        assert!(key.passed, "{}", key.detail);
+        assert!(key.detail.contains(".env"), "{}", key.detail);
+        let provider = report.item("Provider").expect("provider item");
+        assert!(provider.passed);
+        assert!(
+            provider.detail.contains("codex via CODEX_PROXY_API_KEY"),
+            "{}",
+            provider.detail
+        );
+        let route = report.item("Route").expect("route item");
+        assert!(route.passed);
+        assert_eq!(
+            route.detail,
+            "codex/gpt-5.6-sol (pinned by AGENTOS_DEFAULT_PROVIDER/MODEL)"
+        );
+        assert!(output.contains("codex/gpt-5.6-sol"), "{output}");
+    }
+
+    #[test]
+    fn doctor_names_the_missing_api_key_as_the_cause_of_missing_identities() {
+        let config = existing_config();
+        let credentials =
+            Credentials::resolve(Path::new("/runtime/.env"), &BTreeMap::new(), |_| None);
+        let fake = Fake {
+            // The engine is up and one of the two required workers exited,
+            // exactly what an unset AGENTOS_API_KEY produces.
+            connected: RefCell::new(Some(ids(&["core"]))),
+            connected_after_start: Some(ids(&["core"])),
+            ..Fake::default()
+        };
+        let (report, output) =
+            diagnose_with(&fake, ConfigDiscovery::Checkout, &config, &credentials);
+
+        let key = report.item("API key").expect("API key item");
+        assert!(!key.passed);
+        assert!(
+            key.detail.contains("protected HTTP routes"),
+            "{}",
+            key.detail
+        );
+        let connected = report.item("Connected").expect("connected item");
+        assert!(!connected.passed);
+        let hint = connected.hint.clone().expect("missing identities hint");
+        assert!(
+            hint.contains(API_KEY_VARIABLE),
+            "the hint must name the real cause, not just 'start them': {hint}"
+        );
+        let provider = report.item("Provider").expect("provider item");
+        assert!(!provider.passed);
+        assert_eq!(provider.detail, "no provider credential is set");
+        let route = report.item("Route").expect("route item");
+        assert!(!route.passed);
+        assert!(
+            route.detail.contains("provider_credential_missing"),
+            "{}",
+            route.detail
+        );
+        assert!(
+            route
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("ANTHROPIC_API_KEY")),
+            "the hint must name the variables llm-router names: {:?}",
+            route.hint
+        );
+        assert!(output.contains(API_KEY_VARIABLE), "{output}");
+    }
+
+    #[test]
+    fn doctor_keeps_the_start_hint_when_the_api_key_is_present() {
+        let config = existing_config();
+        let fake = Fake {
+            connected: RefCell::new(Some(ids(&["core"]))),
+            connected_after_start: Some(ids(&["core"])),
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let connected = report.item("Connected").expect("connected item");
+        assert_eq!(
+            connected.hint.as_deref(),
+            Some("start them with `agentos up --no-tui`")
+        );
+    }
+
+    #[test]
+    fn state_list_keys_shape_matches_iii_0_22_1() {
+        // Verified against the pinned engine: `state::list_keys` answers
+        // {"keys": [...]}, `state::list` answers a bare array of values, and
+        // `state::list_groups` answers {"groups": [...]}.
+        assert_eq!(
+            reported_state_keys(&json!({ "keys": ["default", "researcher"] })),
+            Some(vec!["default".to_string(), "researcher".to_string()])
+        );
+        assert_eq!(
+            reported_state_keys(&json!({ "keys": [] })),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            reported_state_keys(&json!({ "keys": ["", 7, "kept"] })),
+            Some(vec!["kept".to_string()]),
+            "non-string and empty keys must not become agent ids"
+        );
+        // The bare-array shape belongs to `state::list`; reading it as keys
+        // would silently report every agent as unprovisioned.
+        assert_eq!(reported_state_keys(&json!(["default"])), None);
+        assert_eq!(
+            reported_state_keys(&json!({ "groups": ["capabilities"] })),
+            None
+        );
+    }
+
+    #[test]
+    fn doctor_names_agents_without_a_capability_document() {
+        let config = existing_config();
+        let fake = Fake {
+            agent_keys: Some(vec!["default".to_string(), "researcher".to_string()]),
+            capability_keys: Some(vec!["default".to_string()]),
+            ..Fake::default()
+        };
+        let (report, output) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Capabilities").expect("capabilities item");
+        assert!(!item.passed);
+        assert!(item.detail.contains("researcher"), "{}", item.detail);
+        assert!(
+            item.detail.contains("every tool call for them is denied"),
+            "{}",
+            item.detail
+        );
+        assert!(output.contains("researcher"), "{output}");
+    }
+
+    #[test]
+    fn doctor_flags_the_tui_fallback_agent_when_nothing_is_provisioned() {
+        let config = existing_config();
+        let fake = Fake {
+            agent_keys: Some(Vec::new()),
+            capability_keys: Some(Vec::new()),
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Capabilities").expect("capabilities item");
+        assert!(!item.passed);
+        assert!(
+            item.detail.contains(FALLBACK_AGENT_ID),
+            "the fresh-install case must name the agent the TUI would use: {}",
+            item.detail
+        );
+        assert_eq!(
+            item.hint.as_deref(),
+            Some("create an agent with `agentos agent new`, then re-run `agentos doctor`")
+        );
+    }
+
+    #[test]
+    fn doctor_accepts_a_provisioned_fallback_agent_without_agent_records() {
+        let config = existing_config();
+        let fake = Fake {
+            agent_keys: Some(Vec::new()),
+            capability_keys: Some(vec![FALLBACK_AGENT_ID.to_string()]),
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Capabilities").expect("capabilities item");
+        assert!(item.passed, "{}", item.detail);
+    }
+
+    #[test]
+    fn doctor_reports_capabilities_as_unknown_when_the_engine_is_silent() {
+        let config = existing_config();
+        let fake = Fake {
+            agent_keys: None,
+            capability_keys: None,
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Capabilities").expect("capabilities item");
+        assert!(!item.passed);
+        assert_eq!(item.detail, "the engine did not answer state::list_keys");
+    }
+
+    // -----------------------------------------------------------------------
+    // bus RBAC: the auth daemon starts before the engine
+    // -----------------------------------------------------------------------
+
+    /// A `config.yaml` with the RBAC block, optionally pointing the bridge
+    /// somewhere else than the daemon.
+    fn armed_config(bridge_url: &str) -> String {
+        format!(
+            "workers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n      rbac:\n        auth_function_id: agentos::bus_auth\n  - name: iii-bridge\n    config:\n      url: {bridge_url}\n"
+        )
+    }
+
+    #[test]
+    fn bus_auth_address_comes_from_the_environment_or_the_daemon_default() {
+        assert_eq!(
+            parse_bus_auth_addr(None).expect("default"),
+            "127.0.0.1:49129"
+                .parse::<SocketAddr>()
+                .expect("default addr")
+        );
+        assert_eq!(
+            parse_bus_auth_addr(Some("  ")).expect("blank falls back"),
+            "127.0.0.1:49129"
+                .parse::<SocketAddr>()
+                .expect("default addr")
+        );
+        assert_eq!(
+            parse_bus_auth_addr(Some("127.0.0.1:49999")).expect("explicit"),
+            "127.0.0.1:49999"
+                .parse::<SocketAddr>()
+                .expect("explicit addr")
+        );
+        // Never silently fall back: the engine would fail closed against the
+        // wrong port and refuse every worker.
+        let error = parse_bus_auth_addr(Some("not-an-address"))
+            .expect_err("garbage must not resolve")
+            .to_string();
+        assert!(error.contains(BUS_AUTH_ADDR_VARIABLE), "{error}");
+    }
+
+    #[test]
+    fn bridge_url_endpoint_reads_the_forwarding_target() {
+        assert_eq!(
+            bridge_url_endpoint(&armed_config("ws://127.0.0.1:49129")).as_deref(),
+            Some("127.0.0.1:49129")
+        );
+        assert_eq!(
+            bridge_url_endpoint("    url: \"wss://example.test:8443/\"\n").as_deref(),
+            Some("example.test:8443")
+        );
+        assert_eq!(bridge_url_endpoint("workers: []\n"), None);
+    }
+
+    #[test]
+    fn up_starts_the_bus_auth_daemon_before_the_engine() {
+        let config = existing_config();
+        let mut fake = Fake {
+            // Nothing is listening until the daemon this invocation starts.
+            bus_auth_healthy_from: Some(1),
+            healthy_from: Some(1),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert!(outcome.is_ok(), "{outcome:?}");
+
+        let events = fake.events();
+        let daemon = events
+            .iter()
+            .position(|event| event.starts_with("start_bus_auth"))
+            .expect("daemon must be started");
+        let engine = events
+            .iter()
+            .position(|event| event == "start_engine")
+            .expect("engine must be started");
+        assert!(
+            daemon < engine,
+            "the daemon must be listening before the engine accepts its first bus connection: {events:?}"
+        );
+        assert!(
+            events[daemon].contains("127.0.0.1:49129"),
+            "{:?}",
+            events[daemon]
+        );
+        assert!(output.contains("Bus auth"), "{output}");
+        assert!(output.contains("listening on 127.0.0.1:49129"), "{output}");
+    }
+
+    #[test]
+    fn up_reuses_a_bus_auth_daemon_that_is_already_listening() {
+        let config = existing_config();
+        let mut fake = Fake::default();
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            !fake
+                .events()
+                .iter()
+                .any(|event| event.starts_with("start_bus_auth")),
+            "a second daemon would fail to bind the same port: {:?}",
+            fake.events()
+        );
+        assert!(
+            output.contains("already listening on 127.0.0.1:49129"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn up_fails_when_the_gate_is_armed_and_the_daemon_is_not_built() {
+        let config = existing_config();
+        let mut fake = Fake {
+            bus_auth_binary: None,
+            bus_auth_healthy_from: None,
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome
+            .expect_err("an armed gate without a daemon cannot boot")
+            .to_string();
+        assert!(error.contains(BUS_AUTH_BINARY), "{error}");
+        assert!(error.contains("refuses every bus connection"), "{error}");
+        assert!(
+            !fake.events().contains(&"start_engine".to_string()),
+            "the engine must not start into a gate nothing answers"
+        );
+    }
+
+    #[test]
+    fn up_skips_the_daemon_when_bus_rbac_is_not_armed() {
+        let config = existing_config();
+        let mut fake = Fake {
+            bus_auth_healthy_from: None,
+            engine_config: Some("workers:\n  - name: state\n".to_string()),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            !fake
+                .events()
+                .iter()
+                .any(|event| event.starts_with("start_bus_auth")),
+            "{:?}",
+            fake.events()
+        );
+        assert!(output.contains("bus RBAC is not armed"), "{output}");
+    }
+
+    #[test]
+    fn up_fails_when_the_daemon_exits_before_it_listens() {
+        let config = existing_config();
+        let mut fake = Fake {
+            bus_auth_healthy_from: None,
+            bus_auth_exits: true,
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome
+            .expect_err("a dead daemon must stop the boot")
+            .to_string();
+        assert!(error.contains(API_KEY_VARIABLE), "{error}");
+        assert!(!fake.events().contains(&"start_engine".to_string()));
+    }
+
+    #[test]
+    fn up_warns_when_the_bridge_url_points_somewhere_else() {
+        let config = existing_config();
+        let mut fake = Fake {
+            engine_config: Some(armed_config("ws://127.0.0.1:49999")),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            output.contains("does not match the iii-bridge url 127.0.0.1:49999"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_the_bus_auth_daemon() {
+        let config = existing_config();
+
+        let (report, output) = diagnose(&Fake::default(), ConfigDiscovery::Checkout, &config);
+        let item = report.item("Bus auth").expect("bus auth item");
+        assert!(item.passed);
+        assert!(
+            item.detail
+                .contains("bus-auth daemon: listening on 127.0.0.1:49129"),
+            "{}",
+            item.detail
+        );
+        assert!(output.contains("bus-auth daemon"), "{output}");
+
+        let down = Fake {
+            bus_auth_healthy_from: None,
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&down, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Bus auth").expect("bus auth item");
+        assert!(!item.passed);
+        assert!(
+            item.detail.contains(
+                "bus-auth daemon: not running on 127.0.0.1:49129 (bus RBAC is fail-closed"
+            ),
+            "{}",
+            item.detail
+        );
+        assert!(
+            item.detail.contains("refuse every worker while it is down"),
+            "{}",
+            item.detail
+        );
+
+        // Not armed: a daemon that is not running is not a fault.
+        let unarmed = Fake {
+            bus_auth_healthy_from: None,
+            engine_config: Some("workers:\n  - name: state\n".to_string()),
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&unarmed, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Bus auth").expect("bus auth item");
+        assert!(item.passed, "{}", item.detail);
+        assert!(item.detail.contains("not armed"), "{}", item.detail);
+    }
+
+    #[test]
+    fn doctor_reports_a_bridge_url_that_cannot_be_reached_by_the_daemon() {
+        let config = existing_config();
+        let fake = Fake {
+            engine_config: Some(armed_config("ws://127.0.0.1:49999")),
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Bus auth").expect("bus auth item");
+        assert!(
+            item.detail
+                .contains("the iii-bridge url is 127.0.0.1:49999"),
+            "{}",
+            item.detail
+        );
     }
 
     #[test]

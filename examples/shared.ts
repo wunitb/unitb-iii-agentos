@@ -108,3 +108,42 @@ export function registerShutdown(iii: IIIClient): void {
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 }
+
+type AgentStateWrite = {
+  scope: string;
+  key: string;
+  value: JsonValue;
+};
+
+/**
+ * The `state::set` writes that register one agent.
+ *
+ * Two properties of the engine's state protocol (iii 0.22.1) shape this:
+ *
+ * 1. `state::list` answers a bare array of the stored values with no keys, so
+ *    the agent id must live inside the agent document. Readers such as
+ *    `a2a::list_cards` and `lifecycle::check_all` look for `id`.
+ * 2. Capabilities are read from their own scope (`capabilities`, key
+ *    `<agentId>`, value `{ tools, updatedAt }`), not from the agent document,
+ *    so an agent registered without that document can call no tool at all.
+ */
+export function agentStateWrites(
+  agentId: string,
+  config: Record<string, JsonValue>,
+  now: number,
+): AgentStateWrite[] {
+  const capabilities = config.capabilities;
+  const tools =
+    isJsonObject(capabilities) && Array.isArray(capabilities.tools)
+      ? capabilities.tools
+      : [];
+
+  return [
+    { scope: "agents", key: agentId, value: { ...config, id: agentId } },
+    {
+      scope: "capabilities",
+      key: agentId,
+      value: { tools, updatedAt: now },
+    },
+  ];
+}

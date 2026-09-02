@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createServer } from "node:net";
 import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -15,15 +17,57 @@ interface CapturedEnvironment {
   defaultModel: string | null;
 }
 
+interface MemworkrOptions {
+  /// 40-character commit written to `current`.
+  version?: string;
+  /// Digest recorded beside the binary; "correct" records the real sha256.
+  digest?: "correct" | "wrong" | "missing";
+  /// Whether the fake memworkr reports a healthy schema-v6 memory::health.
+  healthy?: boolean;
+}
+
 interface FixtureOptions {
   dotenvMode?: number;
   dotenvSymlink?: boolean;
+  memworkr?: MemworkrOptions;
+  /// Extra `integrations/<name>.toml` manifests, by integration id.
+  integrations?: Record<string, string[]>;
+  /// "present": ship a fake daemon; "armed-missing": arm config.yaml with no
+  /// daemon binary at all.
+  busAuth?: "present" | "armed-missing";
+}
+
+interface BusAuthCapture {
+  argv: string[];
+  /// How many times the fake daemon was executed.
+  starts: number;
 }
 
 interface FixtureResult {
   captured: CapturedEnvironment | null;
   stderr: string;
+  stdout: string;
   exitCode: number;
+  /// Whether the fake memworkr binary was executed.
+  memworkrStarted: boolean;
+  /// What the fake bus-auth daemon recorded, when one was installed.
+  busAuth: BusAuthCapture | null;
+  /// The address this fixture told dev-up.sh to use for the daemon.
+  busAuthAddr: string;
+}
+
+/// A loopback address nothing is listening on right now. dev-up.sh defaults the
+/// bus-auth daemon to the fixed 127.0.0.1:49129, so a fixture that used the
+/// default would collide with a parallel run, a leftover fake daemon, or a real
+/// one on the machine - and report "did not listen" for the wrong reason.
+async function freeLoopbackAddr(): Promise<string> {
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("no ephemeral port");
+  const port = address.port;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return `127.0.0.1:${port}`;
 }
 
 async function readCapturedValue(capturePath: string, name: string): Promise<string | null> {
@@ -60,6 +104,76 @@ async function runDevUpFixture(
     await writeFile(envPath, dotenv, { mode: dotenvMode });
     await chmod(envPath, dotenvMode);
   }
+  const busAuthAddr = await freeLoopbackAddr();
+  const busAuthLog = join(root, "bus-auth.argv");
+  if (options.busAuth === "present") {
+    const daemonPath = join(root, "target", "release", "agentos-bus-authd");
+    // Holds the port the way the real daemon does, so the readiness probe in
+    // dev-up.sh has something to connect to.
+    await writeFile(
+      daemonPath,
+      `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${JSON.stringify(busAuthLog)}\n` +
+        `port="\${1##*:}"\nexec python3 -c "import socket,time\n` +
+        `s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n` +
+        `s.bind(('127.0.0.1',int('$port')));s.listen();time.sleep(30)"\n`,
+    );
+    await chmod(daemonPath, 0o755);
+  }
+  if (options.busAuth === "armed-missing") {
+    await writeFile(
+      join(root, "config.yaml"),
+      "workers:\n  - name: iii-worker-manager\n    config:\n      rbac:\n        auth_function_id: agentos::bus_auth\n",
+    );
+  }
+
+  const memworkrMarker = join(root, "memworkr.started");
+  const stubDir = join(root, "stub");
+  if (options.memworkr) {
+    const version = options.memworkr.version ?? "0".repeat(39) + "1";
+    const versionDir = join(root, ".agentos-runtime", "memworkr", "versions", version);
+    const memworkrPath = join(versionDir, "memworkr");
+    await mkdir(versionDir, { recursive: true });
+    await mkdir(stubDir, { recursive: true });
+    await writeFile(join(root, ".agentos-runtime", "memworkr", "current"), `${version}\n`);
+    await writeFile(
+      memworkrPath,
+      `#!/usr/bin/env bash\nprintf '%s' started > ${JSON.stringify(memworkrMarker)}\nexec sleep 30\n`,
+    );
+    await chmod(memworkrPath, 0o755);
+
+    const digest = options.memworkr.digest ?? "correct";
+    if (digest !== "missing") {
+      const recorded =
+        digest === "correct"
+          ? createHash("sha256").update(await readFile(memworkrPath)).digest("hex")
+          : "0".repeat(64);
+      await writeFile(join(versionDir, "SHA256"), `${recorded}\n`);
+    }
+
+    // The readiness probe shells out to the real `iii` and `jq`; only `iii` is
+    // faked, so the jq filter in dev-up.sh is exercised for real.
+    const health = options.memworkr.healthy ?? true
+      ? '{"status":"ok","schemaVersion":6,"callerEnforced":true,"instanceClaimed":true}'
+      : '{"status":"degraded","schemaVersion":6}';
+    const iiiStub = join(stubDir, "iii");
+    await writeFile(
+      iiiStub,
+      `#!/usr/bin/env bash\nif [[ "\${1:-}" == "trigger" ]]; then printf '%s\\n' ${JSON.stringify(health)}; exit 0; fi\nexit 1\n`,
+    );
+    await chmod(iiiStub, 0o755);
+  }
+
+  for (const [id, keys] of Object.entries(options.integrations ?? {})) {
+    await mkdir(join(root, "integrations"), { recursive: true });
+    const declarations = keys
+      .map((key) => `${key} = { required = true, description = "test" }`)
+      .join("\n");
+    await writeFile(
+      join(root, "integrations", `${id}.toml`),
+      `[integration]\nid = "${id}"\n\n[integration.env]\n${declarations}\n`,
+    );
+  }
+
   await writeFile(
     workerPath,
     `#!/usr/bin/env bash
@@ -77,29 +191,43 @@ mv "$capture_tmp" "$capture_path"
   await chmod(workerPath, 0o755);
 
   let stderr = "";
+  let stdout = "";
   let exitCode = 0;
   try {
     const result = await execFileAsync("bash", [scriptPath], {
       encoding: "utf8",
       env: {
-        PATH: process.env.PATH,
+        PATH: options.memworkr ? `${stubDir}:${process.env.PATH}` : process.env.PATH,
         HOME: process.env.HOME,
         TMPDIR: process.env.TMPDIR,
+        // Never the fixed default: that port is shared machine state.
+        AGENTOS_BUS_AUTH_ADDR: busAuthAddr,
         ...inherited,
       },
     });
     stderr = result.stderr;
+    stdout = result.stdout;
   } catch (error) {
     const commandError = error as {
       code?: number | string | null;
       stderr?: string;
+      stdout?: string;
     };
     if (typeof commandError.code !== "number") throw error;
     exitCode = commandError.code;
     stderr = commandError.stderr ?? "";
+    stdout = commandError.stdout ?? "";
   }
+  const memworkrStarted = await readCapturedValue(root, "memworkr.started").then(
+    (value) => value !== null,
+  );
+  const busAuthRaw = await readCapturedValue(root, "bus-auth.argv");
+  const busAuthLines = (busAuthRaw ?? "").split("\n").filter(Boolean);
+  const busAuth: BusAuthCapture | null = busAuthRaw === null
+    ? null
+    : { argv: busAuthLines[0]?.split(" ") ?? [], starts: busAuthLines.length };
   if (exitCode !== 0) {
-    return { captured: null, stderr, exitCode };
+    return { captured: null, stderr, stdout, exitCode, memworkrStarted, busAuth, busAuthAddr };
   }
 
   for (let attempt = 0; attempt < 200; attempt += 1) {
@@ -120,12 +248,33 @@ mv "$capture_tmp" "$capture_path"
   return {
     captured: { codex, anthropic, openai, defaultModel },
     stderr,
+    stdout,
     exitCode,
+    memworkrStarted,
+    busAuth,
+    busAuthAddr,
   };
 }
 
+async function stopFixtureProcesses(root: string): Promise<void> {
+  try {
+    const pids = await readFile(join(root, ".agentos-dev.pids"), "utf8");
+    for (const pid of pids.split("\n").filter(Boolean)) {
+      try {
+        process.kill(Number(pid), "SIGTERM");
+      } catch {
+        // Already gone: dev-up.sh degrades by killing memworkr itself.
+      }
+    }
+  } catch {
+    // No PID file: the run failed before spawning anything.
+  }
+}
+
 afterEach(async () => {
-  await Promise.all(fixtureRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  const roots = fixtureRoots.splice(0);
+  await Promise.all(roots.map(stopFixtureProcesses));
+  await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
 });
 
 describe("dev-up dotenv loading", () => {
@@ -244,5 +393,143 @@ AGENTOS_DEFAULT_MODEL=gpt-5.6-sol
 
     expect(stderr).toContain("Anthropic cloud");
     expect(stderr).not.toContain("test-cloud-secret");
+  });
+});
+
+describe("dev-up dotenv allowlist", () => {
+  it("accepts the channel secrets the workers actually read", async () => {
+    // SLACK_* were missing from .env.example, so a correct Slack token was
+    // rejected by the very script that starts the channel workers.
+    const { exitCode, stderr } = await runDevUpFixture(
+      "SLACK_BOT_TOKEN=xoxb-test\nSLACK_SIGNING_SECRET=signing\nTELEGRAM_BOT_TOKEN=telegram\n",
+    );
+    expect(stderr).not.toContain("unknown dotenv variable");
+    expect(exitCode).toBe(0);
+  });
+
+  it("accepts the memworkr runtime names from the template instead of a hand-maintained list", async () => {
+    const { exitCode, stderr } = await runDevUpFixture(
+      "MEMWORKR_INSTANCE_ID=unitb-test\nIII_WS_URL=ws://127.0.0.1:49134\n",
+    );
+    expect(stderr).not.toContain("unknown dotenv variable");
+    expect(exitCode).toBe(0);
+  });
+
+  it("accepts an env key declared by an integration manifest", async () => {
+    const { exitCode, stderr } = await runDevUpFixture("EXAMPLE_INTEGRATION_TOKEN=value\n", {}, {
+      integrations: { example: ["EXAMPLE_INTEGRATION_TOKEN"] },
+    });
+    expect(stderr).not.toContain("unknown dotenv variable");
+    expect(exitCode).toBe(0);
+  });
+
+  it("still refuses a name nothing declares", async () => {
+    const { exitCode, stderr } = await runDevUpFixture("NOT_DECLARED_ANYWHERE=value\n", {}, {
+      integrations: { example: ["EXAMPLE_INTEGRATION_TOKEN"] },
+    });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("error: unknown dotenv variable 'NOT_DECLARED_ANYWHERE' on line 1");
+  });
+
+  it("reads integration manifest keys only from the env section", async () => {
+    // `id = "example"` sits under [integration], not [integration.env]: a
+    // parser that scanned the whole manifest would allow `id` as a variable.
+    const { exitCode, stderr } = await runDevUpFixture("id=value\n", {}, {
+      integrations: { example: ["INSIDE_ENV"] },
+    });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("unknown dotenv variable 'id'");
+  });
+});
+
+describe("dev-up memworkr runtime", () => {
+  it("starts a synced memworkr whose recorded digest matches", async () => {
+    const { exitCode, stdout, stderr, memworkrStarted } = await runDevUpFixture("", {}, {
+      memworkr: { digest: "correct", healthy: true },
+    });
+    expect(exitCode).toBe(0);
+    expect(memworkrStarted).toBe(true);
+    expect(stdout).toContain("memworkr");
+    expect(stdout).toContain("ready");
+    expect(stderr).not.toContain("memworkr disabled");
+  });
+
+  it("refuses to execute a binary that does not match the recorded digest", async () => {
+    const { exitCode, stderr, memworkrStarted } = await runDevUpFixture("", {}, {
+      memworkr: { digest: "wrong" },
+    });
+    // The runtime root sits inside the shell worker's jail, so an unverified
+    // binary must never be executed - and the rest of the stack must survive.
+    expect(memworkrStarted).toBe(false);
+    expect(stderr).toContain("digest mismatch");
+    expect(exitCode).toBe(0);
+  });
+
+  it("refuses a version directory with no recorded digest", async () => {
+    const { exitCode, stderr, memworkrStarted } = await runDevUpFixture("", {}, {
+      memworkr: { digest: "missing" },
+    });
+    expect(memworkrStarted).toBe(false);
+    expect(stderr).toContain("no recorded digest");
+    expect(exitCode).toBe(0);
+  });
+
+  it("keeps the stack running when memworkr fails its readiness check", async () => {
+    const { exitCode, stderr, captured, memworkrStarted } = await runDevUpFixture(
+      "",
+      { MEMWORKR_READY_ATTEMPTS: "2" },
+      { memworkr: { digest: "correct", healthy: false } },
+    );
+    // No AgentOS code path calls memory::assert/as_of/provenance, so an
+    // unhealthy memworkr must not take 62 workers down with it.
+    expect(memworkrStarted).toBe(true);
+    expect(stderr).toContain("failed the memory::health readiness check");
+    expect(stderr).toContain("the rest of the stack keeps running");
+    expect(exitCode).toBe(0);
+    expect(captured).not.toBeNull();
+    // Two readiness attempts plus a one-second sleep each: the default 5s test
+    // budget is too tight once the whole suite runs in parallel.
+  }, 30_000);
+
+  it("refuses a current pointer that is not a 40-character commit", async () => {
+    const { exitCode, stderr, memworkrStarted } = await runDevUpFixture("", {}, {
+      memworkr: { version: "not-a-commit", digest: "correct" },
+    });
+    expect(memworkrStarted).toBe(false);
+    expect(stderr).toContain("not a 40-character commit");
+    expect(exitCode).toBe(0);
+  });
+});
+
+describe("dev-up bus RBAC gate", () => {
+  it("starts the bus-auth daemon and does not treat it as a worker", async () => {
+    const { exitCode, stdout, busAuth, busAuthAddr } = await runDevUpFixture("", {}, {
+      busAuth: "present",
+    });
+
+    expect(exitCode).toBe(0);
+    expect(busAuth).not.toBeNull();
+    // The daemon binds the address dev-up.sh resolved, passed on the command
+    // line rather than left to the daemon's own default.
+    expect(busAuth?.argv).toContain(`--listen=${busAuthAddr}`);
+    expect(stdout).toContain(`bus-auth daemon listening on ${busAuthAddr}`);
+    // It is not a worker: the worker loop must not have started a second copy.
+    expect(busAuth?.starts).toBe(1);
+  }, 30_000);
+
+  it("warns when the config arms bus RBAC and the daemon is not built", async () => {
+    const { exitCode, stderr } = await runDevUpFixture("", {}, { busAuth: "armed-missing" });
+
+    expect(exitCode).toBe(0);
+    expect(stderr).toContain("arms bus RBAC");
+    expect(stderr).toContain("cargo build --workspace --release");
+  });
+
+  it("says nothing when neither the daemon nor the gate is present", async () => {
+    const { exitCode, stderr, stdout } = await runDevUpFixture("");
+
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain("bus RBAC");
+    expect(stdout).not.toContain("bus-auth");
   });
 });

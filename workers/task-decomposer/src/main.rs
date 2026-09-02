@@ -1,7 +1,5 @@
 use iii_sdk::errors::Error;
-use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
-};
+use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
 
 mod types;
@@ -59,6 +57,40 @@ async fn state_list(iii: &IIIClient, scope: &str) -> Result<Value, Error> {
     })
     .await
     .map_err(|e| Error::Handler(e.to_string()))
+}
+
+/// `state::list` answers a bare array of stored values: there is no `{key,
+/// value}` envelope, so unwrapping a `value` field would corrupt any task
+/// document that happens to carry one.
+fn tasks_from_list(list: &Value) -> Vec<Value> {
+    list.as_array().cloned().unwrap_or_default()
+}
+
+/// `state::update` payload that claims a pending task before its worker is
+/// spawned.
+///
+/// The engine names the operation list `ops`; an `operations` key fails the
+/// whole invocation with "missing field `ops`", which made every claim fail
+/// and left `task::spawn_workers` unable to spawn anything.
+fn claim_task_payload(scope: &str, task_id: &str, updated_at: u128) -> Value {
+    json!({
+        "scope": scope,
+        "key": task_id,
+        "ops": [
+            { "type": "set", "path": "status", "value": "in_progress" },
+            { "type": "set", "path": "updatedAt", "value": updated_at }
+        ]
+    })
+}
+
+/// A rejected operation still answers success at the transport level: the
+/// engine reports it inside an `errors` array of an otherwise normal result.
+fn update_rejection(result: &Value) -> Option<String> {
+    let errors = result.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    Some(Value::Array(errors.clone()).to_string())
 }
 
 async fn decompose_task(iii: &IIIClient, input: Value) -> Result<Value, Error> {
@@ -354,12 +386,7 @@ async fn list_tasks(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         .map(String::from);
 
     let entries = state_list(iii, &format!("tasks:{root_id}")).await?;
-    let arr = entries.as_array().cloned().unwrap_or_default();
-
-    let mut tasks: Vec<Value> = arr
-        .into_iter()
-        .map(|e| e.get("value").cloned().unwrap_or(e))
-        .collect();
+    let mut tasks: Vec<Value> = tasks_from_list(&entries);
 
     if let Some(status) = status_filter {
         tasks.retain(|t| {
@@ -385,12 +412,10 @@ async fn spawn_workers(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let root_id = sanitize_id(raw_root_id).map_err(Error::Handler)?;
 
     let entries = state_list(iii, &format!("tasks:{root_id}")).await?;
-    let arr = entries.as_array().cloned().unwrap_or_default();
 
     let mut spawned = 0u64;
     let scope = format!("tasks:{root_id}");
-    for entry in arr {
-        let task_val = entry.get("value").cloned().unwrap_or(entry);
+    for task_val in tasks_from_list(&entries) {
         let status = task_val.get("status").and_then(Value::as_str).unwrap_or("");
         let children_empty = task_val
             .get("children")
@@ -417,21 +442,22 @@ async fn spawn_workers(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         let claim = iii
             .trigger(TriggerRequest {
                 function_id: "state::update".to_string(),
-                payload: json!({
-                    "scope": scope,
-                    "key": task_id,
-                    "operations": [
-                        { "type": "set", "path": "status", "value": "in_progress" },
-                        { "type": "set", "path": "updatedAt", "value": now_ms() }
-                    ]
-                }),
+                payload: claim_task_payload(&scope, &task_id, now_ms()),
                 action: None,
                 timeout_ms: None,
             })
             .await;
-        if let Err(e) = claim {
-            tracing::warn!(task_id = %task_id, error = %e, "skipping task: failed to claim before spawn");
-            continue;
+        match claim {
+            Err(e) => {
+                tracing::warn!(task_id = %task_id, error = %e, "skipping task: failed to claim before spawn");
+                continue;
+            }
+            Ok(result) => {
+                if let Some(rejection) = update_rejection(&result) {
+                    tracing::warn!(task_id = %task_id, rejection = %rejection, "skipping task: claim was rejected");
+                    continue;
+                }
+            }
         }
 
         let iii_clone = iii.clone();
@@ -466,7 +492,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let iii_clone = iii.clone();
     iii.register_function(
@@ -566,5 +592,72 @@ mod tests {
         assert!(a.starts_with("t_"));
         assert!(b.starts_with("t_"));
         assert_ne!(a, b);
+    }
+
+    // --- state::list protocol (verified against iii 0.22.1) ---
+
+    #[test]
+    fn tasks_are_read_from_a_bare_list() {
+        let list = json!([
+            { "id": "t_1", "status": "pending", "children": [] },
+            { "id": "t_2", "status": "complete", "children": [] }
+        ]);
+        let tasks = tasks_from_list(&list);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["id"], "t_1");
+        assert_eq!(tasks[1]["status"], "complete");
+    }
+
+    #[test]
+    fn a_task_carrying_its_own_value_field_survives_intact() {
+        // The old reader unwrapped `entry["value"]` when present, so any task
+        // document with a `value` field was replaced by that field alone.
+        let list = json!([{ "id": "t_1", "status": "pending", "value": { "id": "wrong" } }]);
+        let tasks = tasks_from_list(&list);
+        assert_eq!(tasks[0]["id"], "t_1");
+        assert_eq!(tasks[0]["status"], "pending");
+    }
+
+    #[test]
+    fn a_non_array_list_response_yields_no_tasks() {
+        assert!(tasks_from_list(&json!(null)).is_empty());
+        assert!(tasks_from_list(&json!({ "entries": [] })).is_empty());
+    }
+
+    // --- state::update protocol (verified against iii 0.22.1) ---
+
+    #[test]
+    fn claim_payload_uses_ops_not_operations() {
+        let payload = claim_task_payload("tasks:root", "t_1", 1_700_000_000_000);
+        assert!(
+            payload.get("operations").is_none(),
+            "`operations` fails the whole invocation with `missing field ops`"
+        );
+        assert_eq!(payload["scope"], "tasks:root");
+        assert_eq!(payload["key"], "t_1");
+        assert_eq!(payload["ops"][0]["type"], "set");
+        assert_eq!(payload["ops"][0]["path"], "status");
+        assert_eq!(payload["ops"][0]["value"], "in_progress");
+        assert_eq!(payload["ops"][1]["path"], "updatedAt");
+        assert_eq!(payload["ops"][1]["value"], json!(1_700_000_000_000u128));
+    }
+
+    #[test]
+    fn a_rejected_claim_is_detected_inside_a_successful_response() {
+        let engine_result = json!({
+            "errors": [{ "code": "set.path_invalid", "op_index": 0 }],
+            "new_value": { "status": "pending" },
+            "old_value": { "status": "pending" },
+        });
+        assert!(
+            update_rejection(&engine_result)
+                .expect("rejection must be reported")
+                .contains("set.path_invalid")
+        );
+        assert_eq!(
+            update_rejection(&json!({ "new_value": { "status": "in_progress" } })),
+            None
+        );
+        assert_eq!(update_rejection(&json!({ "errors": [] })), None);
     }
 }

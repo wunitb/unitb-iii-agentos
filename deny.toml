@@ -1,0 +1,122 @@
+# cargo-deny policy for unitb-iii-agentos.
+#
+# Run locally with the same toolchain CI uses:
+#     cargo +1.90 deny check
+#
+# This gate is non-bypassable in CI (.github/workflows/ci.yml, job `rust`).
+# It is a RATCHET, not a snapshot: every exception below is explicit, dated and
+# justified, and `tests/deny_policy.test.ts` fails when an exception outlives the
+# duplicate it excuses. Do not replace an entry with a blanket allow.
+#
+# Review cadence: revisit every dated entry on or after 2026-12-02.
+
+[graph]
+# The three bundles .github/workflows/release.yml actually builds and inspects.
+# Restricting the graph to shipped targets is what makes the duplicate ratchet
+# meaningful: it removes 23 Windows-only duplicate lines the project never ships.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+all-features = false
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------- advisories --
+[advisories]
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2025-0057", reason = "2026-09-02 · fxhash is unmaintained and reachable only through fxprof-processed-profile -> wasmtime 36.x. wasmtime is held on the 36.x line by the Rust 1.90 MSRV (tests/dependency_versions.test.ts); there is no safe upgrade. Re-check when the MSRV moves." },
+]
+
+# ------------------------------------------------------------------ licenses --
+[licenses]
+# Permissive-only. Every entry below is present in the current dependency graph;
+# adding a licence here is a deliberate legal decision, not a build fix.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[licenses.private]
+ignore = false
+
+# ---------------------------------------------------------------------- bans --
+[bans]
+multiple-versions = "deny"
+# Blocking. Every wildcard in this workspace is the workspace-internal
+# `agentos-http-adapter` path dependency, and `allow-wildcard-paths` now excuses
+# exactly those: `Cargo.toml` marks the workspace `publish = false` and all 65
+# members inherit it with `publish.workspace = true`, which is the condition
+# cargo-deny requires ("allow-wildcard-paths ... does not apply to public crates
+# as crates.io disallows path dependencies"). A `*` requirement on a *registry*
+# dependency is therefore an error here, and is additionally asserted by
+# `tests/deny_policy.test.ts` ("declares an explicit version for every registry
+# dependency"), which also covers dependency tables cargo-deny never resolves.
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+deny = []
+allow = []
+
+# Dated, justified duplicate-version exceptions. 23 crate names resolve to more
+# than one version on the shipped targets today. Each line records WHY and WHO
+# would have to move. `tests/deny_policy.test.ts` asserts that every crate@version
+# below is still present in Cargo.lock, so a resolved duplicate forces the
+# exception to be deleted instead of rotting here.
+skip = [
+    { crate = "base64@0.22.1", reason = "2026-09-02 · transitive-only: reqwest/hyper-util/termwiz/email-encoding/wasmtime hold 0.22 while tests/dependency_versions.test.ts pins our direct users on 0.23" },
+    { crate = "block-buffer@0.10.4", reason = "2026-09-02 · pulled only by digest 0.10; disappears when the digest 0.10 line does" },
+    { crate = "const-oid@0.9.6", reason = "2026-09-02 · pulled only by der 0.7 via spki 0.7 (agentos-skill-security); goes with the spki bump" },
+    { crate = "convert_case@0.10.0", reason = "2026-09-02 · transitive-only: derive_more-impl 2.1 vs rquickjs-macro 0.12" },
+    { crate = "cpufeatures@0.2.17", reason = "2026-09-02 · transitive-only: follows the sha2 0.10/0.11 and RustCrypto 0.4/0.5 split" },
+    { crate = "crossterm@0.28.1", reason = "2026-09-02 · agentos-tui pins 0.28 while ratatui-crossterm 0.1 needs 0.29 — ours to fix in crates/tui" },
+    { crate = "crypto-common@0.1.7", reason = "2026-09-02 · transitive-only: follows the digest 0.10/0.11 split" },
+    { crate = "der@0.7.10", reason = "2026-09-02 · pulled only by spki 0.7 (agentos-skill-security); goes with the spki bump" },
+    { crate = "digest@0.10.7", reason = "2026-09-02 · transitive-only: RustCrypto 0.10 line held by hmac/pbkdf2/sha1/sha2 0.10" },
+    { crate = "foldhash@0.1.5", reason = "2026-09-02 · transitive-only: follows the hashbrown split" },
+    { crate = "getrandom@0.2.17", reason = "2026-09-02 · transitive-only: three lines held by ring 0.17/rand_core 0.6, rand_core 0.9 and rand 0.10/uuid 1.26" },
+    { crate = "getrandom@0.3.4", reason = "2026-09-02 · transitive-only: three lines held by ring 0.17/rand_core 0.6, rand_core 0.9 and rand 0.10/uuid 1.26" },
+    { crate = "hashbrown@0.14.5", reason = "2026-09-02 · four lines held by dashmap 6, wasmtime 36, indexmap 2 and ratatui 0.1" },
+    { crate = "hashbrown@0.15.5", reason = "2026-09-02 · four lines held by dashmap 6, wasmtime 36, indexmap 2 and ratatui 0.1" },
+    { crate = "hashbrown@0.16.1", reason = "2026-09-02 · four lines held by dashmap 6, wasmtime 36, indexmap 2 and ratatui 0.1" },
+    { crate = "linux-raw-sys@0.4.15", reason = "2026-09-02 · transitive-only: follows the rustix 0.38/1.1 split, i.e. the crossterm bump" },
+    { crate = "rand@0.9.3", reason = "2026-09-02 · transitive-only: opentelemetry_sdk 0.31 and tungstenite 0.28 hold 0.9; our workers are already on 0.10" },
+    { crate = "rand_core@0.6.4", reason = "2026-09-02 · transitive-only: follows the rand 0.9/0.10 and RustCrypto splits" },
+    { crate = "rand_core@0.9.5", reason = "2026-09-02 · transitive-only: follows the rand 0.9/0.10 and RustCrypto splits" },
+    { crate = "rustix@0.38.44", reason = "2026-09-02 · pulled only by crossterm 0.28 — goes with the crates/tui crossterm bump" },
+    { crate = "sha2@0.10.9", reason = "2026-09-02 · six agentos workers are on 0.10 while ed25519-dalek 3 needs 0.11 — two crypto stacks in a security product, ours to close" },
+    { crate = "spki@0.7.3", reason = "2026-09-02 · agentos-skill-security pins spki 0.7 while pkcs8 0.11 needs 0.8 — ours to fix" },
+    { crate = "syn@2.0.117", reason = "2026-09-02 · transitive-only: serde_derive 1.0.229 moved to syn 3, the rest of the proc-macro ecosystem has not" },
+    { crate = "sysinfo@0.32.1", reason = "2026-09-02 · agentos-telemetry pins 0.32 while iii-helpers 0.22.1 needs 0.38 — ours to fix" },
+    { crate = "toml_datetime@0.6.11", reason = "2026-09-02 · transitive-only: follows the toml_edit 0.22/0.25 split" },
+    { crate = "toml_edit@0.22.27", reason = "2026-09-02 · transitive-only: toml 0.8 vs proc-macro-crate 3.5 (rquickjs)" },
+    { crate = "wasm-encoder@0.236.1", reason = "2026-09-02 · transitive-only: wasmtime 36 internals vs wast 245; wasmtime is held at 36.x by the Rust 1.90 MSRV" },
+]
+skip-tree = []
+
+# ------------------------------------------------------------------- sources --
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

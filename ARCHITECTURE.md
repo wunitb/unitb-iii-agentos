@@ -27,7 +27,7 @@ unitb-iii-agentos/
 | Group | Workers | Function namespaces |
 |---|---|---|
 | Reasoning | `agent-core` `llm-router` `council` `swarm` `directive` `mission` | `agent::*` `agentos::llm::*` `council::*` `swarm::*` `directive::*` `mission::*` |
-| State | `realm` `memory` `ledger` `vault` `context-manager` `context-cache` | `realm::*` `memory::*` `ledger::*` `vault::*` `context::*` |
+| State | `realm` `memory` `ledger` `vault` `context-manager` `context-cache` `context-monitor` | `realm::*` `memory::*` `ledger::*` `vault::*` `context::*` |
 | Coordination | `orchestrator` `workflow` `hierarchy` `coordination` `task-decomposer` | `orchestrator::*` `workflow::*` `hierarchy::*` `task::*` |
 | Execution | `wasm-sandbox` `browser` `code-agent` `hand-runner` `lsp-tools` | `wasm::*` `browser::*` `code::*` `hand::*` `lsp::*` |
 | Safety | `security` `security-headers` `security-map` `security-zeroize` `skill-security` `approval` `approval-tiers` `rate-limiter` `loop-guard` | `security::*` `approval::*` `rate::*` `loop::*` |
@@ -36,7 +36,7 @@ unitb-iii-agentos/
 | Telemetry | `telemetry` `pulse` `session-lifecycle` `session-replay` `feedback` `eval` `evolve` `hashline` `hooks` `cron` | `telemetry::*` `pulse::*` `session::*` `eval::*` `feedback::*` |
 | Embeddings | `embedding` (Python) | `embedding::*` |
 
-The source declares 267 literal function registrations across 63 workers (62 Rust + 1 Python).
+The source registers 301 literal function ids across 63 workers (62 Rust + 1 Python), resolving to 301 distinct function ids. `bun run counts` recomputes every number on this page from the tree; `bun run counts:check` fails the build when a published number drifts.
 
 ## Worker manifest
 
@@ -57,7 +57,11 @@ CI's `validate iii.worker.yaml` job enforces this on every PR.
 
 ## Engine boot
 
-`config.yaml` uses the `.iii-version` stable pin, currently iii v0.22.1, and its configuration-worker layout. It declares the file-backed configuration store plus seven baseline workers: `iii-http`, `state`, `iii-stream`, `queue`, `iii-pubsub`, `cron`, and `iii-observability`. The state, queue, and cron workers use the canonical 0.22.1 names; declaring their deprecated `iii-*` aliases alongside canonical workers makes the engine reject the config. Their committed values live in matching files under `config/`; `config.yaml` keeps only worker entries and migration breadcrumbs. AgentOS workers spawn alongside as separate processes — each connects to the engine WebSocket via `register_worker` and stays resident.
+`config.yaml` uses the `.iii-version` stable pin, currently iii v0.22.1, and its configuration-worker layout. It declares sixteen engine workers — the file-backed `configuration` store, the `iii-worker-manager` bus itself (declared explicitly so its bind host is pinned to loopback; when the entry is absent the engine appends it with the default host 0.0.0.0), plus `iii-http`, `iii-pubsub`, `state`, `llm-router`, `context-manager`, `cron`, `iii-directory`, `iii-observability`, `iii-stream`, `provider-anthropic`, `provider-openai`, `provider-openai-codex`, `queue`, and `session-manager`. These are upstream registry binaries resolved through `iii.lock`; the engine's `llm-router` and `context-manager` are *not* the AgentOS workers of the same folder name. The state, queue, and cron workers use the canonical 0.22.1 names; declaring their deprecated `iii-*` aliases alongside canonical workers makes the engine reject the config. Their committed values live in matching files under `config/`; `config.yaml` keeps only worker entries and migration breadcrumbs. AgentOS workers spawn alongside as separate processes — each connects to the engine WebSocket via `register_worker` and stays resident.
+
+Bus RBAC is **not armed by default**. It fails closed, so an armed configuration with no `agentos-bus-authd` listening refuses every worker connection and the stack does not come up — which is what the documented `iii --config config.yaml` path would do on a clean clone. The `rbac:` block and the `iii-bridge` entry that serves its hooks live in `bus-rbac.overlay.yaml` with instructions; `agentos up` starts the daemon and `agentos doctor` reports whether the gate is armed and whether the daemon answers.
+
+The `shell`, `console` and `harness` registry workers are configured under `config/` but deliberately **not** booted by default: `shell` exposes host command execution on the unauthenticated bus, and console v1.9.16 has no host key — it listens on `0.0.0.0` and proxies `/ws` to the bus — so both are opt-in.
 
 The engine WebSocket endpoint is configurable via `III_URL` (default `ws://localhost:49134`).
 
@@ -99,7 +103,30 @@ CI's `no sandbox::* clash with builtin` job greps the workspace to ensure no age
 
 ## Atomic state ops
 
-iii v0.22.1 exposes `state::update` / `stream::update` with `UpdateOp::set`, `UpdateOp::increment`, `UpdateOp::append`, plus nested shallow-merge paths. Workers prefer these over `state::list + state::set` race patterns when mutating lists or counters.
+iii v0.22.1 exposes `state::update` / `stream::update` with `set`, `increment`, `append` and `merge` operations. Workers prefer these over `state::list + state::set` race patterns when mutating lists or counters.
+
+The wire shape is exact, and three of its fields are easy to get wrong. Verified against the pinned engine on 2026-09-02:
+
+```jsonc
+{
+  "scope": "budgets",
+  "key": "alice",
+  "ops": [                                       // "ops", NOT "operations"
+    { "type": "set",       "path": "status", "value": "active" },
+    { "type": "increment", "path": "spend",  "by": 1 },   // "by", NOT "value"
+    { "type": "append",    "path": "events", "value": { "at": 0 } },  // one ELEMENT
+    { "type": "merge",     "path": "meta",   "value": { "seen": true } }  // OBJECT only
+  ]
+}
+```
+
+- `operations` instead of `ops` fails the whole invocation: `serialization error: missing field \`ops\``.
+- `increment` with `value` instead of `by` fails the same way.
+- `merge` with an array value returns HTTP 200 with a non-empty `errors` array — a **silent no-op**. Growing a list is `append` with the element as `value`, not `merge` with a one-element array.
+
+Read shapes matter too: `state::list` returns a **bare array of values** — no key, no `{key, value}` envelope, so `entry["value"]` and `entry["key"]` read nothing — while `state::list_groups` returns `{"groups": [...]}`.
+
+`tests/state_protocol.test.ts` scans every Rust source for the three write mistakes and fails the build on any of them.
 
 `coordination::{post,reply}` reserves a slot through an atomic `state::update`
 counter before persistence, reconciles pre-counter channel history on first use,
@@ -107,6 +134,21 @@ and decrements the reservation on quota rejection or write failure. This prevent
 concurrent callers from crossing the per-channel post limit.
 
 `council::activity` retains its manual hash-chain on `state::list + state::set` because ordering and previous-hash validation are the protocol itself; replacing it requires compare-and-swap semantics, not an unguarded append.
+
+## The chat path — one pipeline, buffered transport
+
+`agent::chat` is the only chat pipeline. `stream::chat`, `stream::completion` and `stream::sse` in the `streaming` worker delegate to it rather than running a second implementation of their own, so an HTTP caller gets the same tool loop, prompt-injection scan, memory recall and metering the TUI gets. There is no "streaming path" with different semantics.
+
+The transport is **buffered, not token streaming**. `stream::sse` frames an answer that is already complete, and responses label themselves `x-agentos-stream: buffered`. Incremental delivery needs a streaming provider driver in `llm-router`, which does not exist yet; until it does, no document here should describe AgentOS as streaming tokens.
+
+## Stream joins are gated, and the gate fails open
+
+`workers/streaming` registers `stream::authorize_join` on the engine's `stream:join` trigger. It is deny-by-default: a join is authorized only when the handshake left an authenticated context on the connection — `authenticated` literally `true` plus a non-empty `subject`, which is what `security::stream_auth` returns for a valid AgentOS bearer. No context, a context that is not an object, or a missing subject is refused before the subscription is inserted.
+
+Two limits, stated rather than papered over:
+
+- **The engine fails open around it.** In iii 0.22.1 a failing `auth_function` is only logged and the socket is upgraded anyway with `context: None`, and an `Err` from the `stream:join` trigger call is likewise logged while the join proceeds. A slow, crashed or unregistered `streaming` worker therefore means joins are **allowed**, not denied.
+- **So the loopback bind is load-bearing.** `config/iii-stream.yaml` sets `host: 127.0.0.1`; this gate is defence in depth behind that bind, not a replacement for it. Widening the bind re-exposes the socket to anything that can reach the host, fail-open and all.
 
 ## Surfaces (cli, tui)
 
@@ -141,18 +183,30 @@ Development is coordinated outside this repository: **unitb-control-room** owns 
 
 ## CI
 
-Eight jobs run on every PR:
+`.github/workflows/ci.yml` defines eleven jobs. Nine run on every event;
+`dependency-review` runs on pull requests only and `e2e-full` only on a `main`
+push with `AGENTOS_FULL_E2E_ENABLED`. The workflow starts from
+`permissions: {}` and each job re-grants only `contents: read`. No step carries
+`continue-on-error`: every gate below can fail a pull request.
 
 | job | gate |
 |---|---|
-| `rust build + test` | `cargo check --all-targets` + `cargo build --release` + `cargo test --workspace --release` (1,393 tests; 3 live-engine checks ignored by default) |
-| `python worker tests` | `pytest workers/embedding/test_main.py` |
-| `website build` | `npm ci` + `npm run build` in `website/` |
-| `installer shellcheck` | `shellcheck --severity=warning` over `scripts/install.sh`, `scripts/dev-up.sh`, `website/public/install.sh`, `scripts/install-iii.sh` |
-| `validate iii.worker.yaml` | every `workers/<name>/iii.worker.yaml` parses, matches its folder, declares `runtime.kind` of `rust` or `python`, and carries a `scripts.start` string |
-| `no sandbox::* clash with builtin` | grep ensures no agentos worker registers `sandbox::*` |
-| `e2e smoke (no LLM key required)` | typechecks and tests the Node examples and startup configuration, then starts engine + workers, asserts ports listen, ≥30 functions register, no namespace clash |
-| `e2e full (requires AGENTOS_API_KEY secret)` | runs vitest e2e suite against the live stack — gated on `AGENTOS_API_KEY` secret |
+| `rust` | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` (dev profile, 1,808 test attributes; 3 live-engine checks ignored by default) + `cargo build --workspace --release` + `cargo audit` + `cargo deny check` (advisories, bans, licences, sources — policy in `deny.toml`) |
+| `node-unit` | `bun run typecheck`, `bun run test:unit` (tests of the software), `bun run test:governance` (build-evidence and documentation contracts), `bun run counts:check` (every published number recomputed from the tree) |
+| `dependency-review` | `actions/dependency-review-action` with `fail-on-severity: moderate`, pull requests only |
+| `portable-bundle` | stages the release payload from the `rust` artifacts and asserts the extracted bundle needs no checkout-relative path |
+| `python` | `pytest workers/embedding/test_main.py` |
+| `website` | `npm ci` + `npm run build` in `website/` |
+| `scripts` | `shellcheck --severity=warning` over the six shipped shell scripts |
+| `worker-yaml` | every `workers/<name>/iii.worker.yaml` parses, matches its folder, declares `runtime.kind` of `rust` or `python`, and carries a `scripts.start` string |
+| `namespace-clash` | grep ensures no agentos worker registers `sandbox::*` |
+| `e2e-smoke` | typechecks and tests the Node examples and startup configuration, then starts engine + workers, asserts ports listen, the required functions register, and no namespace clash |
+| `e2e-full` | runs the vitest e2e suite against the live stack — needs `AGENTOS_API_KEY` and `ANTHROPIC_API_KEY` secrets and the `AGENTOS_FULL_E2E_ENABLED` variable |
+
+The toolchain is pinned in one place, `rust-toolchain.toml` (`channel = "1.90"`),
+which `ci.yml`, `release.yml` and `Cargo.toml`'s `rust-version` must all match;
+`tests/toolchain_pin.test.ts` fails the build when they diverge, so a local
+`cargo clippy` runs the same linter the gate runs.
 
 Plus `.github/workflows/vercel-deploy.yml`: pushes to `main` touching `website/**` trigger a Vercel Deploy Hook.
 

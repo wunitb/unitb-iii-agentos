@@ -1,7 +1,5 @@
 use iii_sdk::errors::Error;
-use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
-};
+use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -349,7 +347,7 @@ async fn decide_tier(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         payload: json!({
             "scope": format!("tier_approvals:{safe_agent_id}"),
             "key": approval_id,
-            "operations": [
+            "ops": [
                 { "type": "set", "path": "status", "value": "timed_out" },
             ],
         }),
@@ -474,7 +472,7 @@ async fn decide_tier_request(iii: &IIIClient, input: Value) -> Result<Value, Err
         payload: json!({
             "scope": format!("tier_approvals:{safe_agent_id}"),
             "key": safe_approval_id,
-            "operations": [
+            "ops": [
                 { "type": "set", "path": "status", "value": status },
                 { "type": "set", "path": "decidedBy", "value": decided_by },
                 { "type": "set", "path": "decidedAt", "value": now_ms() },
@@ -507,7 +505,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let iii_clone = iii.clone();
     iii.register_function(

@@ -50,7 +50,11 @@ enum Commands {
         #[arg(long)]
         quick: bool,
     },
+    /// Run the engine and workers in the foreground until Ctrl+C. Loads the
+    /// active `.env` exactly like `up`; `up` is the one-command path and also
+    /// launches the TUI.
     Start,
+    /// Stop an engine and workers started by `up`.
     Stop,
     Status {
         #[arg(long)]
@@ -136,6 +140,8 @@ enum Commands {
         shell: String,
     },
     Mcp,
+    /// Interactive first-run setup: state directories, default model, and the
+    /// machine's `AGENTOS_API_KEY`.
     Onboard {
         #[arg(long)]
         quick: bool,
@@ -347,6 +353,8 @@ pub(crate) struct RunningWorker {
 
 struct ProcessGroup {
     engine: Child,
+    /// The bus RBAC gate, started before the engine and stopped after it.
+    bus_auth: Option<Child>,
     workers: Vec<RunningWorker>,
     terminated: bool,
 }
@@ -365,6 +373,12 @@ impl ProcessGroup {
             let _ = worker.child.wait();
         }
         let _ = self.engine.wait();
+        // The gate goes last: everything above talks through it.
+        if let Some(daemon) = self.bus_auth.as_mut() {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+        self.bus_auth = None;
         self.terminated = true;
     }
 }
@@ -848,20 +862,27 @@ pub(crate) fn find_iii_binary(agentos_home: &Path) -> Result<PathBuf> {
         })
 }
 
-/// The `agentos-tui` binary: beside this executable for installed releases,
-/// otherwise the workspace release directory beside the runtime config.
-pub(crate) fn find_tui_binary(runtime_dir: Option<&Path>) -> Option<PathBuf> {
+/// A workspace binary that ships beside the CLI: next to this executable for
+/// installed releases, otherwise the release directory beside the runtime
+/// config, which is where the worker binaries live.
+pub(crate) fn find_sibling_binary(name: &str, runtime_dir: Option<&Path>) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(directory) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
     {
-        candidates.push(directory.join(TUI_BINARY));
+        candidates.push(directory.join(name));
     }
     if let Some(runtime_dir) = runtime_dir {
-        candidates.push(worker_binary_dir(runtime_dir).join(TUI_BINARY));
+        candidates.push(worker_binary_dir(runtime_dir).join(name));
     }
     candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+/// The `agentos-tui` binary: beside this executable for installed releases,
+/// otherwise the workspace release directory beside the runtime config.
+pub(crate) fn find_tui_binary(runtime_dir: Option<&Path>) -> Option<PathBuf> {
+    find_sibling_binary(TUI_BINARY, runtime_dir)
 }
 
 /// Puts a spawned process in its own group so it survives the terminal
@@ -923,6 +944,41 @@ pub(crate) fn launch_workers(
     Ok(())
 }
 
+/// Starts the bus-auth daemon. Its address is passed explicitly so the value
+/// this process resolved is the value the daemon binds, whatever the child
+/// environment says.
+pub(crate) fn spawn_bus_auth(
+    binary: &Path,
+    addr: std::net::SocketAddr,
+    runtime_dir: &Path,
+    log_path: &Path,
+    env: &BTreeMap<String, String>,
+    detached: bool,
+) -> Result<Child> {
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("Cannot open log {}", log_path.display()))?;
+    let log_err = log_file.try_clone()?;
+    let mut command = Command::new(binary);
+    command
+        .arg(format!("--listen={addr}"))
+        .current_dir(runtime_dir)
+        .envs(env)
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_err));
+    if detached {
+        detach_process(&mut command);
+    }
+    command
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("Failed to start {}: {error}", binary.display()))
+}
+
 /// Starts the engine with its log redirected to `log_path`.
 pub(crate) fn spawn_engine(
     iii_path: &Path,
@@ -980,16 +1036,21 @@ async fn main() -> Result<()> {
                 println!(
                     "\n{} Ready. Run {} to start.",
                     "✓".green(),
-                    "agentos start".cyan()
+                    "agentos up".cyan()
                 );
             } else {
-                println!("\nSet your API key:");
+                println!(
+                    "\nSet a provider key (written to the active .env, which the workers read):"
+                );
                 println!(
                     "  {} agentos config set-key anthropic $ANTHROPIC_API_KEY",
                     "▸".dimmed()
                 );
-                println!("\nThen start:");
-                println!("  {} agentos start", "▸".dimmed());
+                println!(
+                    "\nThen start the stack ({} generates AGENTOS_API_KEY on first run):",
+                    "up".cyan()
+                );
+                println!("  {} agentos up", "▸".dimmed());
             }
         }
 
@@ -1017,12 +1078,26 @@ async fn main() -> Result<()> {
             let iii_path = find_iii_binary(&agentos_home)?;
             let engine_log = engine_log_path(&agentos_home);
             let worker_log = worker_log_path(&agentos_home);
-            let launch_env = BTreeMap::new();
+            // Same environment contract as `up`: generate the machine key when
+            // the active `.env` has none, then hand that `.env` to the engine,
+            // the workers, and the TUI.
+            let key_outcome = bootstrap::ensure_api_key(&runtime_dir)?;
+            let launch_env = bootstrap::load_dotenv(&runtime_dir)?;
 
             println!("\n{}", "AgentOS".bold().cyan());
+            println!("{} {}", "✓".green(), key_outcome.describe());
             println!("{}", "─".repeat(40).dimmed());
-            println!("{} Starting iii-engine...", "→".blue());
 
+            // Same order as `up`: the bus RBAC gate must answer before the
+            // engine accepts its first worker connection.
+            let bus_auth = bootstrap::start_bus_auth_for_foreground(
+                &config_yaml,
+                &runtime_dir,
+                &worker_log,
+                &launch_env,
+            )?;
+
+            println!("{} Starting iii-engine...", "→".blue());
             let engine = spawn_engine(
                 &iii_path,
                 &config_yaml,
@@ -1033,6 +1108,7 @@ async fn main() -> Result<()> {
             )?;
             let mut processes = ProcessGroup {
                 engine,
+                bus_auth,
                 workers: Vec::new(),
                 terminated: false,
             };
@@ -1690,6 +1766,13 @@ async fn main() -> Result<()> {
 
             let paths = runtime_paths()?;
             initialize_agentos_home(&paths.agentos_home)?;
+            // A clean machine has no AGENTOS_API_KEY, and without it almost
+            // every worker exits while registering its HTTP routes. Only touch
+            // the runtime the config really names.
+            if paths.config_path.is_file() {
+                let outcome = bootstrap::ensure_api_key(&paths.runtime_dir)?;
+                println!("{} {}", "✓".green(), outcome.describe());
+            }
             let launch_env = bootstrap::load_dotenv(&paths.runtime_dir)?;
             let mut effects = bootstrap::SystemEffects::new(&paths, launch_env);
             let options = bootstrap::UpOptions {
@@ -1711,9 +1794,16 @@ async fn main() -> Result<()> {
 
         Commands::Doctor { json: is_json } => {
             let paths = runtime_paths()?;
-            let probes = bootstrap::SystemEffects::new(&paths, BTreeMap::new());
-            let report =
-                tokio::task::spawn_blocking(move || bootstrap::readiness(&probes, &paths)).await?;
+            let credentials = bootstrap::Credentials::inspect(&paths.runtime_dir)?;
+            // Probe with the same environment `up` would hand the stack, so a
+            // value like AGENTOS_BUS_AUTH_ADDR in the active `.env` is honoured
+            // here too. Reading the file changes nothing.
+            let probe_env = bootstrap::load_dotenv(&paths.runtime_dir).unwrap_or_default();
+            let probes = bootstrap::SystemEffects::new(&paths, probe_env);
+            let report = tokio::task::spawn_blocking(move || {
+                bootstrap::readiness(&probes, &paths, &credentials)
+            })
+            .await?;
 
             if is_json {
                 println!("{}", serde_json::to_string_pretty(&report.to_json())?);
@@ -1923,10 +2013,32 @@ async fn main() -> Result<()> {
                     .entry("keys")
                     .or_insert_with(|| toml::Value::Table(toml::Table::new()));
                 if let toml::Value::Table(kt) = keys_table {
-                    kt.insert(provider.clone(), toml::Value::String(key));
+                    kt.insert(provider.clone(), toml::Value::String(key.clone()));
                 }
                 std::fs::write(&config_path, toml::to_string_pretty(&table)?)?;
                 println!("{} API key set for {}", "✓".green(), provider.cyan());
+
+                // No worker reads config.toml; llm-router resolves credentials
+                // from the process environment only. Write the value where it
+                // is actually read, or say plainly that it is inert.
+                match bootstrap::provider_variable(&provider) {
+                    Some(variable) => {
+                        let paths = runtime_paths()?;
+                        let written =
+                            bootstrap::set_dotenv_value(&paths.runtime_dir, variable, &key)?;
+                        println!(
+                            "{} {variable} written to {} (mode 0600) — this is the value the workers read",
+                            "✓".green(),
+                            written.display()
+                        );
+                    }
+                    None => println!(
+                        "{} {} is not a provider `workers/llm-router` knows, so this key stays in {} and no worker reads it",
+                        "⚠".yellow(),
+                        provider,
+                        config_path.display()
+                    ),
+                }
             }
             ConfigCmd::Keys => {
                 let config_path = agentos_config_path()?;
@@ -2517,14 +2629,34 @@ async fn main() -> Result<()> {
                 config_dir.display()
             );
 
-            let api_key: String = if quick {
-                std::env::var("AGENTOS_API_KEY").unwrap_or_default()
+            // The machine's own key. Generated, never asked for, never invented
+            // from a provider credential.
+            let paths = runtime_paths()?;
+            let key_outcome = bootstrap::ensure_api_key(&paths.runtime_dir)?;
+            println!("  {} {}", "✓".green(), key_outcome.describe());
+
+            // The provider credential is a different thing entirely: workers
+            // read it from the environment, so it goes into the active `.env`.
+            let provider_key: String = if quick {
+                std::env::var("ANTHROPIC_API_KEY").unwrap_or_default()
             } else {
                 Input::new()
-                    .with_prompt("  Enter your API key (or press Enter to skip)")
+                    .with_prompt("  Anthropic API key for ANTHROPIC_API_KEY (Enter to skip)")
                     .allow_empty(true)
                     .interact_text()?
             };
+            if !provider_key.trim().is_empty() {
+                let written = bootstrap::set_dotenv_value(
+                    &paths.runtime_dir,
+                    "ANTHROPIC_API_KEY",
+                    provider_key.trim(),
+                )?;
+                println!(
+                    "  {} ANTHROPIC_API_KEY written to {}",
+                    "✓".green(),
+                    written.display()
+                );
+            }
 
             let models = vec![
                 "claude-opus-4-6",
@@ -2550,12 +2682,6 @@ async fn main() -> Result<()> {
             );
             config.insert("api_url".into(), toml::Value::String(get_api_url()));
 
-            if !api_key.is_empty() {
-                let mut keys = toml::Table::new();
-                keys.insert("default".into(), toml::Value::String(api_key));
-                config.insert("keys".into(), toml::Value::Table(keys));
-            }
-
             let config_path = config_dir.join("config.toml");
             std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
             println!(
@@ -2566,9 +2692,9 @@ async fn main() -> Result<()> {
             println!("  {} Default model: {}", "✓".green(), default_model.cyan());
 
             println!(
-                "\n{} Setup complete! Run {} to start.",
+                "\n{} Setup complete! Run {} to start the stack.",
                 "✓".green().bold(),
-                "agentos start".cyan()
+                "agentos up".cyan()
             );
         }
 

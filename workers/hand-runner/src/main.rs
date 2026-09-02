@@ -1,7 +1,6 @@
 use iii_sdk::errors::Error;
 use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
-    trigger::Trigger,
+    IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker, trigger::Trigger,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -234,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let dir = hands_dir();
     tracing::info!(dir = %dir.display(), "loading hands");

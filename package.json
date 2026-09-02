@@ -6,16 +6,22 @@
   "packageManager": "bun@1.3.14",
   "scripts": {
     "test": "bun run test:unit",
-    "test:unit": "bun test examples scripts tests",
+    "test:unit": "bun test examples scripts tests/*.test.ts",
+    "test:governance": "bun test tests/governance",
     "test:e2e": "AGENTOS_E2E=1 vitest --run --config vitest.e2e.config.ts",
     "test:e2e:smoke": "AGENTOS_E2E=1 vitest --run --config vitest.e2e.config.ts --testNamePattern=\"health|chat_completions\"",
     "test:examples": "vitest --run examples/shared.test.ts",
     "test:scripts": "vitest --run scripts/dev-up.test.ts",
-    "typecheck": "bun run typecheck:examples && bun run typecheck:scripts",
+    "counts": "bun scripts/counts.ts",
+    "counts:check": "bun scripts/counts.ts --check",
+    "counts:write": "bun scripts/counts.ts --write",
+    "typecheck": "bun run typecheck:examples && bun run typecheck:scripts && bun run typecheck:counts && bun run typecheck:tests",
     "typecheck:examples": "tsc --ignoreConfig --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck examples/*.ts",
-    "typecheck:scripts": "tsc --ignoreConfig --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --types node --strict --skipLibCheck scripts/dev-up.test.ts",
+    "typecheck:scripts": "tsc --ignoreConfig --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --types node --strict --skipLibCheck scripts/*.test.ts",
+    "typecheck:counts": "tsc --ignoreConfig --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --types node --strict --skipLibCheck scripts/counts.ts",
+    "typecheck:tests": "tsc --ignoreConfig --noEmit --target ES2022 --module ESNext --moduleResolution bundler --types bun,node --strict --skipLibCheck tests/*.test.ts tests/governance/*.test.ts",
     "build:website": "bash -lc 'cd website && npm run build'",
-    "check": "bun run typecheck && bun run test:unit && bun run build:website"
+    "check": "bun run typecheck && bun run test:unit && bun run test:governance && bun run counts:check && bun run build:website"
   },
   "dependencies": {
     "iii-sdk": "0.22.1"

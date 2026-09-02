@@ -1,7 +1,5 @@
 use iii_sdk::errors::Error;
-use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
-};
+use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
 
 mod types;
@@ -72,8 +70,26 @@ async fn state_list(iii: &IIIClient, scope: &str) -> Result<Vec<Value>, Error> {
     Ok(v.as_array().cloned().unwrap_or_default())
 }
 
-fn entry_value(entry: &Value) -> Value {
-    entry.get("value").cloned().unwrap_or_else(|| entry.clone())
+/// `state::list` answers a bare array of the stored values: there is no
+/// `{key, value}` envelope. Channels are newest first.
+fn channels_newest_first(mut channels: Vec<Value>) -> Vec<Value> {
+    channels.sort_by(|a, b| {
+        let ta = a.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(0);
+        let tb = b.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(0);
+        tb.cmp(&ta)
+    });
+    channels
+}
+
+/// Posts from a `state::list` response, oldest first. Same bare-array shape as
+/// `channels_newest_first`.
+fn posts_oldest_first(mut posts: Vec<Value>) -> Vec<Value> {
+    posts.sort_by(|a, b| {
+        let ta = a.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(0);
+        let tb = b.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(0);
+        ta.cmp(&tb)
+    });
+    posts
 }
 
 fn post_count_from_update(result: &Value) -> Result<(bool, usize), Error> {
@@ -338,13 +354,7 @@ async fn reply(iii: &IIIClient, req: ReplyRequest) -> Result<Value, Error> {
 
 async fn list_channels(iii: &IIIClient) -> Result<Value, Error> {
     let raw = state_list(iii, "coord_channels").await?;
-    let mut channels: Vec<Value> = raw.iter().map(entry_value).collect();
-    channels.sort_by(|a, b| {
-        let ta = a.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(0);
-        let tb = b.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(0);
-        tb.cmp(&ta)
-    });
-    Ok::<Value, Error>(Value::Array(channels))
+    Ok::<Value, Error>(Value::Array(channels_newest_first(raw)))
 }
 
 async fn read(iii: &IIIClient, req: ReadRequest) -> Result<Value, Error> {
@@ -357,12 +367,7 @@ async fn read(iii: &IIIClient, req: ReadRequest) -> Result<Value, Error> {
     let posts_scope = format!("coord_posts:{safe_channel_id}");
     let raw = state_list(iii, &posts_scope).await?;
 
-    let mut posts: Vec<Value> = raw.iter().map(entry_value).collect();
-    posts.sort_by(|a, b| {
-        let ta = a.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(0);
-        let tb = b.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(0);
-        ta.cmp(&tb)
-    });
+    let mut posts: Vec<Value> = posts_oldest_first(raw);
 
     if let Some(thread_id) = req.thread_id {
         let safe_thread = sanitize_id(&thread_id).map_err(Error::Handler)?;
@@ -437,7 +442,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let iii_clone = iii.clone();
     iii.register_function(
@@ -610,5 +615,53 @@ mod tests {
             .is_err()
         );
         assert!(post_count_from_update(&json!({ "new_value": {} })).is_err());
+    }
+
+    // --- state::list protocol (verified against iii 0.22.1) ---
+
+    #[test]
+    fn channels_are_ordered_newest_first_from_a_bare_list() {
+        let raw = vec![
+            json!({ "id": "c1", "createdAt": 10 }),
+            json!({ "id": "c3", "createdAt": 30 }),
+            json!({ "id": "c2", "createdAt": 20 }),
+        ];
+        let ordered = channels_newest_first(raw);
+        let ids: Vec<&str> = ordered
+            .iter()
+            .map(|c| c["id"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(ids, vec!["c3", "c2", "c1"]);
+    }
+
+    #[test]
+    fn posts_are_ordered_oldest_first_from_a_bare_list() {
+        let raw = vec![
+            json!({ "id": "p2", "createdAt": 20 }),
+            json!({ "id": "p1", "createdAt": 10 }),
+        ];
+        let ordered = posts_oldest_first(raw);
+        let ids: Vec<&str> = ordered
+            .iter()
+            .map(|p| p["id"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(ids, vec!["p1", "p2"]);
+    }
+
+    #[test]
+    fn a_post_carrying_its_own_value_field_survives_intact() {
+        // The old reader unwrapped `entry["value"]` when present, so a post
+        // whose body happened to be stored under `value` was replaced by it
+        // and lost its id, author and timestamp.
+        let raw = vec![json!({
+            "id": "p1",
+            "channelId": "c1",
+            "createdAt": 10,
+            "value": { "id": "wrong" },
+        })];
+        let ordered = posts_oldest_first(raw);
+        assert_eq!(ordered[0]["id"], "p1");
+        assert_eq!(ordered[0]["channelId"], "c1");
+        assert_eq!(ordered[0]["value"], json!({ "id": "wrong" }));
     }
 }

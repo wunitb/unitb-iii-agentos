@@ -1,7 +1,5 @@
 use iii_sdk::errors::Error;
-use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
-};
+use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 
@@ -43,22 +41,20 @@ async fn record(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let counter_resp = iii
         .trigger(TriggerRequest {
             function_id: "state::update".into(),
-            payload: json!({
-                "scope": "replay",
-                "key": counter_key,
-                "operations": [
-                    { "type": "increment", "path": "value", "value": 1 }
-                ],
-                "upsert": { "value": 1 }
-            }),
+            payload: counter_payload(&counter_key),
             action: None,
             timeout_ms: None,
         })
         .await
         .map_err(|e| Error::Handler(format!("failed to increment replay counter: {e}")))?;
 
-    let sequence = counter_resp["value"]
-        .as_i64()
+    if let Some(rejection) = update_rejection(&counter_resp) {
+        return Err(Error::Handler(format!(
+            "replay counter update rejected for {counter_key}: {rejection}"
+        )));
+    }
+
+    let sequence = sequence_from_update(&counter_resp)
         .ok_or_else(|| Error::Handler("invalid counter response from state::update".into()))?;
 
     let entry = ReplayEntry {
@@ -91,20 +87,52 @@ async fn record(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     Ok(json!({ "recorded": true, "sequence": sequence }))
 }
 
+/// `state::update` payload for the per-session sequence counter.
+///
+/// The engine names the operation list `ops` (an `operations` key fails the
+/// whole invocation with "missing field `ops`") and an `increment` carries the
+/// step in `by`, not `value`. A missing key increments from zero, so no
+/// separate upsert is needed.
+fn counter_payload(counter_key: &str) -> Value {
+    json!({
+        "scope": "replay",
+        "key": counter_key,
+        "ops": [
+            { "type": "increment", "path": "value", "by": 1 }
+        ],
+    })
+}
+
+/// A rejected operation still answers success at the transport level: the
+/// engine reports it inside an `errors` array of an otherwise normal result.
+fn update_rejection(result: &Value) -> Option<String> {
+    let errors = result.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    Some(Value::Array(errors.clone()).to_string())
+}
+
+/// The post-increment sequence number. `state::update` answers
+/// `{"new_value": ..., "old_value": ...}`, and the counter lives at
+/// `new_value.value` because the increment targets the `value` path.
+fn sequence_from_update(result: &Value) -> Option<i64> {
+    result.get("new_value")?.get("value")?.as_i64()
+}
+
+/// `state::list` answers a bare array of stored values: there is no `key` to
+/// filter on and no `value` envelope to unwrap. The sequence counters share
+/// the `replay` scope, so they are excluded by shape instead.
 fn parse_entries(list: &Value) -> Vec<ReplayEntry> {
     let Some(arr) = list.as_array() else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for item in arr {
-        let key = item["key"].as_str().unwrap_or("");
-        if key.ends_with(":counter") {
-            continue;
-        }
-        let value = &item["value"];
+    for value in arr {
         if !value.is_object() {
             continue;
         }
+        // A counter document is `{"value": n}`: it carries neither field.
         if value["sessionId"].as_str().is_none() || value["action"].as_str().is_none() {
             continue;
         }
@@ -282,7 +310,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let iii_ref = iii.clone();
     iii.register_function(
@@ -359,18 +387,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
+    // `state::list` answers a bare array of stored values (verified against
+    // iii 0.22.1: `iii trigger state::list scope=replay`). The fixtures below
+    // use that shape; the previous `{key, value}` fixtures described an
+    // envelope the engine has never sent.
+
     #[test]
     fn parse_entries_filters_counter() {
         let raw = json!([
-            { "key": "s1:00000001", "value": {
+            {
                 "sessionId": "s1", "agentId": "a1", "action": "tool_call",
                 "data": {}, "durationMs": 50, "timestamp": 1000, "iteration": 1, "sequence": 1
-            }},
-            { "key": "s1:counter", "value": { "value": 1 } },
-            { "key": "s1:00000002", "value": {
+            },
+            { "value": 1 },
+            {
                 "sessionId": "s1", "agentId": "a1", "action": "llm_call",
                 "data": {}, "durationMs": 0, "timestamp": 1100, "iteration": 1, "sequence": 2
-            }}
+            }
         ]);
         let entries = parse_entries(&raw);
         assert_eq!(entries.len(), 2);
@@ -380,15 +413,91 @@ mod tests {
     #[test]
     fn parse_entries_skips_incomplete() {
         let raw = json!([
-            { "key": "k1", "value": { "sessionId": "s1" } },
-            { "key": "k2", "value": "string-not-object" },
-            { "key": "k3", "value": {
+            { "sessionId": "s1" },
+            "string-not-object",
+            null,
+            {
                 "sessionId": "s2", "agentId": "a", "action": "x",
                 "data": {}, "durationMs": 0, "timestamp": 0, "iteration": 0, "sequence": 0
-            }}
+            }
         ]);
         let entries = parse_entries(&raw);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].session_id, "s2");
+    }
+
+    #[test]
+    fn parse_entries_reads_nothing_from_the_envelope_this_worker_used_to_expect() {
+        // Every replay read returned an empty list while the worker looked for
+        // `entry["value"]` in a bare-array response.
+        let enveloped = json!([
+            { "key": "s1:00000001", "value": {
+                "sessionId": "s1", "agentId": "a1", "action": "tool_call",
+                "data": {}, "durationMs": 50, "timestamp": 1000, "iteration": 1, "sequence": 1
+            }}
+        ]);
+        assert!(parse_entries(&enveloped).is_empty());
+    }
+
+    // --- state::update protocol (verified against iii 0.22.1) ---
+
+    #[test]
+    fn counter_payload_uses_ops_not_operations() {
+        let payload = counter_payload("s1:counter");
+        assert!(
+            payload.get("operations").is_none(),
+            "`operations` fails the whole invocation with `missing field ops`"
+        );
+        assert!(
+            payload.get("upsert").is_none(),
+            "state::update has no upsert parameter; a missing key increments from zero"
+        );
+        assert_eq!(payload["scope"], "replay");
+        assert_eq!(payload["key"], "s1:counter");
+    }
+
+    #[test]
+    fn counter_payload_carries_the_step_in_by() {
+        let op = counter_payload("s1:counter")["ops"][0].clone();
+        assert_eq!(op["type"], "increment");
+        assert_eq!(op["path"], "value");
+        assert_eq!(op["by"], json!(1));
+        assert!(
+            op.get("value").is_none(),
+            "`value` fails the whole invocation with `missing field by`"
+        );
+    }
+
+    #[test]
+    fn sequence_is_read_from_new_value() {
+        let engine_result = json!({
+            "new_value": { "value": 3 },
+            "old_value": { "value": 2 },
+        });
+        assert_eq!(sequence_from_update(&engine_result), Some(3));
+    }
+
+    #[test]
+    fn sequence_rejects_the_shape_this_worker_used_to_assume() {
+        assert_eq!(sequence_from_update(&json!({ "value": 3 })), None);
+    }
+
+    #[test]
+    fn a_rejected_increment_is_detected_inside_a_successful_response() {
+        let engine_result = json!({
+            "errors": [{ "code": "increment.not_number", "op_index": 0 }],
+            "new_value": { "value": "x" },
+            "old_value": { "value": "x" },
+        });
+        assert!(
+            update_rejection(&engine_result)
+                .expect("rejection must be reported")
+                .contains("increment.not_number")
+        );
+        assert_eq!(
+            update_rejection(&json!({ "new_value": { "value": 1 } })),
+            None
+        );
+        assert_eq!(update_rejection(&json!({ "errors": [] })), None);
     }
 }

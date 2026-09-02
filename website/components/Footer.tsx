@@ -86,7 +86,7 @@ export default function Footer() {
             </span>
           </div>
           <div className="font-mono text-[10.5px] tracking-[0.18em] uppercase text-fg-3">
-            63 workers · 267 functions · iii-sdk 0.22.1
+            63 workers · 301 functions · iii-sdk 0.22.1
           </div>
         </div>
       </div>

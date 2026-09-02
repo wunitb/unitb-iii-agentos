@@ -41,6 +41,44 @@ describe("iii stable version contract", () => {
     expect(failures).toEqual([]);
   });
 
+  /**
+   * The scan above is satisfied by zero declarations, so on its own it stopped
+   * proving anything once the pin moved into `[workspace.dependencies]`. The
+   * invariant it is really protecting is "exactly one pinned iii-sdk version for
+   * the whole workspace", which is a property of *where* the pin lives, not of
+   * how a member spells it.
+   */
+  it("pins iii-sdk exactly once, in the workspace table every member inherits", async () => {
+    const version = await canonicalVersion();
+    const workspaceManifest = Bun.TOML.parse(
+      await Bun.file(new URL("Cargo.toml", repository)).text(),
+    ) as { workspace?: { members?: string[]; dependencies?: Record<string, unknown> } };
+
+    expect(workspaceManifest.workspace?.dependencies?.["iii-sdk"]).toBe(`=${version}`);
+
+    const declarations: string[] = [];
+    const notInherited: string[] = [];
+    for (const member of workspaceManifest.workspace?.members ?? []) {
+      const manifest = `${member}/Cargo.toml`;
+      const parsed = Bun.TOML.parse(await Bun.file(new URL(manifest, repository)).text()) as {
+        dependencies?: Record<string, unknown>;
+      };
+      const spec = parsed.dependencies?.["iii-sdk"];
+      if (spec === undefined) continue;
+      if (typeof spec === "object" && spec !== null && (spec as { workspace?: boolean }).workspace === true) {
+        continue;
+      }
+      declarations.push(manifest);
+      notInherited.push(`${manifest}: ${JSON.stringify(spec)}`);
+    }
+
+    expect(
+      notInherited,
+      "these members pin iii-sdk themselves; a version bump would have to sweep every one of them",
+    ).toEqual([]);
+    expect(declarations).toEqual([]);
+  });
+
   it("keeps Node and Python SDK pins aligned", async () => {
     const version = await canonicalVersion();
     const packageJson = await Bun.file(new URL("package.json", repository)).json();

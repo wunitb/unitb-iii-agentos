@@ -1,7 +1,5 @@
 use iii_sdk::errors::Error;
-use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
-};
+use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
@@ -84,8 +82,20 @@ async fn state_list(iii: &IIIClient, scope: &str) -> Result<Vec<Value>, Error> {
         .ok_or_else(|| Error::Handler("state::list returned a non-array response".to_string()))
 }
 
-fn message_value(entry: &Value) -> Value {
-    entry.get("value").cloned().unwrap_or_else(|| entry.clone())
+/// Decode one `state::list` entry.
+///
+/// The engine answers a bare array of the stored values themselves: there is
+/// no `{key, value}` envelope. Unwrapping a `value` field would replace any
+/// document that carries one with just that field.
+fn decode_entry<T: serde::de::DeserializeOwned>(entry: &Value) -> Option<T> {
+    serde_json::from_value::<T>(entry.clone()).ok()
+}
+
+/// Swarm messages from a bare `state::list` response, oldest first.
+fn messages_from_list(raw: &[Value]) -> Vec<SwarmMessage> {
+    let mut items: Vec<SwarmMessage> = raw.iter().filter_map(decode_entry).collect();
+    items.sort_by_key(|m| m.timestamp);
+    items
 }
 
 fn normalize_swarm_input(input: Value) -> Value {
@@ -348,7 +358,7 @@ async fn rehydrate_swarms(iii: &IIIClient) -> Result<(), Error> {
     })?;
 
     for entry in entries {
-        let Ok(mut swarm) = serde_json::from_value::<SwarmConfig>(message_value(&entry)) else {
+        let Some(mut swarm) = decode_entry::<SwarmConfig>(&entry) else {
             continue;
         };
         if swarm.status != SwarmStatus::Active {
@@ -568,11 +578,7 @@ async fn collect(iii: &IIIClient, req: CollectRequest) -> Result<Value, Error> {
     let scope = format!("swarm_messages:{safe_swarm_id}");
     let raw = state_list(iii, &scope).await?;
 
-    let mut items: Vec<SwarmMessage> = raw
-        .iter()
-        .filter_map(|v| serde_json::from_value::<SwarmMessage>(message_value(v)).ok())
-        .collect();
-    items.sort_by_key(|m| m.timestamp);
+    let items = messages_from_list(&raw);
 
     let mut by_agent: std::collections::BTreeMap<String, Vec<&SwarmMessage>> =
         std::collections::BTreeMap::new();
@@ -627,9 +633,8 @@ async fn consensus(iii: &IIIClient, req: ConsensusRequest) -> Result<Value, Erro
     let scope = format!("swarm_messages:{safe_swarm_id}");
     let raw = state_list(iii, &scope).await?;
 
-    let votes: Vec<SwarmMessage> = raw
-        .iter()
-        .filter_map(|v| serde_json::from_value::<SwarmMessage>(message_value(v)).ok())
+    let votes: Vec<SwarmMessage> = messages_from_list(&raw)
+        .into_iter()
         .filter(|m| m.kind == MessageType::Vote && m.message == req.proposal)
         .collect();
 
@@ -746,7 +751,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let iii_clone = iii.clone();
     iii.register_function(
@@ -902,5 +907,48 @@ mod tests {
 
         assert!(prompt.contains("agent-1"));
         assert!(prompt.contains("find the root cause"));
+    }
+
+    // --- state::list protocol (verified against iii 0.22.1) ---
+
+    fn stored_message(id: &str, timestamp: i64) -> Value {
+        json!({
+            "id": id,
+            "swarmId": "s1",
+            "agentId": "agent-1",
+            "message": "observation",
+            "type": "observation",
+            "timestamp": timestamp,
+        })
+    }
+
+    #[test]
+    fn messages_are_decoded_from_a_bare_list_oldest_first() {
+        let raw = vec![stored_message("m2", 20), stored_message("m1", 10)];
+        let items = messages_from_list(&raw);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "m1");
+        assert_eq!(items[1].id, "m2");
+    }
+
+    #[test]
+    fn the_envelope_this_worker_used_to_expect_is_never_sent() {
+        // The old reader took `entry["value"]` when present. state::list has
+        // no such field, so an enveloped fixture decodes to nothing.
+        let enveloped = vec![json!({ "key": "m1", "value": stored_message("m1", 10) })];
+        assert!(messages_from_list(&enveloped).is_empty());
+    }
+
+    #[test]
+    fn deleted_entries_and_foreign_documents_are_skipped() {
+        // `state::set value=null` leaves a null entry in the scope.
+        let raw = vec![
+            Value::Null,
+            json!({ "unrelated": true }),
+            stored_message("m1", 1),
+        ];
+        let items = messages_from_list(&raw);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "m1");
     }
 }

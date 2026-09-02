@@ -1,8 +1,6 @@
 use dashmap::DashMap;
 use iii_sdk::errors::Error;
-use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
-};
+use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -105,6 +103,78 @@ fn validate_command(cmd: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Variable families the dynamic loader, the C library or a language runtime
+/// reads before it runs any of the program's own code. Setting one of these is
+/// arbitrary code execution regardless of which binary is spawned, so they are
+/// refused unconditionally — the same rule the upstream `shell` worker applies
+/// to its own per-call `env` ("deny-only ... every key is allowed except the
+/// exec-hijacking keys (PATH, IFS, HOME, LD_*, DYLD_*, BASH_ENV, ...)").
+const DENIED_ENV_PREFIXES: &[&str] = &["LD_", "DYLD_", "BASH_FUNC_", "MALLOC_", "GLIBC_"];
+
+/// Exact keys that are refused. This includes every key `safe_env` supplies, so
+/// a caller can never redefine the values the worker itself pins.
+const DENIED_ENV_KEYS: &[&str] = &[
+    // supplied by safe_env(), and all exec-relevant
+    "PATH",
+    "HOME",
+    "USER",
+    "LANG",
+    "TERM",
+    "SHELL",
+    // shell startup / word splitting
+    "IFS",
+    "ENV",
+    "BASH_ENV",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "CDPATH",
+    "GLOBIGNORE",
+    "PS4",
+    // libc lookup paths
+    "GCONV_PATH",
+    "LOCPATH",
+    "NLSPATH",
+    "HOSTALIASES",
+    "RESOLV_HOST_CONF",
+    "TZDIR",
+    // python
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONSTARTUP",
+    "PYTHONEXECUTABLE",
+    "PYTHONINSPECT",
+    "PYTHONWARNINGS",
+    // node
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NODE_REPL_EXTERNAL_MODULE",
+    // perl
+    "PERL5LIB",
+    "PERL5OPT",
+    "PERL5DB",
+    "PERLLIB",
+    // ruby
+    "RUBYOPT",
+    "RUBYLIB",
+    // lua
+    "LUA_PATH",
+    "LUA_CPATH",
+    // jvm
+    "CLASSPATH",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    // programs a helper may shell out to
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_EDITOR",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+];
+
 fn validate_env_key(key: &str) -> Result<(), Error> {
     if key.is_empty()
         || !key
@@ -113,7 +183,35 @@ fn validate_env_key(key: &str) -> Result<(), Error> {
     {
         return Err(Error::Handler(format!("invalid environment key: {key}")));
     }
+    if DENIED_ENV_KEYS.contains(&key)
+        || DENIED_ENV_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+    {
+        return Err(Error::Handler(format!(
+            "environment key {key} is not allowed: loader, libc and interpreter \
+             startup variables hijack execution before the program runs"
+        )));
+    }
     Ok(())
+}
+
+/// Final environment for a spawned MCP server.
+///
+/// The caller-supplied pairs are applied FIRST and the worker's pinned
+/// `safe_env` values LAST, so an allowlisted key can never be overridden by the
+/// request. Previously the order was reversed, which meant the allowlist was
+/// decorative: `mcp::connect {command:"/bin/true", env:{"LD_PRELOAD":"/tmp/x.so"}}`
+/// executed attacker code.
+fn child_env(
+    safe: Vec<(String, String)>,
+    requested: Vec<(String, String)>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut env: std::collections::BTreeMap<String, String> = requested.into_iter().collect();
+    for (key, value) in safe {
+        env.insert(key, value);
+    }
+    env
 }
 
 fn requested_env(body: &Value) -> Result<Vec<(String, String)>, Error> {
@@ -448,10 +546,7 @@ async fn connect(state: Arc<State>, iii: &IIIClient, input: Value) -> Result<Val
             child_cmd.args(a);
         }
         child_cmd.env_clear();
-        for (k, v) in safe_env() {
-            child_cmd.env(k, v);
-        }
-        for (key, value) in requested_env {
+        for (key, value) in child_env(safe_env(), requested_env) {
             child_cmd.env(key, value);
         }
         child_cmd.stdin(std::process::Stdio::piped());
@@ -844,7 +939,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
     let state = Arc::new(State::default());
 
     {
@@ -1010,6 +1105,114 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    // --- spawned-process environment (H-NEW-1)
+
+    #[test]
+    fn loader_and_interpreter_keys_are_rejected() {
+        for key in [
+            "LD_PRELOAD",
+            "LD_AUDIT",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "PATH",
+            "HOME",
+            "SHELL",
+            "IFS",
+            "BASH_ENV",
+            "ENV",
+            "BASH_FUNC_ls%%",
+            "GCONV_PATH",
+            "LOCPATH",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "NODE_OPTIONS",
+            "PERL5OPT",
+            "RUBYOPT",
+            "CLASSPATH",
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
+            "GIT_SSH_COMMAND",
+            "EDITOR",
+            "MALLOC_CONF",
+            "GLIBC_TUNABLES",
+        ] {
+            assert!(
+                validate_env_key(key).is_err(),
+                "{key} must not be settable by a caller"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_keys_are_still_accepted() {
+        for key in [
+            "GITHUB_TOKEN",
+            "MCP_SERVER_URL",
+            "NODE_ENV",
+            "MY_API_KEY_2",
+            "AGENTOS_TEST_REQUIRED_9C3A",
+        ] {
+            validate_env_key(key)
+                .unwrap_or_else(|error| panic!("{key} should be accepted: {error}"));
+        }
+    }
+
+    #[test]
+    fn malformed_keys_are_still_rejected() {
+        for key in ["", "lower_case", "with-dash", "with space", "WITH=EQUALS"] {
+            assert!(validate_env_key(key).is_err(), "{key:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn requested_env_rejects_a_hijacking_key() {
+        let error = requested_env(&json!({ "env": { "LD_PRELOAD": "/tmp/x.so" } }))
+            .expect_err("LD_PRELOAD must be refused")
+            .to_string();
+        assert!(error.contains("not allowed"), "{error}");
+    }
+
+    #[test]
+    fn requested_env_accepts_ordinary_pairs() {
+        let pairs = requested_env(&json!({ "env": { "GITHUB_TOKEN": "t" } })).unwrap();
+        assert_eq!(pairs, vec![("GITHUB_TOKEN".to_string(), "t".to_string())]);
+        assert!(requested_env(&json!({})).unwrap().is_empty());
+        assert!(requested_env(&json!({ "env": { "OK_KEY": 1 } })).is_err());
+    }
+
+    #[test]
+    fn safe_env_wins_over_a_caller_supplied_value() {
+        // Even if a denied key somehow reached this point, the pinned value is
+        // applied last and therefore wins.
+        let env = child_env(
+            vec![
+                ("PATH".to_string(), "/pinned/bin".to_string()),
+                ("HOME".to_string(), "/pinned/home".to_string()),
+            ],
+            vec![
+                ("PATH".to_string(), "/tmp/evil".to_string()),
+                ("GITHUB_TOKEN".to_string(), "t".to_string()),
+            ],
+        );
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/pinned/bin"));
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/pinned/home"));
+        assert_eq!(env.get("GITHUB_TOKEN").map(String::as_str), Some("t"));
+    }
+
+    #[test]
+    fn safe_env_only_exposes_the_pinned_keys() {
+        let allowed: BTreeSet<&str> = ["PATH", "HOME", "USER", "LANG", "TERM", "SHELL"]
+            .into_iter()
+            .collect();
+        for (key, _) in safe_env() {
+            assert!(allowed.contains(key.as_str()), "unexpected safe key {key}");
+            assert!(
+                validate_env_key(&key).is_err(),
+                "{key} is pinned by safe_env and must not be caller-settable"
+            );
+        }
+    }
 
     fn test_manifest() -> IntegrationManifest {
         IntegrationManifest {

@@ -7,6 +7,26 @@
 # by editing ./config/X.yaml.
 
 workers:
+  # The engine's own WebSocket bus (the socket every worker connects to). It is
+  # mandatory and is auto-added when absent, with WorkerManagerConfig::default()
+  # -> host "0.0.0.0". Declared here so the bind host is pinned to loopback
+  # instead of inherited: the bus carries every AgentOS function and has no
+  # authentication of its own, so an all-interfaces bind is a remote, unauthed
+  # gateway to the whole stack. Verified live: with host 127.0.0.1 the socket is
+  # refused from this machine's LAN and tailnet addresses; with 0.0.0.0 it is
+  # reachable from both. Valid keys are port, host, middleware_function_id,
+  # rbac, handshake_timeout_ms — the struct is deny_unknown_fields, so a typo
+  # fails the boot instead of being ignored.
+  - name: iii-worker-manager
+    config:
+      host: 127.0.0.1
+      # Bus RBAC is NOT armed here. It is fail-closed by design, so an armed
+      # config with no `agentos-bus-authd` listening refuses every worker
+      # connection and the stack does not come up — which is what the documented
+      # `iii --config config.yaml` path would do on a clean clone. The opt-in
+      # overlay and its instructions live in `bus-rbac.overlay.yaml` (repo root, so the
+      # configuration worker does not try to parse it as a worker config);
+      # `agentos up` starts the daemon and `agentos doctor` reports the state.
   - name: iii-http
   - name: iii-pubsub
   - name: state
@@ -21,13 +41,25 @@ workers:
   - name: provider-openai-codex
   - name: queue
   - name: session-manager
-  - name: shell
-    config:
-      fs:
-        host_roots:
-          - ${III_COMPOSE_DIR:.}
-        allow_unjailed: false
-  - name: harness
+  # `shell` is deliberately NOT booted by default. Its function surface
+  # (shell::exec, shell::exec_bg, shell::pty::open, shell::fs::write,
+  # shell::fs::rm, coder::*) lands on the engine bus, which has no
+  # authentication, and `fs.host_roots` jails only the shell::fs::* half — it
+  # does not constrain the program shell::exec runs. Opt in by adding
+  # `- name: shell` here; ./config/shell.yaml holds the hardened settings that
+  # then apply. See config/shell.yaml for what that does and does not buy you.
+  # `harness` is deliberately NOT booted by default, for the same reason as
+  # `shell`. Read out of the shipped v1.8.8-rc.3 binary's own function
+  # descriptions: harness::send and harness::spawn start autonomous agent turns,
+  # harness::function::trigger invokes arbitrary iii functions under the harness
+  # dispatch policy, and harness::filesystem::grant / ::revoke are upstream's own
+  # "Internal control-plane" functions that widen a session's filesystem roots.
+  # It also drives coder::* and shell::* for file writes. All of it sits on the
+  # unauthenticated bus, and upstream's approval-gate spec pairs
+  # `harness::spawn` with `shell::*`. Nothing in this repo calls harness::*, and
+  # its only in-stack consumer was the console worker, which is also opt-in now.
+  # Opt in by adding `- name: harness` here; ./config/harness.yaml holds the
+  # bounded settings that then apply, and says what you still have to decide.
   - name: configuration
     config:
       adapter:
@@ -35,4 +67,12 @@ workers:
         config:
           directory: ./config
       ttl_seconds: 0
-  - name: console
+  # `console` is deliberately NOT booted by default. Its worker configuration
+  # (v1.9.16, pinned in iii.lock) exposes exactly one server key, `http_port` —
+  # there is no bind-host key — and the shipped binary listens on 0.0.0.0, so
+  # the console (which also proxies /ws to the unauthenticated engine bus)
+  # cannot be confined to loopback from this repo. It was observed live as
+  # `LISTEN 0 128 0.0.0.0:3113 users:(("console",...))` on a tailnet-attached
+  # host. Opt in by adding `- name: console` here AND blocking 3113 at the
+  # firewall, or reach it through an SSH tunnel. ./config/console.yaml pins the
+  # port so the value is declared in-tree rather than inherited.

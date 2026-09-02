@@ -1,5 +1,5 @@
 use iii_sdk::errors::Error;
-use iii_sdk::{InitOptions, RegisterFunction, register_worker};
+use iii_sdk::{RegisterFunction, register_worker};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -129,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     iii.register_function(
         "agent::code_detect",

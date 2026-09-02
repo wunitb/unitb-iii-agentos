@@ -1,6 +1,7 @@
+use agentos_http_adapter::bus::CHAT_TIMEOUT_MS;
 use iii_sdk::errors::Error;
 use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction,
+    IIIClient, RegisterFunction,
     protocol::{RegisterTriggerInput, TriggerRequest},
     register_worker,
 };
@@ -51,7 +52,7 @@ async fn missing_channel_secrets(
                 function_id: "vault::get".to_string(),
                 payload: json!({ "key": key }),
                 action: None,
-                timeout_ms: None,
+                timeout_ms: Some(CHAT_TIMEOUT_MS),
             })
             .await
             .ok()
@@ -70,7 +71,7 @@ async fn channel_statuses(iii: &IIIClient) -> Result<Value, Error> {
             function_id: "engine::workers::list".to_string(),
             payload: json!({}),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
         .map_err(|error| Error::Handler(error.to_string()))?;
@@ -127,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let started_at = Instant::now();
     let iii_clone = iii.clone();
@@ -141,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         function_id: "engine::workers::list".to_string(),
                         payload: json!({}),
                         action: None,
-                        timeout_ms: None,
+                        timeout_ms: Some(CHAT_TIMEOUT_MS),
                     })
                     .await
                     .map_err(|error| Error::Handler(error.to_string()))?;
@@ -270,7 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     function_id: "state::list".to_string(),
                     payload: json!({ "scope": "agents" }),
                     action: None,
-                    timeout_ms: None,
+                    timeout_ms: Some(CHAT_TIMEOUT_MS),
                 })
                 .await
                 .map_err(|e| Error::Handler(e.to_string()))
@@ -297,7 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "key": &agent_id,
                     }),
                     action: None,
-                    timeout_ms: None,
+                    timeout_ms: Some(CHAT_TIMEOUT_MS),
                 })
                 .await
                 .map_err(|e| Error::Handler(e.to_string()))?;
@@ -354,7 +355,7 @@ fn spawn_trigger(iii: &IIIClient, function_id: &'static str, payload: Value) {
                 function_id: function_id.to_string(),
                 payload,
                 action: None,
-                timeout_ms: None,
+                timeout_ms: Some(CHAT_TIMEOUT_MS),
             })
             .await;
     });
@@ -460,7 +461,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
                 "key": &req.agent_id,
             }),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
         .ok()
@@ -475,7 +476,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
                 "limit": 20,
             }),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
         .unwrap_or(json!([]));
@@ -485,7 +486,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
             function_id: "agent::list_functions".to_string(),
             payload: json!({ "agentId": &req.agent_id }),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
         .unwrap_or(json!([]));
@@ -509,7 +510,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
                 preferred_model.as_deref(),
             ),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
@@ -520,7 +521,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
             function_id: "security::scan_injection".to_string(),
             payload: json!({ "text": &req.message }),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
         .unwrap_or(json!({ "safe": true, "riskScore": 0.0 }));
@@ -543,7 +544,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
             function_id: "agentos::llm::complete".to_string(),
             payload: completion_payload(&provider, &model, &system_prompt, &messages, &functions),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
@@ -572,7 +573,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
                         "resource": &tc.id,
                     }),
                     action: None,
-                    timeout_ms: None,
+                    timeout_ms: Some(CHAT_TIMEOUT_MS),
                 })
                 .await;
 
@@ -589,7 +590,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
                     function_id: tc.id.to_string(),
                     payload: tc.arguments.clone(),
                     action: None,
-                    timeout_ms: None,
+                    timeout_ms: Some(CHAT_TIMEOUT_MS),
                 })
                 .await
             {
@@ -624,7 +625,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
                     &functions,
                 ),
                 action: None,
-                timeout_ms: None,
+                timeout_ms: Some(CHAT_TIMEOUT_MS),
             })
             .await
             .map_err(|e| Error::Handler(e.to_string()))?;
@@ -655,19 +656,16 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
         }),
     );
 
+    // The engine's `state::update` takes `ops`, and an increment carries `by`, not
+    // `value` (verified against iii 0.22.1). It also REJECTS an increment over a
+    // stored null, so the amount is resolved to a number here: a missing usage
+    // total meters zero instead of poisoning the counter for good.
     if let Err(e) = iii
         .trigger(TriggerRequest {
             function_id: "state::update".to_string(),
-            payload: json!({
-                "scope": "metering",
-                "key": &req.agent_id,
-                "operations": [
-                    { "type": "increment", "path": "totalTokens", "value": response["usage"]["total"] },
-                    { "type": "increment", "path": "invocations", "value": 1 },
-                ],
-            }),
+            payload: metering_update_payload(&req.agent_id, &response),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
     {
@@ -683,13 +681,38 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
     }))
 }
 
+/// Build the metering `state::update` payload for one completed turn.
+///
+/// Extracted so the wire shape is testable without a bus. Two engine facts are
+/// encoded here, both verified against iii 0.22.1: the operation list is `ops`
+/// (not `operations`, which fails the whole invocation), and an increment
+/// carries `by` (not `value`). The engine also REJECTS an increment over a
+/// stored null, so a missing usage total meters zero rather than writing a null
+/// that would break the counter permanently.
+fn metering_update_payload(agent_id: &str, response: &Value) -> Value {
+    let metered_tokens = response
+        .get("usage")
+        .and_then(|usage| usage.get("total"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    json!({
+        "scope": "metering",
+        "key": agent_id,
+        "ops": [
+            { "type": "increment", "path": "totalTokens", "by": metered_tokens },
+            { "type": "increment", "path": "invocations", "by": 1 },
+        ],
+    })
+}
+
 async fn list_functions(iii: &IIIClient, agent_id: &str) -> Result<Value, Error> {
     let config: Option<AgentConfig> = iii
         .trigger(TriggerRequest {
             function_id: "state::get".to_string(),
             payload: json!({ "scope": "agents", "key": agent_id }),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
         .ok()
@@ -712,7 +735,7 @@ async fn list_functions(iii: &IIIClient, agent_id: &str) -> Result<Value, Error>
             function_id: "engine::functions::list".to_string(),
             payload: json!({}),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
         .unwrap_or_else(|_| json!({ "functions": [] }));
@@ -772,7 +795,7 @@ async fn create_agent(iii: &IIIClient, config: AgentConfig) -> Result<Value, Err
         },
     }),
         action: None,
-        timeout_ms: None,
+        timeout_ms: Some(CHAT_TIMEOUT_MS),
     })
     .await
     .map_err(|e| Error::Handler(e.to_string()))?;
@@ -791,6 +814,51 @@ async fn create_agent(iii: &IIIClient, config: AgentConfig) -> Result<Value, Err
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn metering_speaks_the_engines_update_protocol() {
+        let payload = metering_update_payload(
+            "agent-1",
+            &json!({ "usage": { "total": 1234 }, "content": "hi" }),
+        );
+
+        assert_eq!(payload["scope"], "metering");
+        assert_eq!(payload["key"], "agent-1");
+        assert!(
+            payload.get("operations").is_none(),
+            "the engine takes `ops`; an `operations` key fails the whole invocation"
+        );
+        let ops = payload["ops"].as_array().expect("ops must be a list");
+        assert_eq!(ops.len(), 2);
+        for op in ops {
+            assert_eq!(op["type"], "increment");
+            assert!(
+                op.get("value").is_none(),
+                "an increment carries `by`; `value` fails with a missing-field error"
+            );
+            assert!(op["by"].is_u64(), "the amount must be a number");
+        }
+        assert_eq!(ops[0]["path"], "totalTokens");
+        assert_eq!(ops[0]["by"], 1234);
+        assert_eq!(ops[1]["path"], "invocations");
+        assert_eq!(ops[1]["by"], 1);
+    }
+
+    #[test]
+    fn metering_meters_zero_when_the_provider_reports_no_usage() {
+        for response in [
+            json!({ "content": "hi" }),
+            json!({ "usage": null }),
+            json!({ "usage": { "total": null } }),
+            json!({ "usage": { "total": "many" } }),
+        ] {
+            let payload = metering_update_payload("agent-1", &response);
+            assert_eq!(
+                payload["ops"][0]["by"], 0,
+                "a null or non-numeric total must meter 0: the engine rejects an                  increment over a stored null, which would break the counter for good"
+            );
+        }
+    }
+
     use super::*;
     use types::{Capabilities, ModelConfig, Resources};
 

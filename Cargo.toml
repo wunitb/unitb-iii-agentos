@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/bus-auth",
     "crates/cli",
     "crates/http-adapter",
     "crates/tui",
@@ -73,8 +74,21 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.90"
+# Nothing in this workspace is published to crates.io: the binaries ship through
+# `.github/workflows/release.yml` and the engine worker registry, not `cargo publish`.
+# Declaring it is also what makes `deny.toml`'s `allow-wildcard-paths` apply to the
+# workspace-internal `agentos-http-adapter` path dependency, so `wildcards` can stay
+# `deny` (cargo-deny refuses to excuse a path wildcard on a publishable crate).
+publish = false
 
+# Every dependency shared by three or more members lives here and is inherited with
+# `<name>.workspace = true`. Upstream agentos worked this way; the 0.11.6 -> 0.22.1
+# upgrade inlined the versions into all 62 workers and left this table dead, which
+# turned every engine bump into a 62-file sweep. A dependency used by one or two
+# members deliberately stays in that member's manifest.
 [workspace.dependencies]
+agentos-bus-auth = { path = "crates/bus-auth" }
+agentos-http-adapter = { path = "crates/http-adapter" }
 iii-sdk = "=0.22.1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -89,6 +103,14 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
+futures-util = "0.3"
+# `rustls-tls` is the floor every member needs; members that also parse JSON or
+# stream bodies add those features on top of this entry.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+regex = "1"
+toml = "0.8"
+url = "2"
+ed25519-dalek = "3"
 
 [profile.release]
 lto = true

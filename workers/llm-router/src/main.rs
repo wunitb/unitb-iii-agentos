@@ -1,16 +1,127 @@
 use dashmap::DashMap;
 use iii_sdk::errors::Error;
-use iii_sdk::{InitOptions, RegisterFunction, register_worker};
+use iii_sdk::{RegisterFunction, register_worker};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Every provider request is bounded. A chat turn on the bus is budgeted at
+/// 300 s (`CHAT_TIMEOUT_MS` in the streaming worker), so a provider call has to
+/// finish inside that window instead of outliving the turn that pays for it.
+/// Before this, both clients were built without `.timeout(...)`: an abandoned
+/// trigger left the provider request running, and billing, with nobody waiting.
+const PROVIDER_TIMEOUT_DEFAULT_MS: u64 = 240_000;
+const PROVIDER_TIMEOUT_MAX_MS: u64 = 240_000;
+const PROVIDER_TIMEOUT_MIN_MS: u64 = 1_000;
+const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const PROVIDER_ERROR_BODY_LIMIT: usize = 2_000;
+
+/// Resolve the deadline for a single provider call. A caller may ask for less
+/// than the default; nobody may ask for more than `PROVIDER_TIMEOUT_MAX_MS`.
+fn provider_timeout(caller_timeout_ms: Option<u64>) -> Duration {
+    Duration::from_millis(
+        caller_timeout_ms
+            .unwrap_or(PROVIDER_TIMEOUT_DEFAULT_MS)
+            .clamp(PROVIDER_TIMEOUT_MIN_MS, PROVIDER_TIMEOUT_MAX_MS),
+    )
+}
+
+fn caller_timeout_ms(input: &Value) -> Option<u64> {
+    input
+        .get("timeoutMs")
+        .or_else(|| input.get("timeout_ms"))
+        .and_then(Value::as_u64)
+}
+
+fn provider_client(builder: reqwest::ClientBuilder) -> reqwest::Result<reqwest::Client> {
+    builder
+        .timeout(provider_timeout(None))
+        .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+        .build()
+}
 
 struct RouterState {
     usage: DashMap<String, Usage>,
     providers: DashMap<String, ProviderConfig>,
     default_route: Option<Route>,
+}
+
+/// Order used when the operator pinned no default and the request named no
+/// provider. Only providers that require a credential are listed: a keyless
+/// provider such as `ollama` also needs a server running on this machine, so
+/// selecting it automatically would trade one silent failure for another.
+const AUTO_ROUTE_PREFERENCE: &[&str] = &[
+    "anthropic",
+    "openai",
+    "google",
+    CODEX_PROVIDER,
+    "groq",
+    "deepseek",
+    "mistral",
+    "together",
+    "fireworks",
+    "openrouter",
+];
+
+impl RouterState {
+    fn provider_is_available(&self, provider: &str) -> bool {
+        self.providers
+            .get(provider)
+            .is_some_and(|config| config.is_available())
+    }
+
+    /// First provider, in the documented preference order, whose credential is
+    /// actually present.
+    fn available_route(&self) -> Option<Route> {
+        AUTO_ROUTE_PREFERENCE.iter().find_map(|provider| {
+            let config = self.providers.get(*provider)?;
+            if !config.requires_credential() || !config.is_available() {
+                return None;
+            }
+            let model = if *provider == CODEX_PROVIDER
+                && config
+                    .models
+                    .iter()
+                    .any(|model| model == DEFAULT_CODEX_MODEL)
+            {
+                DEFAULT_CODEX_MODEL.to_string()
+            } else {
+                config.models.first().cloned()?
+            };
+            Some(Route {
+                provider: (*provider).to_string(),
+                model,
+            })
+        })
+    }
+
+    /// Structured refusal naming the variables the operator can set, instead of
+    /// a 401 from a provider the user never configured.
+    fn missing_credential_error(&self) -> Error {
+        let variables: Vec<String> = AUTO_ROUTE_PREFERENCE
+            .iter()
+            .filter_map(|provider| self.providers.get(*provider))
+            .filter(|config| config.requires_credential())
+            .map(|config| config.env_key.clone())
+            .collect();
+        Error::Handler(format!(
+            "provider_credential_missing: no provider credential is configured; set one of {} in the active .env, or send an explicit provider and model",
+            variables.join(", ")
+        ))
+    }
+
+    fn ensure_credential(&self, provider: &str) -> Result<(), Error> {
+        let config = self
+            .providers
+            .get(provider)
+            .ok_or_else(|| Error::Handler(format!("unknown provider: {provider}")))?;
+        if config.is_available() {
+            return Ok(());
+        }
+        Err(credential_missing_error(provider, &config.env_key))
+    }
 }
 
 struct Usage {
@@ -135,6 +246,93 @@ struct ProviderConfig {
     env_key: String,
     driver: Driver,
     models: Vec<String>,
+    /// Credential snapshot taken at boot. `None` means the provider needs a
+    /// credential and the environment does not have one, so routing must refuse
+    /// the provider instead of sending an unauthenticated request and reporting
+    /// the provider's 401 as if the user had chosen it.
+    credential: Option<String>,
+}
+
+impl ProviderConfig {
+    fn requires_credential(&self) -> bool {
+        !self.env_key.is_empty()
+    }
+
+    fn is_available(&self) -> bool {
+        self.credential.is_some()
+    }
+}
+
+/// `None` when the provider requires a credential that the environment does not
+/// have; `Some("")` for a provider such as `ollama` that needs no credential.
+fn provider_credential<F>(env_key: &str, get_env: &F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if env_key.is_empty() {
+        return Some(String::new());
+    }
+    get_env(env_key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn credential_missing_error(provider: &str, env_key: &str) -> Error {
+    Error::Handler(format!(
+        "provider_credential_missing: provider {provider} has no credential; set {env_key} in the active .env, or choose a provider whose credential is present"
+    ))
+}
+
+fn provider_base_url_env(provider: &str) -> String {
+    let normalized: String = provider
+        .to_ascii_uppercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("AGENTOS_{normalized}_BASE_URL")
+}
+
+/// A provider may be redirected at a gateway, but only to a URL that cannot
+/// quietly exfiltrate the credential: `https` anywhere, `http` only on a
+/// loopback literal, and never with embedded credentials, query or fragment.
+/// Anything else keeps the compiled-in default.
+fn resolve_provider_base_url(default_base_url: &str, override_value: Option<&str>) -> String {
+    let Some(raw) = override_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return default_base_url.to_string();
+    };
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return default_base_url.to_string();
+    };
+    let is_loopback_literal = url
+        .host_str()
+        .and_then(|host| {
+            let host = host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(host);
+            host.parse::<std::net::IpAddr>().ok()
+        })
+        .is_some_and(|host| host.is_loopback());
+    let scheme_is_safe = match url.scheme() {
+        "https" => true,
+        "http" => is_loopback_literal,
+        _ => false,
+    };
+    let is_safe = scheme_is_safe
+        && url.host_str().is_some_and(|host| !host.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none();
+
+    if !is_safe {
+        return default_base_url.to_string();
+    }
+
+    url.to_string().trim_end_matches('/').to_string()
 }
 
 const CODEX_PROVIDER: &str = "codex";
@@ -296,27 +494,66 @@ struct RuntimeDefaultResolution {
     disabled_provider: Option<String>,
 }
 
+/// Env key of a provider in the compiled-in catalogue.
+fn provider_env_key(provider: &str) -> Option<&'static str> {
+    default_providers()
+        .into_iter()
+        .find(|(name, ..)| *name == provider)
+        .map(|(_, _, env_key, _, _)| env_key)
+}
+
+/// Model used when a default provider is pinned without a model.
+fn provider_default_model(provider: &str) -> Option<&'static str> {
+    if provider == CODEX_PROVIDER {
+        return Some(DEFAULT_CODEX_MODEL);
+    }
+    default_providers()
+        .into_iter()
+        .find(|(name, ..)| *name == provider)
+        .and_then(|(_, _, _, _, models)| models.first().copied())
+}
+
+/// Turn `AGENTOS_DEFAULT_PROVIDER` / `AGENTOS_DEFAULT_MODEL` into a route, but
+/// only when the credential *that provider* needs is present. The old version
+/// gated every default on `CODEX_PROXY_API_KEY`, so an operator who pinned
+/// `openai` with a valid `OPENAI_API_KEY` silently lost the default and was
+/// routed to Anthropic instead.
 fn resolve_runtime_default<F>(get_env: F) -> RuntimeDefaultResolution
 where
     F: Fn(&str) -> Option<String>,
 {
-    let configured = |name: &str| get_env(name).filter(|value| !value.trim().is_empty());
+    let configured = |name: &str| {
+        get_env(name)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
     let provider = configured("AGENTOS_DEFAULT_PROVIDER");
     let model = configured("AGENTOS_DEFAULT_MODEL");
+    let default_requested = provider.is_some() || model.is_some();
+    let provider_name = provider.unwrap_or_else(|| CODEX_PROVIDER.to_string());
+    let disabled = |provider_name: String| RuntimeDefaultResolution {
+        route: None,
+        disabled_provider: default_requested.then_some(provider_name),
+    };
 
-    if configured("CODEX_PROXY_API_KEY").is_none() {
-        let default_requested = provider.is_some() || model.is_some();
+    let Some(env_key) = provider_env_key(&provider_name) else {
         return RuntimeDefaultResolution {
             route: None,
-            disabled_provider: default_requested
-                .then(|| provider.unwrap_or_else(|| CODEX_PROVIDER.to_string())),
+            disabled_provider: Some(provider_name),
         };
+    };
+    if provider_credential(env_key, &configured).is_none() {
+        return disabled(provider_name);
     }
+    let Some(model) = model.or_else(|| provider_default_model(&provider_name).map(str::to_string))
+    else {
+        return disabled(provider_name);
+    };
 
     RuntimeDefaultResolution {
         route: Some(Route {
-            provider: provider.unwrap_or_else(|| CODEX_PROVIDER.to_string()),
-            model: model.unwrap_or_else(|| DEFAULT_CODEX_MODEL.to_string()),
+            provider: provider_name,
+            model,
         }),
         disabled_provider: None,
     }
@@ -375,6 +612,12 @@ fn select_model(complexity: u32, preferred: Option<&str>) -> (&'static str, &'st
     }
 }
 
+/// Name resolution: which provider and model does this request mean? An
+/// explicitly requested provider/model is resolved as asked even when its
+/// credential is absent, so `agentos::llm::route` stays a catalogue query;
+/// `resolve_complete_route` is where a call is refused. Automatic selection is
+/// the exception: choosing *for* the caller has to consider which credential
+/// exists, or the answer is a guess.
 fn resolve_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
     let explicit_provider = route_field(input, "provider")?;
     let requested_model = route_field(input, "model")?;
@@ -442,14 +685,23 @@ fn resolve_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
         });
     }
 
+    // Automatic routing. `select_model` only ever names Anthropic models, so it
+    // may be used only when the Anthropic credential exists; otherwise route to
+    // a provider the operator actually configured, and refuse with the missing
+    // variable names when there is none.
     let messages = input["messages"].as_array().cloned().unwrap_or_default();
     let tools = input["tools"].as_array().cloned().unwrap_or_default();
     let complexity = score_complexity(&messages, &tools);
     let (provider, model) = select_model(complexity, None);
-    Ok(Route {
-        provider: provider.into(),
-        model: model.into(),
-    })
+    if state.provider_is_available(provider) {
+        return Ok(Route {
+            provider: provider.into(),
+            model: model.into(),
+        });
+    }
+    state
+        .available_route()
+        .ok_or_else(|| state.missing_credential_error())
 }
 
 fn has_explicit_route(input: &Value) -> bool {
@@ -466,17 +718,26 @@ fn has_explicit_route(input: &Value) -> bool {
     provider_explicit || model_explicit
 }
 
+/// Route a call that is about to be made: resolve the name, then refuse it here
+/// if the provider has no credential, naming the variable to set. The old code
+/// sent the request anyway with an empty key and reported the provider's 401.
 fn resolve_complete_route(state: &RouterState, input: &Value) -> Result<Route, Error> {
-    if state.default_route.is_none() && !has_explicit_route(input) {
-        return resolve_route(
+    let route = if state.default_route.is_none()
+        && !has_explicit_route(input)
+        && state.provider_is_available("anthropic")
+    {
+        resolve_route(
             state,
             &json!({
                 "provider": "anthropic",
                 "model": "claude-sonnet-4-20250514",
             }),
-        );
-    }
-    resolve_route(state, input)
+        )?
+    } else {
+        resolve_route(state, input)?
+    };
+    state.ensure_credential(&route.provider)?;
+    Ok(route)
 }
 
 fn client_for_provider<'a>(
@@ -883,101 +1144,175 @@ fn gemini_request_body(
     body
 }
 
+/// One provider call. Grouping the fields keeps the boundary honest (the three
+/// drivers really do need all of them) and removes the `too_many_arguments`
+/// suppressions the old positional signatures needed.
+struct ProviderRequest<'a> {
+    provider: &'a str,
+    base_url: &'a str,
+    api_key: &'a str,
+    model: &'a str,
+    system_prompt: Option<&'a str>,
+    messages: &'a [Value],
+    tools: &'a [Value],
+    max_tokens: u64,
+    timeout: Duration,
+}
+
+fn truncate_provider_body(body: &str) -> String {
+    let body = body.trim();
+    if body.chars().count() <= PROVIDER_ERROR_BODY_LIMIT {
+        return body.to_string();
+    }
+    let head: String = body.chars().take(PROVIDER_ERROR_BODY_LIMIT).collect();
+    format!("{head} [truncated]")
+}
+
+fn provider_transport_error(provider: &str, error: &reqwest::Error) -> Error {
+    if error.is_timeout() {
+        Error::Handler(format!(
+            "provider_timeout: {provider} did not answer within the configured timeout ({error})"
+        ))
+    } else if error.is_connect() {
+        Error::Handler(format!(
+            "provider_unreachable: {provider} connection failed ({error})"
+        ))
+    } else {
+        Error::Handler(format!("provider_request_failed: {provider} ({error})"))
+    }
+}
+
+fn provider_status_error(provider: &str, status: u16, body: &str) -> Error {
+    let body = truncate_provider_body(body);
+    let detail = if body.is_empty() {
+        "<empty response body>"
+    } else {
+        body.as_str()
+    };
+    Error::Handler(format!(
+        "provider_error: {provider} returned HTTP {status}: {detail}"
+    ))
+}
+
+/// Send a prepared provider request and keep the provider's own words. The old
+/// code called `error_for_status()`, whose Display is
+/// `HTTP status client error (400 Bad Request) for url (...)` — the message
+/// that explains *why* the call failed was thrown away at three call sites.
+async fn provider_json(provider: &str, request: reqwest::RequestBuilder) -> Result<Value, Error> {
+    let response = request
+        .send()
+        .await
+        .map_err(|error| provider_transport_error(provider, &error))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| provider_transport_error(provider, &error))?;
+    if !status.is_success() {
+        return Err(provider_status_error(provider, status.as_u16(), &body));
+    }
+    serde_json::from_str(&body).map_err(|error| {
+        Error::Handler(format!(
+            "provider_invalid_response: {provider} returned HTTP {} with a body that is not JSON ({error}): {}",
+            status.as_u16(),
+            truncate_provider_body(&body)
+        ))
+    })
+}
+
+/// Anthropic's messages endpoint under a configured base URL. The default
+/// catalogue entry is `https://api.anthropic.com`, and a gateway may already
+/// carry the `/v1` prefix.
+fn anthropic_messages_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    }
+}
+
+fn openai_completions_url(base_url: &str) -> String {
+    format!("{}/chat/completions", base_url.trim_end_matches('/'))
+}
+
+fn gemini_generate_url(base_url: &str, model: &str) -> String {
+    format!(
+        "{}/models/{model}:generateContent",
+        base_url.trim_end_matches('/')
+    )
+}
+
 async fn call_anthropic(
     client: &reqwest::Client,
-    api_key: &str,
-    model: &str,
-    system_prompt: Option<&str>,
-    messages: &[Value],
-    tools: &[Value],
-    max_tokens: u64,
+    request: &ProviderRequest<'_>,
 ) -> Result<Value, Error> {
-    let body = anthropic_request_body(model, system_prompt, messages, tools, max_tokens);
+    let body = anthropic_request_body(
+        request.model,
+        request.system_prompt,
+        request.messages,
+        request.tools,
+        request.max_tokens,
+    );
 
-    let resp = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| Error::Handler(e.to_string()))?
-        .error_for_status()
-        .map_err(|e| Error::Handler(e.to_string()))?
-        .json::<Value>()
-        .await
-        .map_err(|e| Error::Handler(e.to_string()))?;
-
-    Ok(resp)
+    provider_json(
+        request.provider,
+        client
+            .post(anthropic_messages_url(request.base_url))
+            .header("x-api-key", request.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .timeout(request.timeout)
+            .json(&body),
+    )
+    .await
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "provider boundary mirrors the upstream chat request fields"
-)]
 async fn call_openai_compat(
     client: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    system_prompt: Option<&str>,
-    messages: &[Value],
-    tools: &[Value],
-    max_tokens: u64,
+    request: &ProviderRequest<'_>,
 ) -> Result<Value, Error> {
-    let body = openai_request_body(model, system_prompt, messages, tools, max_tokens);
+    let body = openai_request_body(
+        request.model,
+        request.system_prompt,
+        request.messages,
+        request.tools,
+        request.max_tokens,
+    );
 
-    let mut req = client
-        .post(format!("{}/chat/completions", base_url))
-        .header("content-type", "application/json");
+    let mut prepared = client
+        .post(openai_completions_url(request.base_url))
+        .header("content-type", "application/json")
+        .timeout(request.timeout);
 
-    if !api_key.is_empty() {
-        req = req.header("authorization", format!("Bearer {}", api_key));
+    if !request.api_key.is_empty() {
+        prepared = prepared.header("authorization", format!("Bearer {}", request.api_key));
     }
 
-    let resp = req
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| Error::Handler(e.to_string()))?
-        .error_for_status()
-        .map_err(|e| Error::Handler(e.to_string()))?
-        .json::<Value>()
-        .await
-        .map_err(|e| Error::Handler(e.to_string()))?;
-    Ok(resp)
+    provider_json(request.provider, prepared.json(&body)).await
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "provider boundary mirrors the upstream chat request fields"
-)]
 async fn call_gemini(
     client: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    system_prompt: Option<&str>,
-    messages: &[Value],
-    tools: &[Value],
-    max_tokens: u64,
+    request: &ProviderRequest<'_>,
 ) -> Result<Value, Error> {
-    let body = gemini_request_body(system_prompt, messages, tools, max_tokens);
-    let resp = client
-        .post(format!("{base_url}/models/{model}:generateContent"))
-        .query(&[("key", api_key)])
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| Error::Handler(e.to_string()))?
-        .error_for_status()
-        .map_err(|e| Error::Handler(e.to_string()))?
-        .json::<Value>()
-        .await
-        .map_err(|e| Error::Handler(e.to_string()))?;
-    Ok(resp)
+    let body = gemini_request_body(
+        request.system_prompt,
+        request.messages,
+        request.tools,
+        request.max_tokens,
+    );
+
+    provider_json(
+        request.provider,
+        client
+            .post(gemini_generate_url(request.base_url, request.model))
+            .query(&[("key", request.api_key)])
+            .header("content-type", "application/json")
+            .timeout(request.timeout)
+            .json(&body),
+    )
+    .await
 }
 
 fn function_arguments(value: Option<&Value>) -> Value {
@@ -1068,10 +1403,21 @@ async fn complete_handler(
     input: Value,
 ) -> Result<Value, Error> {
     let route = resolve_complete_route(&state, &input)?;
-    let provider = state
-        .providers
-        .get(&route.provider)
-        .ok_or_else(|| Error::Handler(format!("unknown provider: {}", route.provider)))?;
+    // Copy what the call needs and release the map guard: a provider call may
+    // now run for minutes, and nothing else should wait behind its shard lock.
+    let (base_url, env_key, driver, credential) = {
+        let provider = state
+            .providers
+            .get(&route.provider)
+            .ok_or_else(|| Error::Handler(format!("unknown provider: {}", route.provider)))?;
+        (
+            provider.base_url.clone(),
+            provider.env_key.clone(),
+            provider.driver,
+            provider.credential.clone(),
+        )
+    };
+    let api_key = credential.ok_or_else(|| credential_missing_error(&route.provider, &env_key))?;
     let model = route.model.as_str();
     let client = client_for_provider(&route.provider, &shared_client, &direct_client);
     let messages = input["messages"].as_array().cloned().unwrap_or_default();
@@ -1080,53 +1426,24 @@ async fn complete_handler(
     let system_prompt = input["systemPrompt"].as_str();
     let max_tokens = input["max_tokens"].as_u64().unwrap_or(4096);
 
-    let api_key = if provider.env_key.is_empty() {
-        String::new()
-    } else {
-        std::env::var(&provider.env_key).unwrap_or_default()
+    let request = ProviderRequest {
+        provider: &route.provider,
+        base_url: &base_url,
+        api_key: &api_key,
+        model,
+        system_prompt,
+        messages: &messages,
+        tools: &tools,
+        max_tokens,
+        timeout: provider_timeout(caller_timeout_ms(&input)),
     };
 
     let start = Instant::now();
 
-    let result = match provider.driver {
-        Driver::Anthropic => {
-            call_anthropic(
-                client,
-                &api_key,
-                model,
-                system_prompt,
-                &messages,
-                &tools,
-                max_tokens,
-            )
-            .await?
-        }
-        Driver::OpenAiCompat | Driver::Bedrock => {
-            call_openai_compat(
-                client,
-                &provider.base_url,
-                &api_key,
-                model,
-                system_prompt,
-                &messages,
-                &tools,
-                max_tokens,
-            )
-            .await?
-        }
-        Driver::Gemini => {
-            call_gemini(
-                client,
-                &provider.base_url,
-                &api_key,
-                model,
-                system_prompt,
-                &messages,
-                &tools,
-                max_tokens,
-            )
-            .await?
-        }
+    let result = match driver {
+        Driver::Anthropic => call_anthropic(client, &request).await?,
+        Driver::OpenAiCompat | Driver::Bedrock => call_openai_compat(client, &request).await?,
+        Driver::Gemini => call_gemini(client, &request).await?,
     };
 
     let _elapsed_ms = start.elapsed().as_millis() as u64;
@@ -1171,11 +1488,12 @@ async fn complete_handler(
         })
         .unwrap_or("");
 
-    let tool_calls = function_calls(provider.driver, &result, &tool_aliases);
+    let tool_calls = function_calls(driver, &result, &tool_aliases);
 
     Ok(json!({
         "content": content,
         "model": model,
+        "provider": route.provider,
         "toolCalls": tool_calls,
         "usage": {
             "input": input_tokens,
@@ -1212,11 +1530,7 @@ async fn providers_handler(state: Arc<RouterState>, _input: Value) -> Result<Val
                 "base_url": &provider.base_url,
                 "env_key": &provider.env_key,
                 "models": &provider.models,
-                "configured": if provider.env_key.is_empty() { true } else {
-                    std::env::var(&provider.env_key)
-                        .map(|value| !value.trim().is_empty())
-                        .unwrap_or(false)
-                },
+                "configured": provider.is_available(),
             })
         })
         .collect();
@@ -1254,10 +1568,7 @@ fn provider_catalog(state: &RouterState) -> Value {
             let provider = entry.value();
             json!({
                 "name": entry.key(),
-                "available": provider.env_key.is_empty()
-                    || std::env::var(&provider.env_key)
-                        .map(|value| !value.trim().is_empty())
-                        .unwrap_or(false),
+                "available": provider.is_available(),
                 "modelCount": provider.models.len(),
             })
         })
@@ -1279,13 +1590,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
-    let default_resolution = resolve_runtime_default(|name| std::env::var(name).ok());
+    let read_env = |name: &str| std::env::var(name).ok();
+    let default_resolution = resolve_runtime_default(read_env);
     if let Some(provider) = &default_resolution.disabled_provider {
         tracing::warn!(
             provider,
-            "configured default provider disabled because CODEX_PROXY_API_KEY is empty; unqualified requests can fall back to the Anthropic cloud API"
+            env_key = provider_env_key(provider).unwrap_or("<unknown provider>"),
+            "configured default provider has no credential; routing falls back to a provider whose credential is present"
         );
     }
     let state = Arc::new(RouterState {
@@ -1301,17 +1614,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 base_url: if name == CODEX_PROVIDER {
                     resolve_codex_base_url(std::env::var("CODEX_PROXY_BASE_URL").ok().as_deref())
                 } else {
-                    base_url.to_string()
+                    resolve_provider_base_url(
+                        base_url,
+                        std::env::var(provider_base_url_env(name)).ok().as_deref(),
+                    )
                 },
                 env_key: env_key.to_string(),
                 driver,
                 models: models.iter().map(|s| s.to_string()).collect(),
+                credential: provider_credential(env_key, &read_env),
             },
         );
     }
 
-    let shared_client = reqwest::Client::new();
-    let direct_client = reqwest::Client::builder().no_proxy().build()?;
+    match (&state.default_route, state.available_route()) {
+        (Some(route), _) => tracing::info!(
+            provider = %route.provider,
+            model = %route.model,
+            "default route pinned by configuration"
+        ),
+        (None, Some(route)) => tracing::info!(
+            provider = %route.provider,
+            model = %route.model,
+            "no default pinned; unqualified requests route to the first provider whose credential is present"
+        ),
+        (None, None) => tracing::warn!(
+            "no provider credential is configured; unqualified chat requests will fail with provider_credential_missing until one is set"
+        ),
+    }
+
+    let shared_client = provider_client(reqwest::Client::builder())?;
+    let direct_client = provider_client(reqwest::Client::builder().no_proxy())?;
 
     {
         let state = state.clone();
@@ -1426,9 +1759,33 @@ mod tests {
         ToolAliases::from_function_ids(function_ids.iter().map(|id| (*id).to_string()))
     }
 
+    /// Every provider credentialled: the fixture the routing contract tests
+    /// below were written against.
     fn test_state(default_route: Option<Route>) -> RouterState {
+        state_with_credentials(default_route, None)
+    }
+
+    /// `available = Some(&[...])` restricts which provider credentials exist,
+    /// which is what a real machine looks like.
+    fn state_with_credentials(
+        default_route: Option<Route>,
+        available: Option<&[&str]>,
+    ) -> RouterState {
         let providers = DashMap::new();
         for (name, base_url, env_key, driver, models) in default_providers() {
+            let credential = if env_key.is_empty() {
+                // Mirrors `provider_credential`: a keyless provider is always
+                // "available"; it just may not have a server behind it.
+                Some(String::new())
+            } else {
+                match available {
+                    None => Some(format!("test-{name}-key")),
+                    Some(available) if available.contains(&name) => {
+                        Some(format!("test-{name}-key"))
+                    }
+                    Some(_) => None,
+                }
+            };
             providers.insert(
                 name.to_string(),
                 ProviderConfig {
@@ -1436,6 +1793,7 @@ mod tests {
                     env_key: env_key.to_string(),
                     driver,
                     models: models.iter().map(|model| model.to_string()).collect(),
+                    credential,
                 },
             );
         }
@@ -2990,5 +3348,556 @@ mod tests {
             "choices": [{"message": {"content": "openai-style content"}}]
         });
         assert_eq!(extract_anthropic_text(&result), "openai-style content");
+    }
+
+    // ----- provider transport contract -------------------------------------
+    //
+    // A fake provider server proves the three claims the review made about the
+    // transport: a response slower than the old 30 s bus ceiling completes, a
+    // 4xx body reaches the caller, and a hung provider ends in a timeout
+    // instead of running (and billing) forever.
+
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct FakeProvider {
+        addr: SocketAddr,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl FakeProvider {
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+    }
+
+    impl Drop for FakeProvider {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn spawn_fake_provider(
+        status: &'static str,
+        body: &'static str,
+        delay: Duration,
+    ) -> FakeProvider {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake provider");
+        let addr = listener.local_addr().expect("fake provider address");
+        let handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut scratch = vec![0_u8; 16 * 1024];
+                    let _ = stream.read(&mut scratch).await;
+                    tokio::time::sleep(delay).await;
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        FakeProvider { addr, handle }
+    }
+
+    fn provider_request<'a>(
+        provider: &'a str,
+        base_url: &'a str,
+        messages: &'a [Value],
+        timeout: Duration,
+    ) -> ProviderRequest<'a> {
+        ProviderRequest {
+            provider,
+            base_url,
+            api_key: "test-key",
+            model: "test-model",
+            system_prompt: None,
+            messages,
+            tools: &[],
+            max_tokens: 64,
+            timeout,
+        }
+    }
+
+    const SLOW_PROVIDER_DELAY: Duration = Duration::from_secs(45);
+
+    #[tokio::test]
+    async fn a_provider_answer_slower_than_the_legacy_30s_ceiling_still_completes() {
+        let server = spawn_fake_provider(
+            "200 OK",
+            r#"{"content":[{"type":"text","text":"late but complete"}],"usage":{"input_tokens":3,"output_tokens":4}}"#,
+            SLOW_PROVIDER_DELAY,
+        )
+        .await;
+        let client = provider_client(reqwest::Client::builder()).expect("client");
+        let base_url = server.base_url();
+        let messages = vec![json!({ "role": "user", "content": "hello" })];
+        let request = provider_request(
+            "anthropic",
+            &base_url,
+            &messages,
+            provider_timeout(Some(120_000)),
+        );
+
+        let result = call_anthropic(&client, &request)
+            .await
+            .expect("a 45s provider answer must reach the caller");
+        assert_eq!(result["content"][0]["text"], "late but complete");
+    }
+
+    #[tokio::test]
+    async fn a_hung_provider_ends_in_a_timeout_instead_of_running_forever() {
+        let server = spawn_fake_provider("200 OK", "{}", Duration::from_secs(3_600)).await;
+        let client = provider_client(reqwest::Client::builder()).expect("client");
+        let base_url = server.base_url();
+        let messages = vec![json!({ "role": "user", "content": "hello" })];
+        let request =
+            provider_request("anthropic", &base_url, &messages, provider_timeout(Some(1)));
+
+        let error = call_anthropic(&client, &request)
+            .await
+            .expect_err("a hung provider must not hang the worker")
+            .to_string();
+        assert!(error.contains("provider_timeout"), "{error}");
+        assert!(error.contains("anthropic"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn provider_4xx_bodies_reach_the_caller_for_every_driver() {
+        let messages = vec![json!({ "role": "user", "content": "hello" })];
+        let client = provider_client(reqwest::Client::builder()).expect("client");
+
+        let anthropic = spawn_fake_provider(
+            "429 Too Many Requests",
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"anthropic says: workspace rate limit exceeded"}}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let base_url = anthropic.base_url();
+        let error = call_anthropic(
+            &client,
+            &provider_request("anthropic", &base_url, &messages, provider_timeout(None)),
+        )
+        .await
+        .expect_err("429 must surface")
+        .to_string();
+        assert!(error.contains("429"), "{error}");
+        assert!(
+            error.contains("workspace rate limit exceeded"),
+            "provider body was dropped: {error}"
+        );
+
+        let openai = spawn_fake_provider(
+            "400 Bad Request",
+            r#"{"error":{"message":"openai says: this model does not support tools","code":"unsupported"}}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let base_url = openai.base_url();
+        let error = call_openai_compat(
+            &client,
+            &provider_request("openai", &base_url, &messages, provider_timeout(None)),
+        )
+        .await
+        .expect_err("400 must surface")
+        .to_string();
+        assert!(error.contains("400"), "{error}");
+        assert!(
+            error.contains("this model does not support tools"),
+            "provider body was dropped: {error}"
+        );
+
+        let google = spawn_fake_provider(
+            "403 Forbidden",
+            r#"{"error":{"status":"PERMISSION_DENIED","message":"google says: API key not valid"}}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let base_url = google.base_url();
+        let error = call_gemini(
+            &client,
+            &provider_request("google", &base_url, &messages, provider_timeout(None)),
+        )
+        .await
+        .expect_err("403 must surface")
+        .to_string();
+        assert!(error.contains("403"), "{error}");
+        assert!(
+            error.contains("API key not valid"),
+            "provider body was dropped: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_json_provider_body_is_reported_with_its_content() {
+        let server =
+            spawn_fake_provider("200 OK", "<html>gateway timeout</html>", Duration::ZERO).await;
+        let client = provider_client(reqwest::Client::builder()).expect("client");
+        let base_url = server.base_url();
+        let messages = vec![json!({ "role": "user", "content": "hello" })];
+
+        let error = call_openai_compat(
+            &client,
+            &provider_request("openai", &base_url, &messages, provider_timeout(None)),
+        )
+        .await
+        .expect_err("a non-JSON body must not be reported as a decode error alone")
+        .to_string();
+        assert!(error.contains("provider_invalid_response"), "{error}");
+        assert!(error.contains("gateway timeout"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn every_driver_posts_to_the_configured_base_url() {
+        // Each driver answers from a loopback fake server; reaching it at all
+        // proves the request did not go to the compiled-in vendor host.
+        let messages = vec![json!({ "role": "user", "content": "hello" })];
+        let client = provider_client(reqwest::Client::builder()).expect("client");
+
+        let anthropic = spawn_fake_provider(
+            "200 OK",
+            r#"{"content":[{"type":"text","text":"gateway"}]}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let base_url = anthropic.base_url();
+        let result = call_anthropic(
+            &client,
+            &provider_request("anthropic", &base_url, &messages, provider_timeout(None)),
+        )
+        .await
+        .expect("anthropic base_url must be honoured");
+        assert_eq!(result["content"][0]["text"], "gateway");
+
+        let gemini = spawn_fake_provider(
+            "200 OK",
+            r#"{"candidates":[{"content":{"parts":[{"text":"gateway"}]}}]}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let base_url = gemini.base_url();
+        let result = call_gemini(
+            &client,
+            &provider_request("google", &base_url, &messages, provider_timeout(None)),
+        )
+        .await
+        .expect("gemini base_url must be honoured");
+        assert_eq!(
+            result["candidates"][0]["content"]["parts"][0]["text"],
+            "gateway"
+        );
+    }
+
+    #[test]
+    fn provider_timeout_is_bounded_and_honours_a_smaller_caller_budget() {
+        assert_eq!(
+            provider_timeout(None),
+            Duration::from_millis(PROVIDER_TIMEOUT_DEFAULT_MS)
+        );
+        assert!(provider_timeout(None) > Duration::from_secs(45));
+        assert_eq!(provider_timeout(Some(45_000)), Duration::from_secs(45));
+        assert_eq!(
+            provider_timeout(Some(0)),
+            Duration::from_millis(PROVIDER_TIMEOUT_MIN_MS)
+        );
+        assert_eq!(
+            provider_timeout(Some(u64::MAX)),
+            Duration::from_millis(PROVIDER_TIMEOUT_MAX_MS)
+        );
+        assert!(Duration::from_millis(PROVIDER_TIMEOUT_MAX_MS) <= Duration::from_secs(240));
+
+        assert_eq!(
+            caller_timeout_ms(&json!({ "timeoutMs": 5_000 })),
+            Some(5_000)
+        );
+        assert_eq!(
+            caller_timeout_ms(&json!({ "timeout_ms": 5_000 })),
+            Some(5_000)
+        );
+        assert_eq!(caller_timeout_ms(&json!({ "timeoutMs": "soon" })), None);
+        assert_eq!(caller_timeout_ms(&json!({})), None);
+    }
+
+    #[test]
+    fn provider_urls_are_built_from_the_configured_base_url() {
+        assert_eq!(
+            anthropic_messages_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://gateway.internal/anthropic/"),
+            "https://gateway.internal/anthropic/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://gateway.internal/v1"),
+            "https://gateway.internal/v1/messages"
+        );
+        assert_eq!(
+            openai_completions_url("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            gemini_generate_url("https://gen.googleapis.com/v1beta/", "gemini-2.0-flash"),
+            "https://gen.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        );
+    }
+
+    #[test]
+    fn provider_base_url_overrides_are_namespaced_and_safe() {
+        assert_eq!(
+            provider_base_url_env("anthropic"),
+            "AGENTOS_ANTHROPIC_BASE_URL"
+        );
+        assert_eq!(
+            provider_base_url_env("open-router"),
+            "AGENTOS_OPEN_ROUTER_BASE_URL"
+        );
+
+        let default_url = "https://api.anthropic.com";
+        assert_eq!(
+            resolve_provider_base_url(default_url, Some("https://gateway.example.com/anthropic")),
+            "https://gateway.example.com/anthropic"
+        );
+        assert_eq!(
+            resolve_provider_base_url(default_url, Some("http://127.0.0.1:8080/v1")),
+            "http://127.0.0.1:8080/v1"
+        );
+        for rejected in [
+            "",
+            "   ",
+            "not-a-url",
+            "http://gateway.example.com",
+            "ftp://gateway.example.com",
+            "https://user:pass@gateway.example.com",
+            "https://gateway.example.com?key=leak",
+            "https://gateway.example.com#leak",
+        ] {
+            assert_eq!(
+                resolve_provider_base_url(default_url, Some(rejected)),
+                default_url,
+                "accepted {rejected}"
+            );
+        }
+        assert_eq!(resolve_provider_base_url(default_url, None), default_url);
+    }
+
+    #[test]
+    fn provider_errors_keep_the_body_and_stay_bounded() {
+        let error = provider_status_error("openai", 402, "  insufficient credit  ").to_string();
+        assert!(error.contains("provider_error"), "{error}");
+        assert!(error.contains("openai"), "{error}");
+        assert!(error.contains("402"), "{error}");
+        assert!(error.contains("insufficient credit"), "{error}");
+
+        let empty = provider_status_error("openai", 500, "   ").to_string();
+        assert!(empty.contains("<empty response body>"), "{empty}");
+
+        let long = "x".repeat(PROVIDER_ERROR_BODY_LIMIT * 2);
+        let truncated = truncate_provider_body(&long);
+        assert!(truncated.ends_with("[truncated]"), "{truncated}");
+        assert!(truncated.chars().count() < long.len());
+    }
+
+    // ----- credential-aware routing ----------------------------------------
+
+    #[test]
+    fn runtime_default_follows_the_pinned_provider_credential() {
+        let pinned_openai = resolve_runtime_default(|name| match name {
+            "AGENTOS_DEFAULT_PROVIDER" => Some("openai".into()),
+            "OPENAI_API_KEY" => Some("secret".into()),
+            _ => None,
+        });
+        assert_eq!(
+            pinned_openai.route,
+            Some(Route {
+                provider: "openai".into(),
+                model: "gpt-4o".into(),
+            }),
+            "a pinned provider with its own credential must survive an empty CODEX_PROXY_API_KEY"
+        );
+        assert!(pinned_openai.disabled_provider.is_none());
+
+        let pinned_without_credential = resolve_runtime_default(|name| match name {
+            "AGENTOS_DEFAULT_PROVIDER" => Some("openai".into()),
+            _ => None,
+        });
+        assert!(pinned_without_credential.route.is_none());
+        assert_eq!(
+            pinned_without_credential.disabled_provider.as_deref(),
+            Some("openai")
+        );
+
+        let unknown_provider = resolve_runtime_default(|name| match name {
+            "AGENTOS_DEFAULT_PROVIDER" => Some("does-not-exist".into()),
+            _ => None,
+        });
+        assert!(unknown_provider.route.is_none());
+        assert_eq!(
+            unknown_provider.disabled_provider.as_deref(),
+            Some("does-not-exist")
+        );
+
+        let keyless = resolve_runtime_default(|name| match name {
+            "AGENTOS_DEFAULT_PROVIDER" => Some("ollama".into()),
+            _ => None,
+        });
+        assert_eq!(
+            keyless.route,
+            Some(Route {
+                provider: "ollama".into(),
+                model: "llama3.3".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn automatic_routing_uses_a_provider_whose_credential_exists() {
+        let openai_only = state_with_credentials(None, Some(&["openai"]));
+        let route = resolve_route(&openai_only, &json!({ "messages": [] }))
+            .expect("a configured provider must be routable");
+        assert_eq!(route.provider, "openai");
+        assert_eq!(route.model, "gpt-4o");
+
+        let google_only = state_with_credentials(None, Some(&["google"]));
+        let route = resolve_route(&google_only, &json!({ "messages": [] })).expect("google route");
+        assert_eq!(route.provider, "google");
+
+        // Anthropic keeps the complexity ladder when its credential is there.
+        let anthropic_only = state_with_credentials(None, Some(&["anthropic"]));
+        let route = resolve_route(&anthropic_only, &json!({ "messages": [] })).expect("route");
+        assert_eq!(route.provider, "anthropic");
+        assert!(route.model.contains("haiku"), "{}", route.model);
+    }
+
+    #[test]
+    fn automatic_routing_ignores_providers_that_need_no_credential() {
+        // `ollama` is always "available" but needs a server on this machine, so
+        // it must never be chosen automatically.
+        let nothing = state_with_credentials(None, Some(&[]));
+        let error = resolve_route(&nothing, &json!({ "messages": [] }))
+            .expect_err("no credential must not silently route to Anthropic")
+            .to_string();
+        assert!(error.contains("provider_credential_missing"), "{error}");
+        for variable in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GOOGLE_API_KEY",
+            "CODEX_PROXY_API_KEY",
+        ] {
+            assert!(error.contains(variable), "{variable} missing from: {error}");
+        }
+        assert!(!error.contains("OLLAMA"), "{error}");
+
+        let ollama_is_still_explicitly_routable = resolve_route(
+            &nothing,
+            &json!({ "provider": "ollama", "model": "llama3.3" }),
+        )
+        .expect("an explicit keyless provider stays usable");
+        assert_eq!(ollama_is_still_explicitly_routable.provider, "ollama");
+    }
+
+    #[test]
+    fn a_call_to_an_unconfigured_provider_is_refused_by_variable_name() {
+        let openai_only = state_with_credentials(None, Some(&["openai"]));
+
+        let explicit = resolve_complete_route(
+            &openai_only,
+            &json!({ "provider": "anthropic", "model": "claude-sonnet-4-20250514" }),
+        )
+        .expect_err("an unconfigured provider must not produce a silent 401")
+        .to_string();
+        assert!(
+            explicit.contains("provider_credential_missing"),
+            "{explicit}"
+        );
+        assert!(explicit.contains("ANTHROPIC_API_KEY"), "{explicit}");
+
+        let by_model =
+            resolve_complete_route(&openai_only, &json!({ "model": "gemini-2.0-flash" }))
+                .expect_err("model-only routing must check the owner's credential")
+                .to_string();
+        assert!(by_model.contains("GOOGLE_API_KEY"), "{by_model}");
+
+        let pinned_default = state_with_credentials(
+            Some(Route {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-20250514".into(),
+            }),
+            Some(&["openai"]),
+        );
+        let default_error = resolve_complete_route(&pinned_default, &json!({}))
+            .expect_err("a pinned default without a credential must be refused")
+            .to_string();
+        assert!(
+            default_error.contains("ANTHROPIC_API_KEY"),
+            "{default_error}"
+        );
+    }
+
+    #[test]
+    fn naming_a_model_stays_a_catalogue_query_even_without_a_credential() {
+        // `agentos::llm::route` answers "where would this go?"; it must not
+        // start failing for callers that only want the mapping.
+        let nothing = state_with_credentials(None, Some(&[]));
+        let explicit = resolve_route(
+            &nothing,
+            &json!({ "provider": "anthropic", "model": "claude-sonnet-4-20250514" }),
+        )
+        .expect("explicit naming resolves without a credential");
+        assert_eq!(explicit.provider, "anthropic");
+
+        let by_model = resolve_route(&nothing, &json!({ "model": "haiku" }))
+            .expect("alias naming resolves without a credential");
+        assert_eq!(by_model.provider, "anthropic");
+        assert!(by_model.model.contains("haiku"), "{}", by_model.model);
+    }
+
+    #[test]
+    fn complete_route_prefers_a_configured_provider_over_legacy_sonnet() {
+        let openai_only = state_with_credentials(None, Some(&["openai"]));
+        let route = resolve_complete_route(&openai_only, &json!({}))
+            .expect("completion must route to the configured provider");
+        assert_eq!(route.provider, "openai");
+
+        let nothing = state_with_credentials(None, Some(&[]));
+        let error = resolve_complete_route(&nothing, &json!({}))
+            .expect_err("completion without any credential must be refused")
+            .to_string();
+        assert!(error.contains("provider_credential_missing"), "{error}");
+    }
+
+    #[test]
+    fn provider_credential_snapshots_reject_blank_values() {
+        let env = |name: &str| match name {
+            "SET_KEY" => Some(" secret ".to_string()),
+            "BLANK_KEY" => Some("   ".to_string()),
+            _ => None,
+        };
+        assert_eq!(provider_credential("SET_KEY", &env), Some("secret".into()));
+        assert_eq!(provider_credential("BLANK_KEY", &env), None);
+        assert_eq!(provider_credential("ABSENT_KEY", &env), None);
+        assert_eq!(provider_credential("", &env), Some(String::new()));
+    }
+
+    #[test]
+    fn provider_catalogs_report_the_credential_snapshot() {
+        let openai_only = state_with_credentials(None, Some(&["openai"]));
+        let catalog = provider_catalog(&openai_only);
+        let entry = |name: &str| {
+            catalog
+                .as_array()
+                .expect("catalog array")
+                .iter()
+                .find(|provider| provider["name"] == name)
+                .cloned()
+                .expect("provider entry")
+        };
+        assert_eq!(entry("openai")["available"], json!(true));
+        assert_eq!(entry("anthropic")["available"], json!(false));
+        assert_eq!(entry("ollama")["available"], json!(true));
     }
 }

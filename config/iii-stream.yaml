@@ -1,12 +1,23 @@
 id: iii-stream
 name: Stream
-description: WebSocket stream server settings — host/port binding, connection auth function, and the pub/sub adapter backend.
+description: >-
+  WebSocket stream server settings — host/port binding, connection auth
+  function, and the pub/sub adapter backend. `host` is 127.0.0.1: this socket
+  was previously bound to 0.0.0.0, so every process on the LAN could open it.
+  `auth_function` names a function that validates the AgentOS bearer and returns
+  the StreamAuthContext the engine hands to join triggers. Note the limit: in
+  iii 0.22.1 (engine/src/workers/stream/stream.rs:112-157) a failing or erroring
+  auth function is only logged and the socket is upgraded anyway with
+  `context: None`, so `auth_function` supplies identity, it does not deny. The
+  enforcement point is a `join` trigger returning `{"unauthorized": true}` when
+  the context is absent (stream/connection.rs:100-157); until one exists the
+  loopback binding is the control.
 value:
   adapter:
     config:
       file_path: ./data/streams
       store_method: file_based
     name: kv
-  auth_function: null
-  host: 0.0.0.0
+  auth_function: security::stream_auth
+  host: 127.0.0.1
   port: 3112
