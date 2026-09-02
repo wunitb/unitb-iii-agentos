@@ -9,9 +9,18 @@
 ///
 /// Each entry is a first segment: `shell::*`, `bridge::*`, and so on. Only an
 /// exact-id capability entry plus an approval decision may allow one of these.
-pub const DENY_BY_DEFAULT_FAMILIES: [&str; 12] = [
+///
+/// `coder` and `security` were added on .W's ruling (2026-09-02): `coder::*` is
+/// the second surface of the same shell worker binary and writes host files
+/// through the same jail, so `tools: ["*"]` used to be refused `shell::fs::write`
+/// and allowed `coder::update`; `security::docker_exec` is root-equivalent,
+/// `security::audit` can forge the audit chain, and `security::set_capabilities`
+/// is the capability writer. This list gates MODEL-CHOSEN tool dispatch, not
+/// worker-to-worker calls, so a worker calling `security::check_capability`
+/// internally is unaffected.
+pub const DENY_BY_DEFAULT_FAMILIES: [&str; 14] = [
     "shell", "bridge", "mcp", "hook", "cron", "vault", "state", "engine", "code", "harness",
-    "browser", "wasm",
+    "browser", "wasm", "coder", "security",
 ];
 
 /// True when `function_id` belongs to a deny-by-default family.

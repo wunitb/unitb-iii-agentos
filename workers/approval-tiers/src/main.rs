@@ -347,7 +347,7 @@ async fn decide_tier(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         payload: json!({
             "scope": format!("tier_approvals:{safe_agent_id}"),
             "key": approval_id,
-            "operations": [
+            "ops": [
                 { "type": "set", "path": "status", "value": "timed_out" },
             ],
         }),
@@ -472,7 +472,7 @@ async fn decide_tier_request(iii: &IIIClient, input: Value) -> Result<Value, Err
         payload: json!({
             "scope": format!("tier_approvals:{safe_agent_id}"),
             "key": safe_approval_id,
-            "operations": [
+            "ops": [
                 { "type": "set", "path": "status", "value": status },
                 { "type": "set", "path": "decidedBy", "value": decided_by },
                 { "type": "set", "path": "decidedAt", "value": now_ms() },
