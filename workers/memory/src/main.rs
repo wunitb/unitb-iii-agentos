@@ -1,13 +1,22 @@
+use agentos_http_adapter::TriggerBus;
 use iii_sdk::errors::Error;
-use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
-};
+use iii_sdk::{InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+/// Messages loaded per session by `memory::session::history` when the caller
+/// does not ask for a specific number.
+const DEFAULT_HISTORY_LIMIT: usize = 50;
+
+/// One stored memory.
+///
+/// The wire shape is camelCase because that is what `store_memory` writes; the
+/// rename is what makes `recall` and `evict` able to read their own store back
+/// (contract I5).
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct MemoryEntry {
     id: String,
     agent_id: String,
@@ -102,6 +111,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let iii_ref = iii.clone();
     iii.register_function(
+        "memory::session::history",
+        RegisterFunction::new_async(move |input: Value| {
+            let iii = iii_ref.clone();
+            async move { session_history(&iii, input).await }
+        })
+        .description("Load a session's conversation in time order"),
+    );
+
+    let iii_ref = iii.clone();
+    iii.register_function(
         "memory::session::compact",
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_ref.clone();
@@ -189,6 +208,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("memory::recall", "POST", "agentmemory/search"),
         ("memory::store", "POST", "agentmemory/remember"),
         ("memory::session::list", "GET", "/api/sessions"),
+        (
+            "memory::session::history",
+            "GET",
+            "/api/sessions/:sessionId/messages",
+        ),
         ("memory::session::delete", "DELETE", "/api/sessions/:id"),
     ] {
         agentos_http_adapter::register_http_trigger(
@@ -230,7 +254,11 @@ fn memory_key(input: &Value) -> Result<&str, Error> {
         .ok_or_else(|| Error::Handler("key is required".to_string()))
 }
 
-async fn call_state(iii: &IIIClient, function_id: &str, payload: Value) -> Result<Value, Error> {
+async fn call_state(
+    iii: &dyn TriggerBus,
+    function_id: &str,
+    payload: Value,
+) -> Result<Value, Error> {
     iii.trigger(TriggerRequest {
         function_id: function_id.to_string(),
         payload,
@@ -241,7 +269,7 @@ async fn call_state(iii: &IIIClient, function_id: &str, payload: Value) -> Resul
     .map_err(|error| Error::Handler(error.to_string()))
 }
 
-async fn memory_kv_get(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn memory_kv_get(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     call_state(
         iii,
         "state::get",
@@ -250,7 +278,7 @@ async fn memory_kv_get(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     .await
 }
 
-async fn memory_kv_set(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn memory_kv_set(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let value = input
         .get("value")
         .cloned()
@@ -265,7 +293,7 @@ async fn memory_kv_set(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     Ok(json!({ "stored": true, "key": key }))
 }
 
-async fn memory_kv_delete(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn memory_kv_delete(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let key = memory_key(&input)?;
     call_state(
         iii,
@@ -276,7 +304,7 @@ async fn memory_kv_delete(iii: &IIIClient, input: Value) -> Result<Value, Error>
     Ok(json!({ "deleted": true, "key": key }))
 }
 
-async fn memory_kv_list(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn memory_kv_list(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     call_state(
         iii,
         "state::list",
@@ -285,7 +313,7 @@ async fn memory_kv_list(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     .await
 }
 
-async fn list_memories(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn list_memories(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let entries = call_state(
         iii,
         "state::list",
@@ -303,7 +331,7 @@ async fn list_memories(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     Ok(json!({ "memories": memories }))
 }
 
-async fn session_agents(iii: &IIIClient, input: &Value) -> Result<Vec<String>, Error> {
+async fn session_agents(iii: &dyn TriggerBus, input: &Value) -> Result<Vec<String>, Error> {
     if let Some(agent) = input
         .get("agent")
         .or_else(|| input.get("agentId"))
@@ -336,7 +364,7 @@ async fn session_agents(iii: &IIIClient, input: &Value) -> Result<Vec<String>, E
     Ok(agent_ids)
 }
 
-async fn list_sessions(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn list_sessions(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let mut sessions = Vec::new();
     for agent in session_agents(iii, &input).await? {
         let entries = call_state(
@@ -381,7 +409,7 @@ async fn list_sessions(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     Ok(json!(sessions))
 }
 
-async fn delete_session(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn delete_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let id = input
         .get("id")
         .and_then(Value::as_str)
@@ -416,7 +444,7 @@ async fn delete_session(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     Ok(json!({ "deleted": true, "id": id }))
 }
 
-async fn store_memory(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn store_memory(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let agent_id = input["agentId"].as_str().unwrap_or("default");
     let content = input["content"].as_str().unwrap_or("");
     let role = input["role"].as_str().unwrap_or("user");
@@ -428,6 +456,9 @@ async fn store_memory(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         format!("{:x}", hasher.finalize())
     };
 
+    // A missing key is reported as `null` by some state backends and as an error
+    // by others; both mean "not stored yet". Without the null filter every store
+    // would dedup against nothing and silently drop the message.
     let existing: Option<Value> = iii
         .trigger(TriggerRequest {
             function_id: "state::get".to_string(),
@@ -439,10 +470,29 @@ async fn store_memory(iii: &IIIClient, input: Value) -> Result<Value, Error> {
             timeout_ms: None,
         })
         .await
-        .ok();
+        .ok()
+        .filter(|value| !value.is_null());
 
-    if existing.is_some() {
-        return Ok(json!({ "deduplicated": true }));
+    if let Some(existing) = existing {
+        // The entry itself is already stored, but the turn still happened: the
+        // session index has to record it, or a repeated message ("ok", "yes")
+        // disappears from the conversation history.
+        let existing_id = existing
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let indexed = match (&session_id, existing_id.is_empty()) {
+            (Some(sid), false) => {
+                append_session_message(iii, agent_id, sid, &existing_id, role, now_ms()).await
+            }
+            _ => false,
+        };
+        return Ok(json!({
+            "deduplicated": true,
+            "id": existing_id,
+            "sessionIndexed": indexed,
+        }));
     }
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -505,26 +555,162 @@ async fn store_memory(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     .await
     .map_err(|e| Error::Handler(e.to_string()))?;
 
-    if let Some(sid) = &session_id {
-        let _ = iii.trigger(TriggerRequest {
-            function_id: "state::update".to_string(),
-            payload: json!({
-            "scope": format!("sessions:{}", agent_id),
-            "key": sid,
-            "operations": [
-                { "type": "merge", "path": "messages", "value": [{ "id": &id, "role": role, "timestamp": now }] },
-                { "type": "set", "path": "updatedAt", "value": now },
-            ],
-        }),
-            action: None,
-            timeout_ms: None,
-        }).await;
-    }
+    let indexed = match &session_id {
+        Some(sid) => append_session_message(iii, agent_id, sid, &id, role, now).await,
+        None => false,
+    };
 
-    Ok(json!({ "id": id, "stored": true }))
+    Ok(json!({ "id": id, "stored": true, "sessionIndexed": indexed }))
 }
 
-async fn recall_memory(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+/// Appends one message reference to the `sessions:{agent}` index.
+///
+/// The index is what `session_history` reads, so a failure here is the
+/// difference between a conversation and amnesia: it is logged, never silently
+/// dropped. Returns whether the index now contains this message.
+async fn append_session_message(
+    iii: &dyn TriggerBus,
+    agent_id: &str,
+    session_id: &str,
+    message_id: &str,
+    role: &str,
+    now: u64,
+) -> bool {
+    let result = iii
+        .trigger(TriggerRequest {
+            function_id: "state::update".to_string(),
+            payload: json!({
+                "scope": format!("sessions:{agent_id}"),
+                "key": session_id,
+                "operations": [
+                    {
+                        "type": "merge",
+                        "path": "messages",
+                        "value": [{ "id": message_id, "role": role, "timestamp": now }],
+                    },
+                    { "type": "set", "path": "updatedAt", "value": now },
+                ],
+            }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await;
+
+    match result {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(
+                agent_id,
+                session_id,
+                message_id,
+                %error,
+                "session index update failed; this turn will be missing from history"
+            );
+            false
+        }
+    }
+}
+
+/// Loads one session's conversation in time order (contract I5).
+///
+/// The session index has been written since the worker was created and never
+/// read; this is the reader. Ordering is by the index timestamp, which is
+/// assigned per append, so a deduplicated repeat still lands in the right place.
+async fn session_history(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
+    let agent_id = memory_agent(&input).to_string();
+    let session_id = input
+        .get("sessionId")
+        .or_else(|| input.get("session"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Error::Handler("sessionId is required".to_string()))?
+        .to_string();
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(DEFAULT_HISTORY_LIMIT, |limit| limit as usize);
+
+    let session = call_state(
+        iii,
+        "state::get",
+        json!({ "scope": format!("sessions:{agent_id}"), "key": &session_id }),
+    )
+    .await
+    .unwrap_or(Value::Null);
+
+    let mut refs: Vec<(u64, &str)> = session
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| {
+            let id = message.get("id").and_then(Value::as_str)?;
+            if id.is_empty() {
+                return None;
+            }
+            Some((
+                message
+                    .get("timestamp")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                id,
+            ))
+        })
+        .collect();
+    // Stable: equal timestamps keep the order they were appended in.
+    refs.sort_by_key(|(timestamp, _)| *timestamp);
+    if refs.len() > limit {
+        refs.drain(..refs.len() - limit);
+    }
+
+    if refs.is_empty() {
+        return Ok(json!({ "sessionId": session_id, "agentId": agent_id, "messages": [] }));
+    }
+
+    let entries = call_state(
+        iii,
+        "state::list",
+        json!({ "scope": format!("memory:{agent_id}") }),
+    )
+    .await
+    .unwrap_or(json!([]));
+    // Keyed by the state key, not by `value.id`: the dedup records stored under
+    // the content hash carry the same `id` and would otherwise shadow the entry.
+    let by_id: HashMap<&str, &Value> = entries
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let key = entry.get("key")?.as_str()?;
+            let value = entry.get("value")?;
+            value.get("content")?;
+            Some((key, value))
+        })
+        .collect();
+
+    let messages = refs
+        .into_iter()
+        .filter_map(|(timestamp, id)| {
+            let entry = by_id.get(id)?;
+            let content = entry.get("content").and_then(Value::as_str)?;
+            let role = entry.get("role").and_then(Value::as_str)?;
+            Some(json!({
+                "id": id,
+                "role": role,
+                "content": content,
+                "timestamp": timestamp,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "sessionId": session_id,
+        "agentId": agent_id,
+        "messages": messages,
+    }))
+}
+
+async fn recall_memory(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let agent_id = input["agentId"].as_str().unwrap_or("default");
     let query = input["query"].as_str().unwrap_or("");
     let limit = input["limit"].as_u64().unwrap_or(10) as usize;
@@ -608,46 +794,42 @@ async fn recall_memory(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    let results: Vec<Value> = scored
-        .into_iter()
-        .take(limit)
-        .map(|(score, m)| {
-            {
-                let _iii = iii.clone();
-                let _payload = json!({
+    let mut results: Vec<Value> = Vec::new();
+    for (score, m) in scored.into_iter().take(limit) {
+        // Awaited rather than spawned: a dropped access-count update used to be
+        // invisible, and a spawned task cannot be observed by a test.
+        if let Err(error) = iii
+            .trigger(TriggerRequest {
+                function_id: "state::update".to_string(),
+                payload: json!({
                     "scope": format!("memory:{}", m.agent_id),
                     "key": &m.id,
                     "operations": [
                         { "type": "increment", "path": "accessCount", "value": 1 },
                         { "type": "set", "path": "lastAccessed", "value": now_ms() },
                     ],
-                });
-                tokio::spawn(async move {
-                    let _ = _iii
-                        .trigger(TriggerRequest {
-                            function_id: "state::update".to_string(),
-                            payload: _payload,
-                            action: None,
-                            timeout_ms: None,
-                        })
-                        .await;
-                });
-            };
-
-            json!({
-                "role": m.role,
-                "content": m.content,
-                "score": score,
-                "timestamp": m.timestamp,
-                "id": m.id,
+                }),
+                action: None,
+                timeout_ms: None,
             })
-        })
-        .collect();
+            .await
+        {
+            tracing::warn!(id = %m.id, %error, "recall access-count update failed");
+        }
+
+        results.push(json!({
+            "role": m.role,
+            "content": m.content,
+            "score": score,
+            "timestamp": m.timestamp,
+            "id": m.id,
+        }));
+    }
 
     Ok(json!(results))
 }
 
-async fn kg_add(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn kg_add(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let agent_id = input["agentId"].as_str().unwrap_or("default");
     let entity = &input["entity"];
     let entity_id = entity["id"].as_str().unwrap_or("");
@@ -712,7 +894,7 @@ async fn kg_add(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     Ok(json!({ "stored": true, "id": entity_id }))
 }
 
-async fn kg_query(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn kg_query(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let agent_id = input["agentId"].as_str().unwrap_or("default");
     let entity_id = input["entityId"].as_str().unwrap_or("");
     let depth = input["depth"].as_u64().unwrap_or(2);
@@ -753,7 +935,7 @@ async fn kg_query(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     Ok(json!(results))
 }
 
-async fn evict_memories(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn evict_memories(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let max_age_ms = input["maxAge"].as_u64().unwrap_or(30 * 86_400_000);
     let min_importance = input["minImportance"].as_f64().unwrap_or(0.2);
     let cap = input["cap"].as_u64().unwrap_or(10_000) as usize;
@@ -867,7 +1049,7 @@ async fn evict_memories(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     Ok(json!({ "evicted": total_evicted }))
 }
 
-async fn consolidate(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn consolidate(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let decay_rate = input["decayRate"].as_f64().unwrap_or(0.05);
     let start = std::time::Instant::now();
 
@@ -955,7 +1137,7 @@ fn memory_summary_payload(chunk: &str) -> Value {
     })
 }
 
-async fn compact_session(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn compact_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let agent_id = input["agentId"].as_str().unwrap_or("default");
     let session_id = input["sessionId"].as_str().unwrap_or("default");
     let threshold = input["threshold"].as_u64().unwrap_or(30) as usize;
@@ -1082,7 +1264,7 @@ async fn compact_session(iii: &IIIClient, input: Value) -> Result<Value, Error> 
     }))
 }
 
-async fn repair_session(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn repair_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let agent_id = input["agentId"].as_str().unwrap_or("default");
     let session_id = input["sessionId"].as_str().unwrap_or("default");
 
@@ -1574,29 +1756,36 @@ mod tests {
         };
         let val = serde_json::to_value(&entry).unwrap();
         assert_eq!(val["id"], "m-1");
-        assert_eq!(val["agent_id"], "agent-1");
+        assert_eq!(val["agentId"], "agent-1");
         assert_eq!(val["content"], "test content");
         assert_eq!(val["role"], "user");
         assert_eq!(val["importance"], 0.75);
         assert_eq!(val["confidence"], 0.9);
-        assert_eq!(val["access_count"], 5);
+        assert_eq!(val["accessCount"], 5);
+        assert_eq!(val["sessionId"], "sess-1");
+        assert_eq!(val["lastAccessed"], 2000);
+        assert!(
+            val.get("agent_id").is_none(),
+            "snake_case must not reach the store"
+        );
     }
 
     #[test]
     fn test_memory_entry_deserialization() {
+        // Exactly the shape `store_memory` writes.
         let json_val = json!({
             "id": "m-2",
-            "agent_id": "agent-2",
+            "agentId": "agent-2",
             "content": "remembered fact",
             "role": "assistant",
             "embedding": null,
             "timestamp": 5000,
-            "session_id": null,
+            "sessionId": null,
             "importance": 0.5,
             "hash": "def456",
             "confidence": 1.0,
-            "access_count": 0,
-            "last_accessed": 5000,
+            "accessCount": 0,
+            "lastAccessed": 5000,
         });
         let entry: MemoryEntry = serde_json::from_value(json_val).unwrap();
         assert_eq!(entry.id, "m-2");
@@ -1888,7 +2077,7 @@ mod tests {
         assert_eq!(val["id"], "");
         assert_eq!(val["importance"], 0.0);
         assert_eq!(val["confidence"], 0.0);
-        assert_eq!(val["access_count"], 0);
+        assert_eq!(val["accessCount"], 0);
     }
 
     #[test]
@@ -2636,5 +2825,342 @@ mod tests {
         let chunks = chunk_text(&text, 50);
         let rejoined: String = chunks.join("");
         assert_eq!(rejoined, text);
+    }
+
+    // ---- round-trip tests through the real handlers -------------------------
+    //
+    // These drive `store_memory`, `recall_memory`, `evict_memories` and
+    // `session_history` against an in-memory `state::*` implementation, so a
+    // wire-shape mismatch between what store writes and what recall reads is a
+    // test failure instead of a silent empty result.
+
+    use agentos_http_adapter::fake::FakeBus;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    /// Minimal in-memory stand-in for the engine's `state::*` functions.
+    #[derive(Default)]
+    struct StateStore {
+        scopes: Mutex<BTreeMap<String, BTreeMap<String, Value>>>,
+    }
+
+    impl StateStore {
+        fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, BTreeMap<String, Value>>> {
+            self.scopes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        }
+
+        fn scope_of(input: &Value) -> String {
+            input["scope"].as_str().unwrap_or_default().to_string()
+        }
+
+        fn key_of(input: &Value) -> String {
+            input["key"].as_str().unwrap_or_default().to_string()
+        }
+
+        /// A missing key reads back as `null`, like a key-value store miss.
+        fn get(&self, input: &Value) -> Value {
+            self.lock()
+                .get(&Self::scope_of(input))
+                .and_then(|scope| scope.get(&Self::key_of(input)))
+                .cloned()
+                .unwrap_or(Value::Null)
+        }
+
+        fn set(&self, input: &Value) {
+            self.lock()
+                .entry(Self::scope_of(input))
+                .or_default()
+                .insert(Self::key_of(input), input["value"].clone());
+        }
+
+        fn delete(&self, input: &Value) {
+            if let Some(scope) = self.lock().get_mut(&Self::scope_of(input)) {
+                scope.remove(&Self::key_of(input));
+            }
+        }
+
+        fn list(&self, input: &Value) -> Value {
+            let entries = self
+                .lock()
+                .get(&Self::scope_of(input))
+                .map(|scope| {
+                    scope
+                        .iter()
+                        .map(|(key, value)| json!({ "key": key, "value": value }))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Value::Array(entries)
+        }
+
+        fn groups(&self) -> Value {
+            Value::Array(self.lock().keys().map(|scope| json!(scope)).collect())
+        }
+
+        /// Supports the three operation types the memory worker emits.
+        fn update(&self, input: &Value) {
+            let mut scopes = self.lock();
+            let entry = scopes
+                .entry(Self::scope_of(input))
+                .or_default()
+                .entry(Self::key_of(input))
+                .or_insert_with(|| json!({}));
+            if !entry.is_object() {
+                *entry = json!({});
+            }
+            let operations = input
+                .get("operations")
+                .or_else(|| input.get("ops"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for operation in operations {
+                let path = operation["path"].as_str().unwrap_or_default().to_string();
+                let value = operation["value"].clone();
+                let object = entry.as_object_mut().expect("entry is an object");
+                match operation["type"].as_str().unwrap_or_default() {
+                    "set" => {
+                        object.insert(path, value);
+                    }
+                    "merge" => {
+                        let target = object.entry(path).or_insert_with(|| json!([]));
+                        if let (Some(target), Some(added)) =
+                            (target.as_array_mut(), value.as_array())
+                        {
+                            target.extend(added.iter().cloned());
+                        }
+                    }
+                    "increment" => {
+                        let current = object.get(&path).and_then(Value::as_i64).unwrap_or(0);
+                        let added = value.as_i64().unwrap_or(0);
+                        object.insert(path, json!(current + added));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// A bus whose `state::*` functions are backed by `StateStore`.
+    fn state_bus() -> (FakeBus, Arc<StateStore>) {
+        let store = Arc::new(StateStore::default());
+        let bus = FakeBus::new();
+
+        let state = store.clone();
+        bus.on("state::get", move |input| Ok(state.get(&input)));
+        let state = store.clone();
+        bus.on("state::set", move |input| {
+            state.set(&input);
+            Ok(json!({ "stored": true }))
+        });
+        let state = store.clone();
+        bus.on("state::delete", move |input| {
+            state.delete(&input);
+            Ok(json!({ "deleted": true }))
+        });
+        let state = store.clone();
+        bus.on("state::list", move |input| Ok(state.list(&input)));
+        let state = store.clone();
+        bus.on("state::list_groups", move |_| Ok(state.groups()));
+        let state = store.clone();
+        bus.on("state::update", move |input| {
+            state.update(&input);
+            Ok(json!({ "updated": true }))
+        });
+        // No embedding worker in these tests: recall must still work on keyword
+        // and recency alone.
+        bus.on_error("embedding::generate", "no embedding worker");
+
+        (bus, store)
+    }
+
+    async fn store(bus: &FakeBus, agent: &str, session: &str, role: &str, content: &str) -> Value {
+        store_memory(
+            bus,
+            json!({
+                "agentId": agent,
+                "sessionId": session,
+                "role": role,
+                "content": content,
+            }),
+        )
+        .await
+        .expect("store_memory failed")
+    }
+
+    #[tokio::test]
+    async fn store_recall_evict_round_trip_through_the_real_handlers() {
+        let (bus, _store) = state_bus();
+
+        let first = store(&bus, "a-1", "s-1", "user", "the deploy pipeline is broken").await;
+        let second = store(&bus, "a-1", "s-1", "assistant", "I will fix the pipeline").await;
+        assert_eq!(first["stored"], true);
+        assert_eq!(second["stored"], true);
+
+        let recalled = recall_memory(&bus, json!({ "agentId": "a-1", "query": "pipeline" }))
+            .await
+            .expect("recall_memory failed");
+        let recalled = recalled.as_array().expect("recall returns an array");
+        assert_eq!(
+            recalled.len(),
+            2,
+            "recall must read back what store wrote, got {recalled:?}"
+        );
+        let contents: Vec<&str> = recalled
+            .iter()
+            .filter_map(|entry| entry["content"].as_str())
+            .collect();
+        assert!(contents.contains(&"the deploy pipeline is broken"));
+        assert!(contents.contains(&"I will fix the pipeline"));
+        assert!(recalled.iter().all(|entry| entry["role"].is_string()));
+
+        // `cap: 0` forces every entry over the cap, independent of wall clock.
+        let evicted = evict_memories(&bus, json!({ "cap": 0 }))
+            .await
+            .expect("evict_memories failed");
+        assert_eq!(
+            evicted["evicted"], 2,
+            "eviction must be able to deserialize the stored entries"
+        );
+
+        let after = recall_memory(&bus, json!({ "agentId": "a-1", "query": "pipeline" }))
+            .await
+            .expect("recall_memory failed");
+        assert_eq!(after, json!([]), "evicted memories must be gone");
+    }
+
+    #[tokio::test]
+    async fn recall_updates_access_counters_on_the_entries_it_returns() {
+        let (bus, store_handle) = state_bus();
+        let stored = store(&bus, "a-2", "s-1", "user", "remember the release date").await;
+        let id = stored["id"].as_str().expect("stored id").to_string();
+
+        recall_memory(&bus, json!({ "agentId": "a-2", "query": "release" }))
+            .await
+            .expect("recall_memory failed");
+
+        let entry = store_handle.get(&json!({ "scope": "memory:a-2", "key": id }));
+        assert_eq!(entry["accessCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn session_history_returns_turns_in_time_order() {
+        let (bus, _store) = state_bus();
+        store(&bus, "a-3", "s-9", "user", "first question").await;
+        store(&bus, "a-3", "s-9", "assistant", "first answer").await;
+        store(&bus, "a-3", "s-9", "user", "second question").await;
+        // Another session for the same agent must not leak in.
+        store(&bus, "a-3", "other", "user", "unrelated").await;
+
+        let history = session_history(&bus, json!({ "agentId": "a-3", "sessionId": "s-9" }))
+            .await
+            .expect("session_history failed");
+
+        let messages = history["messages"].as_array().expect("messages array");
+        let pairs: Vec<(&str, &str)> = messages
+            .iter()
+            .map(|message| {
+                (
+                    message["role"].as_str().unwrap_or_default(),
+                    message["content"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("user", "first question"),
+                ("assistant", "first answer"),
+                ("user", "second question"),
+            ]
+        );
+        assert!(
+            messages
+                .windows(2)
+                .all(|pair| pair[0]["timestamp"].as_u64() <= pair[1]["timestamp"].as_u64()),
+            "history must be ascending by time"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_history_keeps_a_repeated_message_in_place() {
+        let (bus, _store) = state_bus();
+        store(&bus, "a-4", "s-1", "user", "ok").await;
+        store(&bus, "a-4", "s-1", "assistant", "anything else?").await;
+        let repeat = store(&bus, "a-4", "s-1", "user", "ok").await;
+        assert_eq!(
+            repeat["deduplicated"], true,
+            "content hash dedup still runs"
+        );
+        assert_eq!(repeat["sessionIndexed"], true);
+
+        let history = session_history(&bus, json!({ "agentId": "a-4", "sessionId": "s-1" }))
+            .await
+            .expect("session_history failed");
+
+        let contents: Vec<&str> = history["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .collect();
+        assert_eq!(contents, vec!["ok", "anything else?", "ok"]);
+    }
+
+    #[tokio::test]
+    async fn session_history_honours_the_limit_and_keeps_the_newest_turns() {
+        let (bus, _store) = state_bus();
+        for index in 0..5 {
+            store(&bus, "a-5", "s-1", "user", &format!("message {index}")).await;
+        }
+
+        let history = session_history(
+            &bus,
+            json!({ "agentId": "a-5", "sessionId": "s-1", "limit": 2 }),
+        )
+        .await
+        .expect("session_history failed");
+
+        let contents: Vec<&str> = history["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .collect();
+        assert_eq!(contents, vec!["message 3", "message 4"]);
+    }
+
+    #[tokio::test]
+    async fn session_history_requires_a_session_id() {
+        let (bus, _store) = state_bus();
+        let error = session_history(&bus, json!({ "agentId": "a-6" }))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("sessionId is required"));
+    }
+
+    #[tokio::test]
+    async fn session_history_is_empty_for_an_unknown_session() {
+        let (bus, _store) = state_bus();
+        let history = session_history(&bus, json!({ "agentId": "a-7", "sessionId": "nope" }))
+            .await
+            .expect("session_history failed");
+        assert_eq!(history["messages"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn store_reports_a_failed_session_index_write() {
+        let (bus, _store) = state_bus();
+        bus.on_error("state::update", "state worker offline");
+
+        let stored = store(&bus, "a-8", "s-1", "user", "will not be indexed").await;
+
+        assert_eq!(stored["stored"], true);
+        assert_eq!(
+            stored["sessionIndexed"], false,
+            "a dropped index write must be visible, not silent"
+        );
     }
 }
