@@ -90,6 +90,13 @@ fn invoke(function_id: &str, data: &Value, expected_key: Option<&str>) -> Result
                 .unwrap_or("");
             let context = data.get("context").cloned().unwrap_or(Value::Null);
             if function_registration_allowed(target, &context) {
+                // Debug, not info: on a full boot this is ~700 lines. It is also
+                // how `tests/registry_surface.txt` is captured — see that file.
+                tracing::debug!(
+                    function_id = %target,
+                    tier = %tier_of_context(&context),
+                    "allowed function registration"
+                );
                 Ok(json!({ "function_id": target }))
             } else {
                 tracing::warn!(
@@ -107,6 +114,12 @@ fn invoke(function_id: &str, data: &Value, expected_key: Option<&str>) -> Result
                 .unwrap_or("");
             let context = data.get("context").cloned().unwrap_or(Value::Null);
             if trigger_registration_allowed(target, &context) {
+                tracing::debug!(
+                    function_id = %target,
+                    trigger_id = %data.get("trigger_id").and_then(serde_json::Value::as_str).unwrap_or("?"),
+                    tier = %tier_of_context(&context),
+                    "allowed trigger registration"
+                );
                 Ok(json!({ "function_id": target }))
             } else {
                 tracing::warn!(

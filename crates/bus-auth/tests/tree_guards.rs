@@ -172,3 +172,131 @@ fn quoted_function_ids(source: &str) -> Vec<String> {
     }
     ids
 }
+
+/// A denied id that is also a trigger TARGET is a silently broken schedule.
+///
+/// Cron and queue triggers are fired by engine-spawned registry workers through
+/// their own untrusted sessions, so `forbidden_functions` applies to them. The
+/// deny list gained `memory::*` in review; `memory::consolidate` and
+/// `memory::evict` are cron targets and had to stay out. This test derives the
+/// target set from the tree so the next such addition fails here instead of on a
+/// live stack six hours later.
+#[test]
+fn no_denied_id_is_fired_by_a_registry_worker_trigger() {
+    let root = repository_root();
+    let mut targets: BTreeMap<String, String> = BTreeMap::new();
+
+    for path in worker_sources(&root, "workers") {
+        let source = std::fs::read_to_string(&path).expect("read worker source");
+        let origin = relative(&root, &path);
+        for target in cron_trigger_targets(&source) {
+            targets.insert(target, origin.clone());
+        }
+        for target in registry_fired_trigger_targets(&source) {
+            targets.insert(target, origin.clone());
+        }
+    }
+
+    assert!(
+        targets.len() >= 8,
+        "found only {} trigger targets - the scan is not looking at the tree",
+        targets.len()
+    );
+    let denied: Vec<String> = targets
+        .iter()
+        .filter(|(id, _)| UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&id.as_str()))
+        .map(|(id, path)| format!("  {id}  ({path})"))
+        .collect();
+    assert!(
+        denied.is_empty(),
+        "these ids are fired by an engine-spawned worker that cannot authenticate, \
+         so denying them stops the schedule instead of the attacker:\n{}",
+        denied.join("\n")
+    );
+}
+
+/// Every id the shipped registry workers register must survive the hook.
+///
+/// `tests/registry_surface.txt` is a capture from a live armed boot (the header
+/// of the file records how to regenerate it). The first version of
+/// `UNTRUSTED_REGISTRATION_PREFIXES` held worker names instead of id namespaces
+/// and refused 107 of these, leaving a stack with no LLM routing; this test is
+/// the one that would have caught it in CI.
+#[test]
+fn every_shipped_registry_id_stays_registrable_without_a_credential() {
+    let fixture = include_str!("registry_surface.txt");
+    let untrusted = serde_json::json!({
+        agentos_bus_auth::policy::TIER_CONTEXT_KEY: agentos_bus_auth::policy::TIER_UNTRUSTED,
+    });
+
+    let ids: Vec<&str> = fixture
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    assert!(
+        ids.len() >= 100,
+        "the capture holds only {} ids - an emptied fixture must not pass",
+        ids.len()
+    );
+
+    let refused: Vec<&str> = ids
+        .iter()
+        .copied()
+        .filter(|id| !agentos_bus_auth::policy::function_registration_allowed(id, &untrusted))
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "an armed stack would refuse these registrations and boot without them:\n  {}",
+        refused.join("\n  ")
+    );
+}
+
+/// First quoted `namespace::id` argument of every `register_cron_trigger` call.
+fn cron_trigger_targets(source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for (index, _) in source.match_indices("register_cron_trigger") {
+        let window = &source[index..source.len().min(index + 400)];
+        let Some(open) = window.find('(') else {
+            continue;
+        };
+        if let Some(id) = first_quoted_id(&window[open..]) {
+            found.push(id);
+        }
+    }
+    found
+}
+
+/// `function_id` of every trigger bound to a type an engine-spawned worker
+/// provides (`cron`, `queue`). `subscribe`, `stream:join` and `state` come from
+/// in-process engine workers, which fire without a session and are not gated.
+fn registry_fired_trigger_targets(source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for marker in ["trigger_type: \"cron\"", "trigger_type: \"queue\""] {
+        for (index, _) in source.match_indices(marker) {
+            let window = &source[index..source.len().min(index + 400)];
+            let Some(field) = window.find("function_id:") else {
+                continue;
+            };
+            if let Some(id) = first_quoted_id(&window[field..]) {
+                found.push(id);
+            }
+        }
+    }
+    found
+}
+
+/// First `"namespace::id"` literal in `window`, ignoring format placeholders.
+fn first_quoted_id(window: &str) -> Option<String> {
+    let mut rest = window;
+    while let Some(start) = rest.find('"') {
+        let after = &rest[start + 1..];
+        let end = after.find('"')?;
+        let candidate = &after[..end];
+        if candidate.contains("::") && !candidate.contains('{') && !candidate.contains(' ') {
+            return Some(candidate.to_string());
+        }
+        rest = &after[end + 1..];
+    }
+    None
+}

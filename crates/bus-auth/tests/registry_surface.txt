@@ -1,0 +1,158 @@
+# Function ids the engine's own workers register on a credential-less session.
+#
+# Captured from a LIVE armed boot, not written by hand. Every id here was seen by
+# `agentos::bus_on_register` with `context.agentosBusTier = "untrusted"`, i.e. it
+# is a registration the bus policy must admit or the shipped stack loses that
+# function. The first version of UNTRUSTED_REGISTRATION_PREFIXES held worker
+# names instead of id namespaces and refused 107 of these; the stack came up with
+# 36 functions and no LLM routing at all.
+#
+# Regenerate (iii 0.22.1, ~40 s):
+#   1. cargo +1.90 build -p agentos-bus-auth
+#   2. AGENTOS_API_KEY=<key> RUST_LOG=debug agentos-bus-authd --listen=127.0.0.1:49129
+#   3. boot `iii` with this repo's config.yaml plus the rbac + iii-bridge block
+#      from /tmp/agentos-remediation/requests/bus-rbac.md (do NOT set
+#      IIIWORKER_DISABLE_BUILTIN_DAEMONS: `worker::*` comes from iii-worker-ops)
+#   4. grep the daemon log:
+#        sed -n 's/.*allowed function registration function_id=\([^ ]*\).*/\1/p' \
+#          authd.log | sort -u
+#      and confirm `refused function registration` never appears.
+#
+# Captured 2026-09-02 · engine 0.22.1 · workers as pinned in iii.lock
+# (134 ids from: state, queue, cron, llm-router, context-manager,
+# iii-directory, session-manager, provider-anthropic, provider-openai,
+# provider-openai-codex, iii-worker-ops)
+context-manager::ui-content
+context::assemble
+context::compact
+context::count-tokens
+context::on-config-change
+context::on-models-changed
+context::prune
+directory::__on_worker_added
+directory::agents::create
+directory::agents::delete
+directory::agents::get
+directory::agents::list
+directory::agents::update
+directory::engine::functions::info
+directory::hint-preview
+directory::on-config-change
+directory::on-functions-change
+directory::pre-generate
+directory::registry::workers::info
+directory::registry::workers::list
+directory::search_functions
+directory::skills::create
+directory::skills::delete
+directory::skills::download
+directory::skills::download_from_registry
+directory::skills::download_from_repo
+directory::skills::get
+directory::skills::index
+directory::skills::list
+directory::skills::update
+directory::system-prompts::create
+directory::system-prompts::delete
+directory::system-prompts::get
+directory::system-prompts::list
+directory::system-prompts::update
+engine::queue::dlq_messages
+engine::queue::dlq_topics
+engine::queue::enqueue
+engine::queue::list_topics
+engine::queue::topic_stats
+iii-directory::ui-content
+iii::durable::publish
+iii::queue::discard_message
+iii::queue::redrive
+iii::queue::redrive_message
+llm-router::ui-content
+provider-openai-codex::ui-content
+provider::anthropic::abort
+provider::anthropic::count_tokens
+provider::anthropic::on_router_ready
+provider::anthropic::refresh_models
+provider::anthropic::stream
+provider::openai-codex::abort
+provider::openai-codex::count_tokens
+provider::openai-codex::on_router_ready
+provider::openai-codex::refresh_models
+provider::openai-codex::stream
+provider::openai::abort
+provider::openai::count_tokens
+provider::openai::embed
+provider::openai::on_router_ready
+provider::openai::refresh_models
+provider::openai::stream
+queue::define
+queue::on-config-change
+router::abort
+router::chat
+router::complete
+router::count_tokens
+router::embed
+router::models::budget
+router::models::get
+router::models::list
+router::models::reconcile
+router::models::supports
+router::on_config_changed
+router::on_functions_changed
+router::provider::list
+router::provider::register
+router::provider::resolve
+router::provider::update_credential
+router::route
+session::append
+session::append-many
+session::config-status
+session::create
+session::delete
+session::ensure
+session::fork
+session::get
+session::get-message
+session::list
+session::messages
+session::on-config-change
+session::set-active-leaf
+session::set-draft
+session::set-meta
+session::set-status
+session::store::delete-active-leaf
+session::store::delete-entries
+session::store::delete-meta
+session::store::get-active-leaf
+session::store::get-entry
+session::store::get-meta
+session::store::list-entries
+session::store::list-metas
+session::store::publish-events
+session::store::put-entry
+session::store::put-meta
+session::store::set-active-leaf
+session::update-message
+state::barrier
+state::claim-namespace
+state::compare-and-set
+state::delete
+state::get
+state::list
+state::list_groups
+state::list_keys
+state::on-config-change
+state::set
+state::ui-content
+state::update
+worker::add
+worker::clear
+worker::list
+worker::logs
+worker::remove
+worker::schema
+worker::start
+worker::status
+worker::stop
+worker::update
+worker::validate
