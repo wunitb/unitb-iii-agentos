@@ -1,3 +1,4 @@
+use agentos_http_adapter::policy;
 use iii_sdk::errors::Error;
 use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Map, Value, json};
@@ -264,33 +265,36 @@ fn step_payload(
     Ok(Value::Object(payload))
 }
 
-/// Function families a wildcard capability may never grant (contract I1).
+/// Families .W ruled into contract I1 on 2026-09-02 that
+/// `policy::DENY_BY_DEFAULT_FAMILIES` does not carry yet — chat-core owns that
+/// list and has not landed them.
 ///
-/// Duplicated here on purpose: `agentos_http_adapter::policy` does not exist on
-/// this branch and `crates/http-adapter` belongs to another work package. The
-/// list is byte-for-byte contract I1 so it can be replaced by one `use` at
-/// integration.
-const DENY_BY_DEFAULT_FAMILIES: [&str; 12] = [
-    "shell", "bridge", "mcp", "hook", "cron", "vault", "state", "engine", "code", "harness",
-    "browser", "wasm",
-];
-
-/// Exact function ids that also need an approval decision but whose family is
-/// not one of the twelve in contract I1. Kept separate so the list above stays
-/// identical to the shared definition.
-const EXTRA_APPROVAL_REQUIRED_IDS: [&str; 1] = ["security::docker_exec"];
+/// `security::*` is root-equivalent through `security::docker_exec`
+/// (`docker run` with a caller-supplied command and the workspace bind-mounted
+/// read-write) and `security::audit` lets a caller pollute the audit chain.
+/// `coder::*` is the second surface of the same shell binary, so a capability
+/// set that is refused `shell::fs::write` can still reach `coder::update`.
+///
+/// Delete this constant and the second half of `requires_approval` as soon as
+/// the shared list carries them. The test
+/// `the_pending_families_disappear_when_the_shared_list_catches_up` fails the
+/// moment it does, so this delta can only shrink.
+const PENDING_DENY_BY_DEFAULT_FAMILIES: [&str; 2] = ["security", "coder"];
 
 fn function_family(function_id: &str) -> &str {
     function_id.split("::").next().unwrap_or(function_id)
 }
 
 /// Whether dispatching `function_id` needs a blocking approval decision.
+///
+/// The family vocabulary is `agentos_http_adapter::policy` — the single shared
+/// definition of contract I1 — plus the pending delta above.
 fn requires_approval(function_id: &str) -> bool {
     if function_id.is_empty() {
         return false;
     }
-    DENY_BY_DEFAULT_FAMILIES.contains(&function_family(function_id))
-        || EXTRA_APPROVAL_REQUIRED_IDS.contains(&function_id)
+    policy::is_deny_by_default(function_id)
+        || PENDING_DENY_BY_DEFAULT_FAMILIES.contains(&function_family(function_id))
 }
 
 /// The principal a step runs as.
@@ -1719,7 +1723,13 @@ mod tests {
             "harness::spawn",
             "browser::navigate",
             "wasm::run",
+            // .W ruling 2026-09-02: no agent-chosen call has a legitimate
+            // reason to reach any `security::*` or `coder::*` id.
             "security::docker_exec",
+            "security::audit",
+            "security::set_capabilities",
+            "coder::update",
+            "coder::delete",
         ] {
             let step = step_with("Escalate", function_id, Some("agent-1"));
             let workflow = workflow_with(vec![step.clone()], None);
@@ -1808,18 +1818,36 @@ mod tests {
     }
 
     #[test]
-    fn the_deny_by_default_list_is_contract_i1_verbatim() {
-        assert_eq!(
-            DENY_BY_DEFAULT_FAMILIES,
-            [
-                "shell", "bridge", "mcp", "hook", "cron", "vault", "state", "engine", "code",
-                "harness", "browser", "wasm"
-            ]
-        );
+    fn the_family_vocabulary_is_the_shared_contract_i1_definition() {
+        // The gate reads `agentos_http_adapter::policy`, so this worker and
+        // agent-core can never disagree about what is deny-by-default.
+        for family in policy::DENY_BY_DEFAULT_FAMILIES {
+            assert!(
+                requires_approval(&format!("{family}::anything")),
+                "{family} is deny-by-default in the shared contract"
+            );
+        }
         assert!(!requires_approval("memory::store"));
         assert!(!requires_approval("agent::chat"));
         assert!(!requires_approval(""));
         assert!(requires_approval("shell::exec"));
+    }
+
+    #[test]
+    fn the_pending_families_disappear_when_the_shared_list_catches_up() {
+        // .W ruled `security` and `coder` into contract I1 on 2026-09-02.
+        // Until chat-core lands them in the shared list this worker carries a
+        // local delta; this test fails the moment the shared list catches up,
+        // so the delta can only shrink and never drift.
+        for family in PENDING_DENY_BY_DEFAULT_FAMILIES {
+            assert!(
+                !policy::DENY_BY_DEFAULT_FAMILIES.contains(&family),
+                "`{family}` is now in policy::DENY_BY_DEFAULT_FAMILIES: delete \
+                 PENDING_DENY_BY_DEFAULT_FAMILIES, the second half of \
+                 requires_approval, and this test"
+            );
+            assert!(requires_approval(&format!("{family}::anything")));
+        }
     }
 
     #[test]
