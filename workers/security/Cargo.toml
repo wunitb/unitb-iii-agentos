@@ -27,4 +27,4 @@ dashmap.workspace = true
 # Tree guard only: the config.yaml assertions below take the three RBAC function
 # ids from `agentos_bus_auth::policy` so there is one definition of them, the
 # same rule applied to the capability policy. No runtime edge is added.
-agentos-bus-auth = { path = "../../crates/bus-auth" }
+agentos-bus-auth.workspace = true
