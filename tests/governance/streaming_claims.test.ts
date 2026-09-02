@@ -78,3 +78,42 @@ describe("streaming claims", () => {
     expect(readme).toContain(`x-agentos-stream: ${header}`);
   });
 });
+
+describe("stream join gate", () => {
+  it("does not describe a gate the worker does not register", () => {
+    const documented = architecture.includes("stream::authorize_join");
+    const registered = streaming.includes('"stream::authorize_join"');
+    expect(
+      documented === registered,
+      documented
+        ? "ARCHITECTURE describes stream::authorize_join but workers/streaming does not register it"
+        : "workers/streaming registers stream::authorize_join but ARCHITECTURE does not describe it",
+    ).toBe(true);
+  });
+
+  it("never states the gate without its fail-open limit", () => {
+    if (!architecture.includes("stream::authorize_join")) return;
+    // A reader who takes the gate for enforcement will widen the bind.
+    expect(architecture).toContain("fails open");
+    expect(architecture).toContain("joins are **allowed**");
+    expect(architecture).toContain("loopback bind is load-bearing");
+    expect(architecture).toContain("config/iii-stream.yaml");
+  });
+
+  it("keeps the documented bind identical to the configured one", async () => {
+    const streamConfig = await Bun.file(new URL("config/iii-stream.yaml", repository)).text();
+    const host = /^\s*host:\s*(\S+)\s*$/m.exec(streamConfig)?.[1];
+    expect(host, "config/iii-stream.yaml declares no host").toBeDefined();
+    if (architecture.includes("loopback bind is load-bearing")) {
+      expect(host, "ARCHITECTURE calls the bind loopback; config/iii-stream.yaml disagrees").toBe(
+        "127.0.0.1",
+      );
+    }
+  });
+
+  it("keeps the deny branch deny-by-default in the worker", () => {
+    if (!streaming.includes('"stream::authorize_join"')) return;
+    expect(streaming).toContain('"unauthorized": true');
+    expect(streaming).toContain("stream:join");
+  });
+});
