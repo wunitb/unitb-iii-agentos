@@ -32,12 +32,22 @@ fn authorize_token(expected: &str, token: &str) -> bool {
     bool::from(token.as_bytes().ct_eq(expected.as_bytes()))
 }
 
+fn service_credential() -> Result<String, Error> {
+    std::env::var("AGENTOS_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| {
+            Error::Handler(
+                "AGENTOS_API_KEY is not configured; the MAP worker cannot authenticate its \
+                 callers and cannot read shared secrets from the vault. This is a fail-closed \
+                 refusal, not a bug: set AGENTOS_API_KEY for the whole stack."
+                    .into(),
+            )
+        })
+}
+
 fn require_auth(input: &Value) -> Result<(), Error> {
-    let expected = std::env::var("AGENTOS_API_KEY")
-        .map_err(|_| Error::Handler("AGENTOS_API_KEY not configured".into()))?;
-    if expected.is_empty() {
-        return Err(Error::Handler("AGENTOS_API_KEY not configured".into()));
-    }
+    let expected = service_credential()?;
     let header = input
         .get("headers")
         .and_then(|h| h.get("authorization"))
@@ -48,6 +58,43 @@ fn require_auth(input: &Value) -> Result<(), Error> {
         Ok(())
     } else {
         Err(Error::Handler("Unauthorized".into()))
+    }
+}
+
+/// Read `map:<agent>`'s shared secret out of the vault.
+///
+/// `vault::get` requires the AgentOS bearer on every call (a bus caller used to
+/// be able to read plaintext secrets because the check was skipped whenever the
+/// payload had no `headers` key). This worker therefore presents its OWN
+/// service credential, and only after it has already authenticated its caller
+/// with the same credential — it never forwards a caller-supplied header.
+/// Errors name the failing step so a missing secret cannot be mistaken for an
+/// authentication problem or vice versa.
+async fn shared_secret(iii: &IIIClient, agent: &str) -> Result<String, Error> {
+    let credential = service_credential()?;
+    let entry = iii
+        .trigger(TriggerRequest {
+            function_id: "vault::get".to_string(),
+            payload: json!({
+                "key": format!("map:{agent}"),
+                "headers": { "authorization": format!("Bearer {credential}") },
+            }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|e| {
+            Error::Handler(format!(
+                "vault::get for map:{agent} failed: {e}. The vault must be unlocked \
+                 (vault::init) and hold a `map:{agent}` entry."
+            ))
+        })?;
+
+    match entry.get("value").and_then(|v| v.as_str()) {
+        Some(secret) if !secret.is_empty() => Ok(secret.to_string()),
+        _ => Err(Error::Handler(format!(
+            "no shared secret stored for map:{agent}"
+        ))),
     }
 }
 
@@ -65,6 +112,7 @@ fn hmac_hex(secret: &str, payload: &str) -> Result<String, Error> {
 }
 
 async fn map_challenge(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    require_auth(&input)?;
     let body = body_or_self(&input);
     let source_agent = body
         .get("sourceAgent")
@@ -131,7 +179,17 @@ async fn map_challenge(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     }))
 }
 
+/// Sign a MAP challenge with the responder's shared secret.
+///
+/// DO NOT REMOVE THE AUTH CHECK BELOW. This function is a signing oracle by
+/// construction: it will produce a valid `security::map_verify` response for
+/// ANY `responderAgent` whose secret this host's vault holds. Unauthenticated,
+/// it let any local process on the engine bus forge mutual-auth responses for
+/// every identity on the machine (2026-09-02 review, H-2). If it ever appears
+/// "broken", the cause is a missing AGENTOS_API_KEY or a locked vault — both of
+/// which the errors below name explicitly — never the auth check.
 async fn map_respond(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    require_auth(&input)?;
     let body = body_or_self(&input);
     let nonce = body.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
     let source_agent = body
@@ -150,23 +208,23 @@ async fn map_respond(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         ));
     }
 
-    let secret_entry: Value = iii
-        .trigger(TriggerRequest {
-            function_id: "vault::get".to_string(),
-            payload: json!({ "key": format!("map:{}", responder_agent) }),
-            action: None,
-            timeout_ms: None,
-        })
-        .await
-        .unwrap_or(json!(null));
-
-    let secret = secret_entry
-        .get("value")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Handler("No shared secret configured for agent".into()))?;
+    let secret = shared_secret(iii, responder_agent).await?;
 
     let payload = format!("{nonce}:{source_agent}:{responder_agent}:{timestamp}");
-    let signature = hmac_hex(secret, &payload)?;
+    let signature = hmac_hex(&secret, &payload)?;
+
+    // Every signature this worker issues leaves a trace. An oracle that signs
+    // silently is indistinguishable from one that is never used.
+    audit_emit(
+        iii,
+        "map_response_signed",
+        json!({
+            "sourceAgent": source_agent,
+            "responderAgent": responder_agent,
+            "nonce": nonce.chars().take(8).collect::<String>(),
+        }),
+    )
+    .await;
 
     Ok(json!({
         "signature": signature,
@@ -191,9 +249,10 @@ async fn audit_emit(iii: &IIIClient, entry_type: &str, detail: Value) {
 }
 
 async fn map_verify(iii: &IIIClient, input: Value) -> Result<Value, Error> {
-    if input.get("headers").is_some() {
-        require_auth(&input)?;
-    }
+    // Unconditional: a bus caller never carries a `headers` object, so the old
+    // `if input.get("headers").is_some()` guard meant this ran unauthenticated
+    // for every caller that mattered.
+    require_auth(&input)?;
     let body = body_or_self(&input);
     let nonce = body.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
     let signature = body.get("signature").and_then(|v| v.as_str()).unwrap_or("");
@@ -291,19 +350,19 @@ async fn map_verify(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         return Ok(json!({ "verified": false, "reason": "replay_detected" }));
     }
 
-    let secret_entry: Value = iii
-        .trigger(TriggerRequest {
-            function_id: "vault::get".to_string(),
-            payload: json!({ "key": format!("map:{}", responder_agent) }),
-            action: None,
-            timeout_ms: None,
-        })
-        .await
-        .unwrap_or(json!(null));
-
-    let secret = match secret_entry.get("value").and_then(|v| v.as_str()) {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => return Ok(json!({ "verified": false, "reason": "no_shared_secret" })),
+    let secret = match shared_secret(iii, responder_agent).await {
+        Ok(secret) => secret,
+        Err(error) => {
+            // A verification with no usable secret is a failed verification,
+            // not a handler error — but say which, so an operator can tell a
+            // missing entry from a locked vault.
+            tracing::warn!(responder_agent, error = %error, "map_verify: no usable shared secret");
+            return Ok(json!({
+                "verified": false,
+                "reason": "no_shared_secret",
+                "detail": error.to_string(),
+            }));
+        }
     };
 
     let payload = format!("{nonce}:{source_agent}:{responder_agent}:{challenge_ts}");
@@ -437,6 +496,143 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    fn with_api_key<T>(value: Option<&str>, test: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("AGENTOS_API_KEY");
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var("AGENTOS_API_KEY", value),
+                None => std::env::remove_var("AGENTOS_API_KEY"),
+            }
+        }
+        let result = test();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("AGENTOS_API_KEY", value),
+                None => std::env::remove_var("AGENTOS_API_KEY"),
+            }
+        }
+        result
+    }
+
+    /// Never connected: any handler that reaches the bus would block on the SDK
+    /// timeout, so every assertion here must return before the first call.
+    fn offline_client() -> IIIClient {
+        IIIClient::new("ws://127.0.0.1:1")
+    }
+
+    #[test]
+    fn map_respond_refuses_an_unauthenticated_bus_caller() {
+        let request = json!({
+            "nonce": "aa",
+            "sourceAgent": "attacker",
+            "responderAgent": "victim",
+            "timestamp": 1u64,
+        });
+        let error = with_api_key(Some("map-expected"), || {
+            block_on(map_respond(&offline_client(), request))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("Unauthorized"),
+            "map_respond must not sign for a caller with no bearer, got: {error}"
+        );
+    }
+
+    #[test]
+    fn map_respond_refuses_a_wrong_bearer() {
+        let request = json!({
+            "headers": { "authorization": "Bearer wrong" },
+            "nonce": "aa",
+            "sourceAgent": "attacker",
+            "responderAgent": "victim",
+            "timestamp": 1u64,
+        });
+        let error = with_api_key(Some("map-expected-2"), || {
+            block_on(map_respond(&offline_client(), request))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Unauthorized"), "got: {error}");
+    }
+
+    #[test]
+    fn map_challenge_and_verify_refuse_an_unauthenticated_bus_caller() {
+        with_api_key(Some("map-expected-3"), || {
+            let challenge = block_on(map_challenge(
+                &offline_client(),
+                json!({ "sourceAgent": "a", "targetAgent": "b" }),
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(challenge.contains("Unauthorized"), "{challenge}");
+
+            let verify = block_on(map_verify(
+                &offline_client(),
+                json!({ "nonce": "aa", "signature": "bb", "responderAgent": "b" }),
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(verify.contains("Unauthorized"), "{verify}");
+        });
+    }
+
+    #[test]
+    fn a_missing_service_credential_is_a_named_refusal_not_a_silent_failure() {
+        with_api_key(None, || {
+            let error = service_credential().unwrap_err().to_string();
+            assert!(error.contains("AGENTOS_API_KEY"), "{error}");
+            assert!(
+                error.contains("fail-closed"),
+                "the message must tell a maintainer this is deliberate: {error}"
+            );
+            // and the handlers surface the same message rather than "Unauthorized"
+            let respond = block_on(map_respond(
+                &offline_client(),
+                json!({
+                    "headers": { "authorization": "Bearer anything" },
+                    "nonce": "aa",
+                    "sourceAgent": "a",
+                    "responderAgent": "b",
+                    "timestamp": 1u64,
+                }),
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(respond.contains("AGENTOS_API_KEY"), "{respond}");
+        });
+        with_api_key(Some(""), || {
+            assert!(service_credential().is_err(), "an empty key is not a key");
+        });
+    }
+
+    #[test]
+    fn authenticated_map_respond_still_validates_its_arguments() {
+        // Proves the auth check runs FIRST and that a valid bearer reaches the
+        // argument validation rather than being rejected outright.
+        let error = with_api_key(Some("map-args"), || {
+            block_on(map_respond(
+                &offline_client(),
+                json!({ "headers": { "authorization": "Bearer map-args" } }),
+            ))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("are required"), "got: {error}");
+    }
 
     #[test]
     fn authorization_rejects_empty_credentials_and_accepts_a_match() {
