@@ -1,8 +1,85 @@
 id: shell
 name: Shell
-description: Shell worker settings with filesystem access confined to this checkout.
+description: >-
+  OPT-IN ONLY. The shell worker is not in the default ./config.yaml worker list;
+  these settings apply if an operator adds `- name: shell` there. They restrict
+  what the worker may touch, but they cannot make `shell::exec` safe on their
+  own: in shell v0.11.14 the exec target defaults to the host, `fs.host_roots`
+  jails only `shell::fs::*` and `coder::*`, and `sandbox.enabled` merely PERMITS
+  a `target: {kind: sandbox}` call — it does not force exec into a microVM. The
+  containment that matters is (a) not booting the worker, (b) `env.inherit:
+  false` so a spawned command never sees provider credentials, (c) the command
+  denylist below, and (d) the filesystem jail. After opting in, run
+  `iii trigger shell::config-status` once: a `rejected` outcome means the worker
+  refused this file and is enforcing its own defaults instead.
 value:
   fs:
+    # Every shell::fs::* and coder::* path must resolve inside these roots.
     host_roots:
       - ${III_COMPOSE_DIR:.}
+    # Never true: true reaches the whole host filesystem.
     allow_unjailed: false
+    # No setuid/setgid/sticky bits through shell::fs::chmod.
+    allow_special_bits: false
+    denylist_paths:
+      - "**/.env"
+      - "**/.env.*"
+      - "**/secrets/**"
+      - "**/.ssh/**"
+      - "**/.gnupg/**"
+      - "**/.aws/**"
+      - "**/.git/config"
+      - "**/id_rsa*"
+      - "**/id_ed25519*"
+  env:
+    # Children start from a clean environment holding only `allow`; the process
+    # environment (ANTHROPIC_API_KEY, AGENTOS_API_KEY, ...) is not inherited.
+    inherit: false
+    allow:
+      - PATH
+      - HOME
+      - LANG
+      - LC_ALL
+      - TERM
+  # Setting this key REPLACES the upstream default list, so the six upstream
+  # patterns are repeated here before the additions. These are regexes matched
+  # against the command line; treat them as a speed bump, not a boundary.
+  denylist_patterns:
+    - 'rm\s+-rf\s+/'
+    - 'shutdown\b'
+    - '/etc/shadow'
+    - '/etc/passwd'
+    - '**/.env.*'
+    - '**/secrets/**'
+    - 'rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/'
+    - '\bmkfs(\.[a-z0-9]+)?\b'
+    - '\bdd\b[^\n]*\bof=/dev/'
+    - '\b(reboot|halt|poweroff|init\s+0)\b'
+    - '\bchown\b[^\n]*\s/(etc|usr|bin|sbin|boot|lib)\b'
+    - '\b(iptables|nft|ufw)\b'
+    - '\bsudo\b'
+    - '\bdoas\b'
+    - '\bsu\b\s'
+    - '\bcrontab\b'
+    - '\bsystemctl\b'
+    - '\blaunchctl\b'
+    - '\bssh-keygen\b'
+    - '\bcurl\b[^\n]*\|\s*(ba)?sh'
+    - '\bwget\b[^\n]*\|\s*(ba)?sh'
+    - '\bnc\b\s+-[a-zA-Z]*e'
+    - '/proc/self/mem'
+    - '\bhistory\s+-c\b'
+  # Bound every job so a runaway command cannot hold the worker forever.
+  default_timeout_ms: 30000
+  max_timeout_ms: 120000
+  # Upstream default is 0 = unbounded for background jobs.
+  max_bg_timeout_ms: 600000
+  max_concurrent_jobs: 4
+  job_retention_secs: 900
+  sandbox:
+    # False is the smaller surface: `enabled: true` ADDS the microVM exec route
+    # without removing the host route, because ExecRequest.target defaults to
+    # the host worker and there is no config key that forces sandbox-only exec.
+    # Flip this to true only when you actually intend to use
+    # `target: {kind: sandbox, sandbox_id: ...}`.
+    enabled: false

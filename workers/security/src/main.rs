@@ -49,6 +49,20 @@ struct AuditEntry {
     prev_hash: String,
 }
 
+/// Function-id namespaces that a wildcard capability entry must never grant.
+/// This is the deny-by-default set from the remediation contract (I1): only an
+/// exact, literal function id in an agent's `tools` array can reach one of
+/// these, and `agent-core` must additionally clear it through `approval::check`.
+static DENY_BY_DEFAULT_NAMESPACES: &[&str] = &[
+    "shell", "bridge", "mcp", "hook", "cron", "vault", "state", "engine", "code", "harness",
+    "browser", "wasm",
+];
+
+/// Beyond the contract set: `coder::*` is the second surface of the same
+/// upstream `shell` worker binary (it writes host files through the same jail),
+/// so it is held to the same exact-id rule.
+static ADDITIONAL_PRIVILEGED_NAMESPACES: &[&str] = &["coder"];
+
 static INJECTION_PATTERNS: &[&str] = &[
     r"(?i)ignore\s+(all\s+)?(previous|above|prior)\s+(instructions|prompts)",
     r"(?i)you\s+are\s+now\s+",
@@ -83,40 +97,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "security::set_capabilities",
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_ref.clone();
-            async move {
-                let agent_id = input["agentId"].as_str().unwrap_or("");
-                let caps = &input["capabilities"];
-
-                iii.trigger(TriggerRequest {
-                    function_id: "state::set".to_string(),
-                    payload: json!({
-                        "scope": "capabilities",
-                        "key": agent_id,
-                        "value": caps,
-                    }),
-                    action: None,
-                    timeout_ms: None,
-                })
-                .await
-                .map_err(|e| Error::Handler(e.to_string()))?;
-
-                iii.trigger(TriggerRequest {
-                function_id: "security::audit".to_string(),
-                payload: json!({
-                    "type": "capabilities_updated",
-                    "agentId": agent_id,
-                    "detail": { "tools": caps["tools"].as_array().map(|a| a.len()).unwrap_or(0) },
-                }),
-                action: None,
-                timeout_ms: None,
-            })
-            .await
-            .map_err(|e| Error::Handler(format!("audit emission failed: {e}")))?;
-
-                Ok::<Value, Error>(json!({ "updated": true }))
-            }
+            async move { set_capabilities(&iii, input).await }
         })
-        .description("Set agent capabilities"),
+        .description("Set agent capabilities (requires the AgentOS bearer token)"),
     );
 
     let iii_ref = iii.clone();
@@ -140,6 +123,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     iii.register_function(
+        "security::stream_auth",
+        RegisterFunction::new_async(move |input: Value| async move { stream_auth(input) })
+            .description(
+                "Connection auth for the iii-stream WebSocket: validates the AgentOS bearer \
+                 and returns the StreamAuthContext the engine hands to join triggers",
+            ),
+    );
+
+    iii.register_function(
         "security::scan_injection",
         RegisterFunction::new_async(move |input: Value| async move {
             let text = input["text"].as_str().unwrap_or("");
@@ -151,20 +143,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let iii_ref = iii.clone();
     iii.register_function(
         "security::list_capabilities",
-        RegisterFunction::new_async(move |_: Value| {
+        RegisterFunction::new_async(move |input: Value| {
             let iii = iii_ref.clone();
-            async move {
-                iii.trigger(TriggerRequest {
-                    function_id: "state::list".to_string(),
-                    payload: json!({ "scope": "capabilities" }),
-                    action: None,
-                    timeout_ms: None,
-                })
-                .await
-                .map_err(|error| Error::Handler(error.to_string()))
-            }
+            async move { list_capabilities(&iii, input).await }
         })
-        .description("List configured agent capabilities"),
+        .description("List configured agent capabilities (requires the AgentOS bearer token)"),
     );
 
     iii.register_trigger(RegisterTriggerInput {
@@ -196,7 +179,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
     )?;
 
-    let security_routes = [("security::list_capabilities", "GET", "/api/security")];
+    let security_routes = [
+        ("security::list_capabilities", "GET", "/api/security"),
+        (
+            "security::set_capabilities",
+            "POST",
+            "/api/security/capabilities",
+        ),
+    ];
     for (function_id, method, path) in security_routes {
         agentos_http_adapter::register_http_trigger(
             &iii,
@@ -217,9 +207,275 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Bearer check for the bus-reachable security functions.
+///
+/// The engine bus has no authentication of its own, so every function that
+/// reads or writes the authorization store has to verify the AgentOS token
+/// itself. HTTP callers arrive through `agentos_http_adapter`, which forwards
+/// the request headers verbatim.
+fn require_auth(input: &Value) -> Result<(), Error> {
+    let expected = std::env::var("AGENTOS_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| Error::Handler("AGENTOS_API_KEY not configured".into()))?;
+    let header = input
+        .get("headers")
+        .and_then(Value::as_object)
+        .and_then(|headers| {
+            headers.iter().find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.as_str())
+                    .flatten()
+            })
+        })
+        .unwrap_or_default();
+    let Some((scheme, token)) = header.split_once(' ') else {
+        return Err(Error::Handler("Unauthorized".into()));
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
+        return Err(Error::Handler("Unauthorized".into()));
+    }
+    if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err(Error::Handler("Unauthorized".into()))
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// True when the function id lives in a namespace that a wildcard entry must
+/// never grant.
+fn is_privileged_function(function_id: &str) -> bool {
+    let Some(namespace) = function_id.split("::").next() else {
+        return true;
+    };
+    if namespace.is_empty() {
+        return true;
+    }
+    DENY_BY_DEFAULT_NAMESPACES.contains(&namespace)
+        || ADDITIONAL_PRIVILEGED_NAMESPACES.contains(&namespace)
+}
+
+/// Capability pattern matching.
+///
+/// A pattern is either an exact function id or a `::`-segmented glob in which a
+/// segment of exactly `*` stands for one segment. A trailing `*` segment also
+/// absorbs any further segments, so `memory::*` covers `memory::store` and
+/// `memory::session::list`, and a bare `*` covers every id. An empty pattern,
+/// an empty segment, or an empty function id matches nothing — `starts_with`
+/// semantics (where `""` matched everything) are gone.
+fn capability_pattern_matches(pattern: &str, function_id: &str) -> bool {
+    if pattern.is_empty() || function_id.is_empty() {
+        return false;
+    }
+    let pattern_segments: Vec<&str> = pattern.split("::").collect();
+    let function_segments: Vec<&str> = function_id.split("::").collect();
+    if pattern_segments.iter().any(|segment| segment.is_empty())
+        || function_segments.iter().any(|segment| segment.is_empty())
+    {
+        return false;
+    }
+    if pattern == function_id {
+        return true;
+    }
+
+    let trailing_wildcard = pattern_segments
+        .last()
+        .is_some_and(|segment| *segment == "*");
+    let compared = if trailing_wildcard {
+        if function_segments.len() < pattern_segments.len() {
+            return false;
+        }
+        &pattern_segments[..pattern_segments.len() - 1]
+    } else {
+        if pattern_segments.len() != function_segments.len() {
+            return false;
+        }
+        &pattern_segments[..]
+    };
+
+    compared
+        .iter()
+        .zip(function_segments.iter())
+        .all(|(pattern_segment, function_segment)| {
+            *pattern_segment == "*" || pattern_segment == function_segment
+        })
+}
+
+/// Decide whether `tools` grants `function_id`, honouring the deny-by-default
+/// set (which only an exact-id entry can reach).
+fn capability_granted(tools: &[&str], function_id: &str) -> bool {
+    if function_id.is_empty() {
+        return false;
+    }
+    if is_privileged_function(function_id) {
+        return tools.contains(&function_id);
+    }
+    tools
+        .iter()
+        .any(|tool| capability_pattern_matches(tool, function_id))
+}
+
+/// Read the canonical capability record: scope `capabilities`, key `<agentId>`,
+/// value `{ "tools": [...], "updatedAt": <ms> }`. The `value` unwrap keeps the
+/// reader working if a state backend ever returns the list-entry envelope.
+fn tools_from_record(record: &Value) -> Vec<&str> {
+    record
+        .get("tools")
+        .or_else(|| record.get("value").and_then(|value| value.get("tools")))
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|entry| !entry.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn normalize_tools(capabilities: &Value) -> Result<Vec<String>, Error> {
+    let entries = capabilities
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Handler("capabilities.tools must be an array of strings".into()))?;
+    let mut tools = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let tool = entry
+            .as_str()
+            .ok_or_else(|| Error::Handler("capabilities.tools must contain only strings".into()))?;
+        if tool.trim().is_empty() {
+            return Err(Error::Handler(
+                "capabilities.tools must not contain an empty entry".into(),
+            ));
+        }
+        tools.push(tool.to_string());
+    }
+    Ok(tools)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+async fn set_capabilities(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    require_auth(&input)?;
+
+    let body = input.get("body").cloned().unwrap_or_else(|| input.clone());
+    let agent_id = body
+        .get("agentId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if agent_id.is_empty() {
+        return Err(Error::Handler("agentId is required".into()));
+    }
+    let capabilities = body
+        .get("capabilities")
+        .ok_or_else(|| Error::Handler("capabilities is required".into()))?;
+    let tools = normalize_tools(capabilities)?;
+
+    // I1 shape (`{tools, updatedAt}`) plus `agentId`: `state::list` returns bare
+    // values with no key, so without the id inside the document
+    // `security::list_capabilities` cannot say whose capabilities it listed.
+    let record = json!({ "agentId": &agent_id, "tools": tools, "updatedAt": now_ms() });
+
+    iii.trigger(TriggerRequest {
+        function_id: "state::set".to_string(),
+        payload: json!({
+            "scope": "capabilities",
+            "key": &agent_id,
+            "value": &record,
+        }),
+        action: None,
+        timeout_ms: None,
+    })
+    .await
+    .map_err(|e| Error::Handler(e.to_string()))?;
+
+    iii.trigger(TriggerRequest {
+        function_id: "security::audit".to_string(),
+        payload: json!({
+            "type": "capabilities_updated",
+            "agentId": &agent_id,
+            "detail": { "tools": tools.len() },
+        }),
+        action: None,
+        timeout_ms: None,
+    })
+    .await
+    .map_err(|e| Error::Handler(format!("audit emission failed: {e}")))?;
+
+    Ok(json!({ "updated": true, "agentId": agent_id, "tools": tools }))
+}
+
+async fn list_capabilities(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    require_auth(&input)?;
+    let entries = iii
+        .trigger(TriggerRequest {
+            function_id: "state::list".to_string(),
+            payload: json!({ "scope": "capabilities" }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|error| Error::Handler(error.to_string()))?;
+    Ok(labelled_capabilities(entries))
+}
+
+/// Keep the outer bare-array shape but guarantee every row carries an
+/// `agentId` field, because `state::list` drops the key and the canonical I1
+/// value does not repeat it. Rows written by `security::set_capabilities`
+/// already carry it; rows written elsewhere get an explicit `null` so the TUI
+/// Security pane can tell "unknown agent" from "field missing".
+fn labelled_capabilities(entries: Value) -> Value {
+    let Value::Array(entries) = entries else {
+        return entries;
+    };
+    Value::Array(
+        entries
+            .into_iter()
+            .map(|entry| {
+                let mut entry = match entry {
+                    Value::Object(fields) => fields,
+                    other => return other,
+                };
+                let agent_id = entry
+                    .get("agentId")
+                    .or_else(|| entry.get("agent_id"))
+                    .or_else(|| entry.get("key"))
+                    .or_else(|| entry.get("id"))
+                    .cloned()
+                    .filter(Value::is_string)
+                    .unwrap_or(Value::Null);
+                entry.insert("agentId".to_string(), agent_id);
+                Value::Object(entry)
+            })
+            .collect(),
+    )
+}
+
 async fn check_capability(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let agent_id = input["agentId"].as_str().unwrap_or("");
-    let resource = input["resource"].as_str().unwrap_or("");
+    // `resource` is what agent-core sends today; `functionId` is the name the
+    // remediation contract uses. Accept either, require exactly one value.
+    let resource = input["resource"]
+        .as_str()
+        .or_else(|| input["functionId"].as_str())
+        .unwrap_or("");
 
     if agent_id.is_empty() {
         return Err(Error::Handler("agentId is required".into()));
@@ -241,12 +497,8 @@ async fn check_capability(iii: &IIIClient, input: Value) -> Result<Value, Error>
         .await
         .map_err(|_| Error::Handler(format!("Agent {} has no capabilities defined", agent_id)))?;
 
-    let tools = caps["tools"]
-        .as_array()
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    let allowed = tools.iter().any(|t| *t == "*" || resource.starts_with(t));
+    let tools = tools_from_record(&caps);
+    let allowed = capability_granted(&tools, resource);
 
     if !allowed {
         if let Err(e) = iii
@@ -306,7 +558,7 @@ async fn check_capability(iii: &IIIClient, input: Value) -> Result<Value, Error>
         }
     }
 
-    Ok(json!({ "allowed": true }))
+    Ok(json!({ "allowed": true, "reason": "granted" }))
 }
 
 async fn append_audit(iii: &IIIClient, input: Value) -> Result<Value, Error> {
@@ -322,10 +574,7 @@ async fn append_audit(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
     let prev_hash = prev["hash"].as_str().unwrap_or(&"0".repeat(64)).to_string();
     let id = uuid::Uuid::new_v4().to_string();
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let timestamp = now_ms();
 
     let entry_data = json!({
         "id": &id,
@@ -381,6 +630,34 @@ async fn append_audit(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     Ok(json!({ "id": id, "hash": hash }))
 }
 
+/// Turn a `state::list` reply into the audit chain.
+///
+/// `state::list` on iii 0.22.1 returns a BARE ARRAY OF VALUES (verified against
+/// the pinned engine: `iii trigger state::list scope=<s>` -> `[{...}, {...}]`).
+/// The previous reader required a `value` envelope, so it produced an empty
+/// chain and `verify_audit` answered `valid: true, entries: 0` no matter what
+/// was in the store. The `__latest` pointer carries no `type`/`detail`/`prevHash`
+/// and therefore fails to deserialize as an `AuditEntry` on its own; the key
+/// check is kept for a backend that does supply an envelope.
+fn audit_chain_from_list(entries: &Value) -> Vec<AuditEntry> {
+    entries
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| {
+            if entry.get("key").and_then(Value::as_str) == Some("__latest") {
+                return None;
+            }
+            let value = match entry.get("value") {
+                Some(value) if value.is_object() => value,
+                _ => entry,
+            };
+            serde_json::from_value(value.clone()).ok()
+        })
+        .collect()
+}
+
 async fn verify_audit(iii: &IIIClient) -> Result<Value, Error> {
     let entries: Value = iii
         .trigger(TriggerRequest {
@@ -392,18 +669,7 @@ async fn verify_audit(iii: &IIIClient) -> Result<Value, Error> {
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
 
-    let mut chain: Vec<AuditEntry> = entries
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|e| {
-            let val = e.get("value")?;
-            if e["key"].as_str() == Some("__latest") {
-                return None;
-            }
-            serde_json::from_value(val.clone()).ok()
-        })
-        .collect();
+    let mut chain = audit_chain_from_list(&entries);
 
     chain.sort_by_key(|e| e.timestamp);
 
@@ -453,6 +719,35 @@ async fn verify_audit(iii: &IIIClient) -> Result<Value, Error> {
     }))
 }
 
+/// Connection auth for `iii-stream` (`config/iii-stream.yaml: auth_function`).
+///
+/// The engine calls this once per WebSocket upgrade with
+/// `{ headers, path, query_params, addr }` and expects a `StreamAuthContext`
+/// (`{ "context": <any> }`) back.
+///
+/// IMPORTANT — this is identity, not a gate. In iii 0.22.1
+/// (`engine/src/workers/stream/stream.rs:112-157`) a failing or erroring auth
+/// function is logged and the socket is upgraded anyway with `context: None`.
+/// The enforcement point is a `join` trigger, which may return
+/// `{"unauthorized": true}` after inspecting this context
+/// (`stream/connection.rs:100-157`). The binding host in
+/// `config/iii-stream.yaml` is therefore still the primary control.
+fn stream_auth(input: Value) -> Result<Value, Error> {
+    require_auth(&input)?;
+    let addr = input
+        .get("addr")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok(json!({
+        "context": {
+            "authenticated": true,
+            "subject": "agentos-bearer",
+            "addr": addr,
+        }
+    }))
+}
+
 fn scan_injection(text: &str) -> Result<Value, Error> {
     let mut matches = Vec::new();
     let compiled = compiled_injection_patterns();
@@ -475,6 +770,387 @@ fn scan_injection(text: &str) -> Result<Value, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    static AUTH_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn with_api_key<T>(value: Option<&str>, test: impl FnOnce() -> T) -> T {
+        let _guard = AUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("AGENTOS_API_KEY");
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var("AGENTOS_API_KEY", value),
+                None => std::env::remove_var("AGENTOS_API_KEY"),
+            }
+        }
+        let result = test();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("AGENTOS_API_KEY", value),
+                None => std::env::remove_var("AGENTOS_API_KEY"),
+            }
+        }
+        result
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    /// `IIIClient::new` opens no socket, so a handler that reaches
+    /// `iii.trigger` would block on the SDK timeout. Every handler assertion
+    /// below must return before the first bus call.
+    fn offline_client() -> IIIClient {
+        IIIClient::new("ws://127.0.0.1:1")
+    }
+
+    fn bearer(token: &str) -> Value {
+        json!({ "authorization": format!("Bearer {token}") })
+    }
+
+    // --- security::set_capabilities is bus-reachable and must demand the token
+
+    #[test]
+    fn set_capabilities_rejects_unauthenticated_bus_caller() {
+        let request = json!({
+            "agentId": "attacker",
+            "capabilities": { "tools": ["*"] },
+        });
+        let error = with_api_key(Some("set-caps-expected"), || {
+            block_on(set_capabilities(&offline_client(), request))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("Unauthorized"),
+            "a bus caller must not be able to grant capabilities, got: {error}"
+        );
+    }
+
+    #[test]
+    fn set_capabilities_rejects_wrong_bearer() {
+        let request = json!({
+            "headers": bearer("wrong"),
+            "agentId": "attacker",
+            "capabilities": { "tools": ["memory::*"] },
+        });
+        let error = with_api_key(Some("set-caps-expected-2"), || {
+            block_on(set_capabilities(&offline_client(), request))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Unauthorized"), "got: {error}");
+    }
+
+    #[test]
+    fn set_capabilities_rejects_malformed_tools_after_auth() {
+        let request = json!({
+            "headers": bearer("set-caps-shape"),
+            "agentId": "agent-1",
+            "capabilities": { "tools": "memory::store" },
+        });
+        let error = with_api_key(Some("set-caps-shape"), || {
+            block_on(set_capabilities(&offline_client(), request))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("must be an array of strings"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn set_capabilities_rejects_empty_tool_entry() {
+        let request = json!({
+            "headers": bearer("set-caps-empty"),
+            "agentId": "agent-1",
+            "capabilities": { "tools": ["memory::store", ""] },
+        });
+        let error = with_api_key(Some("set-caps-empty"), || {
+            block_on(set_capabilities(&offline_client(), request))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("empty entry"), "got: {error}");
+    }
+
+    #[test]
+    fn list_capabilities_rejects_unauthenticated_bus_caller() {
+        let error = with_api_key(Some("list-caps-expected"), || {
+            block_on(list_capabilities(&offline_client(), json!({})))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Unauthorized"), "got: {error}");
+    }
+
+    #[test]
+    fn check_capability_requires_agent_and_resource() {
+        let missing_agent = block_on(check_capability(
+            &offline_client(),
+            json!({ "resource": "a::b" }),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(missing_agent.contains("agentId is required"));
+
+        let missing_resource = block_on(check_capability(
+            &offline_client(),
+            json!({ "agentId": "agent-1" }),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(missing_resource.contains("resource is required"));
+    }
+
+    // --- capability matching
+
+    #[test]
+    fn list_capabilities_labels_every_row_with_an_agent_id() {
+        let listed = labelled_capabilities(json!([
+            { "agentId": "a1", "tools": ["memory::*"], "updatedAt": 1 },
+            { "tools": ["workflow::run"], "updatedAt": 2 },
+            { "key": "a3", "tools": [], "updatedAt": 3 },
+        ]));
+        let rows = listed.as_array().expect("bare array is preserved");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["agentId"], "a1");
+        assert_eq!(rows[0]["tools"], json!(["memory::*"]));
+        assert!(
+            rows[1]["agentId"].is_null(),
+            "an unlabelled row must say so explicitly"
+        );
+        assert!(rows[1].get("agentId").is_some());
+        assert_eq!(rows[2]["agentId"], "a3");
+        // non-array and non-object payloads pass through untouched
+        assert_eq!(labelled_capabilities(json!(null)), json!(null));
+        assert_eq!(labelled_capabilities(json!(["x"])), json!(["x"]));
+    }
+
+    #[test]
+    fn audit_chain_reads_the_bare_state_list_shape() {
+        let entry = json!({
+            "id": "a1",
+            "timestamp": 10u64,
+            "type": "vault_get",
+            "agentId": null,
+            "detail": {},
+            "hash": "h1",
+            "prevHash": "0",
+        });
+        let latest = json!({ "hash": "h1", "id": "a1", "timestamp": 10u64 });
+
+        // bare values, which is what iii 0.22.1 actually returns
+        let chain = audit_chain_from_list(&json!([entry.clone(), latest.clone()]));
+        assert_eq!(chain.len(), 1, "the bare audit entry must be read");
+        assert_eq!(chain[0].id, "a1");
+
+        // and the enveloped shape still works
+        let chain = audit_chain_from_list(&json!([
+            { "key": "a1", "value": entry },
+            { "key": "__latest", "value": latest },
+        ]));
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].id, "a1");
+
+        assert!(audit_chain_from_list(&json!([])).is_empty());
+        assert!(audit_chain_from_list(&json!(null)).is_empty());
+    }
+
+    #[test]
+    fn empty_pattern_matches_nothing() {
+        assert!(!capability_pattern_matches("", "memory::store"));
+        assert!(!capability_granted(&[""], "memory::store"));
+        assert!(!capability_granted(&["", ""], "anything::at::all"));
+    }
+
+    #[test]
+    fn empty_function_id_matches_nothing() {
+        assert!(!capability_pattern_matches("*", ""));
+        assert!(!capability_granted(&["*"], ""));
+    }
+
+    #[test]
+    fn prefix_matching_is_not_used() {
+        // `starts_with` semantics would have granted all four of these.
+        assert!(!capability_granted(&["memory"], "memory::store"));
+        assert!(!capability_granted(&["memory::st"], "memory::store"));
+        assert!(!capability_granted(&["mem"], "memory::store"));
+        assert!(!capability_granted(&["workflow::run"], "workflow::runner"));
+    }
+
+    #[test]
+    fn exact_ids_match() {
+        assert!(capability_granted(&["memory::store"], "memory::store"));
+        assert!(!capability_granted(&["memory::store"], "memory::recall"));
+    }
+
+    #[test]
+    fn wildcard_segment_matches_one_namespace() {
+        assert!(capability_granted(&["memory::*"], "memory::store"));
+        assert!(capability_granted(&["memory::*"], "memory::session::list"));
+        assert!(!capability_granted(&["memory::*"], "memoryx::store"));
+        assert!(!capability_granted(&["memory::*"], "memory"));
+    }
+
+    #[test]
+    fn bare_wildcard_matches_ordinary_ids_only() {
+        assert!(capability_granted(&["*"], "memory::store"));
+        assert!(capability_granted(&["*"], "workflow::run"));
+        // ... but never a deny-by-default id.
+        assert!(!capability_granted(&["*"], "shell::exec"));
+    }
+
+    #[test]
+    fn middle_wildcard_segment_matches() {
+        assert!(capability_pattern_matches("a::*::c", "a::b::c"));
+        assert!(!capability_pattern_matches("a::*::c", "a::b::d"));
+        assert!(!capability_pattern_matches("a::*::c", "a::c"));
+    }
+
+    #[test]
+    fn deny_by_default_namespaces_need_an_exact_entry() {
+        for function_id in [
+            "shell::exec",
+            "shell::fs::write",
+            "bridge::invoke",
+            "mcp::connect",
+            "hook::register",
+            "cron::create",
+            "vault::get",
+            "state::set",
+            "engine::functions::list",
+            "code::write",
+            "harness::spawn",
+            "browser::navigate",
+            "wasm::run",
+            "coder::apply",
+        ] {
+            assert!(
+                is_privileged_function(function_id),
+                "{function_id} must be deny-by-default"
+            );
+            assert!(
+                !capability_granted(&["*"], function_id),
+                "bare wildcard must not grant {function_id}"
+            );
+            let namespace = function_id.split("::").next().unwrap();
+            let namespace_glob = format!("{namespace}::*");
+            assert!(
+                !capability_granted(&[namespace_glob.as_str()], function_id),
+                "{namespace_glob} must not grant {function_id}"
+            );
+            assert!(
+                capability_granted(&[function_id], function_id),
+                "an exact entry must grant {function_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_namespaces_are_not_privileged() {
+        for function_id in [
+            "memory::store",
+            "workflow::run",
+            "agent::chat",
+            "session::create",
+        ] {
+            assert!(!is_privileged_function(function_id));
+        }
+    }
+
+    #[test]
+    fn malformed_ids_are_denied() {
+        assert!(!capability_granted(&["*"], "::"));
+        assert!(!capability_granted(&["*"], "::store"));
+        assert!(!capability_granted(&["*"], "memory::"));
+        assert!(!capability_pattern_matches("::", "::"));
+    }
+
+    #[test]
+    fn tools_are_read_from_the_canonical_record() {
+        let record = json!({ "tools": ["memory::*", "workflow::run"], "updatedAt": 1 });
+        assert_eq!(
+            tools_from_record(&record),
+            vec!["memory::*", "workflow::run"]
+        );
+        // the state-list envelope shape still resolves
+        let enveloped = json!({ "value": { "tools": ["memory::store"] } });
+        assert_eq!(tools_from_record(&enveloped), vec!["memory::store"]);
+        // the writer-side shape agent-core used to produce resolves to nothing
+        let legacy = json!({ "capabilities": { "functions": ["memory::store"] } });
+        assert!(tools_from_record(&legacy).is_empty());
+    }
+
+    #[test]
+    fn normalize_tools_produces_the_contract_shape() {
+        let tools = normalize_tools(&json!({ "tools": ["memory::*", "workflow::run"] })).unwrap();
+        assert_eq!(tools, vec!["memory::*", "workflow::run"]);
+        assert!(normalize_tools(&json!({})).is_err());
+        assert!(normalize_tools(&json!({ "tools": [1] })).is_err());
+        assert!(normalize_tools(&json!({ "tools": ["  "] })).is_err());
+    }
+
+    // --- require_auth / stream auth
+
+    #[test]
+    fn require_auth_rejects_missing_and_malformed_headers() {
+        with_api_key(Some("expected"), || {
+            assert!(require_auth(&json!({})).is_err());
+            assert!(require_auth(&json!({ "headers": {} })).is_err());
+            assert!(require_auth(&json!({ "headers": { "authorization": "expected" } })).is_err());
+            assert!(
+                require_auth(&json!({ "headers": { "authorization": "Bearer " } })).is_err(),
+                "an empty token must never authenticate"
+            );
+            assert!(
+                require_auth(&json!({ "headers": { "authorization": "Bearer expected" } })).is_ok()
+            );
+            assert!(
+                require_auth(&json!({ "headers": { "Authorization": "bearer expected" } })).is_ok(),
+                "header name and scheme are case-insensitive"
+            );
+        });
+    }
+
+    #[test]
+    fn require_auth_fails_closed_without_a_configured_key() {
+        with_api_key(None, || {
+            assert!(require_auth(&json!({ "headers": { "authorization": "Bearer x" } })).is_err());
+        });
+        with_api_key(Some(""), || {
+            assert!(require_auth(&json!({ "headers": { "authorization": "Bearer " } })).is_err());
+        });
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_slices() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn stream_auth_requires_the_bearer_and_returns_a_context() {
+        with_api_key(Some("stream-key"), || {
+            assert!(stream_auth(json!({ "addr": "127.0.0.1:5000" })).is_err());
+            let ok = stream_auth(json!({
+                "headers": { "authorization": "Bearer stream-key" },
+                "addr": "127.0.0.1:5000",
+            }))
+            .unwrap();
+            assert_eq!(ok["context"]["authenticated"], true);
+            assert_eq!(ok["context"]["addr"], "127.0.0.1:5000");
+        });
+    }
 
     #[test]
     fn test_scan_injection_ignore_previous_instructions() {
