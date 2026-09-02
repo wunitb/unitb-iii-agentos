@@ -1209,6 +1209,14 @@ mod tests {
         }))
     }
 
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
     /// A client that was never connected: `IIIClient::new` does not open a
     /// socket, so any handler that reaches `iii.trigger` would block on the
     /// SDK timeout. Every assertion below must therefore return before the
@@ -1217,73 +1225,55 @@ mod tests {
         IIIClient::new("ws://127.0.0.1:1")
     }
 
-    #[tokio::test]
-    async fn vault_get_rejects_bus_caller_without_headers() {
-        let key = "bus-caller-get";
+    #[test]
+    fn vault_get_rejects_bus_caller_without_headers() {
         let request = json!({ "key": "ANTHROPIC_API_KEY" });
-        let error = {
-            let _guard = AUTH_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            unsafe { std::env::set_var("AGENTOS_API_KEY", key) };
-            let result = vault_get(unlocked_state(), &offline_client(), request).await;
-            unsafe { std::env::remove_var("AGENTOS_API_KEY") };
-            result.unwrap_err().to_string()
-        };
+        let error = with_api_key(Some("bus-caller-get"), || {
+            block_on(vault_get(unlocked_state(), &offline_client(), request))
+        })
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("Unauthorized"),
             "bus caller must be rejected before the vault is read, got: {error}"
         );
     }
 
-    #[tokio::test]
-    async fn vault_get_rejects_wrong_bearer() {
+    #[test]
+    fn vault_get_rejects_wrong_bearer() {
         let request = json!({
             "headers": { "authorization": "Bearer not-the-key" },
             "body": { "key": "ANTHROPIC_API_KEY" },
         });
-        let error = {
-            let _guard = AUTH_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            unsafe { std::env::set_var("AGENTOS_API_KEY", "vault-get-expected") };
-            let result = vault_get(unlocked_state(), &offline_client(), request).await;
-            unsafe { std::env::remove_var("AGENTOS_API_KEY") };
-            result.unwrap_err().to_string()
-        };
+        let error = with_api_key(Some("vault-get-expected"), || {
+            block_on(vault_get(unlocked_state(), &offline_client(), request))
+        })
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("Unauthorized"), "got: {error}");
     }
 
-    #[tokio::test]
-    async fn vault_list_rejects_bus_caller_without_headers() {
-        let request = json!({});
-        let error = {
-            let _guard = AUTH_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            unsafe { std::env::set_var("AGENTOS_API_KEY", "vault-list-expected") };
-            let result = vault_list(unlocked_state(), &offline_client(), request).await;
-            unsafe { std::env::remove_var("AGENTOS_API_KEY") };
-            result.unwrap_err().to_string()
-        };
+    #[test]
+    fn vault_list_rejects_bus_caller_without_headers() {
+        let error = with_api_key(Some("vault-list-expected"), || {
+            block_on(vault_list(unlocked_state(), &offline_client(), json!({})))
+        })
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("Unauthorized"),
             "bus caller must be rejected before the key list is read, got: {error}"
         );
     }
 
-    #[tokio::test]
-    async fn vault_list_rejects_wrong_bearer() {
+    #[test]
+    fn vault_list_rejects_wrong_bearer() {
         let request = json!({ "headers": { "authorization": "Bearer nope" } });
-        let error = {
-            let _guard = AUTH_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            unsafe { std::env::set_var("AGENTOS_API_KEY", "vault-list-expected-2") };
-            let result = vault_list(unlocked_state(), &offline_client(), request).await;
-            unsafe { std::env::remove_var("AGENTOS_API_KEY") };
-            result.unwrap_err().to_string()
-        };
+        let error = with_api_key(Some("vault-list-expected-2"), || {
+            block_on(vault_list(unlocked_state(), &offline_client(), request))
+        })
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("Unauthorized"), "got: {error}");
     }
 
