@@ -145,18 +145,26 @@ bash scripts/dev-up.sh
 and its recorded digest matches, and waits for schema-v6 `memory::health`. Any memworkr problem degrades to
 a warning; the AgentOS workers keep running.
 
-Install the canonical iii Desktop chat graph and console worker against the running engine:
+### Desktop chat console (opt-in)
+
+The tracked `config.yaml` does **not** boot the `console` worker. iii console 1.9.16 has no `host` key: it
+binds `0.0.0.0:3113` and proxies `/ws` to the iii bus, which has no authentication of its own, so on a host
+with a tailnet or LAN address that is a remotely reachable chat UI in front of the bus. Enable it only when
+you accept that, and block 3113 at the host firewall:
 
 ```bash
+# add under `workers:` in config.yaml
+#   - name: console
 bash scripts/desktop-up.sh
 ```
 
-`desktop-up.sh` runs `iii worker verify --strict` (config.yaml and iii.lock must agree for this platform)
-and then `iii worker sync`, which installs the registry workers exactly as `iii.lock` pins them. It does not
-run `iii worker update`, so `iii.lock` and `config.yaml` are not rewritten. This registry `console` worker
-serves the chat workspace on `http://127.0.0.1:3113` and is what `iii-desktop` renders. Do not start the
-standalone `iii-console` binary on port 3113: that binary is the developer operations console, redirects `/`
-to `/workers`, and has no Chat route.
+`desktop-up.sh` refuses immediately, naming the exposure, when the entry is absent — it does not install
+artifacts and then poll a port nothing will answer. With the entry present it runs `iii worker verify
+--strict` (config.yaml and iii.lock must agree for this platform) and then `iii worker sync`, which installs
+the registry workers exactly as `iii.lock` pins them. It does not run `iii worker update`, so `iii.lock` and
+`config.yaml` are not rewritten. The registry `console` worker serves the chat workspace on port 3113 and is
+what `iii-desktop` renders. Do not start the standalone `iii-console` binary on that port: it is the
+developer operations console, redirects `/` to `/workers`, and has no Chat route.
 
 Diagnose failures with:
 
@@ -204,8 +212,8 @@ Public path:
 
 ```bash
 curl -fsS http://127.0.0.1:3111/api/health
-curl -fsS http://127.0.0.1:3113/
 ./target/release/agentos doctor
+curl -fsS http://127.0.0.1:3113/    # only when you opted into the console worker
 ```
 
 Additions, only when you installed them:

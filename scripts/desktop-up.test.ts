@@ -41,9 +41,16 @@ async function startConsole(mode: "ready" | "redirect" | "absent"): Promise<stri
   return `http://127.0.0.1:${address.port}`;
 }
 
-async function runDesktopUp(mode: "ready" | "redirect" | "absent"): Promise<DesktopResult> {
+async function runDesktopUp(
+  mode: "ready" | "redirect" | "absent",
+  options: { consoleEnabled?: boolean } = {},
+): Promise<DesktopResult> {
   const root = await mkdtemp(join(tmpdir(), "agentos-desktop-up-"));
   fixtureRoots.push(root);
+
+  // The engine config decides whether the console worker boots at all.
+  const workers = ["  - name: state", ...(options.consoleEnabled === false ? [] : ["  - name: console"])];
+  await writeFile(join(root, "config.yaml"), `workers:\n${workers.join("\n")}\n`);
 
   const scriptPath = join(root, "scripts", "desktop-up.sh");
   const stubDir = join(root, "stub");
@@ -128,6 +135,18 @@ describe("desktop-up console install", () => {
 
     expect(exitCode).toBe(0);
     expect(stdout).toContain("iii desktop chat console ready");
+  });
+
+  it("says so at once when the console worker is not enabled in config.yaml", async () => {
+    const { exitCode, stderr, iiiCalls } = await runDesktopUp("absent", { consoleEnabled: false });
+
+    // Without this the script installs artifacts and then polls a dead port for
+    // 60 seconds before failing with no explanation.
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("console is not enabled");
+    expect(stderr).toContain("0.0.0.0:3113");
+    expect(stderr).toContain("- name: console");
+    expect(iiiCalls).toEqual([]);
   });
 
   it("refuses to run when the standalone iii-console squats on the port", async () => {

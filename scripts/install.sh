@@ -70,17 +70,71 @@ adopt_runtime_state() {
   done
 }
 
+# Security policy files are release-governed, not operator overrides: an upgrade
+# must be able to close a hole on a box that was installed before the fix.
+RELEASE_GOVERNED_PATHS=(config/shell.yaml config/iii-stream.yaml config/console.yaml)
+
+# Worker entries the release stopped booting on purpose. `shell` puts
+# shell::exec/coder::* on the bus; `console` (1.9.16) has no host key, so it
+# binds 0.0.0.0 and proxies /ws to that same unauthenticated bus. An adopted
+# config.yaml that still lists them would carry the hole across the upgrade.
+UNSAFE_WORKER_ENTRIES=(shell console)
+
+# Drops one `- name: <worker>` list entry and the block indented under it,
+# leaving every other line untouched.
+strip_worker_entry() {
+  awk -v worker="$1" '
+    BEGIN { skip = 0; entry_indent = 0 }
+    {
+      if (skip) {
+        if ($0 ~ /^[ \t]*$/) { print; next }
+        match($0, /^[ \t]*/)
+        if (RLENGTH > entry_indent) { next }
+        skip = 0
+      }
+      if ($0 ~ "^[ \t]*-[ \t]*name:[ \t]*" worker "[ \t]*$") {
+        match($0, /^[ \t]*/)
+        entry_indent = RLENGTH
+        skip = 1
+        next
+      }
+      print
+    }
+  '
+}
+
 apply_release_security_defaults() {
     local release_runtime="$1"
     local installed_runtime="$2"
-    local relative_path="config/shell.yaml"
+    local relative_path
+    local worker
+    local config="$installed_runtime/config.yaml"
+    local removed=""
+    local stripped
 
-    # Security policy files are release-governed, not operator overrides. Apply
-    # them after adopting state so upgrades cannot retain an unjailed shell.
-    if [ -f "$release_runtime/$relative_path" ]; then
-        mkdir -p "$(dirname "$installed_runtime/$relative_path")"
-        cp "$release_runtime/$relative_path" "$installed_runtime/$relative_path"
-    fi
+    for relative_path in "${RELEASE_GOVERNED_PATHS[@]}"; do
+        if [ -f "$release_runtime/$relative_path" ]; then
+            mkdir -p "$(dirname "$installed_runtime/$relative_path")"
+            cp "$release_runtime/$relative_path" "$installed_runtime/$relative_path"
+        fi
+    done
+
+    [ -f "$config" ] || return 0
+    for worker in "${UNSAFE_WORKER_ENTRIES[@]}"; do
+        if grep -Eq "^[[:space:]]*-[[:space:]]*name:[[:space:]]*${worker}[[:space:]]*$" "$config"; then
+            removed="${removed}${removed:+, }${worker}"
+        fi
+    done
+    [ -n "$removed" ] || return 0
+
+    cp "$config" "$config.bak"
+    for worker in "${UNSAFE_WORKER_ENTRIES[@]}"; do
+        stripped="$(strip_worker_entry "$worker" < "$config")" || return 1
+        printf '%s\n' "$stripped" > "$config"
+    done
+    warn "Removed release-governed worker entries from ${config}: ${removed}"
+    warn "  they expose an arbitrary-command sink and a 0.0.0.0 web console on an unauthenticated bus"
+    warn "  your previous file is kept at ${config}.bak; every other entry was left untouched"
 }
 
 download_and_install() {
