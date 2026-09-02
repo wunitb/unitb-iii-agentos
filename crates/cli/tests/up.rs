@@ -67,6 +67,8 @@ struct Fixture {
     release: PathBuf,
     tui_marker: PathBuf,
     tui_env: PathBuf,
+    bus_auth_env: PathBuf,
+    bus_auth_pid: PathBuf,
 }
 
 impl Fixture {
@@ -97,6 +99,8 @@ impl Fixture {
         let worker_env = root.join("worker.env");
         let tui_marker = root.join("tui.started");
         let tui_env = root.join("tui.env");
+        let bus_auth_env = root.join("bus-auth.env");
+        let bus_auth_pid = root.join("bus-auth.pid");
         write_executable(
             &bin.join("iii"),
             &format!(
@@ -125,6 +129,8 @@ impl Fixture {
             release,
             tui_marker,
             tui_env,
+            bus_auth_env,
+            bus_auth_pid,
         }
     }
 
@@ -150,6 +156,28 @@ impl Fixture {
     /// Replaces the worker with one that dies straight after being spawned.
     fn with_failing_worker(&self) {
         write_executable(&self.release.join("agentos-echo"), "#!/bin/sh\nexit 3\n");
+    }
+
+    /// Arms bus RBAC in the runtime config and installs a fake
+    /// `agentos-bus-authd` that records its argv and environment, then holds
+    /// the port the way the real daemon does.
+    fn with_bus_auth(&self, addr: &str) {
+        fs::write(
+            self.runtime.join("config.yaml"),
+            format!(
+                "workers:\n  - name: iii-worker-manager\n    config:\n      rbac:\n        auth_function_id: agentos::bus_auth\n  - name: iii-bridge\n    config:\n      url: ws://{addr}\n"
+            ),
+        )
+        .expect("write armed config");
+        let port = addr.rsplit(':').next().unwrap_or("0").to_string();
+        write_executable(
+            &self.release.join("agentos-bus-authd"),
+            &format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$AGENTOS_API_KEY\" > '{}'\necho $$ > '{}'\nexec python3 -c \"import socket,time\ns=socket.socket()\ns.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\ns.bind(('127.0.0.1',{port}))\ns.listen()\ntime.sleep(60)\"\n",
+                self.bus_auth_env.display(),
+                self.bus_auth_pid.display()
+            ),
+        );
     }
 
     /// A clean machine: the dotenv ships `AGENTOS_API_KEY` empty, exactly as
@@ -239,6 +267,11 @@ impl Fixture {
 
     fn cleanup(self) {
         self.stop_worker();
+        if let Ok(pid) = fs::read_to_string(&self.bus_auth_pid)
+            && let Ok(pid) = pid.trim().parse::<i32>()
+        {
+            terminate(pid);
+        }
         fs::remove_dir_all(&self.root).expect("remove temporary directory");
     }
 }
@@ -562,6 +595,94 @@ fn start_loads_the_active_dotenv_and_generates_the_api_key() {
         .expect("AGENTOS_API_KEY assignment");
     assert_eq!(key.len(), 64, "start must generate the machine key too");
     assert_eq!(fixture.dotenv_mode(), 0o600);
+
+    fixture.cleanup();
+}
+
+/// Bus RBAC is fail-closed: iii 0.22.1 calls the auth function for every bus
+/// connection, so the daemon has to be listening before the engine starts.
+#[test]
+fn up_starts_the_bus_auth_daemon_with_the_generated_key() {
+    let fixture = Fixture::new("bus-auth");
+    if Command::new("python3")
+        .arg("--version")
+        .output()
+        .map(|output| !output.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipped: python3 is needed to hold the daemon port");
+        fixture.cleanup();
+        return;
+    }
+    fixture.with_empty_api_key();
+    let addr = "127.0.0.1:49529";
+    fixture.with_bus_auth(addr);
+
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_agentos"));
+    let output = Command::new(&cli)
+        .args(["up", "--no-tui", "--timeout", "5"])
+        .env("PATH", fixture.path_with_engine())
+        .env("HOME", &fixture.home)
+        .env("AGENTOS_HOME", &fixture.home)
+        .env("AGENTOS_CONFIG", fixture.runtime.join("config.yaml"))
+        .env("AGENTOS_BUS_AUTH_ADDR", addr)
+        .env_remove("AGENTOS_API_KEY")
+        .current_dir(&fixture.root)
+        .output()
+        .expect("run agentos up");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        wait_for_file(&fixture.bus_auth_env),
+        "the daemon never started: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recorded = fs::read_to_string(&fixture.bus_auth_env).expect("read daemon environment");
+    let (listen, key) = recorded
+        .trim()
+        .split_once('|')
+        .expect("daemon recorded --listen and the key");
+    assert_eq!(listen, format!("--listen={addr}"));
+    // It refuses to start without the key, so `up` must generate it first.
+    assert_eq!(
+        key,
+        fixture
+            .dotenv_value("AGENTOS_API_KEY")
+            .expect("generated key")
+            .as_str()
+    );
+    assert!(stdout.contains(&format!("listening on {addr}")), "{stdout}");
+
+    fixture.cleanup();
+}
+
+/// An armed config with no daemon binary cannot boot: the engine refuses every
+/// bus connection. Saying so beats 62 workers failing for no stated reason.
+#[test]
+fn up_refuses_an_armed_gate_without_the_daemon_binary() {
+    let fixture = Fixture::new("bus-auth-missing");
+    let addr = "127.0.0.1:49531";
+    fixture.with_bus_auth(addr);
+    fs::remove_file(fixture.release.join("agentos-bus-authd")).expect("remove fake daemon");
+
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_agentos"));
+    let output = Command::new(&cli)
+        .args(["up", "--no-tui", "--timeout", "2"])
+        .env("PATH", fixture.path_with_engine())
+        .env("HOME", &fixture.home)
+        .env("AGENTOS_HOME", &fixture.home)
+        .env("AGENTOS_CONFIG", fixture.runtime.join("config.yaml"))
+        .env("AGENTOS_BUS_AUTH_ADDR", addr)
+        .env_remove("AGENTOS_API_KEY")
+        .current_dir(&fixture.root)
+        .output()
+        .expect("run agentos up");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("agentos-bus-authd"), "{stderr}");
+    assert!(stderr.contains("refuses every bus connection"), "{stderr}");
+    assert!(!fixture.worker_pid.exists(), "workers started anyway");
 
     fixture.cleanup();
 }

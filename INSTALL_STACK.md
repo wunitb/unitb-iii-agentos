@@ -141,6 +141,18 @@ cd "$HOME/unitb-stack/unitb-iii-agentos"
 bash scripts/dev-up.sh
 ```
 
+If `config.yaml` arms bus RBAC (`rbac.auth_function_id`), `agentos-bus-authd` must be listening **before**
+the engine starts: iii 0.22.1 calls the auth function for every bus connection, so with the gate armed and
+no daemon the engine refuses every worker. `agentos up` and `agentos start` start it first and stop it with
+the stack. In the two-terminal flow above, start it before the engine:
+
+```bash
+./target/release/agentos-bus-authd --listen=127.0.0.1:49129 &   # must match iii-bridge url in config.yaml
+```
+
+`scripts/dev-up.sh` also starts it when it is not already listening; the engine's `iii-bridge` retries, so a
+late daemon only costs the connections made in that window. It refuses to start without `AGENTOS_API_KEY`.
+
 `dev-up.sh` starts every release worker binary, then starts memworkr only when a synced version is active
 and its recorded digest matches, and waits for schema-v6 `memory::health`. Any memworkr problem degrades to
 a warning; the AgentOS workers keep running.
