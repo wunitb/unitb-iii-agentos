@@ -137,6 +137,15 @@ concurrent callers from crossing the per-channel post limit.
 
 The transport is **buffered, not token streaming**. `stream::sse` frames an answer that is already complete, and responses label themselves `x-agentos-stream: buffered`. Incremental delivery needs a streaming provider driver in `llm-router`, which does not exist yet; until it does, no document here should describe AgentOS as streaming tokens.
 
+## Stream joins are gated, and the gate fails open
+
+`workers/streaming` registers `stream::authorize_join` on the engine's `stream:join` trigger. It is deny-by-default: a join is authorized only when the handshake left an authenticated context on the connection — `authenticated` literally `true` plus a non-empty `subject`, which is what `security::stream_auth` returns for a valid AgentOS bearer. No context, a context that is not an object, or a missing subject is refused before the subscription is inserted.
+
+Two limits, stated rather than papered over:
+
+- **The engine fails open around it.** In iii 0.22.1 a failing `auth_function` is only logged and the socket is upgraded anyway with `context: None`, and an `Err` from the `stream:join` trigger call is likewise logged while the join proceeds. A slow, crashed or unregistered `streaming` worker therefore means joins are **allowed**, not denied.
+- **So the loopback bind is load-bearing.** `config/iii-stream.yaml` sets `host: 127.0.0.1`; this gate is defence in depth behind that bind, not a replacement for it. Widening the bind re-exposes the socket to anything that can reach the host, fail-open and all.
+
 ## Surfaces (cli, tui)
 
 `crates/cli` and `crates/tui` are clients, not workers. They speak HTTP to `iii-http` on port 3111. They register no functions. HTTP routes fail closed: protected routes require a non-empty `AGENTOS_API_KEY`; only triggers explicitly declaring `auth: false` bypass authentication, and there is no process-wide disable switch. Future work moves them onto the iii client SDK so they call workers via `iii.trigger` directly.
