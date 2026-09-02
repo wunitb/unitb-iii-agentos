@@ -21,12 +21,21 @@ interface KnownCollision {
   readonly reason: string;
 }
 
+<<<<<<< HEAD
 // TEMPORARY. Recorded 2026-09-02 by the eng-gates remediation, which does not own
 // either file. Both fixes are requested in
 // /tmp/agentos-remediation/requests/eng-gates.md. Delete the entry, do not edit it.
 // Both 2026-09-02 entries were fixed on wp/state-api-sweep before this branch was
 // integrated: context-monitor now registers context::trim_micro, and a2a-cards now
 // serves GET /api/a2a/agent-card. The allowlist is empty and must stay that way.
+=======
+// EMPTY, and that is the point. Two collisions were recorded here on 2026-09-02 —
+// `context::trim` (context-manager and context-monitor) and
+// `GET /.well-known/agent.json` (a2a and a2a-cards). state-api-sweep fixed both
+// (`context::trim_micro`, `GET /api/a2a/agent-card`), so the entries were deleted.
+// The suite below fails if an entry outlives its collision, so this list can only
+// ever shrink. Adding to it needs a date, an owning file and a reason.
+>>>>>>> wp/eng-gates
 const KNOWN_DUPLICATE_FUNCTION_IDS: KnownCollision[] = [];
 
 const KNOWN_DUPLICATE_HTTP_ROUTES: KnownCollision[] = [];
@@ -87,8 +96,10 @@ describe("worker registration uniqueness", () => {
   });
 
   it("never lets the allowlist grow past the 2026-09-02 baseline", () => {
-    expect(KNOWN_DUPLICATE_FUNCTION_IDS.length).toBeLessThanOrEqual(1);
-    expect(KNOWN_DUPLICATE_HTTP_ROUTES.length).toBeLessThanOrEqual(1);
+    // Ratcheted from 1 and 1 on 2026-09-02 to 0 and 0 once state-api-sweep landed.
+    // Raising either number is a decision, not a fix.
+    expect(KNOWN_DUPLICATE_FUNCTION_IDS.length).toBe(0);
+    expect(KNOWN_DUPLICATE_HTTP_ROUTES.length).toBe(0);
     expectAllowlistIsSound(KNOWN_DUPLICATE_FUNCTION_IDS);
     expectAllowlistIsSound(KNOWN_DUPLICATE_HTTP_ROUTES);
   });

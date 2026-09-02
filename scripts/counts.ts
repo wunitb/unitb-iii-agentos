@@ -38,22 +38,132 @@ function read(relativePath: string): string {
   return readFileSync(join(repositoryRoot, relativePath), "utf8");
 }
 
-function listRustSources(): string[] {
+function listSources(extension: string, roots: readonly string[] = SOURCE_ROOTS): string[] {
   const found: string[] = [];
   const walk = (relativeDirectory: string): void => {
     for (const entry of readdirSync(join(repositoryRoot, relativeDirectory))) {
       if (SKIP_DIRECTORIES.has(entry)) continue;
       const relativePath = join(relativeDirectory, entry);
       if (statSync(join(repositoryRoot, relativePath)).isDirectory()) walk(relativePath);
-      else if (entry.endsWith(".rs")) found.push(relativePath);
+      else if (entry.endsWith(extension)) found.push(relativePath);
     }
   };
-  for (const root of SOURCE_ROOTS) walk(root);
+  for (const root of roots) walk(root);
   return found.sort();
+}
+
+function listRustSources(): string[] {
+  return listSources(".rs");
+}
+
+/** Shipped Python workers. `test_*.py` is not shipped, so it is not scanned. */
+function listPythonSources(): string[] {
+  return listSources(".py", ["workers"]).filter((file) => {
+    const name = file.slice(file.lastIndexOf("/") + 1);
+    return !name.startsWith("test_") && !name.endsWith("_test.py");
+  });
+}
+
+/** The crate a source file belongs to, e.g. `workers/memory`. */
+function crateOf(file: string): string {
+  return file.split("/").slice(0, 2).join("/");
 }
 
 function countMatches(haystack: string, pattern: RegExp): number {
   return haystack.match(pattern)?.length ?? 0;
+}
+
+/**
+ * Blanks every Rust comment, preserving byte offsets and line numbers.
+ *
+ * Reference documentation is the natural place to write the WRONG shape down
+ * ("the engine wants `ops`, not `operations`"), so a scanner that reads comments
+ * flags the very documentation that exists to prevent the mistake — and the
+ * cheapest way to make it green is to delete the documentation. It also must not
+ * mistake the `//` in `"ws://localhost:49134"` for a comment, or it would blank
+ * real code and miss real defects, so this walks strings, char literals and raw
+ * strings rather than pattern-matching.
+ */
+export function withoutComments(source: string): string {
+  const out = source.split("");
+  const blank = (from: number, to: number): void => {
+    for (let index = from; index < to && index < out.length; index += 1) {
+      if (out[index] !== "\n") out[index] = " ";
+    }
+  };
+
+  let index = 0;
+  while (index < source.length) {
+    const two = source.slice(index, index + 2);
+
+    if (two === "//") {
+      const end = source.indexOf("\n", index);
+      const stop = end < 0 ? source.length : end;
+      blank(index, stop);
+      index = stop;
+      continue;
+    }
+
+    if (two === "/*") {
+      let depth = 0;
+      let cursor = index;
+      while (cursor < source.length) {
+        if (source.startsWith("/*", cursor)) {
+          depth += 1;
+          cursor += 2;
+          continue;
+        }
+        if (source.startsWith("*/", cursor)) {
+          depth -= 1;
+          cursor += 2;
+          if (depth === 0) break;
+          continue;
+        }
+        cursor += 1;
+      }
+      blank(index, cursor);
+      index = cursor;
+      continue;
+    }
+
+    // Raw string: r"..." / r#"..."# / br##"..."## — no escapes inside.
+    const raw = /^b?r(#*)"/.exec(source.slice(index, index + 16));
+    if (raw) {
+      const hashes = raw[1]!;
+      const open = index + raw[0].length;
+      const close = source.indexOf(`"${hashes}`, open);
+      index = close < 0 ? source.length : close + 1 + hashes.length;
+      continue;
+    }
+
+    if (source[index] === '"') {
+      let cursor = index + 1;
+      while (cursor < source.length) {
+        if (source[cursor] === "\\") {
+          cursor += 2;
+          continue;
+        }
+        if (source[cursor] === '"') {
+          cursor += 1;
+          break;
+        }
+        cursor += 1;
+      }
+      index = cursor;
+      continue;
+    }
+
+    // A char literal, but not a lifetime: 'a' and '\n' are literals, 'a is not.
+    const char = /^'(\\.|[^\\'])'/.exec(source.slice(index, index + 8));
+    if (char) {
+      index += char[0].length;
+      continue;
+    }
+
+    index += 1;
+  }
+
+  return out.join("");
 }
 
 /**
@@ -178,27 +288,114 @@ export function collectWorkers(): WorkerRecord[] {
   return workers;
 }
 
+/** `const NAME: &str = "value";` and the `static` form, as a name -> value map. */
+export function rustStringConstants(text: string): Map<string, string> {
+  const constants = new Map<string, string>();
+  for (const match of text.matchAll(
+    /(?:const|static)\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*&(?:'static\s+)?str\s*=\s*"([^"]*)"\s*;/g,
+  )) {
+    constants.set(match[1]!, match[2]!);
+  }
+  return constants;
+}
+
 /**
- * Literal `register_function("id", ...)` call sites. Two further call sites build
- * their id at runtime (`workers/hand-runner` per hand, `crates/http-adapter` per
- * adapter) and are deliberately not counted as declared ids.
+ * Ids registered by one Rust source: string literals, plus identifiers resolved
+ * through `constants`. An identifier with no known value is skipped here and
+ * reported by `collectUnresolvedRegistrations()`.
+ */
+export function rustRegistrationIds(
+  text: string,
+  constants: Map<string, string>,
+): Array<{ id: string; line: number }> {
+  const found: Array<{ id: string; line: number }> = [];
+  for (const match of text.matchAll(/register_function\(\s*&?([A-Za-z_][A-Za-z0-9_:]*|"[^"]+")/g)) {
+    const token = match[1]!;
+    const line = lineOf(text, match.index);
+    if (token.startsWith('"')) {
+      found.push({ id: token.slice(1, -1), line });
+      continue;
+    }
+    const bare = token.includes("::") ? token.slice(token.lastIndexOf(":") + 1) : token;
+    const resolved = constants.get(bare);
+    if (resolved !== undefined) found.push({ id: resolved, line });
+  }
+  return found;
+}
+
+/**
+ * Every function id this workspace registers, from all three shapes it uses:
+ *
+ *  - a literal in Rust: `register_function("agent::chat", ...)`;
+ *  - a `const`/`static &str` in Rust: `register_function(STREAM_JOIN_FUNCTION, ...)`,
+ *    resolved from the same file first and then the rest of the crate;
+ *  - a literal in the Python worker: `iii.register_function("embedding::generate", ...)`.
+ *
+ * Two call sites build their id at runtime — `workers/hand-runner` per hand and
+ * `crates/http-adapter` per adapter — so they have no id to count.
+ * `collectUnresolvedRegistrations()` lists them, and a test pins that list, so a
+ * NEW unresolved shape shows up as a failure instead of quietly shrinking the
+ * count. A truth source that under-reports is worse than none, because
+ * everything downstream looks green.
  */
 export function collectRegistrations(): RegistrationSite[] {
   const sites: RegistrationSite[] = [];
-  for (const file of listRustSources()) {
-    const text = withoutTestModules(read(file));
+  const perFile = new Map<string, Map<string, string>>();
+  const perCrate = new Map<string, Map<string, string>>();
+
+  const rustFiles = listRustSources().map((file) => ({
+    file,
+    text: withoutComments(withoutTestModules(read(file))),
+  }));
+
+  for (const { file, text } of rustFiles) {
+    const constants = rustStringConstants(text);
+    perFile.set(file, constants);
+    const crate = perCrate.get(crateOf(file)) ?? new Map<string, string>();
+    for (const [name, value] of constants) crate.set(name, value);
+    perCrate.set(crateOf(file), crate);
+  }
+
+  for (const { file, text } of rustFiles) {
+    const constants = new Map([
+      ...(perCrate.get(crateOf(file)) ?? new Map<string, string>()),
+      ...(perFile.get(file) ?? new Map<string, string>()),
+    ]);
+    for (const found of rustRegistrationIds(text, constants)) {
+      sites.push({ id: found.id, file, line: found.line });
+    }
+  }
+
+  for (const file of listPythonSources()) {
+    const text = read(file);
     for (const match of text.matchAll(/register_function\(\s*"([^"]+)"/g)) {
       sites.push({ id: match[1]!, file, line: lineOf(text, match.index) });
     }
   }
+
   return sites;
+}
+
+/** `register_function` call sites whose id this extractor cannot name. */
+export function collectUnresolvedRegistrations(): Array<{ file: string; line: number; argument: string }> {
+  const unresolved: Array<{ file: string; line: number; argument: string }> = [];
+  const resolvable = new Set(collectRegistrations().map((site) => `${site.file}:${site.line}`));
+  for (const file of listRustSources()) {
+    const text = withoutComments(withoutTestModules(read(file)));
+    for (const match of text.matchAll(/register_function\(\s*([^,\n]{0,60})/g)) {
+      const line = lineOf(text, match.index);
+      if (resolvable.has(`${file}:${line}`)) continue;
+      unresolved.push({ file, line, argument: match[1]!.trim() });
+    }
+  }
+  return unresolved;
 }
 
 /** `"<METHOD> <api_path>"` for every literal HTTP trigger registered by a worker. */
 export function collectHttpRoutes(): RouteSite[] {
   const routes: RouteSite[] = [];
   for (const file of listRustSources()) {
-    const text = withoutTestModules(read(file));
+    const text = withoutComments(withoutTestModules(read(file)));
     for (const match of text.matchAll(/json!\(\{[^}]*"api_path"[^}]*\}\)/g)) {
       const body = match[0];
       const path = /"api_path"\s*:\s*"([^"]*)"/.exec(body)?.[1];
@@ -625,6 +822,7 @@ function report(counts: Counts): string {
     `register_function sites    ${counts.functionRegistrationCount} literal`,
     `distinct function ids      ${counts.functionIdCount}`,
     `duplicate function ids     ${counts.duplicateFunctionIds.size}`,
+    `unresolved registrations   ${collectUnresolvedRegistrations().length} (runtime-built ids)`,
     `http routes                ${counts.httpRoutes.length} literal`,
     `duplicate http routes      ${counts.duplicateHttpRoutes.size}`,
     `rust test attributes       ${counts.rustTestAttributes} (${counts.ignoredRustTests} ignored)`,
@@ -659,6 +857,7 @@ function main(argv: string[]): number {
           functionRegistrations: counts.functionRegistrationCount,
           functionIds: counts.functionIdCount,
           duplicateFunctionIds: [...counts.duplicateFunctionIds.keys()],
+          unresolvedRegistrations: collectUnresolvedRegistrations(),
           duplicateHttpRoutes: [...counts.duplicateHttpRoutes.keys()],
           rustTestAttributes: counts.rustTestAttributes,
           ignoredRustTests: counts.ignoredRustTests,

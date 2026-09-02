@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { withoutComments } from "../scripts/counts";
 
 /**
  * Three `state::*` protocol mistakes were repo-wide, silent, and shipped for
@@ -67,7 +68,19 @@ function enclosingObject(source: string, index: number): string {
   return source.slice(start, end + 1);
 }
 
-const sources = rustSources().map((file) => ({ file, text: readFileSync(join(repositoryRoot, file), "utf8") }));
+/**
+ * Comments are stripped before matching, offsets preserved.
+ *
+ * `crates/http-adapter/src/state.rs` documents the three wrong shapes as
+ * counterexamples, which is exactly the documentation that stops the mistake
+ * recurring. A scanner that reads it reports the cure as the disease, and the
+ * cheapest way to get green is then to delete the documentation — the failure
+ * mode this whole remediation exists to fight.
+ */
+const sources = rustSources().map((file) => ({
+  file,
+  text: withoutComments(readFileSync(join(repositoryRoot, file), "utf8")),
+}));
 
 /** How far after a `"state::update"` literal its `json!` payload can reasonably reach. */
 const PAYLOAD_WINDOW = 900;
@@ -134,5 +147,72 @@ describe("state::update wire protocol", () => {
     expect(scan((batch) => batch.flatMap(({ text }) => (/"operations"\s*:/.test(text) ? ["bad"] : [])))).toEqual([]);
     expect(/"by"\s*:/.test(enclosingObject(good, good.indexOf('"increment"')))).toBe(true);
     expect(/"value"\s*:\s*\[/.test(enclosingObject(good, good.indexOf('"merge"')))).toBe(false);
+  });
+});
+
+describe("state:: scanner", () => {
+  const wrongUpdate = 'let payload = json!({ "scope": "s", "key": "k", "operations": [] });';
+  const wrongIncrement = 'let op = json!({ "type": "increment", "path": "n", "value": 1 });';
+  const wrongMerge = 'let op = json!({ "type": "merge", "path": "m", "value": [1] });';
+  const withUpdateId = (line: string) => `let id = "state::update".to_string();\n${line}\n`;
+
+  function scan(text: string): { operations: boolean; increment: boolean; merge: boolean } {
+    const stripped = withoutComments(text);
+    return {
+      operations: /"state::update"[\s\S]{0,900}?"operations"\s*:/.test(stripped),
+      increment: [...stripped.matchAll(/"type"\s*:\s*"increment"/g)].some(
+        (match) => !/"by"\s*:/.test(enclosingObject(stripped, match.index)),
+      ),
+      merge: [...stripped.matchAll(/"type"\s*:\s*"merge"/g)].some((match) =>
+        /"value"\s*:\s*\[/.test(enclosingObject(stripped, match.index)),
+      ),
+    };
+  }
+
+  it("does not flag a documented counterexample inside a comment", () => {
+    const documented = [
+      "//! The engine's `state::*` wire shapes.",
+      "//!",
+      '//! $ iii trigger "state::update" --json \'{"scope":"t","operations":[...]}\'',
+      "//! Error: serialization error: missing field `ops`",
+      '//! { "type": "increment", "path": "n", "value": 1 }   # wrong: it is `by`',
+      '//! { "type": "merge", "path": "m", "value": [1] }      # wrong: merge takes an object',
+      "",
+      '/* Block form, and /* nested */ too:',
+      '   json!({ "state::update": 1, "operations": [] })',
+      "*/",
+      'let good = json!({ "scope": "s", "key": "k", "ops": [{ "type": "increment", "path": "n", "by": 1 }] });',
+    ].join("\n");
+
+    expect(scan(documented)).toEqual({ operations: false, increment: false, merge: false });
+  });
+
+  it("flags the same text outside a comment", () => {
+    expect(scan(withUpdateId(wrongUpdate)).operations).toBe(true);
+    expect(scan(wrongIncrement).increment).toBe(true);
+    expect(scan(wrongMerge).merge).toBe(true);
+  });
+
+  it("does not mistake a URL in a string for a comment", () => {
+    // Blanking from the `//` of a URL to end of line would hide real code and
+    // turn this scanner into a source of false negatives.
+    const source = `let url = "ws://localhost:49134";\n${withUpdateId(wrongUpdate)}`;
+    expect(withoutComments(source)).toContain('"ws://localhost:49134"');
+    expect(scan(source).operations).toBe(true);
+  });
+
+  it("keeps line numbers stable while blanking", () => {
+    const source = '// wrong: "operations"\nlet a = 1;\n/* two\n   lines */\nlet b = 2;\n';
+    const stripped = withoutComments(source);
+    expect(stripped.length).toBe(source.length);
+    expect(stripped.split("\n").length).toBe(source.split("\n").length);
+    expect(stripped).toContain("let a = 1;");
+    expect(stripped).toContain("let b = 2;");
+    expect(stripped).not.toContain("operations");
+  });
+
+  it("leaves a raw string that contains comment markers alone", () => {
+    const source = 'let s = r#"/* not a comment */ // neither"#;\n';
+    expect(withoutComments(source)).toBe(source);
   });
 });

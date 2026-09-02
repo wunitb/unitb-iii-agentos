@@ -36,7 +36,11 @@ unitb-iii-agentos/
 | Telemetry | `telemetry` `pulse` `session-lifecycle` `session-replay` `feedback` `eval` `evolve` `hashline` `hooks` `cron` | `telemetry::*` `pulse::*` `session::*` `eval::*` `feedback::*` |
 | Embeddings | `embedding` (Python) | `embedding::*` |
 
+<<<<<<< HEAD
 The source registers 295 literal function ids across 63 workers (62 Rust + 1 Python), resolving to 295 distinct function ids. `bun run counts` recomputes every number on this page from the tree; `bun run counts:check` fails the build when a published number drifts.
+=======
+The source registers 296 literal function ids across 63 workers (62 Rust + 1 Python), resolving to 295 distinct function ids. `bun run counts` recomputes every number on this page from the tree; `bun run counts:check` fails the build when a published number drifts.
+>>>>>>> wp/eng-gates
 
 ## Worker manifest
 
@@ -189,7 +193,7 @@ push with `AGENTOS_FULL_E2E_ENABLED`. The workflow starts from
 
 | job | gate |
 |---|---|
-| `rust` | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` (dev profile, 1,802 test attributes; 3 live-engine checks ignored by default) + `cargo build --workspace --release` + `cargo audit` + `cargo deny check` (advisories, bans, licences, sources — policy in `deny.toml`) |
+| `rust` | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` (dev profile, 1,805 test attributes; 3 live-engine checks ignored by default) + `cargo build --workspace --release` + `cargo audit` + `cargo deny check` (advisories, bans, licences, sources — policy in `deny.toml`) |
 | `node-unit` | `bun run typecheck`, `bun run test:unit` (tests of the software), `bun run test:governance` (build-evidence and documentation contracts), `bun run counts:check` (every published number recomputed from the tree) |
 | `dependency-review` | `actions/dependency-review-action` with `fail-on-severity: moderate`, pull requests only |
 | `portable-bundle` | stages the release payload from the `rust` artifacts and asserts the extracted bundle needs no checkout-relative path |
