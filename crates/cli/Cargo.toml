@@ -26,5 +26,5 @@ dirs = "6"
 toml.workspace = true
 urlencoding = "2"
 clap_complete = "4"
-futures-util = "0.3"
+futures-util.workspace = true
 which = "7"

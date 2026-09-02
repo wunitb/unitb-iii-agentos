@@ -27,5 +27,5 @@ uuid.workspace = true
 # The engine side of the iii-sdk WebSocket protocol. Already in Cargo.lock at
 # this exact version as a transitive dependency of `iii-sdk`, so declaring it
 # directly adds no new package to the tree.
-futures-util = "0.3"
+futures-util.workspace = true
 tokio-tungstenite = "0.28"

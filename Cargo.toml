@@ -103,6 +103,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
+futures-util = "0.3"
 # `rustls-tls` is the floor every member needs; members that also parse JSON or
 # stream bodies add those features on top of this entry.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
