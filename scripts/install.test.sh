@@ -370,17 +370,102 @@ OPERATOR
   assert_file_contains "$config.bak" "allow_unjailed: true" unsafe_entries
 }
 
+# A config that already satisfies every release-governed rule is not rewritten:
+# no backup, no reformatting, no gratuitous churn on upgrade.
 test_upgrade_keeps_a_clean_config_untouched() {
   make_release v1.0.0
   run_installer v1.0.0 || return
 
-  printf 'workers:\n  - name: state\nuser: true\n' > "$AGENTOS_HOME/runtime/config.yaml"
+  cat > "$AGENTOS_HOME/runtime/config.yaml" <<'OPERATOR'
+workers:
+  - name: iii-worker-manager
+    config:
+      host: 127.0.0.1
+  - name: state
+user: true
+OPERATOR
+  local before
+  before="$(cat "$AGENTOS_HOME/runtime/config.yaml")"
 
   make_release v2.0.0
   run_installer v2.0.0 || return
 
-  assert_file_contains "$AGENTOS_HOME/runtime/config.yaml" "user: true" clean_config
+  assert_file_content "$AGENTOS_HOME/runtime/config.yaml" "$before" clean_config
   assert_absent "$AGENTOS_HOME/runtime/config.yaml.bak" clean_config
+}
+
+# Regression: the engine bus worker is mandatory. If config.yaml does not
+# declare it the engine appends it with the default config, whose host is
+# 0.0.0.0, so an upgraded box silently exposes an unauthenticated bus to the
+# LAN and the tailnet.
+test_upgrade_pins_the_bus_worker_to_loopback() {
+  make_release v1.0.0
+  run_installer v1.0.0 || return
+
+  cat > "$AGENTOS_HOME/runtime/config.yaml" <<'OPERATOR'
+workers:
+  - name: state
+  - name: operator-worker
+user: true
+OPERATOR
+
+  make_release v2.0.0
+  run_installer v2.0.0 || return
+
+  local config="$AGENTOS_HOME/runtime/config.yaml"
+  assert_file_contains "$config" "- name: iii-worker-manager" bus_binding
+  assert_file_contains "$config" "host: 127.0.0.1" bus_binding
+  assert_file_contains "$config" "- name: operator-worker" bus_binding
+  assert_file_contains "$config" "user: true" bus_binding
+
+  # Idempotent: a second upgrade must not add a second entry.
+  make_release v3.0.0
+  run_installer v3.0.0 || return
+  local count
+  count="$(grep -cE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*iii-worker-manager[[:space:]]*$' "$config")"
+  assert_equal "$count" "1" bus_binding_idempotent
+}
+
+test_upgrade_forces_the_bus_host_and_keeps_other_keys() {
+  make_release v1.0.0
+  run_installer v1.0.0 || return
+
+  cat > "$AGENTOS_HOME/runtime/config.yaml" <<'OPERATOR'
+workers:
+  - name: iii-worker-manager
+    config:
+      host: 0.0.0.0
+      port: 49134
+      handshake_timeout_ms: 5000
+  - name: state
+OPERATOR
+
+  make_release v2.0.0
+  run_installer v2.0.0 || return
+
+  local config="$AGENTOS_HOME/runtime/config.yaml"
+  if grep -q '0\.0\.0\.0' "$config"; then
+    fail "bus_host: the 0.0.0.0 bind survived the upgrade"
+  fi
+  assert_file_contains "$config" "host: 127.0.0.1" bus_host
+  assert_file_contains "$config" "port: 49134" bus_host
+  assert_file_contains "$config" "handshake_timeout_ms: 5000" bus_host
+  assert_file_contains "$config.bak" "host: 0.0.0.0" bus_host
+}
+
+test_upgrade_leaves_a_config_without_a_worker_roster_alone() {
+  make_release v1.0.0
+  run_installer v1.0.0 || return
+
+  printf 'operator: true\n' > "$AGENTOS_HOME/runtime/config.yaml"
+
+  make_release v2.0.0
+  run_installer v2.0.0 || return
+
+  # Not an engine config: no worker roster, so nothing to pin. It must survive
+  # byte for byte.
+  assert_file_content "$AGENTOS_HOME/runtime/config.yaml" "operator: true" roster_absent
+  assert_absent "$AGENTOS_HOME/runtime/config.yaml.bak" roster_absent
 }
 
 test_upgrade_preserves_runtime_data() {
@@ -508,6 +593,9 @@ ALL_TESTS=(
   test_upgrade_applies_release_security_defaults
   test_upgrade_removes_unsafe_worker_entries_from_adopted_config
   test_upgrade_keeps_a_clean_config_untouched
+  test_upgrade_pins_the_bus_worker_to_loopback
+  test_upgrade_forces_the_bus_host_and_keeps_other_keys
+  test_upgrade_leaves_a_config_without_a_worker_roster_alone
   test_upgrade_preserves_runtime_data
   test_upgrade_preserves_runtime_dotenv
   test_upgrade_drops_stale_release_payload
