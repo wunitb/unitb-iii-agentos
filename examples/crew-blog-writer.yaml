@@ -12,6 +12,7 @@ agents:
 steps:
   - name: Research
     functionId: "agent::chat"
+    agentId: researcher
     promptTemplate: >
       Research "{{topic}}" for a blog post targeting {{audience}}.
       Provide key facts, trends, expert opinions, and article angles.
@@ -24,6 +25,7 @@ steps:
 
   - name: Draft
     functionId: "agent::chat"
+    agentId: writer
     promptTemplate: >
       Write a blog post about "{{topic}}" for {{audience}}.
       Use this research: {{research}}.
@@ -36,6 +38,7 @@ steps:
 
   - name: Edit
     functionId: "agent::chat"
+    agentId: code-reviewer
     promptTemplate: >
       Review this blog post as an editor.
       Research: {{research}}
@@ -53,6 +56,7 @@ steps:
 
   - name: Final Polish
     functionId: "agent::chat"
+    agentId: writer
     promptTemplate: >
       Apply this editor feedback to produce the final blog post:
       Draft: {{draft}}
