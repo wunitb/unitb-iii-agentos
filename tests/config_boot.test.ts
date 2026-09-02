@@ -1,28 +1,30 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 /**
- * Boots the real engine against the checkout's config.yaml.
+ * Boots the real engine against the checkout's config.yaml, on ports nobody else
+ * is using.
  *
- * This test cannot pick its own port. Verified against iii 0.22.1 on 2026-09-02:
+ * This test used to run on the pinned default bus port, so a second engine
+ * anywhere on the host made it start its external workers against THAT engine's
+ * bus and then report the result as its own. The bus is configurable, but not
+ * where you would look for it: there is no CLI flag, no top-level config key
+ * (config.yaml accepts only `modules` and `workers`) and no environment
+ * variable — `III_PORT`, `III_URL` and `III_ENGINE_URL` all leave the bind
+ * alone. It is the mandatory `iii-worker-manager` worker entry, whose
+ * `config` accepts `host`, `port`, `middleware_function_id`, `rbac` and
+ * `handshake_timeout_ms`. Omit the entry and the engine appends it with
+ * `WorkerManagerConfig::default()`, i.e. host `0.0.0.0` on port 49134.
  *
- *   - `config.yaml` accepts exactly two top-level fields. Adding any other one
- *     fails with `unknown field ..., expected `modules` or `workers``.
- *   - `iii --help` offers only `-c/--config`, `-v/--version` and
- *     `--no-update-check`. There is no port flag.
- *   - The worker listener address is the fixed literal `ws://0.0.0.0:49134`
- *     inside the binary.
- *   - Booting with `III_PORT`, `III_URL` or `III_ENGINE_URL` pointing elsewhere
- *     still binds 49134: `[ERROR] iii::workers::traits address 0.0.0.0:49134 is
- *     already in use`. Those variables address the *client* side only.
+ * Verified on iii 0.22.1: with that entry set to 127.0.0.1:49611 the engine logs
+ * `Engine listening on address: 127.0.0.1:49611` and binds it, while another
+ * engine holds 49134.
  *
- * So the engine port is global to the host. Two engines cannot coexist, and a
- * second one silently starts its external workers against the first one's bus —
- * which is how this test used to produce a red that was really somebody else's
- * engine. Since it cannot be isolated, it refuses to run rather than lie: when
- * 49134 is already taken the test is skipped with the reason in its own name.
+ * So this test rewrites the bus, HTTP and stream ports of its copied config to
+ * free ones, waits on markers in the log of the engine IT started, and addresses
+ * that engine explicitly. It shares nothing with any other engine on the host.
  */
 
 const repository = new URL("../", import.meta.url);
@@ -30,42 +32,7 @@ const expectedVersion = (
   await Bun.file(new URL(".iii-version", repository)).text()
 ).trim();
 const iii = Bun.which("iii");
-
-/** The engine's fixed worker-listener port. Not configurable in iii 0.22.1. */
-const ENGINE_PORT = 49134;
-const ENGINE_BIND_ERROR = `address 0.0.0.0:${ENGINE_PORT} is already in use`;
-
-/** True when nothing else holds the engine port, tested the way the engine binds it. */
-function enginePortIsFree(): boolean {
-  try {
-    const probe = Bun.listen({
-      hostname: "0.0.0.0",
-      port: ENGINE_PORT,
-      socket: { data() {} },
-    });
-    probe.stop(true);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const portFree = iii ? enginePortIsFree() : false;
-const skipReason = !iii
-  ? "no iii binary on PATH"
-  : portFree
-    ? ""
-    : `port ${ENGINE_PORT} is already in use by another engine, and iii ${expectedVersion} cannot bind a different one`;
-
-if (skipReason) {
-  console.warn(`config_boot: skipping the live-engine test — ${skipReason}`);
-}
-
-const liveEngineTest = skipReason ? it.skip : it;
-const testName = skipReason
-  ? `boots the checkout config with queue and configuration workers [SKIPPED: ${skipReason}]`
-  : "boots the checkout config with queue and configuration workers";
-
+const liveEngineTest = iii ? it : it.skip;
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -75,6 +42,41 @@ afterEach(async () => {
     ),
   );
 });
+
+/** An OS-assigned port, released immediately. Bound the way the engine binds it. */
+function freePort(): number {
+  const probe = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+  const port = probe.port;
+  probe.stop(true);
+  return port;
+}
+
+/**
+ * Pins the engine bus to `127.0.0.1:<port>`, replacing an existing
+ * `iii-worker-manager` entry or inserting one when the checkout has none.
+ */
+export function pinBusAddress(config: string, port: number): string {
+  const block = `  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n      port: ${port}\n`;
+  const entry = /^ *- *name: *iii-worker-manager *$/m.exec(config);
+  if (!entry) {
+    const workers = /^workers: *$/m.exec(config);
+    if (!workers) throw new Error("config.yaml declares no workers list");
+    const at = workers.index + workers[0].length + 1;
+    return `${config.slice(0, at)}${block}${config.slice(at)}`;
+  }
+  const rest = config.slice(entry.index + entry[0].length);
+  const next = /^ *- *name:/m.exec(rest);
+  const tail = next ? rest.slice(next.index) : "";
+  return `${config.slice(0, entry.index)}${block}${tail}`;
+}
+
+/** Rewrites the single `port:` line of a `config/<worker>.yaml` value block. */
+async function repointWorkerPort(path: string, port: number): Promise<void> {
+  const source = await readFile(path, "utf8");
+  const updated = source.replace(/^( *port: *)\d+ *$/m, `$1${port}`);
+  if (updated === source) throw new Error(`${path} has no port to repoint`);
+  await writeFile(path, updated);
+}
 
 async function run(command: string[], cwd?: string) {
   const process = Bun.spawn(command, {
@@ -94,18 +96,18 @@ async function run(command: string[], cwd?: string) {
   return { exitCode, stdout, stderr };
 }
 
-/** Always addresses the engine explicitly, so the coupling is visible in the source. */
-function triggerArgs(binary: string, functionId: string, payload: string): string[] {
+/** Always addresses the engine this test started, never "whatever is on the default port". */
+function triggerArgs(binary: string, functionId: string, port: number): string[] {
   return [
     binary,
     "trigger",
-    functionId,
+    "engine::functions::info",
     "--json",
-    payload,
+    JSON.stringify({ function_id: functionId }),
     "--address",
     "127.0.0.1",
     "--port",
-    String(ENGINE_PORT),
+    String(port),
     "--timeout-ms",
     "1000",
   ];
@@ -142,50 +144,32 @@ function parseQueueProvider(source: string): QueueProviderInfo | null {
 }
 
 /**
- * Fails immediately if the engine we started could not take the port, instead of
- * querying whatever engine did and reporting its answer as ours.
- */
-async function assertOurEngineOwnsThePort(logPath: string): Promise<void> {
-  const log = await Bun.file(logPath).text().catch(() => "");
-  if (log.includes(ENGINE_BIND_ERROR)) {
-    throw new Error(
-      `the engine this test started could not bind ${ENGINE_PORT}: another engine took it between the ` +
-        `pre-flight check and the bind. iii ${expectedVersion} cannot use a different port, so this run ` +
-        `proves nothing about the checkout config.\n${log.slice(-2000)}`,
-    );
-  }
-}
-
-/**
- * Waits for markers in the log of the engine THIS test started.
- *
- * Querying the bus first is not safe: a foreign engine on the same port answers
- * `engine::functions::info` immediately, so the query would succeed while our own
- * engine was still failing to bind. Our own log is the only evidence that the
- * engine under test is the one running.
+ * Waits for markers in the log of the engine THIS test started. Querying the bus
+ * as evidence of readiness is not safe on its own: any engine answers
+ * `engine::functions::info`, so the query would succeed even if ours never came up.
  */
 async function waitForOurEngine(logPath: string, markers: string[]): Promise<void> {
   const deadline = Date.now() + 30_000;
   let log = "";
   while (Date.now() < deadline) {
     log = await Bun.file(logPath).text().catch(() => "");
-    if (log.includes(ENGINE_BIND_ERROR)) {
+    const bindFailure = /address [^\s]+ is already in use/.exec(log);
+    if (bindFailure) {
       throw new Error(
-        `the engine this test started could not bind ${ENGINE_PORT}: another engine took it between the ` +
-          `pre-flight check and the bind. iii ${expectedVersion} cannot use a different port, so this run ` +
-          `proves nothing about the checkout config.`,
+        `the engine this test started could not bind its own port (${bindFailure[0]}). ` +
+          `The test picks free ports, so this means one was taken between the probe and the bind.`,
       );
     }
     if (markers.every((marker) => log.includes(marker))) return;
     await Bun.sleep(100);
   }
   const missing = markers.filter((marker) => !log.includes(marker));
-  throw new Error(`engine did not register ${missing.join(", ")} within 30s:\n${log.slice(-2000)}`);
+  throw new Error(`engine did not reach ${missing.join(", ")} within 30s:\n${log.slice(-2000)}`);
 }
 
 describe(`iii ${expectedVersion} boot compatibility`, () => {
   liveEngineTest(
-    testName,
+    "boots the checkout config on its own ports with queue and configuration workers",
     async () => {
       const binary = iii as string;
       const version = await run([binary, "--version"]);
@@ -194,15 +178,22 @@ describe(`iii ${expectedVersion} boot compatibility`, () => {
 
       const runtime = await mkdtemp(join(tmpdir(), "agentos-config-boot-"));
       temporaryDirectories.push(runtime);
-      await cp(new URL("config.yaml", repository), join(runtime, "config.yaml"));
-      await cp(new URL("iii.lock", repository), join(runtime, "iii.lock"));
       await cp(new URL("config", repository), join(runtime, "config"), {
         recursive: true,
       });
+      await cp(new URL("iii.lock", repository), join(runtime, "iii.lock"));
       await mkdir(join(runtime, "data"), { recursive: true });
 
-      // Redirected to a file so the wait loops can read the engine's own errors
-      // while it is still running, rather than only after it exits.
+      const busPort = freePort();
+      const checkoutConfig = await Bun.file(new URL("config.yaml", repository)).text();
+      await writeFile(join(runtime, "config.yaml"), pinBusAddress(checkoutConfig, busPort));
+      // The HTTP and stream servers are shared host resources too; give this
+      // engine its own so a neighbour cannot make it look broken.
+      await repointWorkerPort(join(runtime, "config", "iii-http.yaml"), freePort());
+      await repointWorkerPort(join(runtime, "config", "iii-stream.yaml"), freePort());
+
+      // Redirected to a file so the wait loop can read the engine's own errors
+      // while it runs, rather than only after it exits.
       const logPath = join(runtime, "engine.log");
       const engine = Bun.spawn(
         [
@@ -213,27 +204,22 @@ describe(`iii ${expectedVersion} boot compatibility`, () => {
         ],
         {
           cwd: runtime,
-          env: {
-            ...Bun.env,
-            III_TELEMETRY_ENABLED: "false",
-          },
+          env: { ...Bun.env, III_TELEMETRY_ENABLED: "false" },
           stdout: "ignore",
           stderr: "ignore",
         },
       );
 
       try {
-        // `shell` is no longer booted by default (sec-perimeter, 2026-09-02), so
-        // the second marker is a function the default stack really registers.
         await waitForOurEngine(logPath, [
+          `Engine listening on address: 127.0.0.1:${busPort}`,
           "Function engine::queue::enqueue",
+          // `shell` is no longer booted by default (sec-perimeter, 2026-09-02),
+          // so this is a function the default stack really registers.
           "Function configuration::get",
         ]);
 
-        // Only now is the bus provably ours, so a query on it means something.
-        const info = await run(
-          triggerArgs(binary, "engine::functions::info", '{"function_id":"engine::queue::enqueue"}'),
-        );
+        const info = await run(triggerArgs(binary, "engine::queue::enqueue", busPort));
         expect(info.exitCode, `${info.stdout}\n${info.stderr}`).toBe(0);
         const provider = parseQueueProvider(info.stdout);
         expect(provider, `unexpected engine::functions::info payload: ${info.stdout}`).not.toBeNull();
@@ -246,11 +232,35 @@ describe(`iii ${expectedVersion} boot compatibility`, () => {
       const exitCode = await engine.exited;
       const logs = await Bun.file(logPath).text();
       expect([0, 130]).toContain(exitCode);
-      expect(logs).not.toContain(ENGINE_BIND_ERROR);
+      expect(logs).not.toContain("is already in use");
       expect(logs).not.toContain("Duplicate worker configurations");
       expect(logs).not.toContain("is the deprecated name for");
       expect(logs).toContain("Function engine::queue::enqueue");
+      // Proof the bus never touched the default port.
+      expect(logs).toContain(`Engine listening on address: 127.0.0.1:${busPort}`);
+      expect(busPort).not.toBe(49134);
     },
     120_000,
   );
+
+  it("pins the bus whether or not the checkout already declares the worker", () => {
+    const inserted = pinBusAddress("workers:\n  - name: state\n", 51000);
+    expect(inserted).toBe(
+      "workers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n      port: 51000\n  - name: state\n",
+    );
+
+    const replaced = pinBusAddress(
+      "workers:\n  - name: iii-worker-manager\n    config:\n      host: 0.0.0.0\n  - name: state\n",
+      51001,
+    );
+    expect(replaced).toBe(
+      "workers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n      port: 51001\n  - name: state\n",
+    );
+    expect(replaced).not.toContain("0.0.0.0");
+
+    const trailing = pinBusAddress("workers:\n  - name: iii-worker-manager\n", 51002);
+    expect(trailing).toBe(
+      "workers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n      port: 51002\n",
+    );
+  });
 });
