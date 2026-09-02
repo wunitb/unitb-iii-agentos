@@ -1,0 +1,120 @@
+import { describe, expect, it } from "bun:test";
+import { collectCounts, type RegistrationSite, type RouteSite } from "../scripts/counts";
+
+/**
+ * Two workers registering the same function id is a silent, order-dependent
+ * outage: whichever worker connects last owns the id on the bus, and the other
+ * worker's capability disappears without an error anywhere. The same is true of
+ * two workers claiming one HTTP route.
+ *
+ * This suite fails on any collision that is not in the allowlist below, and it
+ * also fails on any allowlist entry whose collision has been fixed — so the
+ * allowlist can only ever shrink.
+ */
+
+interface KnownCollision {
+  readonly key: string;
+  /** ISO date the exception was recorded. */
+  readonly since: string;
+  /** Where the fix belongs. */
+  readonly owner: string;
+  readonly reason: string;
+}
+
+// TEMPORARY. Recorded 2026-09-02 by the eng-gates remediation, which does not own
+// either file. Both fixes are requested in
+// /tmp/agentos-remediation/requests/eng-gates.md. Delete the entry, do not edit it.
+const KNOWN_DUPLICATE_FUNCTION_IDS: KnownCollision[] = [
+  {
+    key: "context::trim",
+    since: "2026-09-02",
+    owner: "workers/context-monitor/src/main.rs",
+    reason:
+      "context-manager registers the LLM-backed trim; context-monitor registers a different, lightweight in-turn compression under the same id. context-monitor's must be renamed (for example context::trim_micro).",
+  },
+];
+
+const KNOWN_DUPLICATE_HTTP_ROUTES: KnownCollision[] = [
+  {
+    key: "GET /.well-known/agent.json",
+    since: "2026-09-02",
+    owner: "workers/a2a-cards/src/main.rs",
+    reason:
+      "a2a serves the agent card and a2a-cards serves a card catalogue on the identical path. a2a-cards needs its own path (for example api/a2a/agent-card).",
+  },
+];
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const counts = collectCounts();
+
+function describeSites(sites: readonly (RegistrationSite | RouteSite)[]): string {
+  return sites.map((site) => `${site.file}:${site.line}`).join(", ");
+}
+
+function expectAllowlistIsSound(allowlist: KnownCollision[]): void {
+  const today = new Date().toISOString().slice(0, 10);
+  const seen = new Set<string>();
+  for (const entry of allowlist) {
+    expect(ISO_DATE.test(entry.since), `${entry.key}: since must be an ISO date`).toBe(true);
+    expect(entry.since <= today, `${entry.key}: since is in the future`).toBe(true);
+    expect(entry.reason.length, `${entry.key}: needs a reason`).toBeGreaterThan(40);
+    expect(entry.owner.length, `${entry.key}: needs an owning file`).toBeGreaterThan(0);
+    expect(seen.has(entry.key), `${entry.key}: listed twice`).toBe(false);
+    seen.add(entry.key);
+  }
+}
+
+describe("worker registration uniqueness", () => {
+  it("registers every function id exactly once outside the dated allowlist", () => {
+    const allowed = new Set(KNOWN_DUPLICATE_FUNCTION_IDS.map((entry) => entry.key));
+    const unexpected = [...counts.duplicateFunctionIds]
+      .filter(([id]) => !allowed.has(id))
+      .map(([id, sites]) => `${id} registered by ${describeSites(sites)}`);
+
+    expect(unexpected).toEqual([]);
+  });
+
+  it("binds every HTTP route exactly once outside the dated allowlist", () => {
+    const allowed = new Set(KNOWN_DUPLICATE_HTTP_ROUTES.map((entry) => entry.key));
+    const unexpected = [...counts.duplicateHttpRoutes]
+      .filter(([route]) => !allowed.has(route))
+      .map(([route, sites]) => `${route} bound by ${describeSites(sites)}`);
+
+    expect(unexpected).toEqual([]);
+  });
+
+  it("keeps no allowlist entry alive after its collision is fixed", () => {
+    const stale = [
+      ...KNOWN_DUPLICATE_FUNCTION_IDS.filter((entry) => !counts.duplicateFunctionIds.has(entry.key)).map(
+        (entry) => `function id ${entry.key}`,
+      ),
+      ...KNOWN_DUPLICATE_HTTP_ROUTES.filter((entry) => !counts.duplicateHttpRoutes.has(entry.key)).map(
+        (entry) => `route ${entry.key}`,
+      ),
+    ];
+
+    expect(
+      stale,
+      "these collisions are fixed; delete their entries from this file so the allowlist keeps shrinking",
+    ).toEqual([]);
+  });
+
+  it("never lets the allowlist grow past the 2026-09-02 baseline", () => {
+    expect(KNOWN_DUPLICATE_FUNCTION_IDS.length).toBeLessThanOrEqual(1);
+    expect(KNOWN_DUPLICATE_HTTP_ROUTES.length).toBeLessThanOrEqual(1);
+    expectAllowlistIsSound(KNOWN_DUPLICATE_FUNCTION_IDS);
+    expectAllowlistIsSound(KNOWN_DUPLICATE_HTTP_ROUTES);
+  });
+
+  it("counts a registration only when it ships, not when a unit test writes one", () => {
+    // crates/http-adapter's own tests build `{"api_path": "/api/health", ...}`
+    // literals. Those are test fixtures and must not look like route bindings.
+    const adapterRoutes = counts.httpRoutes.filter((route) =>
+      route.file.startsWith("crates/http-adapter"),
+    );
+    expect(adapterRoutes).toEqual([]);
+
+    const health = counts.httpRoutes.filter((route) => route.route === "GET /api/health");
+    expect(health.map((route) => route.file)).toEqual(["workers/agent-core/src/main.rs"]);
+  });
+});
