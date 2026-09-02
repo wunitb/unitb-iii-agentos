@@ -202,7 +202,6 @@ pub const UNTRUSTED_REGISTRATION_PREFIXES: &[&str] = &[
     "stream",
 ];
 
-
 /// The bus credential from the environment, rejecting an empty value.
 ///
 /// There is no default and no fallback: a daemon without a key must refuse to
