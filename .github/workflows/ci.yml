@@ -392,14 +392,28 @@ jobs:
           done
           timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/3111" 2>/dev/null \
             || { echo "::error::engine HTTP port never opened"; cat engine.log; exit 1; }
-          for _ in {1..120}; do
-            console_probe="$(curl -sS --max-redirs 0 -o /dev/null -w '%{http_code} %{redirect_url}' http://127.0.0.1:3113/ 2>/dev/null || true)"
-            [[ "$console_probe" == 200\ * ]] && break
-            kill -0 "$ENGINE_PID" 2>/dev/null || { cat engine.log; exit 1; }
-            sleep 1
-          done
-          [[ "$console_probe" == 200\ * ]] \
-            || { echo "::error::registry chat console never opened"; cat engine.log; exit 1; }
+          # The registry chat console is opt-in: it has no bind-host key and
+          # listens on 0.0.0.0, so config.yaml does not boot it by default.
+          # Assert whichever state config.yaml declares, so this step is correct
+          # regardless of which branch lands first.
+          if grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*console[[:space:]]*$' config.yaml; then
+            for _ in {1..120}; do
+              console_probe="$(curl -sS --max-redirs 0 -o /dev/null -w '%{http_code} %{redirect_url}' http://127.0.0.1:3113/ 2>/dev/null || true)"
+              [[ "$console_probe" == 200\ * ]] && break
+              kill -0 "$ENGINE_PID" 2>/dev/null || { cat engine.log; exit 1; }
+              sleep 1
+            done
+            [[ "$console_probe" == 200\ * ]] \
+              || { echo "::error::config.yaml boots the console but it never opened"; cat engine.log; exit 1; }
+          else
+            sleep 5
+            if timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/3113" 2>/dev/null; then
+              echo "::error::config.yaml does not boot the console, but something is listening on 3113"
+              cat engine.log
+              exit 1
+            fi
+            echo "ok: console is not booted and port 3113 is closed"
+          fi
           for w in agentos-core agentos-llm-router agentos-memory agentos-security agentos-realm agentos-mission agentos-directive agentos-hierarchy agentos-council agentos-ledger agentos-pulse agentos-bridge agentos-wasm-sandbox; do
             ./target/release/$w > "$w.log" 2>&1 &
           done

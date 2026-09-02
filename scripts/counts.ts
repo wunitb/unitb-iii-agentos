@@ -349,7 +349,7 @@ export function publishedNumbers(counts: Counts): PublishedNumber[] {
     { file: "README.md", label: "distinct function ids", pattern: /(\d+) distinct function ids/g, expected: functions, occurrences: 1 },
     { file: "README.md", label: "worker section subtitle", pattern: /^(\d+) Rust \+ 1 Python, grouped by responsibility\./gm, expected: rust, occurrences: 1 },
     { file: "README.md", label: "layout worker count", pattern: /^workers\/ +(\d+) Rust \+ 1 Python \(embedding\)$/gm, expected: rust, occurrences: 1 },
-    { file: "README.md", label: "engine config file count", pattern: /committed values for the ([a-z]+) built-in iii workers/g, expected: numberWord(counts.engineConfigFiles.length), occurrences: 1 },
+    { file: "README.md", label: "engine config file count", pattern: /committed values for ([a-z]+) iii worker configurations/g, expected: numberWord(counts.engineConfigFiles.length), occurrences: 1 },
     { file: "README.md", label: "unproven release targets", pattern: /does not prove the other ([a-z]+) release targets/g, expected: numberWord(counts.releaseTargets.length - 1), occurrences: 1 },
     { file: "README.md", label: "release target bundles", pattern: /builds and inspects all ([a-z]+) target bundles/g, expected: numberWord(counts.releaseTargets.length), occurrences: 1 },
 
@@ -436,6 +436,19 @@ export interface WorkerTableSite {
   readonly parse: () => string[];
 }
 
+/**
+ * The engine workers ARCHITECTURE.md enumerates in prose. The count beside them
+ * is a published number, but the *names* are free text, so they would otherwise
+ * rot silently when config.yaml gains or loses an entry.
+ */
+export function publishedEngineWorkers(): string[] {
+  const text = read("ARCHITECTURE.md");
+  const start = text.indexOf("It declares");
+  const end = text.indexOf("These are upstream registry binaries", start);
+  if (start < 0 || end < 0) throw new Error("ARCHITECTURE.md no longer enumerates the engine workers");
+  return [...text.slice(start, end).matchAll(/`([^`]+)`/g)].map((match) => match[1]!);
+}
+
 export function workerTableSites(): WorkerTableSite[] {
   return [
     {
@@ -492,6 +505,43 @@ export function findDrift(counts: Counts): Drift[] {
         writable: true,
       });
     }
+  }
+
+  const declaredEngineWorkers = new Set(counts.engineWorkers);
+  const publishedEngine = publishedEngineWorkers();
+  for (const name of publishedEngine) {
+    if (!declaredEngineWorkers.has(name)) {
+      drift.push({
+        file: "ARCHITECTURE.md",
+        label: `engine worker list names "${name}", which config.yaml does not declare`,
+        found: "listed",
+        expected: "absent",
+        line: 0,
+        writable: false,
+      });
+    }
+  }
+  for (const name of counts.engineWorkers) {
+    if (!publishedEngine.includes(name)) {
+      drift.push({
+        file: "ARCHITECTURE.md",
+        label: `engine worker list is missing "${name}"`,
+        found: "absent",
+        expected: "named in the engine-boot paragraph",
+        line: 0,
+        writable: false,
+      });
+    }
+  }
+  if (new Set(publishedEngine).size !== publishedEngine.length) {
+    drift.push({
+      file: "ARCHITECTURE.md",
+      label: "engine worker list names a worker twice",
+      found: "duplicated",
+      expected: "named once",
+      line: 0,
+      writable: false,
+    });
   }
 
   const actual = new Set(counts.workers.map((worker) => worker.name));
