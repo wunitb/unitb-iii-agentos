@@ -1,3 +1,16 @@
+//! Chat transports for the HTTP edge.
+//!
+//! All three endpoints delegate to `agent::chat`. This worker used to run a
+//! second, weaker pipeline for `POST /api/chat/stream` (no tools, no injection
+//! scan, no memory write, no metering, and `toolCalls` dropped on the floor),
+//! which is the branch the TUI actually used. There is one pipeline now.
+//!
+//! Honesty note: none of this is incremental delivery. `agent::chat` is a
+//! request/response call on the bus and `agentos::llm::complete` does not
+//! stream, so `stream::sse` frames a *finished* answer as SSE events. The
+//! framing is real, the streaming is not; the response says so in
+//! `x-agentos-stream: buffered`.
+
 use iii_sdk::errors::Error;
 use iii_sdk::{
     IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
@@ -8,47 +21,32 @@ mod types;
 
 use types::chunk_markdown_aware;
 
+/// A chat turn may legitimately take minutes: a ReAct loop is several provider
+/// calls plus the tools between them. The SDK default is 30 s, and it applied
+/// to the whole outer turn, so the HTTP edge advertised 300 s while the bus cut
+/// the turn at thirty seconds.
+const CHAT_TIMEOUT_MS: u64 = 300_000;
+
+fn chat_trigger(function_id: &str, payload: Value) -> TriggerRequest {
+    TriggerRequest {
+        function_id: function_id.to_string(),
+        payload,
+        action: None,
+        timeout_ms: Some(CHAT_TIMEOUT_MS),
+    }
+}
+
 fn payload_body(input: &Value) -> Value {
     input.get("body").cloned().unwrap_or_else(|| input.clone())
 }
 
-fn valid_route_preference(value: Option<&Value>) -> Option<String> {
-    value
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && *value != "agentos-default")
+fn chat_message(body: &Value) -> Result<String, Error> {
+    body["message"]
+        .as_str()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
         .map(str::to_owned)
-}
-
-fn stream_route_preferences(
-    body: &Value,
-    model_config: Option<&Value>,
-) -> (Option<String>, Option<String>) {
-    let request_provider = valid_route_preference(body.get("provider"));
-    let request_model = valid_route_preference(body.get("model"));
-    if request_provider.is_some() || request_model.is_some() {
-        return (request_provider, request_model);
-    }
-
-    let config_provider =
-        model_config.and_then(|model| valid_route_preference(model.get("provider")));
-    let config_model = model_config.and_then(|model| valid_route_preference(model.get("model")));
-    if config_model.is_some() {
-        (config_provider, config_model)
-    } else {
-        (None, None)
-    }
-}
-
-fn stream_route_fields(route: &Value) -> Result<(&str, &str), Error> {
-    let provider = route["provider"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::Handler("agentos::llm::route omitted provider".into()))?;
-    let model = route["model"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::Handler("agentos::llm::route omitted model".into()))?;
-    Ok((provider, model))
+        .ok_or_else(|| Error::Handler("a non-empty message is required".into()))
 }
 
 fn agent_chat_payload(body: &Value, message: &str) -> Value {
@@ -56,36 +54,9 @@ fn agent_chat_payload(body: &Value, message: &str) -> Value {
         "agentId": body["agentId"].as_str().unwrap_or("default"),
         "message": message,
         "sessionId": body.get("sessionId").cloned().unwrap_or(Value::Null),
+        "systemPrompt": body.get("systemPrompt").cloned().unwrap_or(Value::Null),
         "provider": body.get("provider").cloned().unwrap_or(Value::Null),
         "model": body.get("model").cloned().unwrap_or(Value::Null),
-    })
-}
-
-fn stream_route_payload(message: &str, provider: Option<&str>, model: Option<&str>) -> Value {
-    let mut payload = json!({
-        "messages": [{ "role": "user", "content": message }],
-        "tools": [],
-    });
-    if let Some(provider) = provider {
-        payload["provider"] = json!(provider);
-    }
-    if let Some(model) = model {
-        payload["model"] = json!(model);
-    }
-    payload
-}
-
-fn stream_completion_payload(
-    provider: &str,
-    model: &str,
-    system_prompt: &str,
-    messages: &[Value],
-) -> Value {
-    json!({
-        "provider": provider,
-        "model": model,
-        "systemPrompt": system_prompt,
-        "messages": messages,
     })
 }
 
@@ -96,79 +67,38 @@ fn completion_id() -> String {
     )
 }
 
+/// Transport-neutral view of an `agent::chat` answer. Everything the agent
+/// reported is carried through: dropping `toolCalls` here is what turned a
+/// tool-calling turn into an empty assistant bubble.
 fn stream_chat_response(response: &Value) -> Value {
-    json!({
-        "content": response["content"],
-        "model": response["model"],
-        "usage": response["usage"],
-    })
+    let mut body = json!({
+        "content": response.get("content").cloned().unwrap_or(Value::Null),
+        "model": response.get("model").cloned().unwrap_or(Value::Null),
+        "usage": response.get("usage").cloned().unwrap_or(Value::Null),
+    });
+    for field in ["toolCalls", "iterations", "durationMs", "sessionId"] {
+        if let Some(value) = response.get(field) {
+            body[field] = value.clone();
+        }
+    }
+    body
 }
 
+async fn agent_chat(iii: &IIIClient, body: &Value, message: &str) -> Result<Value, Error> {
+    iii.trigger(chat_trigger(
+        "agent::chat",
+        agent_chat_payload(body, message),
+    ))
+    .await
+    .map_err(|error| Error::Handler(error.to_string()))
+}
+
+/// `POST /api/chat/stream`. One pipeline: `agent::chat` owns tools, the
+/// injection scan, memory and metering.
 async fn stream_chat(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let body = payload_body(&input);
-    let agent_id = body["agentId"].as_str().unwrap_or("default").to_string();
-    let message = body["message"]
-        .as_str()
-        .ok_or_else(|| Error::Handler("message required".into()))?
-        .to_string();
-
-    let config = iii
-        .trigger(TriggerRequest {
-            function_id: "state::get".into(),
-            payload: json!({ "scope": "agents", "key": &agent_id }),
-            action: None,
-            timeout_ms: None,
-        })
-        .await
-        .ok();
-
-    let memories = iii
-        .trigger(TriggerRequest {
-            function_id: "memory::recall".into(),
-            payload: json!({ "agentId": &agent_id, "query": &message, "limit": 10 }),
-            action: None,
-            timeout_ms: None,
-        })
-        .await
-        .unwrap_or_else(|_| json!([]));
-
-    let model_config = config.as_ref().and_then(|c| c.get("model"));
-    let (preferred_provider, preferred_model) = stream_route_preferences(&body, model_config);
-
-    let route = iii
-        .trigger(TriggerRequest {
-            function_id: "agentos::llm::route".into(),
-            payload: stream_route_payload(
-                &message,
-                preferred_provider.as_deref(),
-                preferred_model.as_deref(),
-            ),
-            action: None,
-            timeout_ms: None,
-        })
-        .await
-        .map_err(|e| Error::Handler(e.to_string()))?;
-    let (provider, model) = stream_route_fields(&route)?;
-
-    let system_prompt = config
-        .as_ref()
-        .and_then(|c| c["systemPrompt"].as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let mut messages: Vec<Value> = memories.as_array().cloned().unwrap_or_default();
-    messages.push(json!({ "role": "user", "content": &message }));
-
-    let response = iii
-        .trigger(TriggerRequest {
-            function_id: "agentos::llm::complete".into(),
-            payload: stream_completion_payload(provider, model, &system_prompt, &messages),
-            action: None,
-            timeout_ms: None,
-        })
-        .await
-        .map_err(|e| Error::Handler(e.to_string()))?;
-
+    let message = chat_message(&body)?;
+    let response = agent_chat(iii, &body, &message).await?;
     Ok(stream_chat_response(&response))
 }
 
@@ -192,15 +122,7 @@ async fn chat_completion(iii: &IIIClient, input: Value) -> Result<Value, Error> 
     let message = latest_user_message(&body)?;
     let requested_model = body["model"].as_str().unwrap_or("agentos-default");
 
-    let response = iii
-        .trigger(TriggerRequest {
-            function_id: "agent::chat".into(),
-            payload: agent_chat_payload(&body, &message),
-            action: None,
-            timeout_ms: None,
-        })
-        .await
-        .map_err(|error| Error::Handler(error.to_string()))?;
+    let response = agent_chat(iii, &body, &message).await?;
 
     let content = response.get("content").cloned().unwrap_or(Value::Null);
     let model = response["model"].as_str().unwrap_or(requested_model);
@@ -222,40 +144,21 @@ async fn chat_completion(iii: &IIIClient, input: Value) -> Result<Value, Error> 
     }))
 }
 
-async fn stream_sse(iii: &IIIClient, input: Value) -> Result<Value, Error> {
-    let body = payload_body(&input);
-    let message = body["message"]
-        .as_str()
-        .ok_or_else(|| Error::Handler("message required".into()))?
-        .to_string();
-    let response = iii
-        .trigger(TriggerRequest {
-            function_id: "agent::chat".into(),
-            payload: agent_chat_payload(&body, &message),
-            action: None,
-            timeout_ms: None,
-        })
-        .await
-        .map_err(|e| Error::Handler(e.to_string()))?;
-
-    let content = response["content"].as_str().unwrap_or("").to_string();
-    let model = response["model"]
-        .as_str()
-        .unwrap_or("agentos-default")
-        .to_string();
-
-    let chunks = chunk_markdown_aware(&content, 20, 100);
+/// SSE events for a finished answer. Pure so the framing can be asserted
+/// without a bus.
+fn sse_events(content: &str, model: &str) -> Result<String, Error> {
+    let chunks = chunk_markdown_aware(content, 20, 100);
     let chunks_len = chunks.len();
     let created = chrono::Utc::now().timestamp();
 
     let mut sse_body = String::new();
-    for (i, chunk) in chunks.iter().enumerate() {
-        let finish_reason = if i == chunks_len - 1 {
+    for (index, chunk) in chunks.iter().enumerate() {
+        let finish_reason = if index + 1 == chunks_len {
             json!("stop")
         } else {
             Value::Null
         };
-        let delta = if i == 0 {
+        let delta = if index == 0 {
             json!({ "role": "assistant", "content": chunk })
         } else {
             json!({ "content": chunk })
@@ -271,22 +174,42 @@ async fn stream_sse(iii: &IIIClient, input: Value) -> Result<Value, Error> {
                 "finish_reason": finish_reason,
             }]
         });
-        let encoded = serde_json::to_string(&event).map_err(|e| Error::Handler(e.to_string()))?;
+        let encoded =
+            serde_json::to_string(&event).map_err(|error| Error::Handler(error.to_string()))?;
         sse_body.push_str("data: ");
         sse_body.push_str(&encoded);
         sse_body.push_str("\n\n");
     }
     sse_body.push_str("data: [DONE]\n\n");
+    Ok(sse_body)
+}
 
-    Ok(json!({
+fn sse_envelope(sse_body: String) -> Value {
+    json!({
         "status_code": 200,
         "headers": {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            // The events are framed after the answer is complete. Say so
+            // instead of letting a client believe it is reading tokens live.
+            "x-agentos-stream": "buffered",
         },
         "body": sse_body,
-    }))
+    })
+}
+
+/// `POST /v1/chat/completions/stream`. SSE framing of an answer that is already
+/// complete — see the module note; the response labels itself `buffered`.
+async fn stream_sse(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+    let body = payload_body(&input);
+    let message = chat_message(&body)?;
+    let response = agent_chat(iii, &body, &message).await?;
+
+    let content = response["content"].as_str().unwrap_or("");
+    let model = response["model"].as_str().unwrap_or("agentos-default");
+
+    Ok(sse_envelope(sse_events(content, model)?))
 }
 
 #[tokio::main]
@@ -303,7 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let iii = iii_ref.clone();
             async move { stream_chat(&iii, input).await }
         })
-        .description("SSE streaming chat endpoint"),
+        .description("Chat endpoint backed by agent::chat (buffered, not incremental)"),
     );
 
     let iii_ref = iii.clone();
@@ -323,7 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let iii = iii_ref.clone();
             async move { stream_sse(&iii, input).await }
         })
-        .description("SSE event stream for chat completions"),
+        .description("SSE framing of a completed agent::chat answer (buffered, not incremental)"),
     );
 
     agentos_http_adapter::register_http_trigger(
@@ -357,19 +280,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn route_and_completion_payloads_use_top_level_strings() {
-        let route = stream_route_payload("hello", Some("codex"), Some("gpt-5.6-sol"));
-        assert_eq!(route["provider"], "codex");
-        assert_eq!(route["model"], "gpt-5.6-sol");
-
-        let complete = stream_completion_payload(
-            "codex",
-            "gpt-5.6-sol",
-            "system",
-            &[json!({ "role": "user", "content": "hello" })],
-        );
-        assert_eq!(complete["provider"], "codex");
-        assert_eq!(complete["model"], "gpt-5.6-sol");
+    fn every_chat_hop_carries_the_full_turn_budget() {
+        // The SDK default is 30_000 ms and it applied to the whole outer turn:
+        // a ReAct loop with tools could not finish inside it.
+        let trigger = chat_trigger("agent::chat", json!({ "message": "hello" }));
+        assert_eq!(trigger.function_id, "agent::chat");
+        assert_eq!(trigger.timeout_ms, Some(CHAT_TIMEOUT_MS));
+        assert_eq!(CHAT_TIMEOUT_MS, 300_000);
+        assert!(trigger.timeout_ms.is_some_and(|budget| budget > 30_000));
     }
 
     #[test]
@@ -382,39 +300,61 @@ mod tests {
             }),
             "hello",
         );
+        assert_eq!(payload["agentId"], "agent-1");
+        assert_eq!(payload["message"], "hello");
         assert_eq!(payload["provider"], "codex");
         assert_eq!(payload["model"], "gpt-5.6-sol");
     }
 
     #[test]
-    fn stream_route_preferences_handle_absent_empty_and_incomplete_values() {
-        assert_eq!(stream_route_preferences(&json!({}), None), (None, None));
-        assert_eq!(
-            stream_route_preferences(
-                &json!({ "provider": "", "model": "agentos-default" }),
-                Some(&json!({ "provider": "codex" })),
-            ),
-            (None, None)
+    fn agent_chat_payload_carries_the_session_and_defaults_the_agent() {
+        let with_session = agent_chat_payload(
+            &json!({ "agentId": "agent-1", "sessionId": "tui-1", "systemPrompt": "be brief" }),
+            "hello",
         );
-        assert_eq!(
-            stream_route_preferences(
-                &json!({}),
-                Some(&json!({ "provider": "codex", "model": "gpt-5.6-sol" })),
-            ),
-            (Some("codex".into()), Some("gpt-5.6-sol".into()))
-        );
+        assert_eq!(with_session["sessionId"], "tui-1");
+        assert_eq!(with_session["systemPrompt"], "be brief");
+
+        let without_session = agent_chat_payload(&json!({}), "hello");
+        assert_eq!(without_session["agentId"], "default");
+        assert_eq!(without_session["sessionId"], Value::Null);
+        assert_eq!(without_session["provider"], Value::Null);
     }
 
     #[test]
-    fn stream_route_fields_reject_missing_empty_and_nested_values() {
-        for route in [
+    fn chat_message_rejects_absent_empty_and_blank_messages() {
+        for body in [
             json!({}),
-            json!({ "provider": "", "model": "gpt-5.6-sol" }),
-            json!({ "provider": "codex", "model": "" }),
-            json!({ "provider": "codex", "model": { "name": "gpt-5.6-sol" } }),
+            json!({ "message": "" }),
+            json!({ "message": "   " }),
+            json!({ "message": 42 }),
+            json!({ "message": { "text": "hello" } }),
         ] {
-            assert!(stream_route_fields(&route).is_err(), "accepted {route}");
+            assert!(chat_message(&body).is_err(), "accepted {body}");
         }
+        assert_eq!(chat_message(&json!({ "message": " hi " })).unwrap(), "hi");
+    }
+
+    #[test]
+    fn stream_chat_response_keeps_tool_calls() {
+        // The second pipeline dropped `toolCalls`, so a turn that answered with
+        // a tool call reached the client as an empty assistant bubble.
+        let response = stream_chat_response(&json!({
+            "content": "",
+            "model": "test-model",
+            "usage": { "total": 7 },
+            "toolCalls": [{ "callId": "call-1", "id": "memory::recall", "arguments": { "query": "x" } }],
+            "iterations": 2,
+            "durationMs": 1234,
+        }));
+
+        assert_eq!(
+            response["toolCalls"],
+            json!([{ "callId": "call-1", "id": "memory::recall", "arguments": { "query": "x" } }])
+        );
+        assert_eq!(response["iterations"], 2);
+        assert_eq!(response["durationMs"], 1234);
+        assert_eq!(response["usage"], json!({ "total": 7 }));
     }
 
     #[test]
@@ -435,5 +375,47 @@ mod tests {
         );
         assert!(response.get("status_code").is_none());
         assert!(response.get("body").is_none());
+        assert!(response.get("toolCalls").is_none());
+    }
+
+    #[test]
+    fn stream_chat_response_reports_a_missing_answer_as_null_not_as_a_silent_string() {
+        let response = stream_chat_response(&json!({}));
+        assert_eq!(response["content"], Value::Null);
+        assert_eq!(response["model"], Value::Null);
+        assert_eq!(response["usage"], Value::Null);
+    }
+
+    #[test]
+    fn sse_framing_declares_that_it_is_buffered() {
+        let envelope = sse_envelope(sse_events("hello", "test-model").expect("events"));
+        assert_eq!(envelope["headers"]["x-agentos-stream"], "buffered");
+        assert_eq!(envelope["headers"]["Content-Type"], "text/event-stream");
+        let body = envelope["body"].as_str().expect("body");
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+        assert!(body.contains("\"role\":\"assistant\""), "{body}");
+        assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+    }
+
+    #[test]
+    fn sse_framing_closes_the_last_chunk_of_a_long_answer() {
+        let long = "word ".repeat(200);
+        let body = sse_events(&long, "test-model").expect("events");
+        let events: Vec<&str> = body
+            .split("\n\n")
+            .filter(|event| !event.is_empty() && *event != "data: [DONE]")
+            .collect();
+        assert!(events.len() > 1, "expected several chunks, got {events:?}");
+        let stops = events
+            .iter()
+            .filter(|event| event.contains("\"finish_reason\":\"stop\""))
+            .count();
+        assert_eq!(stops, 1, "exactly the last chunk closes the stream");
+        assert!(
+            events
+                .last()
+                .expect("last event")
+                .contains("\"finish_reason\":\"stop\"")
+        );
     }
 }
