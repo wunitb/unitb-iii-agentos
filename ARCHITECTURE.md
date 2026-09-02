@@ -36,11 +36,7 @@ unitb-iii-agentos/
 | Telemetry | `telemetry` `pulse` `session-lifecycle` `session-replay` `feedback` `eval` `evolve` `hashline` `hooks` `cron` | `telemetry::*` `pulse::*` `session::*` `eval::*` `feedback::*` |
 | Embeddings | `embedding` (Python) | `embedding::*` |
 
-<<<<<<< HEAD
-The source registers 295 literal function ids across 63 workers (62 Rust + 1 Python), resolving to 295 distinct function ids. `bun run counts` recomputes every number on this page from the tree; `bun run counts:check` fails the build when a published number drifts.
-=======
-The source registers 296 literal function ids across 63 workers (62 Rust + 1 Python), resolving to 295 distinct function ids. `bun run counts` recomputes every number on this page from the tree; `bun run counts:check` fails the build when a published number drifts.
->>>>>>> wp/eng-gates
+The source registers 301 literal function ids across 63 workers (62 Rust + 1 Python), resolving to 301 distinct function ids. `bun run counts` recomputes every number on this page from the tree; `bun run counts:check` fails the build when a published number drifts.
 
 ## Worker manifest
 
