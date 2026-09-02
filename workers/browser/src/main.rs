@@ -171,6 +171,34 @@ async fn get_session_index(iii: &IIIClient) -> Vec<String> {
     Vec::new()
 }
 
+/// Read the post-append session index out of a `state::update` reply.
+///
+/// The engine answers `{ "new_value": <doc>, "old_value": <doc>, "errors"?: [] }`.
+/// `None` means the update did not produce a usable list (an op error, or an
+/// `append` onto an absent path, which yields a scalar rather than a list) and
+/// the caller must repair the document.
+fn reserved_ids(update_reply: &Value, expected_id: &str) -> Option<Vec<String>> {
+    if update_reply
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return None;
+    }
+    let ids: Vec<String> = update_reply
+        .get("new_value")
+        .and_then(|value| value.get("ids"))
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|entry| entry.as_str().map(String::from))
+        .collect();
+    if ids.iter().any(|id| id == expected_id) {
+        Some(ids)
+    } else {
+        None
+    }
+}
+
 async fn set_session_index(iii: &IIIClient, index: Vec<String>) -> Result<(), Error> {
     iii.trigger(TriggerRequest {
         function_id: "state::set".into(),
@@ -405,26 +433,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // state::update is the engine's CAS-style primitive: we append the
                 // agent id and check the resulting size in a single round-trip so
                 // two concurrent create_session calls cannot both pass the cap.
+                //
+                // Protocol, verified against the pinned engine (iii 0.22.1):
+                //   * the field is `ops`, not `operations` (`operations` fails the
+                //     whole invocation with "missing field `ops`");
+                //   * a list element is added with `append`, not `merge` — `merge`
+                //     rejects a non-object value and answers 200 with an `errors`
+                //     array, i.e. a silent no-op;
+                //   * `append` adds ONE element, so the value is the id itself;
+                //   * the reply is `{ new_value, old_value }`, not the value.
                 let updated_index = iii
                     .trigger(TriggerRequest {
                         function_id: "state::update".into(),
                         payload: json!({
                             "scope": "browser_sessions",
                             "key": "_index",
-                            "operations": [
-                                { "type": "merge", "path": "ids", "value": [agent_id.clone()] }
+                            "ops": [
+                                { "type": "append", "path": "ids", "value": agent_id.clone() }
                             ],
-                            "upsert": { "ids": [agent_id.clone()] }
                         }),
                         action: None,
                         timeout_ms: None,
                     })
                     .await
                     .map_err(|e| Error::Handler(format!("reserve session slot: {e}")))?;
-                let ids: Vec<String> = updated_index
-                    .get("ids")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
+                let ids = reserved_ids(&updated_index, &agent_id);
+                let ids: Vec<String> = match ids {
+                    Some(ids) => ids,
+                    None => {
+                        // `append` onto an absent path produces a scalar, not a
+                        // list. Repair the index instead of leaving a corrupted
+                        // document behind, then continue with a one-entry index.
+                        set_session_index(&iii, vec![agent_id.clone()]).await?;
+                        vec![agent_id.clone()]
+                    }
+                };
                 if ids.len() > MAX_SESSIONS {
                     // Roll the reservation back.
                     let rolled: Vec<String> =
@@ -761,4 +804,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     iii.shutdown_async().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod state_protocol_tests {
+    use super::reserved_ids;
+    use serde_json::json;
+
+    #[test]
+    fn reserved_ids_reads_the_update_envelope() {
+        let reply = json!({
+            "new_value": { "ids": ["agent-1", "agent-2"] },
+            "old_value": { "ids": ["agent-1"] },
+        });
+        assert_eq!(
+            reserved_ids(&reply, "agent-2"),
+            Some(vec!["agent-1".to_string(), "agent-2".to_string()])
+        );
+    }
+
+    #[test]
+    fn reserved_ids_rejects_a_reply_that_is_not_the_envelope() {
+        // The value itself, which is what the old code read.
+        let reply = json!({ "ids": ["agent-1"] });
+        assert_eq!(reserved_ids(&reply, "agent-1"), None);
+    }
+
+    #[test]
+    fn reserved_ids_rejects_op_errors() {
+        let reply = json!({
+            "errors": [{ "code": "merge.value.not_an_object" }],
+            "new_value": { "ids": ["agent-1"] },
+        });
+        assert_eq!(reserved_ids(&reply, "agent-1"), None);
+    }
+
+    #[test]
+    fn reserved_ids_rejects_a_scalar_produced_by_append_on_a_missing_path() {
+        // `append` onto an absent path concatenates strings instead of building
+        // a list; the caller has to repair the document.
+        let reply = json!({ "new_value": { "ids": "agent-1agent-2" }, "old_value": null });
+        assert_eq!(reserved_ids(&reply, "agent-2"), None);
+    }
+
+    #[test]
+    fn reserved_ids_rejects_a_list_without_our_reservation() {
+        let reply = json!({ "new_value": { "ids": ["someone-else"] } });
+        assert_eq!(reserved_ids(&reply, "agent-1"), None);
+    }
 }

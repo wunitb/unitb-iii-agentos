@@ -388,7 +388,10 @@ async fn set_capabilities(iii: &IIIClient, input: Value) -> Result<Value, Error>
         .ok_or_else(|| Error::Handler("capabilities is required".into()))?;
     let tools = normalize_tools(capabilities)?;
 
-    let record = json!({ "tools": tools, "updatedAt": now_ms() });
+    // I1 shape (`{tools, updatedAt}`) plus `agentId`: `state::list` returns bare
+    // values with no key, so without the id inside the document
+    // `security::list_capabilities` cannot say whose capabilities it listed.
+    let record = json!({ "agentId": &agent_id, "tools": tools, "updatedAt": now_ms() });
 
     iii.trigger(TriggerRequest {
         function_id: "state::set".to_string(),
@@ -593,6 +596,34 @@ async fn append_audit(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     Ok(json!({ "id": id, "hash": hash }))
 }
 
+/// Turn a `state::list` reply into the audit chain.
+///
+/// `state::list` on iii 0.22.1 returns a BARE ARRAY OF VALUES (verified against
+/// the pinned engine: `iii trigger state::list scope=<s>` -> `[{...}, {...}]`).
+/// The previous reader required a `value` envelope, so it produced an empty
+/// chain and `verify_audit` answered `valid: true, entries: 0` no matter what
+/// was in the store. The `__latest` pointer carries no `type`/`detail`/`prevHash`
+/// and therefore fails to deserialize as an `AuditEntry` on its own; the key
+/// check is kept for a backend that does supply an envelope.
+fn audit_chain_from_list(entries: &Value) -> Vec<AuditEntry> {
+    entries
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| {
+            if entry.get("key").and_then(Value::as_str) == Some("__latest") {
+                return None;
+            }
+            let value = match entry.get("value") {
+                Some(value) if value.is_object() => value,
+                _ => entry,
+            };
+            serde_json::from_value(value.clone()).ok()
+        })
+        .collect()
+}
+
 async fn verify_audit(iii: &IIIClient) -> Result<Value, Error> {
     let entries: Value = iii
         .trigger(TriggerRequest {
@@ -604,18 +635,7 @@ async fn verify_audit(iii: &IIIClient) -> Result<Value, Error> {
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
 
-    let mut chain: Vec<AuditEntry> = entries
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|e| {
-            let val = e.get("value")?;
-            if e["key"].as_str() == Some("__latest") {
-                return None;
-            }
-            serde_json::from_value(val.clone()).ok()
-        })
-        .collect();
+    let mut chain = audit_chain_from_list(&entries);
 
     chain.sort_by_key(|e| e.timestamp);
 
@@ -857,6 +877,36 @@ mod tests {
     }
 
     // --- capability matching
+
+    #[test]
+    fn audit_chain_reads_the_bare_state_list_shape() {
+        let entry = json!({
+            "id": "a1",
+            "timestamp": 10u64,
+            "type": "vault_get",
+            "agentId": null,
+            "detail": {},
+            "hash": "h1",
+            "prevHash": "0",
+        });
+        let latest = json!({ "hash": "h1", "id": "a1", "timestamp": 10u64 });
+
+        // bare values, which is what iii 0.22.1 actually returns
+        let chain = audit_chain_from_list(&json!([entry.clone(), latest.clone()]));
+        assert_eq!(chain.len(), 1, "the bare audit entry must be read");
+        assert_eq!(chain[0].id, "a1");
+
+        // and the enveloped shape still works
+        let chain = audit_chain_from_list(&json!([
+            { "key": "a1", "value": entry },
+            { "key": "__latest", "value": latest },
+        ]));
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].id, "a1");
+
+        assert!(audit_chain_from_list(&json!([])).is_empty());
+        assert!(audit_chain_from_list(&json!(null)).is_empty());
+    }
 
     #[test]
     fn empty_pattern_matches_nothing() {

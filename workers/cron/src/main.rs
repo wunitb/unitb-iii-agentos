@@ -32,27 +32,44 @@ async fn list_scope(iii: &IIIClient, scope: &str) -> Vec<Value> {
     .unwrap_or_default()
 }
 
+/// `state::list` on iii 0.22.1 answers with a BARE ARRAY OF VALUES: no `key`,
+/// no `{key, value}` envelope (verified against the pinned engine:
+/// `iii trigger state::list scope=<s>` -> `[{...}, {...}]`). These two readers
+/// accept the bare value and still tolerate an envelope, so a backend that
+/// re-introduces one does not silently empty every list again.
+fn entry_value(entry: &Value) -> &Value {
+    match entry.get("value") {
+        Some(value) if value.is_object() || value.is_array() => value,
+        _ => entry,
+    }
+}
+
+/// The record id, which after the bare-array change must come from inside the
+/// value itself. Falls back to the envelope `key` when one is present.
+fn entry_key(entry: &Value) -> Option<&str> {
+    entry
+        .get("key")
+        .and_then(Value::as_str)
+        .or_else(|| entry_value(entry).get("id").and_then(Value::as_str))
+        .or_else(|| entry_value(entry).get("key").and_then(Value::as_str))
+        .filter(|id| !id.is_empty())
+}
+
 async fn cleanup_stale_sessions(iii: &IIIClient) -> Result<Value, Error> {
     let agents = list_scope(iii, "agents").await;
     let cutoff = now_ms() - 24 * 60 * 60 * 1000;
     let mut cleaned = 0u64;
 
     for agent in agents {
-        let agent_id = agent
-            .get("key")
-            .and_then(|v| v.as_str())
-            .or_else(|| agent.get("id").and_then(|v| v.as_str()))
-            .map(String::from);
-
-        let agent_id = match agent_id {
-            Some(id) if !id.is_empty() => id,
-            _ => continue,
+        let agent_id = match entry_key(&agent) {
+            Some(id) => id.to_string(),
+            None => continue,
         };
 
         let sessions = list_scope(iii, &format!("sessions:{agent_id}")).await;
 
         for session in sessions {
-            let value = session.get("value").cloned().unwrap_or(json!({}));
+            let value = entry_value(&session);
             let last_active = value
                 .get("lastActiveAt")
                 .and_then(|v| v.as_i64())
@@ -60,7 +77,7 @@ async fn cleanup_stale_sessions(iii: &IIIClient) -> Result<Value, Error> {
                 .unwrap_or(0);
 
             if last_active != 0 && last_active < cutoff {
-                let key = match session.get("key").and_then(|v| v.as_str()) {
+                let key = match entry_key(&session) {
                     Some(k) => k.to_string(),
                     None => continue,
                 };
@@ -103,9 +120,8 @@ async fn aggregate_daily_costs(iii: &IIIClient) -> Result<Value, Error> {
         let metering = list_scope(iii, "metering").await;
         let mut total_tokens: u64 = 0;
         for entry in &metering {
-            total_tokens += entry
-                .get("value")
-                .and_then(|v| v.get("totalTokens"))
+            total_tokens += entry_value(entry)
+                .get("totalTokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
         }
@@ -116,7 +132,9 @@ async fn aggregate_daily_costs(iii: &IIIClient) -> Result<Value, Error> {
                 payload: json!({
                     "scope": "costs",
                     "key": today,
-                    "operations": [
+                    // iii 0.22.1 names this field `ops`; `operations` failed the
+                    // whole invocation with "missing field `ops`".
+                    "ops": [
                         { "type": "set", "path": "totalTokens", "value": total_tokens },
                         { "type": "set", "path": "aggregatedAt", "value": now_iso() },
                     ],
@@ -139,11 +157,13 @@ async fn reset_rate_limits(iii: &IIIClient) -> Result<Value, Error> {
     let mut reset = 0u64;
 
     for rate in rates {
-        let value = rate.get("value").cloned().unwrap_or(json!({}));
-        let window_end = value.get("windowEnd").and_then(|v| v.as_i64()).unwrap_or(0);
+        let window_end = entry_value(&rate)
+            .get("windowEnd")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
 
         if window_end != 0 && window_end < now {
-            let key = match rate.get("key").and_then(|v| v.as_str()) {
+            let key = match entry_key(&rate) {
                 Some(k) => k.to_string(),
                 None => continue,
             };
@@ -230,7 +250,7 @@ fn state_values(entries: Value) -> Vec<Value> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|entry| entry.get("value").cloned())
+        .map(|entry| entry_value(entry).clone())
         .collect()
 }
 
@@ -614,6 +634,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entry_readers_accept_the_bare_state_list_shape() {
+        // iii 0.22.1 `state::list` returns bare values.
+        let bare = json!({ "id": "job-1", "expression": "0 * * * * *" });
+        assert_eq!(entry_value(&bare), &bare);
+        assert_eq!(entry_key(&bare), Some("job-1"));
+
+        // an envelope, if a backend ever supplies one, still resolves
+        let enveloped = json!({ "key": "job-2", "value": { "id": "job-2" } });
+        assert_eq!(entry_value(&enveloped), &json!({ "id": "job-2" }));
+        assert_eq!(entry_key(&enveloped), Some("job-2"));
+
+        // and a record with neither is skipped rather than mis-keyed
+        assert_eq!(entry_key(&json!({ "expression": "* * * * * *" })), None);
+        assert_eq!(entry_key(&json!({ "id": "" })), None);
+    }
+
+    #[test]
+    fn state_values_passes_bare_records_through() {
+        let bare = json!([{ "id": "a", "type": "cron" }, { "id": "b", "type": "cron" }]);
+        let values = state_values(bare);
+        assert_eq!(values.len(), 2, "bare values must not be dropped");
+        assert_eq!(values[0]["id"], "a");
+
+        let enveloped = json!([{ "key": "a", "value": { "id": "a" } }]);
+        assert_eq!(state_values(enveloped), vec![json!({ "id": "a" })]);
+    }
+
+    #[test]
+    fn metering_total_reads_bare_records() {
+        let metering = [json!({ "totalTokens": 500 }), json!({ "totalTokens": 300 })];
+        let total: u64 = metering
+            .iter()
+            .map(|entry| {
+                entry_value(entry)
+                    .get("totalTokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert_eq!(total, 800);
+    }
 
     #[test]
     fn test_now_ms_positive() {
