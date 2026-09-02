@@ -24,25 +24,12 @@ interface KnownCollision {
 // TEMPORARY. Recorded 2026-09-02 by the eng-gates remediation, which does not own
 // either file. Both fixes are requested in
 // /tmp/agentos-remediation/requests/eng-gates.md. Delete the entry, do not edit it.
-const KNOWN_DUPLICATE_FUNCTION_IDS: KnownCollision[] = [
-  {
-    key: "context::trim",
-    since: "2026-09-02",
-    owner: "workers/context-monitor/src/main.rs",
-    reason:
-      "context-manager registers the LLM-backed trim; context-monitor registers a different, lightweight in-turn compression under the same id. context-monitor's must be renamed (for example context::trim_micro).",
-  },
-];
+// Both 2026-09-02 entries were fixed on wp/state-api-sweep before this branch was
+// integrated: context-monitor now registers context::trim_micro, and a2a-cards now
+// serves GET /api/a2a/agent-card. The allowlist is empty and must stay that way.
+const KNOWN_DUPLICATE_FUNCTION_IDS: KnownCollision[] = [];
 
-const KNOWN_DUPLICATE_HTTP_ROUTES: KnownCollision[] = [
-  {
-    key: "GET /.well-known/agent.json",
-    since: "2026-09-02",
-    owner: "workers/a2a-cards/src/main.rs",
-    reason:
-      "a2a serves the agent card and a2a-cards serves a card catalogue on the identical path. a2a-cards needs its own path (for example api/a2a/agent-card).",
-  },
-];
+const KNOWN_DUPLICATE_HTTP_ROUTES: KnownCollision[] = [];
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const counts = collectCounts();

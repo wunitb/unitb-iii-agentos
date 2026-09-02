@@ -36,7 +36,7 @@ unitb-iii-agentos/
 | Telemetry | `telemetry` `pulse` `session-lifecycle` `session-replay` `feedback` `eval` `evolve` `hashline` `hooks` `cron` | `telemetry::*` `pulse::*` `session::*` `eval::*` `feedback::*` |
 | Embeddings | `embedding` (Python) | `embedding::*` |
 
-The source registers 294 literal function ids across 63 workers (62 Rust + 1 Python), resolving to 293 distinct function ids. `bun run counts` recomputes every number on this page from the tree; `bun run counts:check` fails the build when a published number drifts.
+The source registers 294 literal function ids across 63 workers (62 Rust + 1 Python), resolving to 294 distinct function ids. `bun run counts` recomputes every number on this page from the tree; `bun run counts:check` fails the build when a published number drifts.
 
 ## Worker manifest
 
@@ -57,7 +57,9 @@ CI's `validate iii.worker.yaml` job enforces this on every PR.
 
 ## Engine boot
 
-`config.yaml` uses the `.iii-version` stable pin, currently iii v0.22.1, and its configuration-worker layout. It declares eighteen engine workers — the file-backed `configuration` store plus `iii-http`, `iii-pubsub`, `state`, `llm-router`, `context-manager`, `cron`, `iii-directory`, `iii-observability`, `iii-stream`, `provider-anthropic`, `provider-openai`, `provider-openai-codex`, `queue`, `session-manager`, `shell`, `harness`, and `console`. These are upstream registry binaries resolved through `iii.lock`; the engine's `llm-router` and `context-manager` are *not* the AgentOS workers of the same folder name. The state, queue, and cron workers use the canonical 0.22.1 names; declaring their deprecated `iii-*` aliases alongside canonical workers makes the engine reject the config. Their committed values live in matching files under `config/`; `config.yaml` keeps only worker entries and migration breadcrumbs. AgentOS workers spawn alongside as separate processes — each connects to the engine WebSocket via `register_worker` and stays resident.
+`config.yaml` uses the `.iii-version` stable pin, currently iii v0.22.1, and its configuration-worker layout. It declares sixteen engine workers — the file-backed `configuration` store plus `iii-http`, `iii-pubsub`, `state`, `llm-router`, `context-manager`, `cron`, `iii-directory`, `iii-observability`, `iii-stream`, `provider-anthropic`, `provider-openai`, `provider-openai-codex`, `queue`, `session-manager`, and `harness`. These are upstream registry binaries resolved through `iii.lock`; the engine's `llm-router` and `context-manager` are *not* the AgentOS workers of the same folder name. The state, queue, and cron workers use the canonical 0.22.1 names; declaring their deprecated `iii-*` aliases alongside canonical workers makes the engine reject the config. Their committed values live in matching files under `config/`; `config.yaml` keeps only worker entries and migration breadcrumbs. AgentOS workers spawn alongside as separate processes — each connects to the engine WebSocket via `register_worker` and stays resident.
+
+The `shell` and `console` registry workers are configured under `config/` but deliberately **not** booted by default: `shell` exposes host command execution on the unauthenticated bus, and console v1.9.16 has no host key — it listens on `0.0.0.0` and proxies `/ws` to the bus — so both are opt-in.
 
 The engine WebSocket endpoint is configurable via `III_URL` (default `ws://localhost:49134`).
 
@@ -178,7 +180,7 @@ push with `AGENTOS_FULL_E2E_ENABLED`. The workflow starts from
 
 | job | gate |
 |---|---|
-| `rust` | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` (dev profile, 1,500 test attributes; 3 live-engine checks ignored by default) + `cargo build --workspace --release` + `cargo audit` + `cargo deny check` (advisories, bans, licences, sources — policy in `deny.toml`) |
+| `rust` | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` (dev profile, 1,676 test attributes; 3 live-engine checks ignored by default) + `cargo build --workspace --release` + `cargo audit` + `cargo deny check` (advisories, bans, licences, sources — policy in `deny.toml`) |
 | `node-unit` | `bun run typecheck`, `bun run test:unit` (tests of the software), `bun run test:governance` (build-evidence and documentation contracts), `bun run counts:check` (every published number recomputed from the tree) |
 | `dependency-review` | `actions/dependency-review-action` with `fail-on-severity: moderate`, pull requests only |
 | `portable-bundle` | stages the release payload from the `rust` artifacts and asserts the extracted bundle needs no checkout-relative path |
