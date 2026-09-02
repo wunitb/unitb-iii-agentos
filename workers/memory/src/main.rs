@@ -1,4 +1,8 @@
 use agentos_http_adapter::TriggerBus;
+use agentos_http_adapter::state::{
+    append_op, groups as state_groups, increment_op, set_op, update_errors,
+    update_payload as state_update_payload, value_of as state_value, values as state_values,
+};
 use iii_sdk::errors::Error;
 use iii_sdk::{InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde::{Deserialize, Serialize};
@@ -252,97 +256,6 @@ fn memory_key(input: &Value) -> Result<&str, Error> {
         .and_then(Value::as_str)
         .filter(|key| !key.is_empty())
         .ok_or_else(|| Error::Handler("key is required".to_string()))
-}
-
-/// Extracts the stored value from one `state::list` element.
-///
-/// iii 0.22.1 answers `state::list` with a bare array of the stored values —
-/// verified with `iii trigger state::list scope=...` against the engine this
-/// repo pins. The `{ key, value }` envelope this worker used to assume never
-/// arrives, which is why every list-driven code path read nothing. Both shapes
-/// are accepted so a future envelope does not break it again.
-fn state_value(entry: &Value) -> &Value {
-    match entry.as_object() {
-        Some(object)
-            if object.contains_key("value")
-                && object.keys().all(|key| key == "value" || key == "key") =>
-        {
-            &object["value"]
-        }
-        _ => entry,
-    }
-}
-
-/// The stored values of a `state::list` response.
-fn state_values(response: &Value) -> Vec<&Value> {
-    response
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(state_value)
-        .collect()
-}
-
-/// The scope names of a `state::list_groups` response.
-///
-/// The engine answers `{ "groups": [...] }`; a bare array is accepted too.
-fn state_groups(response: &Value) -> Vec<&str> {
-    response
-        .get("groups")
-        .and_then(Value::as_array)
-        .or_else(|| response.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect()
-}
-
-/// A `state::update` `set` operation.
-fn set_op(path: &str, value: Value) -> Value {
-    json!({ "type": "set", "path": path, "value": value })
-}
-
-/// A `state::update` `append` operation.
-///
-/// `append` takes the element itself: passing an array appends the array as one
-/// nested element. `merge` cannot be used for a list — the engine rejects a
-/// non-object merge value with `merge.value.not_an_object`.
-fn append_op(path: &str, value: Value) -> Value {
-    json!({ "type": "append", "path": path, "value": value })
-}
-
-/// A `state::update` `increment` operation. The amount field is `by`.
-fn increment_op(path: &str, by: i64) -> Value {
-    json!({ "type": "increment", "path": path, "by": by })
-}
-
-/// A `state::update` payload. The operation list field is `ops`.
-fn state_update_payload(scope: String, key: &str, ops: Vec<Value>) -> Value {
-    json!({ "scope": scope, "key": key, "ops": ops })
-}
-
-/// The per-operation errors a `state::update` reports inside a 200 response.
-///
-/// A rejected operation does not fail the invocation, so the only way to notice
-/// is to read `errors`.
-fn update_errors(response: &Value) -> Option<String> {
-    let errors = response.get("errors")?.as_array()?;
-    if errors.is_empty() {
-        return None;
-    }
-    Some(
-        errors
-            .iter()
-            .map(|error| {
-                error
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-    )
 }
 
 async fn call_state(
