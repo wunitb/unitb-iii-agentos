@@ -57,7 +57,10 @@ struct AuditEntry {
 /// than folded into the shared list silently; see the report for the request to
 /// promote it into `policy::DENY_BY_DEFAULT_FAMILIES`, which would also close
 /// it on the chat path.
-static ADDITIONAL_PRIVILEGED_NAMESPACES: &[&str] = &["coder"];
+// Empty since .W's 2026-09-02 ruling folded `coder` and `security` into
+// policy::DENY_BY_DEFAULT_FAMILIES. Keep the seam: a namespace that is privileged
+// here but not on the chat path belongs in this list, with a reason.
+static ADDITIONAL_PRIVILEGED_NAMESPACES: &[&str] = &[];
 
 static INJECTION_PATTERNS: &[&str] = &[
     r"(?i)ignore\s+(all\s+)?(previous|above|prior)\s+(instructions|prompts)",
@@ -982,12 +985,14 @@ mod tests {
              agentos_http_adapter::policy::DENY_BY_DEFAULT_FAMILIES + \
              ADDITIONAL_PRIVILEGED_NAMESPACES"
         );
-        // The shared contract set is 12 families (I1); growth there must be deliberate.
-        assert_eq!(policy::DENY_BY_DEFAULT_FAMILIES.len(), 12);
-        // And so must growth on this side.
-        assert_eq!(
-            ADDITIONAL_PRIVILEGED_NAMESPACES,
-            &["coder"],
+        // The shared contract set is 14 families (I1 after .W's 2026-09-02 ruling
+        // folded in `coder` and `security`); growth there must be deliberate.
+        assert_eq!(policy::DENY_BY_DEFAULT_FAMILIES.len(), 14);
+        // And this side now carries no delta at all. A new local-only privileged
+        // family needs a written reason and a request to promote it into the
+        // shared list, so that the two definitions cannot drift apart again.
+        assert!(
+            ADDITIONAL_PRIVILEGED_NAMESPACES.is_empty(),
             "a new local-only privileged family needs a written reason and a request to \
              promote it into the shared list"
         );

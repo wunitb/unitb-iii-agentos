@@ -265,22 +265,6 @@ fn step_payload(
     Ok(Value::Object(payload))
 }
 
-/// Families .W ruled into contract I1 on 2026-09-02 that
-/// `policy::DENY_BY_DEFAULT_FAMILIES` does not carry yet — chat-core owns that
-/// list and has not landed them.
-///
-/// `security::*` is root-equivalent through `security::docker_exec`
-/// (`docker run` with a caller-supplied command and the workspace bind-mounted
-/// read-write) and `security::audit` lets a caller pollute the audit chain.
-/// `coder::*` is the second surface of the same shell binary, so a capability
-/// set that is refused `shell::fs::write` can still reach `coder::update`.
-///
-/// Delete this constant and the second half of `requires_approval` as soon as
-/// the shared list carries them. The test
-/// `the_pending_families_disappear_when_the_shared_list_catches_up` fails the
-/// moment it does, so this delta can only shrink.
-const PENDING_DENY_BY_DEFAULT_FAMILIES: [&str; 2] = ["security", "coder"];
-
 fn function_family(function_id: &str) -> &str {
     function_id.split("::").next().unwrap_or(function_id)
 }
@@ -288,13 +272,13 @@ fn function_family(function_id: &str) -> &str {
 /// Whether dispatching `function_id` needs a blocking approval decision.
 ///
 /// The family vocabulary is `agentos_http_adapter::policy` — the single shared
-/// definition of contract I1 — plus the pending delta above.
+/// definition of contract I1. There is no local delta: `security` and `coder`
+/// landed in the shared list on 2026-09-02.
 fn requires_approval(function_id: &str) -> bool {
     if function_id.is_empty() {
         return false;
     }
     policy::is_deny_by_default(function_id)
-        || PENDING_DENY_BY_DEFAULT_FAMILIES.contains(&function_family(function_id))
 }
 
 /// The principal a step runs as.
@@ -1834,17 +1818,18 @@ mod tests {
     }
 
     #[test]
-    fn the_pending_families_disappear_when_the_shared_list_catches_up() {
-        // .W ruled `security` and `coder` into contract I1 on 2026-09-02.
-        // Until chat-core lands them in the shared list this worker carries a
-        // local delta; this test fails the moment the shared list catches up,
-        // so the delta can only shrink and never drift.
-        for family in PENDING_DENY_BY_DEFAULT_FAMILIES {
+    fn the_ruled_families_stay_in_the_shared_list() {
+        // .W ruled `security` and `coder` into contract I1 on 2026-09-02, and
+        // chat-core landed them in `policy::DENY_BY_DEFAULT_FAMILIES`, so the
+        // local delta this worker used to carry is gone. This test keeps them
+        // there: dropping either one silently re-opens `security::docker_exec`
+        // (root-equivalent) and `coder::update` (the shell binary's second
+        // file-writing surface) to an unapproved workflow step.
+        for family in ["security", "coder"] {
             assert!(
-                !policy::DENY_BY_DEFAULT_FAMILIES.contains(&family),
-                "`{family}` is now in policy::DENY_BY_DEFAULT_FAMILIES: delete \
-                 PENDING_DENY_BY_DEFAULT_FAMILIES, the second half of \
-                 requires_approval, and this test"
+                policy::DENY_BY_DEFAULT_FAMILIES.contains(&family),
+                "`{family}` was removed from policy::DENY_BY_DEFAULT_FAMILIES; \
+                 that is a .W-level decision, not a refactor"
             );
             assert!(requires_approval(&format!("{family}::anything")));
         }
