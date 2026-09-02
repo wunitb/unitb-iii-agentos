@@ -10,6 +10,7 @@ name = "agentos-loop-guard"
 path = "src/main.rs"
 
 [dependencies]
+agentos-bus-auth.workspace = true
 iii-sdk.workspace = true
 tokio.workspace = true
 serde.workspace = true

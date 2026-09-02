@@ -2,7 +2,7 @@ use agentos_http_adapter::TriggerBus;
 use agentos_http_adapter::policy;
 use agentos_http_adapter::state::{self, set_op};
 use iii_sdk::errors::Error;
-use iii_sdk::{InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker};
+use iii_sdk::{RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
 
 mod types;
@@ -595,7 +595,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let iii_clone = iii.clone();
     iii.register_function(

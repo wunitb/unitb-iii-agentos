@@ -11,6 +11,7 @@ name = "agentos-channel-email"
 path = "src/main.rs"
 
 [dependencies]
+agentos-bus-auth.workspace = true
 agentos-http-adapter.workspace = true
 iii-sdk.workspace = true
 tokio.workspace = true

@@ -3,9 +3,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use iii_sdk::errors::Error;
-use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
-};
+use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use rand::RngExt;
 use scrypt::{Params, scrypt};
 use serde::{Deserialize, Serialize};
@@ -775,7 +773,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let state: SharedState = Arc::new(Mutex::new(VaultState {
         auto_lock_ms: DEFAULT_AUTO_LOCK_MS,

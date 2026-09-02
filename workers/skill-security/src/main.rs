@@ -2,7 +2,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use iii_sdk::errors::Error;
-use iii_sdk::{InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker};
+use iii_sdk::{RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::OnceLock;
@@ -232,7 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     iii.register_function(
         "skill::verify_signature",

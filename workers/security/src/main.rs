@@ -2,7 +2,7 @@ use agentos_http_adapter::policy;
 use hmac::{Hmac, Mac};
 use iii_sdk::errors::Error;
 use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction,
+    IIIClient, RegisterFunction,
     protocol::{RegisterTriggerInput, TriggerRequest},
     register_worker,
 };
@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let iii_ref = iii.clone();
     iii.register_function(

@@ -1,7 +1,5 @@
 use iii_sdk::errors::Error;
-use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
-};
+use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
 use std::net::IpAddr;
 use std::time::Duration;
@@ -756,7 +754,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_url = std::env::var("III_URL")
         .or_else(|_| std::env::var("III_URL"))
         .unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let iii_clone = iii.clone();
     iii.register_function(

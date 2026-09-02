@@ -1,0 +1,31 @@
+[package]
+name = "agentos-bus-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "agentos_bus_auth"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentos-bus-authd"
+path = "src/bin/agentos-bus-authd.rs"
+
+[dependencies]
+agentos-http-adapter.workspace = true
+anyhow.workspace = true
+iii-sdk.workspace = true
+serde_json.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+# The engine side of the iii-sdk WebSocket protocol. Already in Cargo.lock at
+# this exact version as a transitive dependency of `iii-sdk`, so declaring it
+# directly adds no new package to the tree.
+futures-util = "0.3"
+tokio-tungstenite = "0.28"

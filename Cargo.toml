@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/bus-auth",
     "crates/cli",
     "crates/http-adapter",
     "crates/tui",
@@ -86,6 +87,7 @@ publish = false
 # turned every engine bump into a 62-file sweep. A dependency used by one or two
 # members deliberately stays in that member's manifest.
 [workspace.dependencies]
+agentos-bus-auth = { path = "crates/bus-auth" }
 agentos-http-adapter = { path = "crates/http-adapter" }
 iii-sdk = "=0.22.1"
 tokio = { version = "1", features = ["full"] }

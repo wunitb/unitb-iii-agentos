@@ -1,6 +1,6 @@
 use iii_sdk::errors::Error;
 use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction,
+    IIIClient, RegisterFunction,
     protocol::{RegisterTriggerInput, TriggerRequest},
     register_worker,
     trigger::Trigger,
@@ -607,7 +607,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, InitOptions::default());
+    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
 
     let cron_registry: TriggerRegistry = Arc::new(Mutex::new(HashMap::new()));
     let trigger_registry: TriggerRegistry = Arc::new(Mutex::new(HashMap::new()));
