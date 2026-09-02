@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { createServer } from "node:net";
 import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -51,6 +52,22 @@ interface FixtureResult {
   memworkrStarted: boolean;
   /// What the fake bus-auth daemon recorded, when one was installed.
   busAuth: BusAuthCapture | null;
+  /// The address this fixture told dev-up.sh to use for the daemon.
+  busAuthAddr: string;
+}
+
+/// A loopback address nothing is listening on right now. dev-up.sh defaults the
+/// bus-auth daemon to the fixed 127.0.0.1:49129, so a fixture that used the
+/// default would collide with a parallel run, a leftover fake daemon, or a real
+/// one on the machine - and report "did not listen" for the wrong reason.
+async function freeLoopbackAddr(): Promise<string> {
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("no ephemeral port");
+  const port = address.port;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return `127.0.0.1:${port}`;
 }
 
 async function readCapturedValue(capturePath: string, name: string): Promise<string | null> {
@@ -87,6 +104,7 @@ async function runDevUpFixture(
     await writeFile(envPath, dotenv, { mode: dotenvMode });
     await chmod(envPath, dotenvMode);
   }
+  const busAuthAddr = await freeLoopbackAddr();
   const busAuthLog = join(root, "bus-auth.argv");
   if (options.busAuth === "present") {
     const daemonPath = join(root, "target", "release", "agentos-bus-authd");
@@ -182,6 +200,8 @@ mv "$capture_tmp" "$capture_path"
         PATH: options.memworkr ? `${stubDir}:${process.env.PATH}` : process.env.PATH,
         HOME: process.env.HOME,
         TMPDIR: process.env.TMPDIR,
+        // Never the fixed default: that port is shared machine state.
+        AGENTOS_BUS_AUTH_ADDR: busAuthAddr,
         ...inherited,
       },
     });
@@ -207,7 +227,7 @@ mv "$capture_tmp" "$capture_path"
     ? null
     : { argv: busAuthLines[0]?.split(" ") ?? [], starts: busAuthLines.length };
   if (exitCode !== 0) {
-    return { captured: null, stderr, stdout, exitCode, memworkrStarted, busAuth };
+    return { captured: null, stderr, stdout, exitCode, memworkrStarted, busAuth, busAuthAddr };
   }
 
   for (let attempt = 0; attempt < 200; attempt += 1) {
@@ -232,6 +252,7 @@ mv "$capture_tmp" "$capture_path"
     exitCode,
     memworkrStarted,
     busAuth,
+    busAuthAddr,
   };
 }
 
@@ -482,13 +503,16 @@ describe("dev-up memworkr runtime", () => {
 
 describe("dev-up bus RBAC gate", () => {
   it("starts the bus-auth daemon and does not treat it as a worker", async () => {
-    const { exitCode, stdout, busAuth } = await runDevUpFixture("", {}, { busAuth: "present" });
+    const { exitCode, stdout, busAuth, busAuthAddr } = await runDevUpFixture("", {}, {
+      busAuth: "present",
+    });
 
     expect(exitCode).toBe(0);
     expect(busAuth).not.toBeNull();
-    // The daemon takes its address from the CLI, not from the environment.
-    expect(busAuth?.argv).toContain("--listen=127.0.0.1:49129");
-    expect(stdout).toContain("bus-auth daemon listening on 127.0.0.1:49129");
+    // The daemon binds the address dev-up.sh resolved, passed on the command
+    // line rather than left to the daemon's own default.
+    expect(busAuth?.argv).toContain(`--listen=${busAuthAddr}`);
+    expect(stdout).toContain(`bus-auth daemon listening on ${busAuthAddr}`);
     // It is not a worker: the worker loop must not have started a second copy.
     expect(busAuth?.starts).toBe(1);
   }, 30_000);
