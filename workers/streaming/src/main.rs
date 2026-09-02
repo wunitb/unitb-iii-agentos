@@ -13,7 +13,9 @@
 
 use iii_sdk::errors::Error;
 use iii_sdk::{
-    IIIClient, InitOptions, RegisterFunction, protocol::TriggerRequest, register_worker,
+    IIIClient, InitOptions, RegisterFunction,
+    protocol::{RegisterTriggerInput, TriggerRequest},
+    register_worker,
 };
 use serde_json::{Value, json};
 
@@ -33,6 +35,86 @@ fn chat_trigger(function_id: &str, payload: Value) -> TriggerRequest {
         payload,
         action: None,
         timeout_ms: Some(CHAT_TIMEOUT_MS),
+    }
+}
+
+/// Deny-by-default authorization for `iii-stream` WebSocket joins.
+///
+/// The engine cannot refuse the handshake. `iii/engine/src/workers/stream/stream.rs`
+/// logs a failing `auth_function` ("Failed to invoke auth function" /
+/// "No result from auth function" / "Failed to convert result to context") and
+/// then calls `ws.on_upgrade(... None)` anyway, so an unauthenticated socket is
+/// upgraded with `context: None`. The first place the engine reads a verdict is
+/// the `stream:join` trigger: its handler's `{"unauthorized": true}` makes the
+/// connection answer `stream.unauthorized` and return **before** the
+/// subscription is inserted (`workers/stream/connection.rs`).
+///
+/// So the rule here is: a join is authorized only when the handshake produced an
+/// authenticated auth context. `security::stream_auth` returns
+/// `{"context": {"authenticated": true, "subject": ..., "addr": ...}}`; the
+/// engine hands the inner object to this trigger. No context, a context that is
+/// not an object, `authenticated` that is not literally `true`, or an empty
+/// `subject` -> refused.
+///
+/// Known limits, stated rather than papered over:
+/// * The engine fails **open** if this handler cannot be called at all (an
+///   `Err` from the trigger call is logged and the join proceeds), so this is
+///   defence in depth behind the loopback bind, not a replacement for it.
+/// * Nothing in this repository joins an engine stream today, so the allow
+///   branch has no production consumer to regress; the deny branch is the one
+///   that matters.
+const STREAM_JOIN_TRIGGER_TYPE: &str = "stream:join";
+const STREAM_JOIN_FUNCTION: &str = "stream::authorize_join";
+
+/// The auth context the engine stamped on the join event, wherever it carries
+/// it. Deny-by-default means an unrecognised envelope simply has no context.
+fn stream_join_context(event: &Value) -> Option<&Value> {
+    event
+        .get("context")
+        .or_else(|| event.get("data").and_then(|data| data.get("context")))
+        .filter(|context| !context.is_null())
+}
+
+fn join_context_is_authenticated(context: Option<&Value>) -> bool {
+    let Some(Value::Object(context)) = context else {
+        return false;
+    };
+    let authenticated = matches!(context.get("authenticated"), Some(Value::Bool(true)));
+    let subject = context
+        .get("subject")
+        .and_then(Value::as_str)
+        .is_some_and(|subject| !subject.trim().is_empty());
+    authenticated && subject
+}
+
+fn stream_join_decision(event: &Value) -> Value {
+    if join_context_is_authenticated(stream_join_context(event)) {
+        return json!({ "unauthorized": false });
+    }
+    let stream_name = event
+        .get("stream_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    let subscription_id = event
+        .get("subscription_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    tracing::warn!(
+        stream_name,
+        subscription_id,
+        "refused an iii-stream join without an authenticated connection context"
+    );
+    json!({ "unauthorized": true })
+}
+
+fn stream_join_trigger() -> RegisterTriggerInput {
+    RegisterTriggerInput {
+        trigger_type: STREAM_JOIN_TRIGGER_TYPE.to_string(),
+        function_id: STREAM_JOIN_FUNCTION.to_string(),
+        // The engine matches join triggers on trigger type only, so an empty
+        // config gates every stream instead of one named stream.
+        config: json!({}),
+        metadata: None,
     }
 }
 
@@ -249,6 +331,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("SSE framing of a completed agent::chat answer (buffered, not incremental)"),
     );
 
+    iii.register_function(
+        STREAM_JOIN_FUNCTION,
+        RegisterFunction::new_async(|input: Value| async move {
+            Ok::<Value, Error>(stream_join_decision(&input))
+        })
+        .description(
+            "Authorize an iii-stream WebSocket join; refuses any join whose connection \
+             carries no authenticated auth context",
+        ),
+    );
+
+    // A failure here must not take the chat transport down: the engine keeps
+    // serving the stream port either way, so refusing to boot would close
+    // nothing and cost chat. Log it loudly instead.
+    if let Err(error) = iii.register_trigger(stream_join_trigger()) {
+        tracing::error!(
+            error = %error,
+            trigger_type = STREAM_JOIN_TRIGGER_TYPE,
+            "could not register the stream join gate; iii-stream joins are NOT authorized by this worker"
+        );
+    }
+
     agentos_http_adapter::register_http_trigger(
         &iii,
         "stream::chat",
@@ -417,5 +521,71 @@ mod tests {
                 .expect("last event")
                 .contains("\"finish_reason\":\"stop\"")
         );
+    }
+
+    #[test]
+    fn stream_join_is_refused_without_an_authenticated_context() {
+        // engine 0.22.1 upgrades the socket even when the auth function fails,
+        // leaving `context: null`. That join must not subscribe.
+        for event in [
+            json!({ "subscription_id": "s1", "stream_name": "chat", "group_id": "g" }),
+            json!({ "stream_name": "chat", "context": Value::Null }),
+            json!({ "stream_name": "chat", "context": "agentos-bearer" }),
+            json!({ "stream_name": "chat", "context": [] }),
+            json!({ "stream_name": "chat", "context": { "subject": "agentos-bearer" } }),
+            json!({ "stream_name": "chat", "context": { "authenticated": true } }),
+            json!({ "stream_name": "chat", "context": { "authenticated": "true", "subject": "x" } }),
+            json!({ "stream_name": "chat", "context": { "authenticated": 1, "subject": "x" } }),
+            json!({ "stream_name": "chat", "context": { "authenticated": false, "subject": "x" } }),
+            json!({ "stream_name": "chat", "context": { "authenticated": true, "subject": "" } }),
+            json!({ "stream_name": "chat", "context": { "authenticated": true, "subject": "   " } }),
+            json!({ "stream_name": "chat", "context": { "authenticated": true, "subject": 7 } }),
+        ] {
+            assert_eq!(
+                stream_join_decision(&event),
+                json!({ "unauthorized": true }),
+                "allowed {event}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_join_is_allowed_for_an_authenticated_connection() {
+        // The context `security::stream_auth` returns, as the engine hands it on.
+        let authenticated = json!({
+            "authenticated": true,
+            "subject": "agentos-bearer",
+            "addr": "127.0.0.1:51000",
+        });
+
+        assert_eq!(
+            stream_join_decision(&json!({
+                "subscription_id": "s1",
+                "stream_name": "chat",
+                "group_id": "g",
+                "context": authenticated,
+            })),
+            json!({ "unauthorized": false })
+        );
+
+        // Same verdict if the engine wraps the event payload in `data`.
+        assert_eq!(
+            stream_join_decision(&json!({
+                "type": "stream:join",
+                "data": { "stream_name": "chat", "context": authenticated },
+            })),
+            json!({ "unauthorized": false })
+        );
+    }
+
+    #[test]
+    fn stream_join_gate_is_registered_for_every_stream() {
+        let trigger = stream_join_trigger();
+        assert_eq!(trigger.trigger_type, "stream:join");
+        assert_eq!(trigger.function_id, STREAM_JOIN_FUNCTION);
+        // No `stream_name` filter: the engine matches join triggers on type
+        // only, so an empty config covers every stream.
+        assert_eq!(trigger.config, json!({}));
+        assert!(trigger.metadata.is_none());
     }
 }
