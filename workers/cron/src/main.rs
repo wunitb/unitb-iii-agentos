@@ -314,7 +314,8 @@ fn is_reserved_function(function_id: &str) -> bool {
 /// Applied inside `register_cron_job` / `register_managed_trigger`, so it covers
 /// creation AND the boot-time rehydrate of anything already persisted.
 fn ensure_mintable_function(function_id: &str) -> Result<(), Error> {
-    if function_id.is_empty() || function_id.split("::").count() < 2 {
+    let segments: Vec<&str> = function_id.split("::").collect();
+    if segments.len() < 2 || segments.iter().any(|segment| segment.is_empty()) {
         return Err(Error::Handler(format!(
             "functionId must be a namespaced function id, got {function_id:?}"
         )));

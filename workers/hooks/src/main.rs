@@ -24,6 +24,121 @@ fn is_valid_hook_type(s: &str) -> bool {
     VALID_HOOK_TYPES.contains(&s)
 }
 
+/// Namespaces a hook may never target.
+///
+/// `hook::register` used to accept ANY `functionId` and `hook::fire` later
+/// invoked it, so a `BeforeToolCall` hook pointing at `bridge::invoke` or
+/// `vault::get` was accepted and fired on every tool call. The first twelve
+/// entries are the deny-by-default set from the remediation contract; the rest
+/// close self-amplification and the engine control surface.
+const RESERVED_HOOK_NAMESPACES: &[&str] = &[
+    "shell",
+    "bridge",
+    "mcp",
+    "hook",
+    "cron",
+    "vault",
+    "state",
+    "engine",
+    "code",
+    "harness",
+    "browser",
+    "wasm",
+    "coder",
+    "security",
+    "approval",
+    "approval-tiers",
+    "agentos",
+    "trigger",
+    "control",
+    "configuration",
+];
+
+/// Optional operator allowlist. When set, a hook target must ALSO match one of
+/// these patterns (exact ids or `namespace::*` globs). When unset, any
+/// well-formed non-reserved id is accepted, because hook targets are ordinary
+/// user-supplied functions.
+const HOOK_ALLOWLIST_ENV: &str = "AGENTOS_HOOK_ALLOWLIST";
+
+/// Same segment glob as the capability reader in `workers/security` and the
+/// mint allowlist in `workers/cron`: `*` stands for one segment, a trailing `*`
+/// also covers any further segments, and an empty pattern matches nothing.
+fn hook_pattern_matches(pattern: &str, function_id: &str) -> bool {
+    if pattern.is_empty() || function_id.is_empty() {
+        return false;
+    }
+    let pattern_segments: Vec<&str> = pattern.split("::").collect();
+    let function_segments: Vec<&str> = function_id.split("::").collect();
+    if pattern_segments.iter().any(|segment| segment.is_empty())
+        || function_segments.iter().any(|segment| segment.is_empty())
+    {
+        return false;
+    }
+    if pattern == function_id {
+        return true;
+    }
+    let trailing_wildcard = pattern_segments
+        .last()
+        .is_some_and(|segment| *segment == "*");
+    let compared = if trailing_wildcard {
+        if function_segments.len() < pattern_segments.len() {
+            return false;
+        }
+        &pattern_segments[..pattern_segments.len() - 1]
+    } else {
+        if pattern_segments.len() != function_segments.len() {
+            return false;
+        }
+        &pattern_segments[..]
+    };
+    compared
+        .iter()
+        .zip(function_segments.iter())
+        .all(|(pattern_segment, function_segment)| {
+            *pattern_segment == "*" || pattern_segment == function_segment
+        })
+}
+
+fn is_reserved_hook_target(function_id: &str) -> bool {
+    match function_id.split("::").next() {
+        Some(namespace) if !namespace.is_empty() => RESERVED_HOOK_NAMESPACES.contains(&namespace),
+        _ => true,
+    }
+}
+
+/// Gate for every function id a hook can point at. Enforced at registration AND
+/// again at fire time, so a hook persisted before this landed cannot still run.
+fn ensure_hookable_function(function_id: &str) -> Result<(), Error> {
+    if function_id.is_empty() {
+        return Err(Error::Handler("functionId is required".into()));
+    }
+    let segments: Vec<&str> = function_id.split("::").collect();
+    if segments.len() < 2 || segments.iter().any(|segment| segment.is_empty()) {
+        return Err(Error::Handler(format!(
+            "functionId must be a namespaced function id, got {function_id:?}"
+        )));
+    }
+    if is_reserved_hook_target(function_id) {
+        return Err(Error::Handler(format!(
+            "functionId {function_id} is reserved and cannot be used as a hook target"
+        )));
+    }
+    if let Ok(raw) = std::env::var(HOOK_ALLOWLIST_ENV)
+        && !raw.trim().is_empty()
+    {
+        let allowed = raw
+            .split(',')
+            .map(str::trim)
+            .any(|pattern| hook_pattern_matches(pattern, function_id));
+        if !allowed {
+            return Err(Error::Handler(format!(
+                "functionId {function_id} is not in the operator allowlist ({HOOK_ALLOWLIST_ENV})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HookDefinition {
     id: String,
@@ -152,9 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )));
                 }
                 let function_id = input["functionId"].as_str().unwrap_or("").to_string();
-                if function_id.is_empty() {
-                    return Err(Error::Handler("functionId is required".into()));
-                }
+                ensure_hookable_function(&function_id)?;
 
                 let hook_id = uuid::Uuid::new_v4().to_string();
                 let provided_name = input["name"].as_str().unwrap_or("").to_string();
@@ -280,6 +393,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut applicable: Vec<HookDefinition> = all_hooks
                     .into_iter()
                     .filter(|h| {
+                        // Re-check the target at fire time: a hook stored before
+                        // the registration gate existed would otherwise still be
+                        // invoked on every matching event.
+                        if let Err(error) = ensure_hookable_function(&h.function_id) {
+                            tracing::warn!(
+                                hook_id = %h.id,
+                                function_id = %h.function_id,
+                                error = %error,
+                                "refusing to fire a hook with a reserved target"
+                            );
+                            return false;
+                        }
                         h.hook_type == hook_type
                             && h.enabled
                             && (h.agent_id.is_none()
@@ -574,6 +699,108 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- hook target policy
+
+    fn with_hook_allowlist<T>(value: Option<&str>, test: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(HOOK_ALLOWLIST_ENV);
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(HOOK_ALLOWLIST_ENV, value),
+                None => std::env::remove_var(HOOK_ALLOWLIST_ENV),
+            }
+        }
+        let result = test();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(HOOK_ALLOWLIST_ENV, value),
+                None => std::env::remove_var(HOOK_ALLOWLIST_ENV),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn hook_targets_refuse_the_privileged_namespaces() {
+        with_hook_allowlist(None, || {
+            for function_id in [
+                "bridge::invoke",
+                "shell::exec",
+                "vault::get",
+                "mcp::connect",
+                "state::set",
+                "hook::register",
+                "hook::fire",
+                "cron::create",
+                "engine::functions::list",
+                "harness::spawn",
+                "browser::navigate",
+                "wasm::run",
+                "coder::apply",
+                "security::set_capabilities",
+                "trigger::create",
+                "configuration::set",
+            ] {
+                let error = ensure_hookable_function(function_id)
+                    .expect_err(&format!("{function_id} must be refused"))
+                    .to_string();
+                assert!(error.contains("reserved"), "{function_id}: {error}");
+            }
+        });
+    }
+
+    #[test]
+    fn hook_targets_accept_ordinary_functions_by_default() {
+        with_hook_allowlist(None, || {
+            for function_id in ["memory::store", "workflow::run", "myworker::on_tool_call"] {
+                ensure_hookable_function(function_id)
+                    .unwrap_or_else(|error| panic!("{function_id} must be allowed: {error}"));
+            }
+        });
+    }
+
+    #[test]
+    fn hook_targets_require_a_namespaced_id() {
+        with_hook_allowlist(None, || {
+            for function_id in ["", "bare", "::", "::fire", "memory::"] {
+                assert!(
+                    ensure_hookable_function(function_id).is_err(),
+                    "{function_id:?} must be refused"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn operator_allowlist_narrows_but_never_widens_past_reserved() {
+        with_hook_allowlist(Some("myworker::*"), || {
+            assert!(ensure_hookable_function("myworker::on_tool_call").is_ok());
+            assert!(
+                ensure_hookable_function("memory::store").is_err(),
+                "an id outside the allowlist must be refused"
+            );
+        });
+        with_hook_allowlist(Some("*"), || {
+            assert!(ensure_hookable_function("memory::store").is_ok());
+            assert!(
+                ensure_hookable_function("bridge::invoke").is_err(),
+                "a wildcard allowlist must not reach a reserved namespace"
+            );
+        });
+    }
+
+    #[test]
+    fn hook_pattern_has_no_prefix_semantics() {
+        assert!(!hook_pattern_matches("", "memory::store"));
+        assert!(!hook_pattern_matches("memory", "memory::store"));
+        assert!(!hook_pattern_matches("memory::st", "memory::store"));
+        assert!(hook_pattern_matches("memory::*", "memory::store"));
+        assert!(hook_pattern_matches("*", "memory::store"));
+    }
 
     #[test]
     fn valid_hook_types_recognised() {
