@@ -7,6 +7,19 @@
 # by editing ./config/X.yaml.
 
 workers:
+  # The engine's own WebSocket bus (the socket every worker connects to). It is
+  # mandatory and is auto-added when absent, with WorkerManagerConfig::default()
+  # -> host "0.0.0.0". Declared here so the bind host is pinned to loopback
+  # instead of inherited: the bus carries every AgentOS function and has no
+  # authentication of its own, so an all-interfaces bind is a remote, unauthed
+  # gateway to the whole stack. Verified live: with host 127.0.0.1 the socket is
+  # refused from this machine's LAN and tailnet addresses; with 0.0.0.0 it is
+  # reachable from both. Valid keys are port, host, middleware_function_id,
+  # rbac, handshake_timeout_ms — the struct is deny_unknown_fields, so a typo
+  # fails the boot instead of being ignored.
+  - name: iii-worker-manager
+    config:
+      host: 127.0.0.1
   - name: iii-http
   - name: iii-pubsub
   - name: state
@@ -28,7 +41,18 @@ workers:
   # does not constrain the program shell::exec runs. Opt in by adding
   # `- name: shell` here; ./config/shell.yaml holds the hardened settings that
   # then apply. See config/shell.yaml for what that does and does not buy you.
-  - name: harness
+  # `harness` is deliberately NOT booted by default, for the same reason as
+  # `shell`. Read out of the shipped v1.8.8-rc.3 binary's own function
+  # descriptions: harness::send and harness::spawn start autonomous agent turns,
+  # harness::function::trigger invokes arbitrary iii functions under the harness
+  # dispatch policy, and harness::filesystem::grant / ::revoke are upstream's own
+  # "Internal control-plane" functions that widen a session's filesystem roots.
+  # It also drives coder::* and shell::* for file writes. All of it sits on the
+  # unauthenticated bus, and upstream's approval-gate spec pairs
+  # `harness::spawn` with `shell::*`. Nothing in this repo calls harness::*, and
+  # its only in-stack consumer was the console worker, which is also opt-in now.
+  # Opt in by adding `- name: harness` here; ./config/harness.yaml holds the
+  # bounded settings that then apply, and says what you still have to decide.
   - name: configuration
     config:
       adapter:
