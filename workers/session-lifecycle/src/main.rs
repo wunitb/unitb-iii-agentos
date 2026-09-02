@@ -61,6 +61,26 @@ fn reaction_from_entry(entry: &Value) -> Option<Reaction> {
     serde_json::from_value::<Reaction>(entry.clone()).ok()
 }
 
+/// The non-deleted documents of a `state::list` response.
+///
+/// `state::set value=null` leaves a null entry in the scope until the key is
+/// deleted, so the nulls are dropped here.
+fn stored_values(entries: Vec<Value>) -> Vec<Value> {
+    entries.into_iter().filter(|v| !v.is_null()).collect()
+}
+
+/// Agent ids from a `state::list` over the `agents` scope.
+///
+/// The storage key is not part of the response, so the id is read from the
+/// agent document itself, which `agent::create` writes as `id`.
+fn agent_ids_from_entries(entries: &[Value]) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|agent| agent.get("id")?.as_str().map(String::from))
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
 /// `state::update` payload that appends one transition to the history list.
 ///
 /// The engine names the operation list `ops` (an `operations` key fails the
@@ -386,23 +406,12 @@ async fn list_reactions(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         _ => "lifecycle_reactions".to_string(),
     };
     let entries = safe_state_list(iii, &scope).await;
-    let values: Vec<Value> = entries
-        .into_iter()
-        .filter_map(|e| {
-            let v = e.get("value").cloned()?;
-            if v.is_null() { None } else { Some(v) }
-        })
-        .collect();
-    Ok(json!(values))
+    Ok(json!(stored_values(entries)))
 }
 
 async fn check_all(iii: &IIIClient) -> Result<Value, Error> {
     let agents = safe_state_list(iii, "agents").await;
-    let valid_agents: Vec<String> = agents
-        .iter()
-        .filter_map(|a| a["key"].as_str().map(String::from))
-        .filter(|k| !k.is_empty())
-        .collect();
+    let valid_agents = agent_ids_from_entries(&agents);
 
     let mut active: Vec<(String, Value)> = Vec::new();
     for agent_id in &valid_agents {
@@ -647,6 +656,34 @@ mod tests {
         assert_eq!(set["type"], "set");
         assert_eq!(set["path"], "lastFiredAt");
         assert_eq!(set["value"], json!(1_700_000_000_000i64));
+    }
+
+    #[test]
+    fn reactions_are_listed_from_the_bare_values() {
+        // `lifecycle::list_reactions` used to read `entry["value"]` and so
+        // returned an empty array for every scope.
+        let entries = vec![stored_reaction(), Value::Null];
+        let values = stored_values(entries);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["id"], "rxn_1");
+    }
+
+    #[test]
+    fn agent_ids_come_from_the_document_because_the_key_is_not_returned() {
+        // `check_all` used to read `entry["key"]`, which state::list never
+        // sends, so it never found a single agent to check.
+        let agents = vec![
+            json!({ "id": "agent-1", "name": "One" }),
+            json!({ "name": "no id" }),
+            json!({ "id": "" }),
+            Value::Null,
+            json!({ "id": "agent-2" }),
+        ];
+        assert_eq!(
+            agent_ids_from_entries(&agents),
+            vec!["agent-1".to_string(), "agent-2".to_string()]
+        );
+        assert!(agent_ids_from_entries(&[json!({ "key": "agent-1" })]).is_empty());
     }
 
     #[test]
