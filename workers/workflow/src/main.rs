@@ -304,15 +304,32 @@ async fn state_set(iii: &IIIClient, scope: &str, key: &str, value: Value) -> Res
     Ok(())
 }
 
+/// A rejected operation still answers success at the transport level: the
+/// engine reports it inside an `errors` array of an otherwise normal result,
+/// so a `state::update` that changed nothing looks like a clean write.
+fn update_rejection(result: &Value) -> Option<String> {
+    let errors = result.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    Some(Value::Array(errors.clone()).to_string())
+}
+
 async fn state_update(iii: &IIIClient, scope: &str, key: &str, ops: Value) -> Result<(), Error> {
-    iii.trigger(TriggerRequest {
-        function_id: "state::update".to_string(),
-        payload: json!({ "scope": scope, "key": key, "ops": ops }),
-        action: None,
-        timeout_ms: None,
-    })
-    .await
-    .map_err(|e| Error::Handler(e.to_string()))?;
+    let result = iii
+        .trigger(TriggerRequest {
+            function_id: "state::update".to_string(),
+            payload: json!({ "scope": scope, "key": key, "ops": ops }),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|e| Error::Handler(e.to_string()))?;
+    if let Some(rejection) = update_rejection(&result) {
+        return Err(Error::Handler(format!(
+            "state::update rejected for {scope}/{key}: {rejection}"
+        )));
+    }
     Ok(())
 }
 
@@ -1324,5 +1341,59 @@ mod tests {
         .unwrap();
 
         assert_eq!(workflow_execution_order(&workflow).unwrap(), vec![1, 0]);
+    }
+
+    // --- state protocol (verified against iii 0.22.1) ---
+
+    #[test]
+    fn a_rejected_update_is_detected_inside_a_successful_response() {
+        // `state::update` answers 200 with an `errors` array when an operation
+        // is refused, so a run marked failed could silently stay "running".
+        let engine_result = json!({
+            "errors": [{ "code": "set.path_invalid", "op_index": 2 }],
+            "new_value": { "status": "running" },
+            "old_value": { "status": "running" },
+        });
+        assert!(
+            update_rejection(&engine_result)
+                .expect("rejection must be reported")
+                .contains("set.path_invalid")
+        );
+    }
+
+    #[test]
+    fn a_clean_update_reports_no_rejection() {
+        assert_eq!(
+            update_rejection(&json!({ "new_value": { "status": "failed" } })),
+            None
+        );
+        assert_eq!(
+            update_rejection(&json!({ "new_value": {}, "errors": [] })),
+            None
+        );
+    }
+
+    #[test]
+    fn runs_are_paged_from_a_bare_list() {
+        // `state::list` answers a bare array of stored values: no `{key,
+        // value}` envelope, so a run document is filtered as it arrives.
+        let all = json!([
+            { "runId": "r1", "workflowId": "wf-1" },
+            { "runId": "r2", "workflowId": "wf-2" },
+            { "runId": "r3", "workflowId": "wf-1" }
+        ]);
+        let (page, total) = workflow_run_page(all, "wf-1", 10, 0);
+        assert_eq!(total, 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0]["runId"], "r1");
+        assert_eq!(page[1]["runId"], "r3");
+    }
+
+    #[test]
+    fn the_envelope_this_worker_never_receives_matches_no_run() {
+        let enveloped = json!([{ "key": "r1", "value": { "workflowId": "wf-1" } }]);
+        let (page, total) = workflow_run_page(enveloped, "wf-1", 10, 0);
+        assert_eq!(total, 0);
+        assert!(page.is_empty());
     }
 }

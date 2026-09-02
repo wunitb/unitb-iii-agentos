@@ -289,6 +289,32 @@ async fn list_comments(iii: &IIIClient, realm_id: &str, mission_id: &str) -> Res
     .map_err(|e| Error::Handler(e.to_string()))
 }
 
+/// Missions from a `state::list` response.
+///
+/// The engine answers a bare array of the stored values themselves: there is
+/// no `{key, value}` envelope to unwrap, so each entry is decoded directly.
+fn missions_from_list(all: &Value, req: &ListMissionsRequest) -> Vec<Mission> {
+    let Some(entries) = all.as_array() else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|v| serde_json::from_value::<Mission>(v.clone()).ok())
+        .filter(|m| {
+            let status_ok = req.status.as_ref().is_none_or(|s| &m.status == s);
+            let assignee_ok = req
+                .assignee_id
+                .as_ref()
+                .is_none_or(|a| m.assignee_id.as_ref() == Some(a));
+            let dir_ok = req
+                .directive_id
+                .as_ref()
+                .is_none_or(|d| m.directive_id.as_ref() == Some(d));
+            status_ok && assignee_ok && dir_ok
+        })
+        .collect()
+}
+
 async fn list_missions(iii: &IIIClient, req: ListMissionsRequest) -> Result<Value, Error> {
     let all = iii
         .trigger(TriggerRequest {
@@ -300,26 +326,7 @@ async fn list_missions(iii: &IIIClient, req: ListMissionsRequest) -> Result<Valu
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
 
-    let missions: Vec<Mission> = all
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| serde_json::from_value::<Mission>(v.clone()).ok())
-                .filter(|m| {
-                    let status_ok = req.status.as_ref().is_none_or(|s| &m.status == s);
-                    let assignee_ok = req
-                        .assignee_id
-                        .as_ref()
-                        .is_none_or(|a| m.assignee_id.as_ref() == Some(a));
-                    let dir_ok = req
-                        .directive_id
-                        .as_ref()
-                        .is_none_or(|d| m.directive_id.as_ref() == Some(d));
-                    status_ok && assignee_ok && dir_ok
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let missions = missions_from_list(&all, &req);
 
     Ok(json!({
         "missions": missions,
@@ -490,4 +497,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     iii.shutdown_async().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored_mission(id: &str, status: &str, assignee: Option<&str>) -> Value {
+        json!({
+            "id": id,
+            "realmId": "r1",
+            "directiveId": null,
+            "parentId": null,
+            "title": "t",
+            "description": null,
+            "status": status,
+            "priority": "normal",
+            "assigneeId": assignee,
+            "createdBy": "w",
+            "billingCode": null,
+            "version": 1,
+            "startedAt": null,
+            "completedAt": null,
+            "createdAt": "2026-09-02T00:00:00Z",
+            "updatedAt": "2026-09-02T00:00:00Z",
+        })
+    }
+
+    fn request(status: Option<MissionStatus>, assignee: Option<&str>) -> ListMissionsRequest {
+        ListMissionsRequest {
+            realm_id: "r1".into(),
+            status,
+            assignee_id: assignee.map(String::from),
+            directive_id: None,
+        }
+    }
+
+    // --- state::list protocol (verified against iii 0.22.1) ---
+
+    #[test]
+    fn missions_are_decoded_from_a_bare_list() {
+        let all = json!([
+            stored_mission("m1", "backlog", None),
+            stored_mission("m2", "active", Some("agent-1")),
+        ]);
+        let missions = missions_from_list(&all, &request(None, None));
+        assert_eq!(missions.len(), 2);
+        assert_eq!(missions[0].id, "m1");
+        assert_eq!(missions[1].assignee_id.as_deref(), Some("agent-1"));
+    }
+
+    #[test]
+    fn the_envelope_this_worker_never_receives_decodes_to_nothing() {
+        // Guards the reader against a future "tolerant" `entry["value"]`
+        // unwrap: state::list has never sent a `{key, value}` envelope.
+        let enveloped = json!([{ "key": "m1", "value": stored_mission("m1", "backlog", None) }]);
+        assert!(missions_from_list(&enveloped, &request(None, None)).is_empty());
+    }
+
+    #[test]
+    fn filters_apply_to_the_decoded_documents() {
+        let all = json!([
+            stored_mission("m1", "backlog", None),
+            stored_mission("m2", "active", Some("agent-1")),
+        ]);
+        let filtered = missions_from_list(&all, &request(Some(MissionStatus::Active), None));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "m2");
+
+        let by_assignee = missions_from_list(&all, &request(None, Some("agent-1")));
+        assert_eq!(by_assignee.len(), 1);
+        assert_eq!(by_assignee[0].id, "m2");
+    }
+
+    #[test]
+    fn deleted_entries_and_non_array_responses_are_ignored() {
+        // `state::set value=null` leaves a null entry in the scope.
+        let all = json!([Value::Null, stored_mission("m1", "backlog", None)]);
+        assert_eq!(missions_from_list(&all, &request(None, None)).len(), 1);
+        assert!(missions_from_list(&json!(null), &request(None, None)).is_empty());
+    }
 }

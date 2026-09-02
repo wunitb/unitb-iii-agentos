@@ -77,22 +77,19 @@ async fn list_agent_functions(iii: &IIIClient, agent_id: &str) -> Result<Vec<Str
         .unwrap_or_default())
 }
 
-async fn list_skill_entries(iii: &IIIClient) -> Result<Vec<AgentSkillRef>, Error> {
-    let skills = state_list(iii, "skills").await?;
-    Ok(skills
+/// `state::list` answers a bare array of the stored values: there is no
+/// `{key, value}` envelope, so a skill document is read as it arrives.
+fn skills_from_entries(entries: Vec<Value>) -> Vec<AgentSkillRef> {
+    entries
         .into_iter()
-        .filter_map(|entry| {
-            let s = entry.get("value").cloned().unwrap_or(entry);
-            if s.is_null() {
-                return None;
-            }
-            let id = s.get("id")?.as_str()?.to_string();
-            let name = s
+        .filter_map(|skill| {
+            let id = skill.get("id")?.as_str()?.to_string();
+            let name = skill
                 .get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let description = s
+            let description = skill
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
@@ -104,7 +101,19 @@ async fn list_skill_entries(iii: &IIIClient) -> Result<Vec<AgentSkillRef>, Error
             })
         })
         .take(20)
-        .collect())
+        .collect()
+}
+
+/// Agent ids from a bare `state::list` response over the `agents` scope.
+fn agent_ids_from_entries(entries: &[Value]) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|agent| agent.get("id")?.as_str().map(String::from))
+        .collect()
+}
+
+async fn list_skill_entries(iii: &IIIClient) -> Result<Vec<AgentSkillRef>, Error> {
+    Ok(skills_from_entries(state_list(iii, "skills").await?))
 }
 
 async fn generate_card(iii: &IIIClient, req: GenerateCardRequest) -> Result<Value, Error> {
@@ -153,12 +162,7 @@ async fn list_cards(iii: &IIIClient) -> Result<Value, Error> {
     let agents = state_list(iii, "agents").await?;
     let mut cards: Vec<Value> = Vec::new();
 
-    for entry in agents {
-        let agent = entry.get("value").cloned().unwrap_or(entry);
-        let agent_id = match agent.get("id").and_then(|v| v.as_str()) {
-            Some(id) => id.to_string(),
-            None => continue,
-        };
+    for agent_id in agent_ids_from_entries(&agents) {
         if let Ok(card) = generate_card(iii, GenerateCardRequest { agent_id }).await {
             cards.push(card);
         }
@@ -260,4 +264,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     iii.shutdown_async().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- state::list protocol (verified against iii 0.22.1) ---
+
+    #[test]
+    fn skills_are_read_from_a_bare_list() {
+        let entries = vec![
+            json!({ "id": "s1", "name": "Search", "description": "find things" }),
+            json!({ "id": "s2", "name": "Write" }),
+        ];
+        let skills = skills_from_entries(entries);
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].id, "s1");
+        assert_eq!(skills[0].name, "Search");
+        assert_eq!(skills[1].description, "");
+    }
+
+    #[test]
+    fn a_skill_carrying_its_own_value_field_survives_intact() {
+        // The old reader unwrapped `entry["value"]` when present, so a skill
+        // document with a `value` field was replaced by that field alone.
+        let entries = vec![json!({
+            "id": "s1",
+            "name": "Search",
+            "description": "find things",
+            "value": { "id": "wrong", "name": "wrong" },
+        })];
+        let skills = skills_from_entries(entries);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].id, "s1");
+        assert_eq!(skills[0].name, "Search");
+    }
+
+    #[test]
+    fn skills_are_capped_at_twenty() {
+        let entries: Vec<Value> = (0..25).map(|i| json!({ "id": format!("s{i}") })).collect();
+        assert_eq!(skills_from_entries(entries).len(), 20);
+    }
+
+    #[test]
+    fn deleted_entries_are_skipped() {
+        // `state::set value=null` leaves a null entry in the scope.
+        let entries = vec![Value::Null, json!({ "id": "s1" })];
+        assert_eq!(skills_from_entries(entries).len(), 1);
+    }
+
+    #[test]
+    fn agent_ids_are_read_from_a_bare_list() {
+        let entries = vec![
+            json!({ "id": "agent-1", "name": "One" }),
+            json!({ "name": "no id" }),
+            Value::Null,
+            json!({ "id": "agent-2" }),
+        ];
+        assert_eq!(
+            agent_ids_from_entries(&entries),
+            vec!["agent-1".to_string(), "agent-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_envelope_this_worker_used_to_expect_is_never_sent() {
+        let enveloped = vec![json!({ "key": "agent-1", "value": { "id": "agent-1" } })];
+        assert!(agent_ids_from_entries(&enveloped).is_empty());
+    }
 }

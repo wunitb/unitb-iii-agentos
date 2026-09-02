@@ -56,6 +56,49 @@ fn uuid_v4() -> String {
     format!("zb-{:x}", nanos)
 }
 
+/// A stable label for one entry of a `state::list` result.
+///
+/// `state::list` answers a bare array of stored values, so the storage key is
+/// simply not available. The document's own `id` is the closest identifier a
+/// finding can carry; otherwise the position in the scope is reported so an
+/// operator can still locate the entry.
+fn entry_label(entry: &Value, index: usize) -> String {
+    entry
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| format!("#{index}"))
+}
+
+/// Scan one `state::list` response for secrets.
+///
+/// The engine answers a bare array of the stored values themselves: there is
+/// no `{key, value}` envelope. Reading `entry["value"]` therefore scanned an
+/// empty string for every entry, which is why this scan never reported a
+/// finding.
+fn scan_scope_entries(scope: &str, entries: &Value) -> Vec<Value> {
+    let Some(items) = entries.as_array() else {
+        return Vec::new();
+    };
+    let mut findings = Vec::new();
+    for (index, entry) in items.iter().enumerate() {
+        if entry.is_null() {
+            continue;
+        }
+        let matched = scan_value_for_secrets(entry);
+        if matched.is_empty() {
+            continue;
+        }
+        findings.push(json!({
+            "scope": scope,
+            "key": entry_label(entry, index),
+            "patterns": matched,
+        }));
+    }
+    findings
+}
+
 fn scan_value_for_secrets(value: &Value) -> Vec<String> {
     let s = serde_json::to_string(value).unwrap_or_default();
     secret_patterns()
@@ -130,27 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await
                         .unwrap_or(json!([]));
 
-                    let items: Vec<Value> = match &entries {
-                        Value::Array(a) => a.clone(),
-                        Value::Object(o) => o
-                            .get("entries")
-                            .and_then(|v| v.as_array())
-                            .cloned()
-                            .unwrap_or_default(),
-                        _ => Vec::new(),
-                    };
-
-                    for entry in items {
-                        let value = entry.get("value").cloned().unwrap_or(json!(""));
-                        let matched = scan_value_for_secrets(&value);
-                        if !matched.is_empty() {
-                            findings.push(json!({
-                            "scope": scope,
-                            "key": entry.get("key").and_then(|v| v.as_str()).unwrap_or("unknown"),
-                            "patterns": matched,
-                        }));
-                        }
-                    }
+                    findings.extend(scan_scope_entries(scope, &entries));
                 }
 
                 if !findings.is_empty() {
@@ -273,5 +296,52 @@ mod tests {
     fn test_zeroizing_buffer_holds_data() {
         let buf = Zeroizing::new(b"hello".to_vec());
         assert_eq!(&*buf, b"hello");
+    }
+
+    // --- state::list protocol (verified against iii 0.22.1) ---
+
+    #[test]
+    fn scan_reads_the_bare_values_state_list_returns() {
+        // `iii trigger state::list scope=config` answers the stored values
+        // themselves, with no key and no `{key, value}` envelope.
+        let entries = json!([
+            { "id": "prod", "note": "api_key=abcdef1234567890" },
+            { "id": "dev", "note": "nothing to see" }
+        ]);
+        let findings = scan_scope_entries("config", &entries);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["scope"], "config");
+        assert_eq!(findings[0]["key"], "prod");
+        assert!(!findings[0]["patterns"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_envelope_this_worker_used_to_expect_hid_every_secret() {
+        // The old reader scanned `entry["value"]`, defaulting to "" when the
+        // field was absent - which it always is - so the scan could never
+        // report a finding. Reproduce that read over a real list response.
+        let entries = json!([{ "id": "prod", "note": "api_key=abcdef1234567890" }]);
+        let old_read = entries[0].get("value").cloned().unwrap_or(json!(""));
+        assert!(scan_value_for_secrets(&old_read).is_empty());
+        assert!(!scan_scope_entries("config", &entries).is_empty());
+    }
+
+    #[test]
+    fn an_entry_without_an_id_is_reported_by_position() {
+        let entries = json!([
+            { "note": "clean" },
+            { "note": "password=hunter2hello" }
+        ]);
+        let findings = scan_scope_entries("sessions", &entries);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["key"], "#1");
+    }
+
+    #[test]
+    fn deleted_entries_and_non_array_responses_are_ignored() {
+        // `state::set value=null` leaves a null entry in the scope.
+        assert!(scan_scope_entries("config", &json!([null])).is_empty());
+        assert!(scan_scope_entries("config", &json!(null)).is_empty());
+        assert!(scan_scope_entries("config", &json!({ "entries": [] })).is_empty());
     }
 }
