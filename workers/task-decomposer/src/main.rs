@@ -641,6 +641,7 @@ mod tests {
         assert_eq!(payload["ops"][0]["path"], "status");
         assert_eq!(payload["ops"][0]["value"], "in_progress");
         assert_eq!(payload["ops"][1]["path"], "updatedAt");
+        assert_eq!(payload["ops"][1]["value"], json!(1_700_000_000_000u128));
     }
 
     #[test]
