@@ -152,6 +152,55 @@ impl Fixture {
         write_executable(&self.release.join("agentos-echo"), "#!/bin/sh\nexit 3\n");
     }
 
+    /// A clean machine: the dotenv ships `AGENTOS_API_KEY` empty, exactly as
+    /// `.env.example` does, so nothing can boot until a key exists.
+    fn with_empty_api_key(&self) {
+        fs::write(
+            self.runtime.join(".env"),
+            "DOTENV_ONLY=from-dotenv\nEXPLICIT_WINS=from-dotenv\nAGENTOS_API_KEY=\n",
+        )
+        .expect("write dotenv without a key");
+    }
+
+    fn dotenv(&self) -> String {
+        fs::read_to_string(self.runtime.join(".env")).expect("read dotenv")
+    }
+
+    /// The value assigned to `name` in the fixture dotenv, if any.
+    fn dotenv_value(&self, name: &str) -> Option<String> {
+        self.dotenv().lines().find_map(|line| {
+            line.split_once('=')
+                .filter(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    fn dotenv_mode(&self) -> u32 {
+        fs::metadata(self.runtime.join(".env"))
+            .expect("stat dotenv")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// `agentos start` runs until interrupted, so the caller gets the child and
+    /// stops it once the launched worker has recorded its environment.
+    fn start(&self, program: &Path, path: &str) -> std::process::Child {
+        Command::new(program)
+            .arg("start")
+            .env("PATH", path)
+            .env("HOME", &self.home)
+            .env("AGENTOS_HOME", &self.home)
+            .env("AGENTOS_CONFIG", self.runtime.join("config.yaml"))
+            .env("EXPLICIT_WINS", "from-shell")
+            .env_remove("AGENTOS_API_KEY")
+            .current_dir(&self.root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run agentos start")
+    }
+
     fn up(&self, program: &Path, arguments: &[&str], path: &str) -> Output {
         Command::new(program)
             .arg("up")
@@ -161,6 +210,9 @@ impl Fixture {
             .env("AGENTOS_HOME", &self.home)
             .env("AGENTOS_CONFIG", self.runtime.join("config.yaml"))
             .env("EXPLICIT_WINS", "from-shell")
+            // An inherited key would win over the file and hide whether `up`
+            // wrote one, so the fixture always starts without it.
+            .env_remove("AGENTOS_API_KEY")
             .current_dir(&self.root)
             .output()
             .expect("run agentos up")
@@ -387,5 +439,129 @@ fn up_fails_when_a_started_worker_dies_before_reaching_the_bus() {
     );
 
     drop(engine);
+    fixture.cleanup();
+}
+
+/// `.env.example` ships `AGENTOS_API_KEY=` empty and `crates/http-adapter`
+/// refuses to register protected routes without it, so a clean machine loses
+/// almost every worker. `up` must close that gap by itself, before it touches
+/// the stack, whatever the engine does afterwards. This test is deliberately
+/// independent of the shared engine port.
+#[test]
+fn up_writes_the_machine_api_key_before_starting_anything() {
+    let fixture = Fixture::new("generate-api-key");
+    fixture.with_empty_api_key();
+
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_agentos"));
+    let output = fixture.up(
+        &cli,
+        &["--no-tui", "--timeout", "2"],
+        &fixture.path_with_engine(),
+    );
+
+    let key = fixture
+        .dotenv_value("AGENTOS_API_KEY")
+        .expect("AGENTOS_API_KEY assignment");
+    assert_eq!(key.len(), 64, "expected 32 bytes of hex, got {key:?}");
+    assert!(
+        key.chars().all(|c| c.is_ascii_hexdigit()),
+        "not a hex key: {key}"
+    );
+    assert_eq!(fixture.dotenv_mode(), 0o600, "{}", fixture.dotenv());
+    assert!(
+        fixture.dotenv().contains("DOTENV_ONLY=from-dotenv"),
+        "the operator's other values must survive: {}",
+        fixture.dotenv()
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("generated a new 32-byte AGENTOS_API_KEY"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&fixture.runtime.join(".env").display().to_string()),
+        "up must print where the key went: {stdout}"
+    );
+
+    fixture.cleanup();
+}
+
+/// The generated key is worthless unless the processes that need it receive it.
+#[test]
+fn up_hands_the_generated_api_key_to_the_launched_processes() {
+    let _guard = engine_port_lock();
+    let fixture = Fixture::new("propagate-api-key");
+    let Ok(engine) = TcpListener::bind(("127.0.0.1", ENGINE_PORT)) else {
+        eprintln!("skipped: port {ENGINE_PORT} is already in use by another engine");
+        fixture.cleanup();
+        return;
+    };
+    fixture.with_empty_api_key();
+
+    let cli = fixture.with_tui(0);
+    let output = fixture.up(&cli, &[], &fixture.path_with_engine());
+    assert!(
+        output.status.success(),
+        "up failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let key = fixture
+        .dotenv_value("AGENTOS_API_KEY")
+        .expect("AGENTOS_API_KEY assignment");
+    assert_eq!(
+        fs::read_to_string(&fixture.tui_env).expect("read TUI environment"),
+        format!("from-dotenv|from-shell|{key}\n")
+    );
+
+    drop(engine);
+    fixture.cleanup();
+}
+
+#[test]
+fn up_never_overwrites_an_existing_api_key() {
+    let fixture = Fixture::new("keep-api-key");
+    let before = fixture.dotenv();
+
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_agentos"));
+    let output = fixture.up(
+        &cli,
+        &["--no-tui", "--timeout", "2"],
+        &fixture.path_with_engine(),
+    );
+    assert_eq!(fixture.dotenv(), before, "up rewrote an operator secret");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("AGENTOS_API_KEY already set in"),
+        "{stdout}"
+    );
+
+    fixture.cleanup();
+}
+
+/// `start` used to pass an empty environment to the engine and the workers,
+/// so a mode-600 `.env` honoured by `up` was silently ignored here.
+#[test]
+fn start_loads_the_active_dotenv_and_generates_the_api_key() {
+    let fixture = Fixture::new("start-dotenv");
+    fixture.with_empty_api_key();
+
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_agentos"));
+    let mut child = fixture.start(&cli, &fixture.path_with_engine());
+    let started = wait_for_file(&fixture.worker_env);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(started, "start never launched the worker");
+    assert_eq!(
+        fs::read_to_string(&fixture.worker_env).expect("read worker environment"),
+        "from-dotenv|from-shell|echo\n",
+        "start must load the same dotenv as up"
+    );
+    let key = fixture
+        .dotenv_value("AGENTOS_API_KEY")
+        .expect("AGENTOS_API_KEY assignment");
+    assert_eq!(key.len(), 64, "start must generate the machine key too");
+    assert_eq!(fixture.dotenv_mode(), 0o600);
+
     fixture.cleanup();
 }
