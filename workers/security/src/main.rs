@@ -1719,3 +1719,117 @@ mod tests {
         assert!(pattern.contains("jailbreak"));
     }
 }
+
+/// Tree guards over `config.yaml`.
+///
+/// The bus RBAC block is invisible when it is missing: the engine silently
+/// falls back to admitting every connection, and nothing else in the tree
+/// notices. These assertions make its removal a test failure. The three
+/// function ids come from `agentos_bus_auth::policy` so there is exactly one
+/// definition of them in the tree.
+#[cfg(test)]
+mod config_tree_guards {
+    use agentos_bus_auth::policy::{
+        AUTH_FUNCTION_ID, FUNCTION_REGISTRATION_HOOK_ID, TRIGGER_REGISTRATION_HOOK_ID,
+    };
+
+    /// Engine bus default port. `iii-bridge` must never point at it: the bridge
+    /// serves the auth function that gates this very listener, so aiming it here
+    /// makes the gate depend on the connection it is gating.
+    const ENGINE_BUS_PORT: &str = "49134";
+
+    fn config_yaml() -> String {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.yaml");
+        std::fs::read_to_string(path).expect("config.yaml is readable from the worker crate")
+    }
+
+    /// The `- name: X` entry block, from that line to the next `- name:`.
+    fn worker_entry(source: &str, name: &str) -> String {
+        let marker = format!("- name: {name}\n");
+        let start = source
+            .find(&marker)
+            .unwrap_or_else(|| panic!("config.yaml does not declare `{name}`"));
+        let rest = &source[start + marker.len()..];
+        let end = rest
+            .find("\n  - name:")
+            .map(|at| at + 1)
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    #[test]
+    fn the_bus_is_pinned_to_loopback_and_carries_the_rbac_block() {
+        let source = config_yaml();
+        let entry = worker_entry(&source, "iii-worker-manager");
+
+        assert!(
+            entry.contains("host: 127.0.0.1"),
+            "the bus must be pinned to loopback; without this entry the engine \
+             appends iii-worker-manager with WorkerManagerConfig::default() -> 0.0.0.0"
+        );
+        assert!(
+            !entry.contains("0.0.0.0"),
+            "the bus must not bind all interfaces"
+        );
+
+        assert!(
+            entry.contains("rbac:"),
+            "the rbac block is gone; the engine then admits every bus connection"
+        );
+        for id in [
+            AUTH_FUNCTION_ID,
+            FUNCTION_REGISTRATION_HOOK_ID,
+            TRIGGER_REGISTRATION_HOOK_ID,
+        ] {
+            assert!(
+                entry.contains(id),
+                "rbac block does not reference {id}; the hook it belongs to is unarmed"
+            );
+        }
+        assert!(
+            entry.contains(&format!("auth_function_id: {AUTH_FUNCTION_ID}")),
+            "auth_function_id must name {AUTH_FUNCTION_ID}"
+        );
+    }
+
+    #[test]
+    fn the_bridge_serves_the_rbac_hooks_from_off_the_bus() {
+        let source = config_yaml();
+        let entry = worker_entry(&source, "iii-bridge");
+
+        assert!(
+            entry.contains("url: ws://127.0.0.1:"),
+            "iii-bridge must reach the bus-auth daemon over loopback"
+        );
+        assert!(
+            !entry.contains(ENGINE_BUS_PORT),
+            "iii-bridge.url must not be the engine's own bus ({ENGINE_BUS_PORT}); that deadlocks by construction"
+        );
+        for id in [
+            AUTH_FUNCTION_ID,
+            FUNCTION_REGISTRATION_HOOK_ID,
+            TRIGGER_REGISTRATION_HOOK_ID,
+        ] {
+            assert!(
+                entry.contains(&format!("local_function: {id}")),
+                "iii-bridge does not forward {id}; the engine would answer \
+                 `Function not found` and refuse every bus connection"
+            );
+            assert!(
+                entry.contains(&format!("remote_function: {id}")),
+                "iii-bridge does not map {id} to the daemon"
+            );
+        }
+    }
+
+    #[test]
+    fn the_host_reaching_workers_stay_out_of_the_default_stack() {
+        let source = config_yaml();
+        for worker in ["shell", "console", "harness"] {
+            assert!(
+                !source.contains(&format!("- name: {worker}\n")),
+                "{worker} is back in the default stack"
+            );
+        }
+    }
+}
