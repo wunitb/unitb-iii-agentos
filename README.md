@@ -10,7 +10,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-apache_2.0-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Apache 2.0"></a>
   <img src="https://img.shields.io/badge/workers-63-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Workers">
   <img src="https://img.shields.io/badge/functions-294-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Functions">
-  <img src="https://img.shields.io/badge/rust_tests-1700_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="1,700 Rust tests">
+  <img src="https://img.shields.io/badge/rust_tests-1703_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="1,703 Rust tests">
   <img src="https://img.shields.io/badge/iii--sdk-0.22.1-d96e2e?style=flat-square&labelColor=f2ede1" alt="iii-sdk 0.22.1">
 </p>
 
@@ -300,7 +300,7 @@ agents/          agent templates
 workflows/       workflow definitions (YAML)
 plugin/          reusable agent/command/skill/hook bundles
 config.yaml      iii v0.22.1 engine and configuration-worker boot list
-config/           committed values for nine iii worker configurations
+config/           committed values for ten iii worker configurations
 website/         agentsos.sh — design.md aesthetic, three themes
 ```
 
