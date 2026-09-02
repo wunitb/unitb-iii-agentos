@@ -183,10 +183,43 @@ fi
 
 : > "$PIDFILE"
 spawned=0
+
+# Bus RBAC gate. iii 0.22.1 calls the RBAC auth function for EVERY bus
+# connection, so this daemon has to answer before a worker connects; it is not a
+# worker itself and must not be started by the loop below. Started here as a
+# best effort: in this flow the engine is already running, and its iii-bridge
+# retries, so a late daemon costs the connections made in that window.
+BUS_AUTH_BIN="$RELEASE_DIR/agentos-bus-authd"
+BUS_AUTH_ADDR="${AGENTOS_BUS_AUTH_ADDR:-127.0.0.1:49129}"
+bus_auth_listening() {
+    local host="${BUS_AUTH_ADDR%:*}" port="${BUS_AUTH_ADDR##*:}"
+    (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null
+}
+if bus_auth_listening; then
+    echo "▸ bus-auth daemon already listening on $BUS_AUTH_ADDR"
+elif [[ -x "$BUS_AUTH_BIN" ]]; then
+    "$BUS_AUTH_BIN" "--listen=$BUS_AUTH_ADDR" >> "$ROOT/.agentos-bus-authd.log" 2>&1 &
+    echo $! >> "$PIDFILE"
+    spawned=$((spawned + 1))
+    for _ in {1..20}; do
+        bus_auth_listening && break
+        sleep 0.2
+    done
+    if bus_auth_listening; then
+        echo "▸ bus-auth daemon listening on $BUS_AUTH_ADDR"
+    else
+        echo "warning: agentos-bus-authd did not listen on $BUS_AUTH_ADDR; see $ROOT/.agentos-bus-authd.log" >&2
+        echo "         it refuses to start without AGENTOS_API_KEY; with bus RBAC armed the engine refuses every worker" >&2
+    fi
+elif grep -q 'auth_function_id' "$ROOT/config.yaml" 2>/dev/null; then
+    echo "warning: $ROOT/config.yaml arms bus RBAC but $BUS_AUTH_BIN is not built" >&2
+    echo "         the engine will refuse every worker connection; run: cargo build --workspace --release" >&2
+fi
+
 for bin in "$RELEASE_DIR"/agentos-*; do
     name="$(basename "$bin")"
     case "$name" in
-        agentos-tui|agentos-cli|*.d|*.dSYM) continue ;;
+        agentos-tui|agentos-cli|agentos-bus-authd|*.d|*.dSYM) continue ;;
     esac
     [[ -x "$bin" ]] || continue
     "$bin" >> "$ROOT/.agentos-${name#agentos-}.log" 2>&1 &

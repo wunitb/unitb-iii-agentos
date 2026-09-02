@@ -353,6 +353,8 @@ pub(crate) struct RunningWorker {
 
 struct ProcessGroup {
     engine: Child,
+    /// The bus RBAC gate, started before the engine and stopped after it.
+    bus_auth: Option<Child>,
     workers: Vec<RunningWorker>,
     terminated: bool,
 }
@@ -371,6 +373,12 @@ impl ProcessGroup {
             let _ = worker.child.wait();
         }
         let _ = self.engine.wait();
+        // The gate goes last: everything above talks through it.
+        if let Some(daemon) = self.bus_auth.as_mut() {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+        self.bus_auth = None;
         self.terminated = true;
     }
 }
@@ -854,20 +862,27 @@ pub(crate) fn find_iii_binary(agentos_home: &Path) -> Result<PathBuf> {
         })
 }
 
-/// The `agentos-tui` binary: beside this executable for installed releases,
-/// otherwise the workspace release directory beside the runtime config.
-pub(crate) fn find_tui_binary(runtime_dir: Option<&Path>) -> Option<PathBuf> {
+/// A workspace binary that ships beside the CLI: next to this executable for
+/// installed releases, otherwise the release directory beside the runtime
+/// config, which is where the worker binaries live.
+pub(crate) fn find_sibling_binary(name: &str, runtime_dir: Option<&Path>) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(directory) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
     {
-        candidates.push(directory.join(TUI_BINARY));
+        candidates.push(directory.join(name));
     }
     if let Some(runtime_dir) = runtime_dir {
-        candidates.push(worker_binary_dir(runtime_dir).join(TUI_BINARY));
+        candidates.push(worker_binary_dir(runtime_dir).join(name));
     }
     candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+/// The `agentos-tui` binary: beside this executable for installed releases,
+/// otherwise the workspace release directory beside the runtime config.
+pub(crate) fn find_tui_binary(runtime_dir: Option<&Path>) -> Option<PathBuf> {
+    find_sibling_binary(TUI_BINARY, runtime_dir)
 }
 
 /// Puts a spawned process in its own group so it survives the terminal
@@ -927,6 +942,41 @@ pub(crate) fn launch_workers(
         });
     }
     Ok(())
+}
+
+/// Starts the bus-auth daemon. Its address is passed explicitly so the value
+/// this process resolved is the value the daemon binds, whatever the child
+/// environment says.
+pub(crate) fn spawn_bus_auth(
+    binary: &Path,
+    addr: std::net::SocketAddr,
+    runtime_dir: &Path,
+    log_path: &Path,
+    env: &BTreeMap<String, String>,
+    detached: bool,
+) -> Result<Child> {
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("Cannot open log {}", log_path.display()))?;
+    let log_err = log_file.try_clone()?;
+    let mut command = Command::new(binary);
+    command
+        .arg(format!("--listen={addr}"))
+        .current_dir(runtime_dir)
+        .envs(env)
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_err));
+    if detached {
+        detach_process(&mut command);
+    }
+    command
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("Failed to start {}: {error}", binary.display()))
 }
 
 /// Starts the engine with its log redirected to `log_path`.
@@ -1037,8 +1087,17 @@ async fn main() -> Result<()> {
             println!("\n{}", "AgentOS".bold().cyan());
             println!("{} {}", "✓".green(), key_outcome.describe());
             println!("{}", "─".repeat(40).dimmed());
-            println!("{} Starting iii-engine...", "→".blue());
 
+            // Same order as `up`: the bus RBAC gate must answer before the
+            // engine accepts its first worker connection.
+            let bus_auth = bootstrap::start_bus_auth_for_foreground(
+                &config_yaml,
+                &runtime_dir,
+                &worker_log,
+                &launch_env,
+            )?;
+
+            println!("{} Starting iii-engine...", "→".blue());
             let engine = spawn_engine(
                 &iii_path,
                 &config_yaml,
@@ -1049,6 +1108,7 @@ async fn main() -> Result<()> {
             )?;
             let mut processes = ProcessGroup {
                 engine,
+                bus_auth,
                 workers: Vec::new(),
                 terminated: false,
             };
@@ -1735,7 +1795,11 @@ async fn main() -> Result<()> {
         Commands::Doctor { json: is_json } => {
             let paths = runtime_paths()?;
             let credentials = bootstrap::Credentials::inspect(&paths.runtime_dir)?;
-            let probes = bootstrap::SystemEffects::new(&paths, BTreeMap::new());
+            // Probe with the same environment `up` would hand the stack, so a
+            // value like AGENTOS_BUS_AUTH_ADDR in the active `.env` is honoured
+            // here too. Reading the file changes nothing.
+            let probe_env = bootstrap::load_dotenv(&paths.runtime_dir).unwrap_or_default();
+            let probes = bootstrap::SystemEffects::new(&paths, probe_env);
             let report = tokio::task::spawn_blocking(move || {
                 bootstrap::readiness(&probes, &paths, &credentials)
             })

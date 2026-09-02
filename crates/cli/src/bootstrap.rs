@@ -22,6 +22,19 @@ use crate::{RunningWorker, RuntimePaths, WorkerLaunch, WorkerRuntime, WorkerSpec
 pub(crate) const ENGINE_HOST: Ipv4Addr = Ipv4Addr::LOCALHOST;
 pub(crate) const ENGINE_PORT: u16 = 49134;
 
+/// The bus-auth daemon: `crates/bus-auth`, binary `agentos-bus-authd`. It must
+/// be listening before the engine starts, because iii 0.22.1 calls the RBAC
+/// auth function for every bus connection — including the connection of any
+/// worker that could have provided it.
+pub(crate) const BUS_AUTH_BINARY: &str = "agentos-bus-authd";
+/// Must match `agentos_bus_auth::daemon::DEFAULT_LISTEN_ADDR` and the
+/// `iii-bridge` `url` in `config.yaml`.
+pub(crate) const BUS_AUTH_ADDR_VARIABLE: &str = "AGENTOS_BUS_AUTH_ADDR";
+const DEFAULT_BUS_AUTH_ADDR: &str = "127.0.0.1:49129";
+/// The key in `config.yaml` that arms the gate. `WorkerManagerConfig` is
+/// `deny_unknown_fields`, so its presence is a reliable signal.
+const BUS_RBAC_MARKER: &str = "auth_function_id";
+
 pub(crate) const ENGINE_INSTALL_HINT: &str =
     "install it with `bash scripts/install-iii.sh` (or reinstall AgentOS) and keep `iii` on PATH";
 pub(crate) const WORKSPACE_BUILD_HINT: &str = "run `cargo build --workspace --release`";
@@ -584,6 +597,34 @@ fn engine_endpoint() -> SocketAddr {
     SocketAddr::from((ENGINE_HOST, ENGINE_PORT))
 }
 
+/// Where the bus-auth daemon listens: `AGENTOS_BUS_AUTH_ADDR` when set,
+/// otherwise the daemon's own default. A value that is not a socket address is
+/// an error, never a silent fallback: the engine would fail closed against the
+/// wrong port and refuse every worker.
+fn parse_bus_auth_addr(raw: Option<&str>) -> Result<SocketAddr> {
+    let raw = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_BUS_AUTH_ADDR);
+    raw.parse().map_err(|error| {
+        anyhow::anyhow!("{BUS_AUTH_ADDR_VARIABLE} is not a host:port address ({raw}): {error}")
+    })
+}
+
+/// The `host:port` an `iii-bridge` entry in `config.yaml` forwards the RBAC
+/// hooks to, so a mismatch with the daemon's address can be reported instead of
+/// silently failing every bus connection closed.
+fn bridge_url_endpoint(config: &str) -> Option<String> {
+    config.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("url:")?.trim();
+        let value = value.trim_matches(['"', '\''].as_slice());
+        let rest = value
+            .strip_prefix("ws://")
+            .or_else(|| value.strip_prefix("wss://"))?;
+        Some(rest.trim_end_matches('/').to_string())
+    })
+}
+
 /// Read-only probes. Nothing here changes machine state.
 pub(crate) trait Diagnostics {
     /// The resolved `iii` binary, or why it could not be found.
@@ -598,6 +639,15 @@ pub(crate) trait Diagnostics {
     /// The keys stored in a state scope, `None` when the engine cannot answer
     /// `state::list_keys`. Read-only: `doctor` never writes state.
     fn state_keys(&self, scope: &str) -> Option<Vec<String>>;
+    /// The `agentos-bus-authd` binary, when it is installed or built.
+    fn bus_auth_binary(&self) -> Option<PathBuf>;
+    /// Where the bus-auth daemon should listen.
+    fn bus_auth_addr(&self) -> Result<SocketAddr>;
+    /// Whether something already accepts connections there.
+    fn bus_auth_healthy(&self) -> bool;
+    /// The active `config.yaml`, when it can be read: used to tell whether bus
+    /// RBAC is armed and which address `iii-bridge` forwards to.
+    fn engine_config(&self) -> Option<String>;
     /// Worker manifests plus the release binary resolved for each of them.
     fn worker_specs(&self) -> Result<Vec<WorkerSpec>>;
     /// The `agentos-tui` binary, when it is installed or built.
@@ -610,6 +660,12 @@ pub(crate) trait Diagnostics {
 
 /// Process control used by `agentos up` only.
 pub(crate) trait Bootstrap: Diagnostics {
+    /// Starts the bus-auth daemon detached on `addr` and returns its pid.
+    fn start_bus_auth(&mut self, binary: &Path, addr: SocketAddr) -> Result<u32>;
+    /// The exit status of a daemon started by this process, if it died. It
+    /// refuses to start without `AGENTOS_API_KEY`, which is a boot-stopping
+    /// condition once the gate is armed.
+    fn bus_auth_stopped(&mut self) -> Option<String>;
     /// Starts the engine detached and returns its pid.
     fn start_engine(&mut self, binary: &Path) -> Result<u32>;
     /// The exit status of an engine started by this process, if it died.
@@ -915,6 +971,8 @@ pub(crate) fn readiness(
         ),
     });
 
+    items.push(bus_auth_item(probes));
+
     items.push(capability_item(probes));
 
     items.push(match probes.tui_binary() {
@@ -952,6 +1010,100 @@ pub(crate) fn readiness(
     });
 
     Readiness { items }
+}
+
+/// The foreground (`agentos start`) half of the bus-auth stage: reuse a daemon
+/// that is already listening, start one when the gate is armed, and refuse to
+/// continue when the gate is armed and the daemon is not built. Returns the
+/// child so the caller can stop it with the rest of the stack.
+pub(crate) fn start_bus_auth_for_foreground(
+    config_path: &Path,
+    runtime_dir: &Path,
+    log_path: &Path,
+    launch_env: &BTreeMap<String, String>,
+) -> Result<Option<std::process::Child>> {
+    let addr = parse_bus_auth_addr(
+        std::env::var(BUS_AUTH_ADDR_VARIABLE)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| launch_env.get(BUS_AUTH_ADDR_VARIABLE).cloned())
+            .as_deref(),
+    )?;
+    let config = std::fs::read_to_string(config_path).unwrap_or_default();
+    let armed = config.contains(BUS_RBAC_MARKER);
+
+    if TcpStream::connect_timeout(&addr, HEALTH_PROBE_TIMEOUT).is_ok() {
+        println!(
+            "{} bus-auth daemon already listening on {addr}",
+            "✓".green()
+        );
+        return Ok(None);
+    }
+    if !armed {
+        return Ok(None);
+    }
+    let Some(binary) = crate::find_sibling_binary(BUS_AUTH_BINARY, Some(runtime_dir)) else {
+        anyhow::bail!(
+            "{} arms bus RBAC ({BUS_RBAC_MARKER}) but {BUS_AUTH_BINARY} was not found: {WORKSPACE_BUILD_HINT}, or reinstall AgentOS",
+            config_path.display()
+        );
+    };
+    let daemon = crate::spawn_bus_auth(&binary, addr, runtime_dir, log_path, launch_env, false)?;
+    println!(
+        "{} bus-auth daemon listening on {addr} (pid {})",
+        "✓".green(),
+        daemon.id()
+    );
+    Ok(Some(daemon))
+}
+
+/// Read-only report on the bus-auth daemon. Bus RBAC is fail-closed: with the
+/// gate armed in `config.yaml` and no daemon listening, the engine refuses every
+/// worker connection, which otherwise looks like 62 workers that will not start.
+fn bus_auth_item(probes: &dyn Diagnostics) -> ReadinessItem {
+    let addr = match probes.bus_auth_addr() {
+        Ok(addr) => addr,
+        Err(error) => {
+            return ReadinessItem::failed(
+                "Bus auth",
+                error.to_string(),
+                format!("set {BUS_AUTH_ADDR_VARIABLE} to a host:port address, or unset it"),
+            );
+        }
+    };
+    let config = probes.engine_config();
+    let armed = config
+        .as_deref()
+        .is_some_and(|config| config.contains(BUS_RBAC_MARKER));
+    let bridge = config.as_deref().and_then(bridge_url_endpoint);
+    let mismatch = match &bridge {
+        Some(bridge) if *bridge != addr.to_string() => {
+            format!("; the iii-bridge url is {bridge}, which is a different address")
+        }
+        _ => String::new(),
+    };
+
+    match (probes.bus_auth_healthy(), armed) {
+        (true, _) => ReadinessItem::ok(
+            "Bus auth",
+            format!("bus-auth daemon: listening on {addr}{mismatch}"),
+        ),
+        (false, true) => ReadinessItem::failed(
+            "Bus auth",
+            format!(
+                "bus-auth daemon: not running on {addr} (bus RBAC is fail-closed — the engine will refuse every worker while it is down){mismatch}"
+            ),
+            format!(
+                "start the stack with `agentos up`, which starts {BUS_AUTH_BINARY} before the engine"
+            ),
+        ),
+        (false, false) => ReadinessItem::ok(
+            "Bus auth",
+            format!(
+                "bus-auth daemon: not running on {addr}; bus RBAC is not armed in the active config"
+            ),
+        ),
+    }
 }
 
 /// The agent id the TUI falls back to when no agent exists
@@ -1153,7 +1305,12 @@ fn up_stages(
         None
     };
 
-    // 4. engine: reuse a healthy one, otherwise start it detached and wait.
+    // 4. bus-auth daemon, before the engine: iii 0.22.1 calls the RBAC auth
+    //    function for every bus connection, so a daemon that is not listening
+    //    when the engine starts refuses every worker (fail-closed by design).
+    bus_auth_stage(effects, options, paths, out)?;
+
+    // 5. engine: reuse a healthy one, otherwise start it detached and wait.
     let endpoint = engine_endpoint();
     let reused_engine = effects.engine_healthy();
     if reused_engine {
@@ -1165,7 +1322,7 @@ fn up_stages(
         stage_ok(out, "Bus", &format!("healthy on {endpoint} (pid {pid})"))?;
     }
 
-    // 5. worker binaries
+    // 6. worker binaries
     let workers = effects.worker_specs()?;
     let missing = crate::missing_worker_binaries(&workers);
     if !missing.is_empty() {
@@ -1188,7 +1345,7 @@ fn up_stages(
         &format!("{} release binaries", required.len()),
     )?;
 
-    // 6. workers: compare canonical identities, never aggregate counts. On a
+    // 7. workers: compare canonical identities, never aggregate counts. On a
     //    partial stack only missing workers are launched, preserving the
     //    already-connected processes and avoiding duplicate registrations.
     let already_connected = await_worker_identity_report(effects, options)?;
@@ -1240,7 +1397,7 @@ fn up_stages(
     // report success against a dead bus.
     ensure_engine_alive(effects)?;
 
-    // 7. TUI in the foreground.
+    // 8. TUI in the foreground.
     match tui_binary {
         Some(path) => {
             stage_run(out, "Starting agentos-tui...")?;
@@ -1271,6 +1428,101 @@ fn up_stages(
             Ok(UpOutcome::Ready)
         }
     }
+}
+
+/// Starts (or reuses) the bus-auth daemon and reports what happened. A missing
+/// binary is fatal only when the active config arms the gate: an armed config
+/// without a daemon cannot boot at all, and failing here names the cause
+/// instead of leaving 62 workers refused by the bus.
+fn bus_auth_stage(
+    effects: &mut dyn Bootstrap,
+    options: &UpOptions,
+    paths: &RuntimePaths,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let addr = effects.bus_auth_addr()?;
+    let config = effects.engine_config();
+    let armed = config
+        .as_deref()
+        .is_some_and(|config| config.contains(BUS_RBAC_MARKER));
+
+    if let Some(bridge) = config.as_deref().and_then(bridge_url_endpoint)
+        && bridge != addr.to_string()
+    {
+        writeln!(
+            out,
+            "  {} bus-auth address {addr} does not match the iii-bridge url {bridge} in {}; the engine would forward the RBAC hooks somewhere else",
+            "!".yellow(),
+            paths.config_path.display()
+        )?;
+    }
+
+    if effects.bus_auth_healthy() {
+        stage_ok(out, "Bus auth", &format!("already listening on {addr}"))?;
+        return Ok(());
+    }
+
+    let Some(binary) = effects.bus_auth_binary() else {
+        if armed {
+            anyhow::bail!(
+                "{} arms bus RBAC ({BUS_RBAC_MARKER}) but {BUS_AUTH_BINARY} was not found: {WORKSPACE_BUILD_HINT}, or reinstall AgentOS. With the gate armed and no daemon listening on {addr}, the engine refuses every bus connection",
+                paths.config_path.display()
+            );
+        }
+        stage_ok(
+            out,
+            "Bus auth",
+            &format!("not started: {BUS_AUTH_BINARY} is not built and bus RBAC is not armed"),
+        )?;
+        return Ok(());
+    };
+
+    if !armed {
+        stage_ok(
+            out,
+            "Bus auth",
+            &format!(
+                "not started: bus RBAC is not armed in {}",
+                paths.config_path.display()
+            ),
+        )?;
+        return Ok(());
+    }
+
+    stage_run(out, &format!("Starting {BUS_AUTH_BINARY} on {addr}..."))?;
+    let pid = effects.start_bus_auth(&binary, addr)?;
+    await_bus_auth(effects, options, addr)?;
+    stage_ok(out, "Bus auth", &format!("listening on {addr} (pid {pid})"))?;
+    Ok(())
+}
+
+/// Waits for the daemon to accept connections, failing fast when it exited —
+/// which is what it does when `AGENTOS_API_KEY` is missing.
+fn await_bus_auth(
+    effects: &mut dyn Bootstrap,
+    options: &UpOptions,
+    addr: SocketAddr,
+) -> Result<()> {
+    let (poll, deadline) = poll_plan(options);
+    loop {
+        if let Some(status) = effects.bus_auth_stopped() {
+            anyhow::bail!(
+                "{BUS_AUTH_BINARY} exited with {status} before it listened on {addr}; it refuses to start without {API_KEY_VARIABLE}"
+            );
+        }
+        if effects.bus_auth_healthy() {
+            return Ok(());
+        }
+        let now = effects.now();
+        if now >= deadline {
+            break;
+        }
+        effects.sleep(poll.min(deadline.saturating_duration_since(now)));
+    }
+    anyhow::bail!(
+        "{BUS_AUTH_BINARY} did not accept connections on {addr} within {:?}",
+        options.stage_timeout
+    )
 }
 
 /// Builds a wall-clock polling budget for each readiness wait. A deadline caps
@@ -1413,6 +1665,7 @@ pub(crate) struct SystemEffects {
     runtime_dir: PathBuf,
     launch_env: BTreeMap<String, String>,
     engine: Option<std::process::Child>,
+    bus_auth: Option<std::process::Child>,
     workers: Vec<RunningWorker>,
 }
 
@@ -1424,8 +1677,23 @@ impl SystemEffects {
             runtime_dir: paths.runtime_dir.clone(),
             launch_env,
             engine: None,
+            bus_auth: None,
             workers: Vec::new(),
         }
+    }
+
+    /// Values this invocation would hand to a child process: the active `.env`
+    /// first, then whatever this process already exports.
+    fn launch_value(&self, name: &str) -> Option<String> {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                self.launch_env
+                    .get(name)
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+            })
     }
 }
 
@@ -1543,6 +1811,23 @@ impl Diagnostics for SystemEffects {
         reported_state_keys(&parse_registry_output(&output.stdout)?)
     }
 
+    fn bus_auth_binary(&self) -> Option<PathBuf> {
+        crate::find_sibling_binary(BUS_AUTH_BINARY, Some(&self.runtime_dir))
+    }
+
+    fn bus_auth_addr(&self) -> Result<SocketAddr> {
+        parse_bus_auth_addr(self.launch_value(BUS_AUTH_ADDR_VARIABLE).as_deref())
+    }
+
+    fn bus_auth_healthy(&self) -> bool {
+        self.bus_auth_addr()
+            .is_ok_and(|addr| TcpStream::connect_timeout(&addr, HEALTH_PROBE_TIMEOUT).is_ok())
+    }
+
+    fn engine_config(&self) -> Option<String> {
+        std::fs::read_to_string(&self.config_path).ok()
+    }
+
     fn worker_specs(&self) -> Result<Vec<WorkerSpec>> {
         crate::collect_worker_specs(&self.runtime_dir)
     }
@@ -1561,6 +1846,29 @@ impl Diagnostics for SystemEffects {
 }
 
 impl Bootstrap for SystemEffects {
+    fn start_bus_auth(&mut self, binary: &Path, addr: SocketAddr) -> Result<u32> {
+        let daemon = crate::spawn_bus_auth(
+            binary,
+            addr,
+            &self.runtime_dir,
+            &self.worker_log(),
+            &self.launch_env,
+            true,
+        )?;
+        let pid = daemon.id();
+        self.bus_auth = Some(daemon);
+        Ok(pid)
+    }
+
+    fn bus_auth_stopped(&mut self) -> Option<String> {
+        let daemon = self.bus_auth.as_mut()?;
+        daemon
+            .try_wait()
+            .ok()
+            .flatten()
+            .map(|status| status.to_string())
+    }
+
     fn start_engine(&mut self, binary: &Path) -> Result<u32> {
         let engine = crate::spawn_engine(
             binary,
@@ -1618,6 +1926,13 @@ impl Bootstrap for SystemEffects {
             let _ = engine.wait();
         }
         self.engine = None;
+        // The daemon goes last: it is the gate the rest of the stack talks
+        // through, and killing it first would refuse their shutdown traffic.
+        if let Some(daemon) = self.bus_auth.as_mut() {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+        self.bus_auth = None;
     }
 
     fn run_tui(&mut self, binary: &Path) -> Result<i32> {
@@ -1691,6 +2006,15 @@ mod tests {
         engine_start_error: Option<String>,
         /// Stable worker identities the engine reports; `None` when silent.
         connected: RefCell<Option<BTreeSet<String>>>,
+        /// The bus-auth daemon binary, when it is built.
+        bus_auth_binary: Option<PathBuf>,
+        /// Listening from this probe onwards; `None` never listens.
+        bus_auth_healthy_from: Option<usize>,
+        bus_auth_probes: Cell<usize>,
+        /// The daemon this invocation started reports exited.
+        bus_auth_exits: bool,
+        /// Contents of the active `config.yaml`.
+        engine_config: Option<String>,
         /// Keys in state scope `agents`; `None` when the engine cannot answer.
         agent_keys: Option<Vec<String>>,
         /// Keys in state scope `capabilities`.
@@ -1725,6 +2049,14 @@ mod tests {
                 stop_checks: Cell::new(0),
                 engine_start_error: None,
                 connected: RefCell::new(Some(ids(&["core", "memory"]))),
+                bus_auth_binary: Some(PathBuf::from("/release/agentos-bus-authd")),
+                bus_auth_healthy_from: Some(0),
+                bus_auth_probes: Cell::new(0),
+                bus_auth_exits: false,
+                engine_config: Some(
+                    "workers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n      rbac:\n        auth_function_id: agentos::bus_auth\n  - name: iii-bridge\n    config:\n      url: ws://127.0.0.1:49129\n"
+                        .to_string(),
+                ),
                 agent_keys: Some(vec!["default".to_string()]),
                 capability_keys: Some(vec!["default".to_string()]),
                 identity_probes: Cell::new(0),
@@ -1800,6 +2132,25 @@ mod tests {
             None
         }
 
+        fn bus_auth_binary(&self) -> Option<PathBuf> {
+            self.bus_auth_binary.clone()
+        }
+
+        fn bus_auth_addr(&self) -> Result<SocketAddr> {
+            parse_bus_auth_addr(None)
+        }
+
+        fn bus_auth_healthy(&self) -> bool {
+            let probe = self.bus_auth_probes.get();
+            self.bus_auth_probes.set(probe + 1);
+            self.bus_auth_healthy_from
+                .is_some_and(|threshold| probe >= threshold)
+        }
+
+        fn engine_config(&self) -> Option<String> {
+            self.engine_config.clone()
+        }
+
         fn state_keys(&self, scope: &str) -> Option<Vec<String>> {
             match scope {
                 AGENT_SCOPE => self.agent_keys.clone(),
@@ -1832,6 +2183,15 @@ mod tests {
     }
 
     impl Bootstrap for Fake {
+        fn start_bus_auth(&mut self, _binary: &Path, addr: SocketAddr) -> Result<u32> {
+            self.record(&format!("start_bus_auth {addr}"));
+            Ok(4242)
+        }
+
+        fn bus_auth_stopped(&mut self) -> Option<String> {
+            self.bus_auth_exits.then(|| "exit status: 1".to_string())
+        }
+
         fn start_engine(&mut self, _binary: &Path) -> Result<u32> {
             self.record("start_engine");
             match &self.engine_start_error {
@@ -3360,6 +3720,249 @@ mod tests {
         let item = report.item("Capabilities").expect("capabilities item");
         assert!(!item.passed);
         assert_eq!(item.detail, "the engine did not answer state::list_keys");
+    }
+
+    // -----------------------------------------------------------------------
+    // bus RBAC: the auth daemon starts before the engine
+    // -----------------------------------------------------------------------
+
+    /// A `config.yaml` with the RBAC block, optionally pointing the bridge
+    /// somewhere else than the daemon.
+    fn armed_config(bridge_url: &str) -> String {
+        format!(
+            "workers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n      rbac:\n        auth_function_id: agentos::bus_auth\n  - name: iii-bridge\n    config:\n      url: {bridge_url}\n"
+        )
+    }
+
+    #[test]
+    fn bus_auth_address_comes_from_the_environment_or_the_daemon_default() {
+        assert_eq!(
+            parse_bus_auth_addr(None).expect("default"),
+            "127.0.0.1:49129"
+                .parse::<SocketAddr>()
+                .expect("default addr")
+        );
+        assert_eq!(
+            parse_bus_auth_addr(Some("  ")).expect("blank falls back"),
+            "127.0.0.1:49129"
+                .parse::<SocketAddr>()
+                .expect("default addr")
+        );
+        assert_eq!(
+            parse_bus_auth_addr(Some("127.0.0.1:49999")).expect("explicit"),
+            "127.0.0.1:49999"
+                .parse::<SocketAddr>()
+                .expect("explicit addr")
+        );
+        // Never silently fall back: the engine would fail closed against the
+        // wrong port and refuse every worker.
+        let error = parse_bus_auth_addr(Some("not-an-address"))
+            .expect_err("garbage must not resolve")
+            .to_string();
+        assert!(error.contains(BUS_AUTH_ADDR_VARIABLE), "{error}");
+    }
+
+    #[test]
+    fn bridge_url_endpoint_reads_the_forwarding_target() {
+        assert_eq!(
+            bridge_url_endpoint(&armed_config("ws://127.0.0.1:49129")).as_deref(),
+            Some("127.0.0.1:49129")
+        );
+        assert_eq!(
+            bridge_url_endpoint("    url: \"wss://example.test:8443/\"\n").as_deref(),
+            Some("example.test:8443")
+        );
+        assert_eq!(bridge_url_endpoint("workers: []\n"), None);
+    }
+
+    #[test]
+    fn up_starts_the_bus_auth_daemon_before_the_engine() {
+        let config = existing_config();
+        let mut fake = Fake {
+            // Nothing is listening until the daemon this invocation starts.
+            bus_auth_healthy_from: Some(1),
+            healthy_from: Some(1),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert!(outcome.is_ok(), "{outcome:?}");
+
+        let events = fake.events();
+        let daemon = events
+            .iter()
+            .position(|event| event.starts_with("start_bus_auth"))
+            .expect("daemon must be started");
+        let engine = events
+            .iter()
+            .position(|event| event == "start_engine")
+            .expect("engine must be started");
+        assert!(
+            daemon < engine,
+            "the daemon must be listening before the engine accepts its first bus connection: {events:?}"
+        );
+        assert!(
+            events[daemon].contains("127.0.0.1:49129"),
+            "{:?}",
+            events[daemon]
+        );
+        assert!(output.contains("Bus auth"), "{output}");
+        assert!(output.contains("listening on 127.0.0.1:49129"), "{output}");
+    }
+
+    #[test]
+    fn up_reuses_a_bus_auth_daemon_that_is_already_listening() {
+        let config = existing_config();
+        let mut fake = Fake::default();
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            !fake
+                .events()
+                .iter()
+                .any(|event| event.starts_with("start_bus_auth")),
+            "a second daemon would fail to bind the same port: {:?}",
+            fake.events()
+        );
+        assert!(
+            output.contains("already listening on 127.0.0.1:49129"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn up_fails_when_the_gate_is_armed_and_the_daemon_is_not_built() {
+        let config = existing_config();
+        let mut fake = Fake {
+            bus_auth_binary: None,
+            bus_auth_healthy_from: None,
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome
+            .expect_err("an armed gate without a daemon cannot boot")
+            .to_string();
+        assert!(error.contains(BUS_AUTH_BINARY), "{error}");
+        assert!(error.contains("refuses every bus connection"), "{error}");
+        assert!(
+            !fake.events().contains(&"start_engine".to_string()),
+            "the engine must not start into a gate nothing answers"
+        );
+    }
+
+    #[test]
+    fn up_skips_the_daemon_when_bus_rbac_is_not_armed() {
+        let config = existing_config();
+        let mut fake = Fake {
+            bus_auth_healthy_from: None,
+            engine_config: Some("workers:\n  - name: state\n".to_string()),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            !fake
+                .events()
+                .iter()
+                .any(|event| event.starts_with("start_bus_auth")),
+            "{:?}",
+            fake.events()
+        );
+        assert!(output.contains("bus RBAC is not armed"), "{output}");
+    }
+
+    #[test]
+    fn up_fails_when_the_daemon_exits_before_it_listens() {
+        let config = existing_config();
+        let mut fake = Fake {
+            bus_auth_healthy_from: None,
+            bus_auth_exits: true,
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome
+            .expect_err("a dead daemon must stop the boot")
+            .to_string();
+        assert!(error.contains(API_KEY_VARIABLE), "{error}");
+        assert!(!fake.events().contains(&"start_engine".to_string()));
+    }
+
+    #[test]
+    fn up_warns_when_the_bridge_url_points_somewhere_else() {
+        let config = existing_config();
+        let mut fake = Fake {
+            engine_config: Some(armed_config("ws://127.0.0.1:49999")),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            output.contains("does not match the iii-bridge url 127.0.0.1:49999"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_the_bus_auth_daemon() {
+        let config = existing_config();
+
+        let (report, output) = diagnose(&Fake::default(), ConfigDiscovery::Checkout, &config);
+        let item = report.item("Bus auth").expect("bus auth item");
+        assert!(item.passed);
+        assert!(
+            item.detail
+                .contains("bus-auth daemon: listening on 127.0.0.1:49129"),
+            "{}",
+            item.detail
+        );
+        assert!(output.contains("bus-auth daemon"), "{output}");
+
+        let down = Fake {
+            bus_auth_healthy_from: None,
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&down, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Bus auth").expect("bus auth item");
+        assert!(!item.passed);
+        assert!(
+            item.detail.contains(
+                "bus-auth daemon: not running on 127.0.0.1:49129 (bus RBAC is fail-closed"
+            ),
+            "{}",
+            item.detail
+        );
+        assert!(
+            item.detail.contains("refuse every worker while it is down"),
+            "{}",
+            item.detail
+        );
+
+        // Not armed: a daemon that is not running is not a fault.
+        let unarmed = Fake {
+            bus_auth_healthy_from: None,
+            engine_config: Some("workers:\n  - name: state\n".to_string()),
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&unarmed, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Bus auth").expect("bus auth item");
+        assert!(item.passed, "{}", item.detail);
+        assert!(item.detail.contains("not armed"), "{}", item.detail);
+    }
+
+    #[test]
+    fn doctor_reports_a_bridge_url_that_cannot_be_reached_by_the_daemon() {
+        let config = existing_config();
+        let fake = Fake {
+            engine_config: Some(armed_config("ws://127.0.0.1:49999")),
+            ..Fake::default()
+        };
+        let (report, _) = diagnose(&fake, ConfigDiscovery::Checkout, &config);
+        let item = report.item("Bus auth").expect("bus auth item");
+        assert!(
+            item.detail
+                .contains("the iii-bridge url is 127.0.0.1:49999"),
+            "{}",
+            item.detail
+        );
     }
 
     #[test]

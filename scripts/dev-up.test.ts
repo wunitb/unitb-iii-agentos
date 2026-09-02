@@ -31,6 +31,15 @@ interface FixtureOptions {
   memworkr?: MemworkrOptions;
   /// Extra `integrations/<name>.toml` manifests, by integration id.
   integrations?: Record<string, string[]>;
+  /// "present": ship a fake daemon; "armed-missing": arm config.yaml with no
+  /// daemon binary at all.
+  busAuth?: "present" | "armed-missing";
+}
+
+interface BusAuthCapture {
+  argv: string[];
+  /// How many times the fake daemon was executed.
+  starts: number;
 }
 
 interface FixtureResult {
@@ -40,6 +49,8 @@ interface FixtureResult {
   exitCode: number;
   /// Whether the fake memworkr binary was executed.
   memworkrStarted: boolean;
+  /// What the fake bus-auth daemon recorded, when one was installed.
+  busAuth: BusAuthCapture | null;
 }
 
 async function readCapturedValue(capturePath: string, name: string): Promise<string | null> {
@@ -76,6 +87,27 @@ async function runDevUpFixture(
     await writeFile(envPath, dotenv, { mode: dotenvMode });
     await chmod(envPath, dotenvMode);
   }
+  const busAuthLog = join(root, "bus-auth.argv");
+  if (options.busAuth === "present") {
+    const daemonPath = join(root, "target", "release", "agentos-bus-authd");
+    // Holds the port the way the real daemon does, so the readiness probe in
+    // dev-up.sh has something to connect to.
+    await writeFile(
+      daemonPath,
+      `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${JSON.stringify(busAuthLog)}\n` +
+        `port="\${1##*:}"\nexec python3 -c "import socket,time\n` +
+        `s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n` +
+        `s.bind(('127.0.0.1',int('$port')));s.listen();time.sleep(30)"\n`,
+    );
+    await chmod(daemonPath, 0o755);
+  }
+  if (options.busAuth === "armed-missing") {
+    await writeFile(
+      join(root, "config.yaml"),
+      "workers:\n  - name: iii-worker-manager\n    config:\n      rbac:\n        auth_function_id: agentos::bus_auth\n",
+    );
+  }
+
   const memworkrMarker = join(root, "memworkr.started");
   const stubDir = join(root, "stub");
   if (options.memworkr) {
@@ -169,8 +201,13 @@ mv "$capture_tmp" "$capture_path"
   const memworkrStarted = await readCapturedValue(root, "memworkr.started").then(
     (value) => value !== null,
   );
+  const busAuthRaw = await readCapturedValue(root, "bus-auth.argv");
+  const busAuthLines = (busAuthRaw ?? "").split("\n").filter(Boolean);
+  const busAuth: BusAuthCapture | null = busAuthRaw === null
+    ? null
+    : { argv: busAuthLines[0]?.split(" ") ?? [], starts: busAuthLines.length };
   if (exitCode !== 0) {
-    return { captured: null, stderr, stdout, exitCode, memworkrStarted };
+    return { captured: null, stderr, stdout, exitCode, memworkrStarted, busAuth };
   }
 
   for (let attempt = 0; attempt < 200; attempt += 1) {
@@ -194,6 +231,7 @@ mv "$capture_tmp" "$capture_path"
     stdout,
     exitCode,
     memworkrStarted,
+    busAuth,
   };
 }
 
@@ -439,5 +477,35 @@ describe("dev-up memworkr runtime", () => {
     expect(memworkrStarted).toBe(false);
     expect(stderr).toContain("not a 40-character commit");
     expect(exitCode).toBe(0);
+  });
+});
+
+describe("dev-up bus RBAC gate", () => {
+  it("starts the bus-auth daemon and does not treat it as a worker", async () => {
+    const { exitCode, stdout, busAuth } = await runDevUpFixture("", {}, { busAuth: "present" });
+
+    expect(exitCode).toBe(0);
+    expect(busAuth).not.toBeNull();
+    // The daemon takes its address from the CLI, not from the environment.
+    expect(busAuth?.argv).toContain("--listen=127.0.0.1:49129");
+    expect(stdout).toContain("bus-auth daemon listening on 127.0.0.1:49129");
+    // It is not a worker: the worker loop must not have started a second copy.
+    expect(busAuth?.starts).toBe(1);
+  }, 30_000);
+
+  it("warns when the config arms bus RBAC and the daemon is not built", async () => {
+    const { exitCode, stderr } = await runDevUpFixture("", {}, { busAuth: "armed-missing" });
+
+    expect(exitCode).toBe(0);
+    expect(stderr).toContain("arms bus RBAC");
+    expect(stderr).toContain("cargo build --workspace --release");
+  });
+
+  it("says nothing when neither the daemon nor the gate is present", async () => {
+    const { exitCode, stderr, stdout } = await runDevUpFixture("");
+
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain("bus RBAC");
+    expect(stdout).not.toContain("bus-auth");
   });
 });
