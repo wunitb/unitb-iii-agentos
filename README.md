@@ -9,8 +9,12 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-apache_2.0-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Apache 2.0"></a>
   <img src="https://img.shields.io/badge/workers-63-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Workers">
-  <img src="https://img.shields.io/badge/functions-294-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Functions">
+  <img src="https://img.shields.io/badge/functions-295-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Functions">
+<<<<<<< HEAD
   <img src="https://img.shields.io/badge/rust_tests-1703_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="1,703 Rust tests">
+=======
+  <img src="https://img.shields.io/badge/rust_tests-1700_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="1,700 Rust tests">
+>>>>>>> wp/manifest-parity
   <img src="https://img.shields.io/badge/iii--sdk-0.22.1-d96e2e?style=flat-square&labelColor=f2ede1" alt="iii-sdk 0.22.1">
 </p>
 
@@ -134,7 +138,7 @@ use, and the resulting default route.
 `scripts/dev-up.sh` still starts only the workers against an engine you booted
 yourself.
 
-Engine boots on port 49134. `agentos up` starts the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source registers 294 literal function ids, which resolve to 294 distinct function ids (`bun run counts`). The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
+Engine boots on port 49134. `agentos up` starts the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source registers 295 literal function ids, which resolve to 295 distinct function ids (`bun run counts`). The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
 
 Prefer driving by HTTP? Same thing without the TUI:
 

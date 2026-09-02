@@ -58,17 +58,16 @@ ignore = false
 # ---------------------------------------------------------------------- bans --
 [bans]
 multiple-versions = "deny"
-# `warn`, deliberately, and the only relaxation in this file. Every wildcard in
-# this workspace is `agentos-http-adapter = { path = "../../crates/http-adapter" }`
-# — a workspace-internal path dependency, which carries no registry-resolution
-# risk. cargo-deny's `allow-wildcard-paths` cannot excuse them because it only
-# applies to crates marked `publish = false`, and the shared workspace manifest
-# does not mark them (changing that is a 65-manifest edit outside this change).
-# The thing the wildcard lint actually protects against — a registry dependency
-# with a `*` requirement — is instead asserted, blocking, by
+# Blocking. Every wildcard in this workspace is the workspace-internal
+# `agentos-http-adapter` path dependency, and `allow-wildcard-paths` now excuses
+# exactly those: `Cargo.toml` marks the workspace `publish = false` and all 65
+# members inherit it with `publish.workspace = true`, which is the condition
+# cargo-deny requires ("allow-wildcard-paths ... does not apply to public crates
+# as crates.io disallows path dependencies"). A `*` requirement on a *registry*
+# dependency is therefore an error here, and is additionally asserted by
 # `tests/deny_policy.test.ts` ("declares an explicit version for every registry
-# dependency"), which is strictly stronger than this lint for this workspace.
-wildcards = "warn"
+# dependency"), which also covers dependency tables cargo-deny never resolves.
+wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
 deny = []

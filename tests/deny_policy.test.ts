@@ -62,6 +62,13 @@ describe("cargo-deny policy", () => {
     expect(denyToml).not.toContain('multiple-versions = "allow"');
     expect(denyToml).not.toContain('multiple-versions = "warn"');
     expect(denyToml).not.toContain("skip-tree = [\n");
+
+    // The wildcard lint is only excusable for path dependencies while the crates
+    // that declare them are unpublishable. `Cargo.toml` marks the workspace
+    // `publish = false`, so this gate has no reason to be softer than the rest.
+    expect(denyToml, "the wildcard lint must stay blocking").toContain('wildcards = "deny"');
+    expect(denyToml).not.toContain('wildcards = "warn"');
+    expect(denyToml).not.toContain('wildcards = "allow"');
   });
 
   it("allows only permissive licences", () => {
@@ -121,11 +128,12 @@ describe("cargo-deny policy", () => {
 
 describe("dependency declarations", () => {
   it("declares an explicit version for every registry dependency", async () => {
-    // cargo-deny's own wildcard lint cannot excuse this workspace's path
-    // dependencies (they are not marked `publish = false`), so the property that
-    // lint protects is asserted here instead, and it is asserted for every
-    // dependency table rather than only the resolved graph.
+    // cargo-deny only inspects the resolved graph; this asserts the same property
+    // over every dependency table that exists, including the root
+    // `[workspace.dependencies]` table that members now inherit from. Without the
+    // root in this scan, centralising a dependency would move it out of the gate.
     const manifests = [
+      "Cargo.toml",
       ...new Bun.Glob("workers/*/Cargo.toml").scanSync(repository.pathname),
       ...new Bun.Glob("crates/*/Cargo.toml").scanSync(repository.pathname),
     ].sort();
@@ -136,22 +144,29 @@ describe("dependency declarations", () => {
       const parsed = Bun.TOML.parse(
         await Bun.file(new URL(manifest, repository)).text(),
       ) as Record<string, unknown>;
-      for (const table of ["dependencies", "dev-dependencies", "build-dependencies"]) {
-        const dependencies = parsed[table];
+      const workspace = (parsed.workspace ?? {}) as Record<string, unknown>;
+      const tables: Array<[string, unknown]> = [
+        ["dependencies", parsed.dependencies],
+        ["dev-dependencies", parsed["dev-dependencies"]],
+        ["build-dependencies", parsed["build-dependencies"]],
+        ["workspace.dependencies", workspace.dependencies],
+      ];
+      for (const [table, dependencies] of tables) {
         if (typeof dependencies !== "object" || dependencies === null) continue;
         for (const [name, spec] of Object.entries(dependencies as Record<string, unknown>)) {
+          const where = `${manifest} [${table}]`;
           if (typeof spec === "string") {
-            if (spec.trim().length === 0 || spec.includes("*")) offenders.push(`${manifest}: ${name} = "${spec}"`);
+            if (spec.trim().length === 0 || spec.includes("*")) offenders.push(`${where}: ${name} = "${spec}"`);
             continue;
           }
           const detail = spec as Record<string, unknown>;
           const version = detail.version;
           if (typeof version === "string") {
-            if (version.includes("*")) offenders.push(`${manifest}: ${name} version "${version}"`);
+            if (version.includes("*")) offenders.push(`${where}: ${name} version "${version}"`);
             continue;
           }
           if (typeof detail.path === "string" || detail.workspace === true) continue;
-          offenders.push(`${manifest}: ${name} has no version, path or workspace inheritance`);
+          offenders.push(`${where}: ${name} has no version, path or workspace inheritance`);
         }
       }
     }
