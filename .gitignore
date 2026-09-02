@@ -12,7 +12,10 @@ data/
 .env.*
 !.env.example
 .claude/
-CLAUDE.md
+# Anchored to the repository root on purpose. A bare `CLAUDE.md` matches at any
+# depth, which silently excluded the tracked upstream file `identity/CLAUDE.md`
+# from this fork; anything deeper than the root is content, not agent scratch.
+/CLAUDE.md
 pnpm-lock.yaml
 yarn.lock
 
