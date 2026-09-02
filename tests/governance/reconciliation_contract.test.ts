@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-const repository = new URL("../", import.meta.url);
+const repository = new URL("../../", import.meta.url);
 
 function git(...args: string[]) {
   return Bun.spawnSync({
