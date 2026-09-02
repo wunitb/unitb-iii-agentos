@@ -190,6 +190,173 @@ type TriggerRegistry = Arc<Mutex<HashMap<String, Trigger>>>;
 const CRON_SCOPE: &str = "control:cron";
 const TRIGGER_SCOPE: &str = "control:triggers";
 
+/// Operator allowlist for everything `cron::create` and `trigger::create` may
+/// mint, and for everything `control::rehydrate` may restore at boot.
+///
+/// `POST /api/cron` and `POST /api/triggers` used to accept ANY function id and
+/// (for triggers) registered it with `iii.register_trigger` directly, i.e.
+/// outside `agentos_http_adapter`, so one authenticated call minted a permanent
+/// UNAUTHENTICATED route to any function on the bus — and `rehydrate_registry`
+/// restored it after every restart.
+///
+/// Override with `AGENTOS_TRIGGER_ALLOWLIST` (comma-separated exact ids, or
+/// `namespace::*` globs). `RESERVED_*` below is not overridable.
+const DEFAULT_MINTABLE_FUNCTIONS: &[&str] = &[
+    "cron::cleanup_stale_sessions",
+    "cron::aggregate_daily_costs",
+    "cron::reset_rate_limits",
+    "workflow::run",
+];
+
+const TRIGGER_ALLOWLIST_ENV: &str = "AGENTOS_TRIGGER_ALLOWLIST";
+
+/// Namespaces a minted job or trigger may never reach, whatever the operator
+/// allowlist says. The first twelve are the deny-by-default set from the
+/// remediation contract; the rest close self-amplification (a trigger that
+/// mints triggers) and the engine's own control surface.
+const RESERVED_NAMESPACES: &[&str] = &[
+    "shell",
+    "bridge",
+    "mcp",
+    "hook",
+    "vault",
+    "state",
+    "engine",
+    "code",
+    "harness",
+    "browser",
+    "wasm",
+    "coder",
+    "security",
+    "approval",
+    "approval-tiers",
+    "agentos",
+    "trigger",
+    "control",
+    "configuration",
+];
+
+/// `cron::*` as a whole cannot be reserved — the worker's own maintenance jobs
+/// live there — so the control functions are reserved by exact id instead.
+const RESERVED_FUNCTIONS: &[&str] = &["cron::create", "cron::patch", "cron::delete"];
+
+/// Trigger types a minted trigger may use. `http` is accepted but is always
+/// routed through `agentos_http_adapter::register_http_trigger`, which attaches
+/// the bearer check; `stream*` is refused because a minted join trigger sits on
+/// the stream authorization path.
+const MINTABLE_TRIGGER_TYPES: &[&str] = &["cron", "queue", "subscribe", "state", "log", "http"];
+
+/// Same segment glob as the capability reader in `workers/security`: `*` stands
+/// for one segment and a trailing `*` also covers any further segments. An
+/// empty pattern or an empty id matches nothing.
+fn allowlist_pattern_matches(pattern: &str, function_id: &str) -> bool {
+    if pattern.is_empty() || function_id.is_empty() {
+        return false;
+    }
+    let pattern_segments: Vec<&str> = pattern.split("::").collect();
+    let function_segments: Vec<&str> = function_id.split("::").collect();
+    if pattern_segments.iter().any(|segment| segment.is_empty())
+        || function_segments.iter().any(|segment| segment.is_empty())
+    {
+        return false;
+    }
+    if pattern == function_id {
+        return true;
+    }
+    let trailing_wildcard = pattern_segments
+        .last()
+        .is_some_and(|segment| *segment == "*");
+    let compared = if trailing_wildcard {
+        if function_segments.len() < pattern_segments.len() {
+            return false;
+        }
+        &pattern_segments[..pattern_segments.len() - 1]
+    } else {
+        if pattern_segments.len() != function_segments.len() {
+            return false;
+        }
+        &pattern_segments[..]
+    };
+    compared
+        .iter()
+        .zip(function_segments.iter())
+        .all(|(pattern_segment, function_segment)| {
+            *pattern_segment == "*" || pattern_segment == function_segment
+        })
+}
+
+fn mintable_allowlist() -> Vec<String> {
+    match std::env::var(TRIGGER_ALLOWLIST_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => DEFAULT_MINTABLE_FUNCTIONS
+            .iter()
+            .map(|entry| (*entry).to_string())
+            .collect(),
+    }
+}
+
+fn is_reserved_function(function_id: &str) -> bool {
+    if RESERVED_FUNCTIONS.contains(&function_id) {
+        return true;
+    }
+    match function_id.split("::").next() {
+        Some(namespace) if !namespace.is_empty() => RESERVED_NAMESPACES.contains(&namespace),
+        _ => true,
+    }
+}
+
+/// Gate for every function id a cron job or managed trigger can point at.
+/// Applied inside `register_cron_job` / `register_managed_trigger`, so it covers
+/// creation AND the boot-time rehydrate of anything already persisted.
+fn ensure_mintable_function(function_id: &str) -> Result<(), Error> {
+    if function_id.is_empty() || function_id.split("::").count() < 2 {
+        return Err(Error::Handler(format!(
+            "functionId must be a namespaced function id, got {function_id:?}"
+        )));
+    }
+    if is_reserved_function(function_id) {
+        return Err(Error::Handler(format!(
+            "functionId {function_id} is reserved and can never be scheduled or triggered"
+        )));
+    }
+    let allowlist = mintable_allowlist();
+    if allowlist
+        .iter()
+        .any(|pattern| allowlist_pattern_matches(pattern, function_id))
+    {
+        return Ok(());
+    }
+    Err(Error::Handler(format!(
+        "functionId {function_id} is not in the operator allowlist (set {TRIGGER_ALLOWLIST_ENV} to widen it)"
+    )))
+}
+
+fn ensure_mintable_trigger_type(trigger_type: &str) -> Result<(), Error> {
+    if MINTABLE_TRIGGER_TYPES.contains(&trigger_type) {
+        Ok(())
+    } else {
+        Err(Error::Handler(format!(
+            "trigger type {trigger_type} cannot be minted through this API"
+        )))
+    }
+}
+
+/// Strip a caller-supplied `auth` flag so `register_http_trigger` falls back to
+/// its default (`auth: true`), which also refuses to register when
+/// `AGENTOS_API_KEY` is unset.
+fn forced_auth_http_config(config: Value) -> Value {
+    let mut config = config;
+    if let Some(object) = config.as_object_mut() {
+        object.remove("auth");
+    }
+    config
+}
+
 fn required_string<'a>(input: &'a Value, key: &str) -> Result<&'a str, Error> {
     input
         .get(key)
@@ -262,17 +429,35 @@ async fn list_control_records(iii: &IIIClient, scope: &str) -> Result<Value, Err
 fn register_cron_job(iii: &IIIClient, record: &Value) -> Result<Trigger, Error> {
     let expression = required_string(record, "expression")?;
     let function_id = required_string(record, "functionId")?;
+    ensure_mintable_function(function_id)?;
     agentos_http_adapter::register_cron_trigger(iii, function_id.to_string(), expression)
 }
 
 fn register_managed_trigger(iii: &IIIClient, record: &Value) -> Result<Trigger, Error> {
     let trigger_type = required_string(record, "type")?;
     let function_id = required_string(record, "functionId")?;
+    ensure_mintable_trigger_type(trigger_type)?;
+    ensure_mintable_function(function_id)?;
+    let config = record.get("config").cloned().unwrap_or_else(|| json!({}));
+    let metadata = record.get("metadata").cloned();
+
+    if trigger_type == "http" {
+        // Never `iii.register_trigger` an HTTP route directly: the AgentOS
+        // bearer check lives inside the adapter closure, so a route registered
+        // here would have no auth wrapper at all.
+        return agentos_http_adapter::register_http_trigger(
+            iii,
+            function_id.to_string(),
+            forced_auth_http_config(config),
+            metadata,
+        );
+    }
+
     iii.register_trigger(RegisterTriggerInput {
         trigger_type: trigger_type.to_string(),
         function_id: function_id.to_string(),
-        config: record.get("config").cloned().unwrap_or_else(|| json!({})),
-        metadata: record.get("metadata").cloned(),
+        config,
+        metadata,
     })
 }
 
@@ -416,7 +601,13 @@ async fn rehydrate_registry(
                 lock_registry(cron_registry)?.insert(id.to_string(), handle);
                 restored += 1;
             }
-            Err(error) => errors.push(format!("cron {id}: {error}")),
+            Err(error) => {
+                // A persisted job whose target is no longer mintable is a
+                // security event, not noise: it is exactly the record an
+                // attacker would have planted before the allowlist landed.
+                tracing::warn!(id, error = %error, "refused to rehydrate cron job");
+                errors.push(format!("cron {id}: {error}"));
+            }
         }
     }
 
@@ -430,7 +621,10 @@ async fn rehydrate_registry(
                 lock_registry(trigger_registry)?.insert(id.to_string(), handle);
                 restored += 1;
             }
-            Err(error) => errors.push(format!("trigger {id}: {error}")),
+            Err(error) => {
+                tracing::warn!(id, error = %error, "refused to rehydrate managed trigger");
+                errors.push(format!("trigger {id}: {error}"));
+            }
         }
     }
 
@@ -634,6 +828,150 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- route-factory closure (plan item 12)
+
+    fn with_allowlist<T>(value: Option<&str>, test: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(TRIGGER_ALLOWLIST_ENV);
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(TRIGGER_ALLOWLIST_ENV, value),
+                None => std::env::remove_var(TRIGGER_ALLOWLIST_ENV),
+            }
+        }
+        let result = test();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(TRIGGER_ALLOWLIST_ENV, value),
+                None => std::env::remove_var(TRIGGER_ALLOWLIST_ENV),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn minting_refuses_the_privileged_namespaces() {
+        with_allowlist(None, || {
+            for function_id in [
+                "vault::get",
+                "shell::exec",
+                "bridge::invoke",
+                "mcp::connect",
+                "state::set",
+                "hook::register",
+                "engine::functions::list",
+                "harness::spawn",
+                "browser::navigate",
+                "wasm::run",
+                "coder::apply",
+                "security::set_capabilities",
+                "trigger::create",
+                "control::rehydrate",
+                "cron::create",
+                "cron::delete",
+                "cron::patch",
+            ] {
+                let error = ensure_mintable_function(function_id)
+                    .expect_err(&format!("{function_id} must not be mintable"))
+                    .to_string();
+                assert!(error.contains("reserved"), "{function_id}: {error}");
+            }
+        });
+    }
+
+    #[test]
+    fn minting_refuses_ids_outside_the_allowlist() {
+        with_allowlist(None, || {
+            let error = ensure_mintable_function("memory::store")
+                .expect_err("an unlisted id must be refused")
+                .to_string();
+            assert!(error.contains("not in the operator allowlist"), "{error}");
+        });
+    }
+
+    #[test]
+    fn minting_accepts_the_default_maintenance_jobs() {
+        with_allowlist(None, || {
+            for function_id in DEFAULT_MINTABLE_FUNCTIONS {
+                ensure_mintable_function(function_id)
+                    .unwrap_or_else(|error| panic!("{function_id} must be mintable: {error}"));
+            }
+        });
+    }
+
+    #[test]
+    fn operator_allowlist_widens_but_never_reaches_a_reserved_id() {
+        with_allowlist(Some("memory::*, workflow::run"), || {
+            assert!(ensure_mintable_function("memory::store").is_ok());
+            assert!(ensure_mintable_function("workflow::run").is_ok());
+            assert!(ensure_mintable_function("memory::session::list").is_ok());
+            assert!(ensure_mintable_function("agent::chat").is_err());
+        });
+        with_allowlist(Some("*"), || {
+            assert!(
+                ensure_mintable_function("vault::get").is_err(),
+                "a wildcard allowlist must still not reach a reserved namespace"
+            );
+            assert!(
+                ensure_mintable_function("shell::exec").is_err(),
+                "a wildcard allowlist must still not reach a reserved namespace"
+            );
+            assert!(ensure_mintable_function("memory::store").is_ok());
+        });
+    }
+
+    #[test]
+    fn minting_refuses_ids_that_are_not_namespaced() {
+        with_allowlist(Some("*"), || {
+            for function_id in ["", "bare", "::", "::store", "memory::"] {
+                assert!(
+                    ensure_mintable_function(function_id).is_err(),
+                    "{function_id:?} must be refused"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn only_known_trigger_types_can_be_minted() {
+        for trigger_type in MINTABLE_TRIGGER_TYPES {
+            assert!(ensure_mintable_trigger_type(trigger_type).is_ok());
+        }
+        for trigger_type in ["stream", "stream:join", "stream:leave", "made-up", ""] {
+            assert!(
+                ensure_mintable_trigger_type(trigger_type).is_err(),
+                "{trigger_type} must not be mintable"
+            );
+        }
+    }
+
+    #[test]
+    fn http_config_never_carries_a_caller_supplied_auth_flag() {
+        let config = forced_auth_http_config(json!({
+            "api_path": "/pwn",
+            "http_method": "POST",
+            "auth": false,
+        }));
+        assert!(
+            config.get("auth").is_none(),
+            "auth must fall back to the adapter default (true)"
+        );
+        assert_eq!(config["api_path"], "/pwn");
+    }
+
+    #[test]
+    fn allowlist_glob_has_no_prefix_semantics() {
+        assert!(!allowlist_pattern_matches("", "memory::store"));
+        assert!(!allowlist_pattern_matches("memory", "memory::store"));
+        assert!(!allowlist_pattern_matches("memory::st", "memory::store"));
+        assert!(allowlist_pattern_matches("memory::*", "memory::store"));
+        assert!(allowlist_pattern_matches("*", "memory::store"));
+        assert!(!allowlist_pattern_matches("*", ""));
+    }
 
     #[test]
     fn entry_readers_accept_the_bare_state_list_shape() {
