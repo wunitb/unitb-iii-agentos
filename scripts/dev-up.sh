@@ -270,8 +270,12 @@ if [[ -n "$memworkr_bin" && -x "$memworkr_bin" ]]; then
         spawned=$((spawned + 1))
         memworkr_started=1
 
+        # Attempts are fixed at 30 in normal use; the override is a test seam,
+        # read from the process environment only (never from the dotenv gate).
+        memworkr_attempts="${MEMWORKR_READY_ATTEMPTS:-30}"
+        [[ "$memworkr_attempts" =~ ^[0-9]+$ ]] || memworkr_attempts=30
         memworkr_ready=0
-        for _ in {1..30}; do
+        for ((memworkr_attempt = 0; memworkr_attempt < memworkr_attempts; memworkr_attempt++)); do
             if health="$(iii trigger memory::health --json '{}' 2>/dev/null)" &&
                jq -e --arg production "${MEMWORKR_PRODUCTION:-0}" \
                  '.status == "ok" and .schemaVersion == 6 and

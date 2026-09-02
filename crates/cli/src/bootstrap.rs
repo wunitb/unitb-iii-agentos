@@ -144,31 +144,30 @@ pub(crate) const API_KEY_VARIABLE: &str = "AGENTOS_API_KEY";
 const API_KEY_BYTES: usize = 32;
 
 /// Provider credentials `workers/llm-router` resolves from the process
-/// environment (`workers/llm-router/src/main.rs:201-291`, read via
-/// `std::env::var(&provider.env_key)` at `:1086`). `ollama` is omitted: it has
-/// an empty `env_key` and needs no credential.
+/// environment, **in the router's automatic-routing preference order**
+/// (`AUTO_ROUTE_PREFERENCE` in `workers/llm-router/src/main.rs`). `ollama` is
+/// omitted: it has an empty `env_key` and needs no credential, and the router
+/// deliberately never selects it automatically. Duplicated because the router
+/// is a separate crate with no shared library; `default_route_*` tests pin the
+/// behaviour, and `scripts/env-contract.test.ts` pins the variable names
+/// against the router's own table.
 const PROVIDER_VARIABLES: [(&str, &str); 10] = [
     ("anthropic", "ANTHROPIC_API_KEY"),
     ("openai", "OPENAI_API_KEY"),
     ("google", "GOOGLE_API_KEY"),
+    ("codex", "CODEX_PROXY_API_KEY"),
     ("groq", "GROQ_API_KEY"),
-    ("together", "TOGETHER_API_KEY"),
     ("deepseek", "DEEPSEEK_API_KEY"),
     ("mistral", "MISTRAL_API_KEY"),
+    ("together", "TOGETHER_API_KEY"),
     ("fireworks", "FIREWORKS_API_KEY"),
     ("openrouter", "OPENROUTER_API_KEY"),
-    ("codex", "CODEX_PROXY_API_KEY"),
 ];
 
-/// Mirrors `workers/llm-router/src/main.rs:141-142` (`DEFAULT_CODEX_MODEL`) and
-/// `:300-323` (`resolve_runtime_default`). Duplicated because the router is a
-/// separate crate with no shared library; `default_route_matches_llm_router`
-/// pins the behaviour.
+/// The provider assumed when `AGENTOS_DEFAULT_MODEL` is pinned without a
+/// provider (`workers/llm-router/src/main.rs`, `resolve_runtime_default`).
 const CODEX_PROVIDER: &str = "codex";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
-/// `select_model` (`workers/llm-router/src/main.rs:365-375`) picks these by
-/// complexity when no configured default route exists.
-const CLOUD_FALLBACK_PROVIDER: &str = "anthropic";
 
 /// Where a credential value comes from. The shell export wins at spawn time
 /// (see [`parse_dotenv`]), so the two are never confused in a report.
@@ -195,40 +194,54 @@ pub(crate) struct ProviderCredential {
     pub(crate) source: CredentialSource,
 }
 
-/// What an unqualified chat request resolves to today.
+/// What an unqualified chat request resolves to today, mirroring
+/// `workers/llm-router`: a pinned default whose own credential is present,
+/// otherwise the first provider in `AUTO_ROUTE_PREFERENCE` that has one,
+/// otherwise a structured `provider_credential_missing` refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DefaultRoute {
-    /// `CODEX_PROXY_API_KEY` is set, so the configured default is live.
-    Configured { provider: String, model: String },
-    /// No configured default; the router falls back to Anthropic cloud models
-    /// selected by complexity. `requested` names the default that is disabled.
-    CloudFallback { requested: Option<String> },
-    /// No usable credential at all.
-    Unavailable { requested: Option<String> },
+    /// `AGENTOS_DEFAULT_PROVIDER`/`AGENTOS_DEFAULT_MODEL` are pinned and the
+    /// credential that provider needs is present. `model` is `None` when the
+    /// router picks the provider's own default.
+    Pinned {
+        provider: String,
+        model: Option<String>,
+    },
+    /// No usable pinned default; the router routes to this provider.
+    Automatic { provider: &'static str },
+    /// No provider credential at all: unqualified requests are refused.
+    Unavailable,
 }
 
 impl DefaultRoute {
     pub(crate) fn detail(&self) -> String {
         match self {
-            Self::Configured { provider, model } => format!("{provider}/{model}"),
-            Self::CloudFallback { requested } => {
-                let disabled = requested
-                    .as_deref()
-                    .map(|provider| format!("configured default '{provider}' is disabled; "))
-                    .unwrap_or_default();
-                format!(
-                    "{disabled}unqualified requests route to {CLOUD_FALLBACK_PROVIDER} by complexity"
-                )
-            }
-            Self::Unavailable { requested } => {
-                let disabled = requested
-                    .as_deref()
-                    .map(|provider| format!("configured default '{provider}' is disabled and "))
-                    .unwrap_or_default();
-                format!("{disabled}no provider credential is set, so chat cannot be routed")
+            Self::Pinned {
+                provider,
+                model: Some(model),
+            } => format!("{provider}/{model} (pinned by AGENTOS_DEFAULT_PROVIDER/MODEL)"),
+            Self::Pinned {
+                provider,
+                model: None,
+            } => format!("{provider} (pinned by AGENTOS_DEFAULT_PROVIDER; llm-router picks the model)"),
+            Self::Automatic { provider } => format!(
+                "{provider} — first provider with a credential in llm-router's preference order"
+            ),
+            Self::Unavailable => {
+                "no provider credential is set; unqualified chat requests are refused with provider_credential_missing".to_string()
             }
         }
     }
+}
+
+/// Every credential variable an operator may set, in the router's preference
+/// order. Matches the list in llm-router's `provider_credential_missing`.
+fn credential_variables() -> String {
+    PROVIDER_VARIABLES
+        .iter()
+        .map(|(_, variable)| *variable)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The credential half of first-run readiness, resolved from the active `.env`
@@ -239,6 +252,9 @@ pub(crate) struct Credentials {
     pub(crate) api_key: Option<CredentialSource>,
     pub(crate) providers: Vec<ProviderCredential>,
     pub(crate) route: DefaultRoute,
+    /// A pinned default provider whose own credential is absent, so the router
+    /// ignores it. Named separately because the route above is still usable.
+    pub(crate) disabled_default: Option<String>,
 }
 
 impl Credentials {
@@ -283,23 +299,37 @@ impl Credentials {
 
         let requested_provider = lookup("AGENTOS_DEFAULT_PROVIDER").map(|(value, _)| value);
         let requested_model = lookup("AGENTOS_DEFAULT_MODEL").map(|(value, _)| value);
-        let route = if lookup("CODEX_PROXY_API_KEY").is_some() {
-            DefaultRoute::Configured {
-                provider: requested_provider.unwrap_or_else(|| CODEX_PROVIDER.to_string()),
-                model: requested_model.unwrap_or_else(|| DEFAULT_CODEX_MODEL.to_string()),
-            }
-        } else {
-            // The router only reports a disabled default when one was asked
-            // for, by provider or by model.
-            let requested = (requested_provider.is_some() || requested_model.is_some())
-                .then(|| requested_provider.unwrap_or_else(|| CODEX_PROVIDER.to_string()));
-            if providers
+        // A default is "requested" by either variable; a model on its own means
+        // the codex provider, exactly as the router resolves it.
+        let pinned = (requested_provider.is_some() || requested_model.is_some())
+            .then(|| requested_provider.unwrap_or_else(|| CODEX_PROVIDER.to_string()));
+        let pinned_is_usable = pinned.as_deref().is_some_and(|provider| {
+            providers
                 .iter()
-                .any(|credential| credential.provider == CLOUD_FALLBACK_PROVIDER)
-            {
-                DefaultRoute::CloudFallback { requested }
-            } else {
-                DefaultRoute::Unavailable { requested }
+                .any(|credential| credential.provider == provider)
+        });
+
+        let (route, disabled_default) = match (&pinned, pinned_is_usable) {
+            (Some(provider), true) => {
+                let model = requested_model.or_else(|| {
+                    (provider == CODEX_PROVIDER).then(|| DEFAULT_CODEX_MODEL.to_string())
+                });
+                (
+                    DefaultRoute::Pinned {
+                        provider: provider.clone(),
+                        model,
+                    },
+                    None,
+                )
+            }
+            (pinned, _) => {
+                let automatic = providers
+                    .first()
+                    .map(|credential| DefaultRoute::Automatic {
+                        provider: credential.provider,
+                    })
+                    .unwrap_or(DefaultRoute::Unavailable);
+                (automatic, pinned.clone())
             }
         };
 
@@ -308,6 +338,7 @@ impl Credentials {
             api_key,
             providers,
             route,
+            disabled_default,
         }
     }
 
@@ -731,19 +762,35 @@ pub(crate) fn readiness(
         ReadinessItem::failed(
             "Provider",
             credentials.provider_detail(),
-            "set one of ANTHROPIC_API_KEY, OPENAI_API_KEY, or CODEX_PROXY_API_KEY in the active .env",
+            format!("set one of {} in the active .env", credential_variables()),
         )
     } else {
         ReadinessItem::ok("Provider", credentials.provider_detail())
     });
 
-    items.push(match &credentials.route {
-        DefaultRoute::Unavailable { .. } => ReadinessItem::failed(
-            "Route",
+    let route_detail = match &credentials.disabled_default {
+        Some(provider) => format!(
+            "{}; pinned default '{provider}' is disabled because {} is not set",
             credentials.route.detail(),
-            "set a provider credential, then re-run `agentos doctor`",
+            provider_variable(provider).unwrap_or("its credential")
         ),
-        route => ReadinessItem::ok("Route", route.detail()),
+        None => credentials.route.detail(),
+    };
+    items.push(match &credentials.route {
+        DefaultRoute::Unavailable => ReadinessItem::failed(
+            "Route",
+            route_detail,
+            format!(
+                "set one of {} in the active .env, then re-run `agentos doctor`",
+                credential_variables()
+            ),
+        ),
+        _ if credentials.disabled_default.is_some() => ReadinessItem::failed(
+            "Route",
+            route_detail,
+            "set the pinned provider's credential, or clear AGENTOS_DEFAULT_PROVIDER/MODEL",
+        ),
+        _ => ReadinessItem::ok("Route", route_detail),
     });
 
     let engine_binary = probes.engine_binary();
@@ -2964,58 +3011,108 @@ mod tests {
         assert_eq!(provider_variable("not-a-provider"), None);
     }
 
-    fn route_for(pairs: &[(&str, &str)]) -> DefaultRoute {
+    fn credentials_for(pairs: &[(&str, &str)]) -> Credentials {
         let values = pairs
             .iter()
             .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
             .collect::<BTreeMap<_, _>>();
-        Credentials::resolve(Path::new("/runtime/.env"), &values, |_| None).route
+        Credentials::resolve(Path::new("/runtime/.env"), &values, |_| None)
+    }
+
+    fn route_for(pairs: &[(&str, &str)]) -> DefaultRoute {
+        credentials_for(pairs).route
     }
 
     #[test]
     fn default_route_mirrors_the_llm_router_resolution() {
-        // Configured default is live only while the codex proxy key is set.
+        // A pinned default is live when the credential *that provider* needs is
+        // present - not when CODEX_PROXY_API_KEY happens to be set.
         assert_eq!(
             route_for(&[
                 ("CODEX_PROXY_API_KEY", "proxy"),
                 ("AGENTOS_DEFAULT_PROVIDER", "codex"),
                 ("AGENTOS_DEFAULT_MODEL", "gpt-5.6-sol"),
             ]),
-            DefaultRoute::Configured {
+            DefaultRoute::Pinned {
                 provider: "codex".to_string(),
-                model: "gpt-5.6-sol".to_string(),
+                model: Some("gpt-5.6-sol".to_string()),
             }
         );
-        assert_eq!(
-            route_for(&[("CODEX_PROXY_API_KEY", "proxy")]),
-            DefaultRoute::Configured {
-                provider: CODEX_PROVIDER.to_string(),
-                model: DEFAULT_CODEX_MODEL.to_string(),
-            }
-        );
-        // `.env.example`'s shipped shape: a default is requested, the proxy key
-        // is empty, and Anthropic picks up unqualified requests.
         assert_eq!(
             route_for(&[
-                ("CODEX_PROXY_API_KEY", ""),
-                ("AGENTOS_DEFAULT_PROVIDER", "codex"),
-                ("AGENTOS_DEFAULT_MODEL", "gpt-5.6-sol"),
-                ("ANTHROPIC_API_KEY", "cloud"),
+                ("OPENAI_API_KEY", "cloud"),
+                ("AGENTOS_DEFAULT_PROVIDER", "openai"),
             ]),
-            DefaultRoute::CloudFallback {
-                requested: Some("codex".to_string()),
+            DefaultRoute::Pinned {
+                provider: "openai".to_string(),
+                model: None,
+            },
+            "a pinned provider with its own credential must not need the codex proxy key"
+        );
+        // A model on its own means the codex provider, as the router resolves it.
+        assert_eq!(
+            route_for(&[("CODEX_PROXY_API_KEY", "proxy")]),
+            DefaultRoute::Automatic {
+                provider: CODEX_PROVIDER
+            },
+            "no default was requested, so routing is automatic"
+        );
+
+        // `.env.example`'s shipped shape: codex is pinned, its proxy key is
+        // empty, and the first credential in preference order takes over.
+        let disabled = credentials_for(&[
+            ("CODEX_PROXY_API_KEY", ""),
+            ("AGENTOS_DEFAULT_PROVIDER", "codex"),
+            ("AGENTOS_DEFAULT_MODEL", "gpt-5.6-sol"),
+            ("ANTHROPIC_API_KEY", "cloud"),
+        ]);
+        assert_eq!(
+            disabled.route,
+            DefaultRoute::Automatic {
+                provider: "anthropic"
             }
         );
-        // Nothing configured at all: no route, and doctor must say so.
+        assert_eq!(disabled.disabled_default.as_deref(), Some("codex"));
+
+        // Preference order decides, and it is llm-router's AUTO_ROUTE_PREFERENCE.
         assert_eq!(
-            route_for(&[]),
-            DefaultRoute::Unavailable { requested: None }
+            route_for(&[("OPENROUTER_API_KEY", "x"), ("OPENAI_API_KEY", "y")]),
+            DefaultRoute::Automatic { provider: "openai" }
         );
         assert_eq!(
-            route_for(&[("AGENTOS_DEFAULT_MODEL", "gpt-5.6-sol")]),
-            DefaultRoute::Unavailable {
-                requested: Some(CODEX_PROVIDER.to_string()),
+            route_for(&[("OPENROUTER_API_KEY", "x")]),
+            DefaultRoute::Automatic {
+                provider: "openrouter"
             }
+        );
+
+        // Nothing configured at all: unqualified chat is refused, and doctor
+        // must say that instead of naming a provider that cannot answer.
+        assert_eq!(route_for(&[]), DefaultRoute::Unavailable);
+        let pinned_without_credential =
+            credentials_for(&[("AGENTOS_DEFAULT_MODEL", "gpt-5.6-sol")]);
+        assert_eq!(pinned_without_credential.route, DefaultRoute::Unavailable);
+        assert_eq!(
+            pinned_without_credential.disabled_default.as_deref(),
+            Some(CODEX_PROVIDER)
+        );
+        assert!(
+            pinned_without_credential
+                .route
+                .detail()
+                .contains("provider_credential_missing"),
+            "doctor must use llm-router's own refusal vocabulary: {}",
+            pinned_without_credential.route.detail()
+        );
+    }
+
+    #[test]
+    fn credential_variables_are_listed_in_router_preference_order() {
+        // llm-router's provider_credential_missing lists the same variables in
+        // the same order; a user who reads either message sees one contract.
+        assert_eq!(
+            credential_variables(),
+            "ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, CODEX_PROXY_API_KEY, GROQ_API_KEY, DEEPSEEK_API_KEY, MISTRAL_API_KEY, TOGETHER_API_KEY, FIREWORKS_API_KEY, OPENROUTER_API_KEY"
         );
     }
 
@@ -3096,7 +3193,10 @@ mod tests {
         );
         let route = report.item("Route").expect("route item");
         assert!(route.passed);
-        assert_eq!(route.detail, "codex/gpt-5.6-sol");
+        assert_eq!(
+            route.detail,
+            "codex/gpt-5.6-sol (pinned by AGENTOS_DEFAULT_PROVIDER/MODEL)"
+        );
         assert!(output.contains("codex/gpt-5.6-sol"), "{output}");
     }
 
@@ -3135,9 +3235,17 @@ mod tests {
         let route = report.item("Route").expect("route item");
         assert!(!route.passed);
         assert!(
-            route.detail.contains("cannot be routed"),
+            route.detail.contains("provider_credential_missing"),
             "{}",
             route.detail
+        );
+        assert!(
+            route
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("ANTHROPIC_API_KEY")),
+            "the hint must name the variables llm-router names: {:?}",
+            route.hint
         );
         assert!(output.contains(API_KEY_VARIABLE), "{output}");
     }
