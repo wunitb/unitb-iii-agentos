@@ -1,0 +1,42 @@
+id: harness
+name: Harness
+description: >-
+  OPT-IN ONLY. The harness worker is not in the default ./config.yaml worker
+  list; these settings apply if an operator adds `- name: harness` there.
+  Rationale for the removal, read out of the shipped v1.8.8-rc.3 binary's own
+  registered-function descriptions: harness::send and harness::spawn start
+  autonomous agent turns ("Spawn a sub-agent in a child session"),
+  harness::function::trigger "invoke[s] one iii function ... enforce[s] the
+  dispatch policy", and harness::filesystem::grant / ::revoke are labelled by
+  upstream itself as "Internal control-plane: grant a session access to an
+  additional filesystem root". All of that lands on the engine bus, which has no
+  authentication of its own. Upstream's approval-gate tech spec treats
+  ["shell::*", "harness::spawn"] as the canonical approval-gated pair, so this
+  worker gets the same treatment as `shell`. Nothing in this repository calls
+  any harness::* function; its only in-stack consumer was the console worker,
+  which is also opt-in now.
+  Before opting in, set `default_functions` (harness::types::turn::FunctionPolicy
+  = { allow, expose }, where expose is `agent_trigger` or `native`) to the
+  narrowest set your agents need. It is deliberately NOT set below: this file
+  only pins the values whose type is unambiguous in the shipped schema, because
+  a config the worker rejects silently falls back to its built-in defaults
+  ("no configuration value found; using built-in default configuration").
+value:
+  # No implicit working directory. Without this a session's first turn is
+  # stamped with the engine's cwd as its filesystem root; "off" means a session
+  # gets a root only when the caller names one explicitly.
+  default_filesystem_root: "off"
+  # Bound the blast radius of one accepted request: turn count, sub-agent depth
+  # and fan-out are what turn a single harness::send into an unbounded tree.
+  default_max_turns: 12
+  max_depth: 2
+  max_children: 4
+  max_validation_retries: 2
+  max_transient_resumes: 2
+  # No call, turn or dispatch runs unbounded.
+  default_pending_timeout_ms: 120000
+  session_timeout_ms: 900000
+  context_timeout_ms: 60000
+  router_timeout_ms: 240000
+  dispatch_timeout_ms: 120000
+  idem_ttl_secs: 3600
