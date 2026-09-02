@@ -8,6 +8,14 @@ mod types;
 
 use types::{A2aAgentCard, A2aAuthentication, A2aCapabilities, AgentSkillRef, GenerateCardRequest};
 
+/// HTTP path of this worker's discovery document.
+///
+/// `GET /.well-known/agent.json` is the A2A spec location and is bound by
+/// `workers/a2a` to `a2a::agent_card`. Two workers binding the same method and
+/// path leaves the winner to process start order, so the card catalogue serves
+/// its copy from its own path.
+const WELL_KNOWN_ROUTE: &str = "api/a2a/agent-card";
+
 fn api_url() -> String {
     std::env::var("AGENTOS_API_URL").unwrap_or_else(|_| "http://localhost:3111".to_string())
 }
@@ -256,7 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     agentos_http_adapter::register_http_trigger(
         &iii,
         "a2a::well_known".to_string(),
-        json!({ "api_path": ".well-known/agent.json", "http_method": "GET" }),
+        json!({ "api_path": WELL_KNOWN_ROUTE, "http_method": "GET" }),
         None,
     )?;
 
@@ -312,6 +320,20 @@ mod tests {
         // `state::set value=null` leaves a null entry in the scope.
         let entries = vec![Value::Null, json!({ "id": "s1" })];
         assert_eq!(skills_from_entries(entries).len(), 1);
+    }
+
+    // --- HTTP route uniqueness ---
+
+    #[test]
+    fn the_card_catalogue_does_not_bind_the_spec_route() {
+        // `workers/a2a` binds GET /.well-known/agent.json to a2a::agent_card.
+        assert_ne!(WELL_KNOWN_ROUTE, ".well-known/agent.json");
+        assert_eq!(WELL_KNOWN_ROUTE, "api/a2a/agent-card");
+    }
+
+    #[test]
+    fn the_card_catalogue_route_stays_under_the_a2a_api_prefix() {
+        assert!(WELL_KNOWN_ROUTE.starts_with("api/a2a/"));
     }
 
     #[test]
