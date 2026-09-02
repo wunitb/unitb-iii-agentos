@@ -60,43 +60,12 @@ const RESERVED_HOOK_NAMESPACES: &[&str] = &[
 /// user-supplied functions.
 const HOOK_ALLOWLIST_ENV: &str = "AGENTOS_HOOK_ALLOWLIST";
 
-/// Same segment glob as the capability reader in `workers/security` and the
-/// mint allowlist in `workers/cron`: `*` stands for one segment, a trailing `*`
-/// also covers any further segments, and an empty pattern matches nothing.
+/// One glob definition for the whole tree: `agentos_http_adapter::policy`
+/// (contract I1). `*` stands for one segment, a trailing `*` also covers any
+/// further segments, and an empty pattern or id matches nothing.
+/// `ensure_hookable_function` rejects malformed ids before this is reached.
 fn hook_pattern_matches(pattern: &str, function_id: &str) -> bool {
-    if pattern.is_empty() || function_id.is_empty() {
-        return false;
-    }
-    let pattern_segments: Vec<&str> = pattern.split("::").collect();
-    let function_segments: Vec<&str> = function_id.split("::").collect();
-    if pattern_segments.iter().any(|segment| segment.is_empty())
-        || function_segments.iter().any(|segment| segment.is_empty())
-    {
-        return false;
-    }
-    if pattern == function_id {
-        return true;
-    }
-    let trailing_wildcard = pattern_segments
-        .last()
-        .is_some_and(|segment| *segment == "*");
-    let compared = if trailing_wildcard {
-        if function_segments.len() < pattern_segments.len() {
-            return false;
-        }
-        &pattern_segments[..pattern_segments.len() - 1]
-    } else {
-        if pattern_segments.len() != function_segments.len() {
-            return false;
-        }
-        &pattern_segments[..]
-    };
-    compared
-        .iter()
-        .zip(function_segments.iter())
-        .all(|(pattern_segment, function_segment)| {
-            *pattern_segment == "*" || pattern_segment == function_segment
-        })
+    agentos_http_adapter::policy::capability_matches(pattern, function_id)
 }
 
 fn is_reserved_hook_target(function_id: &str) -> bool {
@@ -722,6 +691,21 @@ mod tests {
             }
         }
         result
+    }
+
+    /// Same containment rule as `workers/cron`: the hook-target deny set is
+    /// deliberately wider than the shared capability deny set (it also covers
+    /// the control-plane families and `coder`), but it must never be narrower,
+    /// so a family added to the shared contract cannot quietly become a legal
+    /// hook target.
+    #[test]
+    fn reserved_hook_namespaces_are_a_superset_of_the_shared_contract_families() {
+        for family in agentos_http_adapter::policy::DENY_BY_DEFAULT_FAMILIES {
+            assert!(
+                RESERVED_HOOK_NAMESPACES.contains(&family),
+                "{family} is deny-by-default for capabilities but usable as a hook target"
+            );
+        }
     }
 
     #[test]

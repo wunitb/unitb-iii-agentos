@@ -246,43 +246,13 @@ const RESERVED_FUNCTIONS: &[&str] = &["cron::create", "cron::patch", "cron::dele
 /// the stream authorization path.
 const MINTABLE_TRIGGER_TYPES: &[&str] = &["cron", "queue", "subscribe", "state", "log", "http"];
 
-/// Same segment glob as the capability reader in `workers/security`: `*` stands
-/// for one segment and a trailing `*` also covers any further segments. An
-/// empty pattern or an empty id matches nothing.
+/// One glob definition for the whole tree: `agentos_http_adapter::policy`
+/// (contract I1). `*` stands for one segment, a trailing `*` also covers any
+/// further segments, and an empty pattern or id matches nothing. Callers here
+/// reject malformed ids first (`ensure_mintable_function`), which is the only
+/// thing the shared matcher deliberately leaves open.
 fn allowlist_pattern_matches(pattern: &str, function_id: &str) -> bool {
-    if pattern.is_empty() || function_id.is_empty() {
-        return false;
-    }
-    let pattern_segments: Vec<&str> = pattern.split("::").collect();
-    let function_segments: Vec<&str> = function_id.split("::").collect();
-    if pattern_segments.iter().any(|segment| segment.is_empty())
-        || function_segments.iter().any(|segment| segment.is_empty())
-    {
-        return false;
-    }
-    if pattern == function_id {
-        return true;
-    }
-    let trailing_wildcard = pattern_segments
-        .last()
-        .is_some_and(|segment| *segment == "*");
-    let compared = if trailing_wildcard {
-        if function_segments.len() < pattern_segments.len() {
-            return false;
-        }
-        &pattern_segments[..pattern_segments.len() - 1]
-    } else {
-        if pattern_segments.len() != function_segments.len() {
-            return false;
-        }
-        &pattern_segments[..]
-    };
-    compared
-        .iter()
-        .zip(function_segments.iter())
-        .all(|(pattern_segment, function_segment)| {
-            *pattern_segment == "*" || pattern_segment == function_segment
-        })
+    agentos_http_adapter::policy::capability_matches(pattern, function_id)
 }
 
 fn mintable_allowlist() -> Vec<String> {
@@ -852,6 +822,33 @@ mod tests {
             }
         }
         result
+    }
+
+    /// The mint deny set is deliberately WIDER than the capability deny set:
+    /// `agentos_http_adapter::policy::DENY_BY_DEFAULT_FAMILIES` says what an
+    /// agent may never be granted by a wildcard, while this says what may never
+    /// be scheduled or triggered at all — which additionally covers the
+    /// control-plane families (`trigger`, `control`, `configuration`,
+    /// `security`, `approval`, `agentos`) and `coder`. Two different questions,
+    /// so two different sets; this asserts the containment that must hold, so a
+    /// family added to the shared contract cannot quietly become mintable.
+    #[test]
+    fn reserved_namespaces_are_a_superset_of_the_shared_contract_families() {
+        for family in agentos_http_adapter::policy::DENY_BY_DEFAULT_FAMILIES {
+            if family == "cron" {
+                // `cron::*` cannot be reserved wholesale — the worker's own
+                // maintenance jobs are the canonical schedulable targets — so
+                // the control functions are reserved by exact id instead.
+                assert!(RESERVED_FUNCTIONS.contains(&"cron::create"));
+                assert!(RESERVED_FUNCTIONS.contains(&"cron::patch"));
+                assert!(RESERVED_FUNCTIONS.contains(&"cron::delete"));
+                continue;
+            }
+            assert!(
+                RESERVED_NAMESPACES.contains(&family),
+                "{family} is deny-by-default for capabilities but mintable as a trigger"
+            );
+        }
     }
 
     #[test]

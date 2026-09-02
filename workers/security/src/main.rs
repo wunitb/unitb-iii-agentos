@@ -1,3 +1,4 @@
+use agentos_http_adapter::policy;
 use hmac::{Hmac, Mac};
 use iii_sdk::errors::Error;
 use iii_sdk::{
@@ -49,18 +50,13 @@ struct AuditEntry {
     prev_hash: String,
 }
 
-/// Function-id namespaces that a wildcard capability entry must never grant.
-/// This is the deny-by-default set from the remediation contract (I1): only an
-/// exact, literal function id in an agent's `tools` array can reach one of
-/// these, and `agent-core` must additionally clear it through `approval::check`.
-static DENY_BY_DEFAULT_NAMESPACES: &[&str] = &[
-    "shell", "bridge", "mcp", "hook", "cron", "vault", "state", "engine", "code", "harness",
-    "browser", "wasm",
-];
-
-/// Beyond the contract set: `coder::*` is the second surface of the same
-/// upstream `shell` worker binary (it writes host files through the same jail),
-/// so it is held to the same exact-id rule.
+/// Beyond `policy::DENY_BY_DEFAULT_FAMILIES`: `coder::*` is the second surface
+/// of the same upstream `shell` worker binary — `coder::create`, `::update`,
+/// `::delete` and `::move` write host files through the same jail — so it is
+/// held to the same exact-id rule. It is kept as a NAMED local delta rather
+/// than folded into the shared list silently; see the report for the request to
+/// promote it into `policy::DENY_BY_DEFAULT_FAMILIES`, which would also close
+/// it on the chat path.
 static ADDITIONAL_PRIVILEGED_NAMESPACES: &[&str] = &["coder"];
 
 static INJECTION_PATTERNS: &[&str] = &[
@@ -253,8 +249,20 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-/// True when the function id lives in a namespace that a wildcard entry must
-/// never grant.
+/// A function id this worker will reason about at all.
+///
+/// `policy::capability_matches` treats a segment as opaque, so `*` grants
+/// `memory::` and `::store`. Those cannot name a registered function, and a
+/// reader that accepts them would report a grant for something that can never
+/// be dispatched, so they are rejected here before the shared matcher sees
+/// them. Reported to the shared module as a candidate tightening.
+fn is_well_formed_function_id(function_id: &str) -> bool {
+    let segments: Vec<&str> = function_id.split("::").collect();
+    segments.len() >= 2 && !segments.iter().any(|segment| segment.is_empty())
+}
+
+/// True when the function id lives in a family that a wildcard entry must never
+/// grant: the shared contract set plus this worker's named local addition.
 fn is_privileged_function(function_id: &str) -> bool {
     let Some(namespace) = function_id.split("::").next() else {
         return true;
@@ -262,74 +270,36 @@ fn is_privileged_function(function_id: &str) -> bool {
     if namespace.is_empty() {
         return true;
     }
-    DENY_BY_DEFAULT_NAMESPACES.contains(&namespace)
-        || ADDITIONAL_PRIVILEGED_NAMESPACES.contains(&namespace)
+    policy::is_deny_by_default(function_id) || ADDITIONAL_PRIVILEGED_NAMESPACES.contains(&namespace)
 }
 
-/// Capability pattern matching.
+/// Decide whether `tools` grants `function_id`.
 ///
-/// A pattern is either an exact function id or a `::`-segmented glob in which a
-/// segment of exactly `*` stands for one segment. A trailing `*` segment also
-/// absorbs any further segments, so `memory::*` covers `memory::store` and
-/// `memory::session::list`, and a bare `*` covers every id. An empty pattern,
-/// an empty segment, or an empty function id matches nothing — `starts_with`
-/// semantics (where `""` matched everything) are gone.
-fn capability_pattern_matches(pattern: &str, function_id: &str) -> bool {
-    if pattern.is_empty() || function_id.is_empty() {
-        return false;
-    }
-    let pattern_segments: Vec<&str> = pattern.split("::").collect();
-    let function_segments: Vec<&str> = function_id.split("::").collect();
-    if pattern_segments.iter().any(|segment| segment.is_empty())
-        || function_segments.iter().any(|segment| segment.is_empty())
-    {
-        return false;
-    }
-    if pattern == function_id {
-        return true;
-    }
-
-    let trailing_wildcard = pattern_segments
-        .last()
-        .is_some_and(|segment| *segment == "*");
-    let compared = if trailing_wildcard {
-        if function_segments.len() < pattern_segments.len() {
-            return false;
-        }
-        &pattern_segments[..pattern_segments.len() - 1]
-    } else {
-        if pattern_segments.len() != function_segments.len() {
-            return false;
-        }
-        &pattern_segments[..]
-    };
-
-    compared
-        .iter()
-        .zip(function_segments.iter())
-        .all(|(pattern_segment, function_segment)| {
-            *pattern_segment == "*" || pattern_segment == function_segment
-        })
-}
-
-/// Decide whether `tools` grants `function_id`, honouring the deny-by-default
-/// set (which only an exact-id entry can reach).
-fn capability_granted(tools: &[&str], function_id: &str) -> bool {
-    if function_id.is_empty() {
+/// The glob semantics and the "a wildcard never reaches a deny-by-default
+/// family" rule come from `agentos_http_adapter::policy`, which is the single
+/// definition shared with the chat path (contract I1). Only two things are
+/// decided here, both deliberate and both tested:
+///   * a malformed id is refused outright (`is_well_formed_function_id`);
+///   * `ADDITIONAL_PRIVILEGED_NAMESPACES` is held to the same exact-id rule as
+///     the shared families.
+fn capability_granted(tools: &[String], function_id: &str) -> bool {
+    if !is_well_formed_function_id(function_id) {
         return false;
     }
     if is_privileged_function(function_id) {
-        return tools.contains(&function_id);
+        // Exact-id only. For the twelve shared families this is exactly what
+        // `policy::capabilities_grant` does — `shared_and_local_agree_on_the_
+        // contract_families` asserts the two answers are identical — and the
+        // named local additions ride the same rule.
+        return tools.iter().any(|tool| tool == function_id);
     }
-    tools
-        .iter()
-        .any(|tool| capability_pattern_matches(tool, function_id))
+    policy::capabilities_grant(tools, function_id)
 }
 
 /// Read the canonical capability record: scope `capabilities`, key `<agentId>`,
 /// value `{ "tools": [...], "updatedAt": <ms> }`. The `value` unwrap keeps the
 /// reader working if a state backend ever returns the list-entry envelope.
-fn tools_from_record(record: &Value) -> Vec<&str> {
+fn tools_from_record(record: &Value) -> Vec<String> {
     record
         .get("tools")
         .or_else(|| record.get("value").and_then(|value| value.get("tools")))
@@ -339,6 +309,7 @@ fn tools_from_record(record: &Value) -> Vec<&str> {
                 .iter()
                 .filter_map(Value::as_str)
                 .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
                 .collect()
         })
         .unwrap_or_default()
@@ -964,55 +935,162 @@ mod tests {
         assert!(audit_chain_from_list(&json!(null)).is_empty());
     }
 
+    /// Capability entries as the store holds them.
+    fn caps(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|entry| (*entry).to_string()).collect()
+    }
+
+    /// The one test the shared/local split exists for: this worker's effective
+    /// deny set must be exactly the shared contract set plus the named local
+    /// delta. Editing either side without editing the other fails here instead
+    /// of drifting silently — the reader/writer drift class this whole
+    /// remediation is about.
+    #[test]
+    fn the_effective_deny_set_equals_the_shared_constant_plus_named_additions() {
+        use std::collections::BTreeSet;
+
+        let shared: BTreeSet<&str> = policy::DENY_BY_DEFAULT_FAMILIES.into_iter().collect();
+        let local: BTreeSet<&str> = ADDITIONAL_PRIVILEGED_NAMESPACES.iter().copied().collect();
+        let expected: BTreeSet<&str> = shared.union(&local).copied().collect();
+
+        // Probe a universe wide enough to catch both a dropped family and an
+        // unannounced addition.
+        let universe: Vec<&str> = policy::DENY_BY_DEFAULT_FAMILIES
+            .into_iter()
+            .chain(ADDITIONAL_PRIVILEGED_NAMESPACES.iter().copied())
+            .chain([
+                "memory",
+                "workflow",
+                "agent",
+                "session",
+                "security",
+                "approval",
+                "a2a",
+                "swarm",
+                "context",
+                "telemetry",
+            ])
+            .collect();
+        let effective: BTreeSet<&str> = universe
+            .into_iter()
+            .filter(|family| is_privileged_function(&format!("{family}::probe")))
+            .collect();
+
+        assert_eq!(
+            effective, expected,
+            "the security worker's deny set drifted from \
+             agentos_http_adapter::policy::DENY_BY_DEFAULT_FAMILIES + \
+             ADDITIONAL_PRIVILEGED_NAMESPACES"
+        );
+        // The shared contract set is 12 families (I1); growth there must be deliberate.
+        assert_eq!(policy::DENY_BY_DEFAULT_FAMILIES.len(), 12);
+        // And so must growth on this side.
+        assert_eq!(
+            ADDITIONAL_PRIVILEGED_NAMESPACES,
+            &["coder"],
+            "a new local-only privileged family needs a written reason and a request to \
+             promote it into the shared list"
+        );
+    }
+
+    /// The local exact-id branch must return the same answer as the shared
+    /// function for every family the shared function owns. If the shared rule
+    /// changes, this fails rather than leaving the two enforcers disagreeing.
+    #[test]
+    fn shared_and_local_agree_on_the_contract_families() {
+        let patterns = [
+            caps(&["*"]),
+            caps(&["shell::*"]),
+            caps(&["shell::exec"]),
+            caps(&["memory::*", "shell::exec"]),
+            caps(&[]),
+            caps(&[""]),
+        ];
+        for family in policy::DENY_BY_DEFAULT_FAMILIES {
+            for suffix in ["exec", "get", "fs::write"] {
+                let function_id = format!("{family}::{suffix}");
+                for tools in &patterns {
+                    assert_eq!(
+                        capability_granted(tools, &function_id),
+                        policy::capabilities_grant(tools, &function_id),
+                        "local and shared disagree on {function_id} for {tools:?}"
+                    );
+                }
+            }
+        }
+        // Ordinary ids go straight through the shared function.
+        for function_id in ["memory::store", "workflow::run", "memory::session::list"] {
+            for tools in &patterns {
+                assert_eq!(
+                    capability_granted(tools, function_id),
+                    policy::capabilities_grant(tools, function_id),
+                    "local and shared disagree on {function_id} for {tools:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn empty_pattern_matches_nothing() {
-        assert!(!capability_pattern_matches("", "memory::store"));
-        assert!(!capability_granted(&[""], "memory::store"));
-        assert!(!capability_granted(&["", ""], "anything::at::all"));
+        assert!(!policy::capability_matches("", "memory::store"));
+        assert!(!capability_granted(&caps(&[""]), "memory::store"));
+        assert!(!capability_granted(&caps(&["", ""]), "anything::at::all"));
     }
 
     #[test]
     fn empty_function_id_matches_nothing() {
-        assert!(!capability_pattern_matches("*", ""));
-        assert!(!capability_granted(&["*"], ""));
+        assert!(!policy::capability_matches("*", ""));
+        assert!(!capability_granted(&caps(&["*"]), ""));
     }
 
     #[test]
     fn prefix_matching_is_not_used() {
         // `starts_with` semantics would have granted all four of these.
-        assert!(!capability_granted(&["memory"], "memory::store"));
-        assert!(!capability_granted(&["memory::st"], "memory::store"));
-        assert!(!capability_granted(&["mem"], "memory::store"));
-        assert!(!capability_granted(&["workflow::run"], "workflow::runner"));
+        assert!(!capability_granted(&caps(&["memory"]), "memory::store"));
+        assert!(!capability_granted(&caps(&["memory::st"]), "memory::store"));
+        assert!(!capability_granted(&caps(&["mem"]), "memory::store"));
+        assert!(!capability_granted(
+            &caps(&["workflow::run"]),
+            "workflow::runner"
+        ));
     }
 
     #[test]
     fn exact_ids_match() {
-        assert!(capability_granted(&["memory::store"], "memory::store"));
-        assert!(!capability_granted(&["memory::store"], "memory::recall"));
+        assert!(capability_granted(
+            &caps(&["memory::store"]),
+            "memory::store"
+        ));
+        assert!(!capability_granted(
+            &caps(&["memory::store"]),
+            "memory::recall"
+        ));
     }
 
     #[test]
     fn wildcard_segment_matches_one_namespace() {
-        assert!(capability_granted(&["memory::*"], "memory::store"));
-        assert!(capability_granted(&["memory::*"], "memory::session::list"));
-        assert!(!capability_granted(&["memory::*"], "memoryx::store"));
-        assert!(!capability_granted(&["memory::*"], "memory"));
+        assert!(capability_granted(&caps(&["memory::*"]), "memory::store"));
+        assert!(capability_granted(
+            &caps(&["memory::*"]),
+            "memory::session::list"
+        ));
+        assert!(!capability_granted(&caps(&["memory::*"]), "memoryx::store"));
+        assert!(!capability_granted(&caps(&["memory::*"]), "memory"));
     }
 
     #[test]
     fn bare_wildcard_matches_ordinary_ids_only() {
-        assert!(capability_granted(&["*"], "memory::store"));
-        assert!(capability_granted(&["*"], "workflow::run"));
+        assert!(capability_granted(&caps(&["*"]), "memory::store"));
+        assert!(capability_granted(&caps(&["*"]), "workflow::run"));
         // ... but never a deny-by-default id.
-        assert!(!capability_granted(&["*"], "shell::exec"));
+        assert!(!capability_granted(&caps(&["*"]), "shell::exec"));
     }
 
     #[test]
     fn middle_wildcard_segment_matches() {
-        assert!(capability_pattern_matches("a::*::c", "a::b::c"));
-        assert!(!capability_pattern_matches("a::*::c", "a::b::d"));
-        assert!(!capability_pattern_matches("a::*::c", "a::c"));
+        assert!(policy::capability_matches("a::*::c", "a::b::c"));
+        assert!(!policy::capability_matches("a::*::c", "a::b::d"));
+        assert!(!policy::capability_matches("a::*::c", "a::c"));
     }
 
     #[test]
@@ -1038,17 +1116,17 @@ mod tests {
                 "{function_id} must be deny-by-default"
             );
             assert!(
-                !capability_granted(&["*"], function_id),
+                !capability_granted(&caps(&["*"]), function_id),
                 "bare wildcard must not grant {function_id}"
             );
             let namespace = function_id.split("::").next().unwrap();
             let namespace_glob = format!("{namespace}::*");
             assert!(
-                !capability_granted(&[namespace_glob.as_str()], function_id),
+                !capability_granted(&caps(&[namespace_glob.as_str()]), function_id),
                 "{namespace_glob} must not grant {function_id}"
             );
             assert!(
-                capability_granted(&[function_id], function_id),
+                capability_granted(&caps(&[function_id]), function_id),
                 "an exact entry must grant {function_id}"
             );
         }
@@ -1068,10 +1146,20 @@ mod tests {
 
     #[test]
     fn malformed_ids_are_denied() {
-        assert!(!capability_granted(&["*"], "::"));
-        assert!(!capability_granted(&["*"], "::store"));
-        assert!(!capability_granted(&["*"], "memory::"));
-        assert!(!capability_pattern_matches("::", "::"));
+        // The shared matcher treats a segment as opaque, so it would grant
+        // these under `*`; this worker refuses them before delegating.
+        for function_id in ["::", "::store", "memory::", "bare", ""] {
+            assert!(
+                !is_well_formed_function_id(function_id),
+                "{function_id:?} must be malformed"
+            );
+            assert!(
+                !capability_granted(&caps(&["*"]), function_id),
+                "{function_id:?} must not be grantable"
+            );
+        }
+        assert!(is_well_formed_function_id("memory::store"));
+        assert!(is_well_formed_function_id("memory::session::list"));
     }
 
     #[test]
@@ -1079,11 +1167,14 @@ mod tests {
         let record = json!({ "tools": ["memory::*", "workflow::run"], "updatedAt": 1 });
         assert_eq!(
             tools_from_record(&record),
-            vec!["memory::*", "workflow::run"]
+            vec!["memory::*".to_string(), "workflow::run".to_string()]
         );
         // the state-list envelope shape still resolves
         let enveloped = json!({ "value": { "tools": ["memory::store"] } });
-        assert_eq!(tools_from_record(&enveloped), vec!["memory::store"]);
+        assert_eq!(
+            tools_from_record(&enveloped),
+            vec!["memory::store".to_string()]
+        );
         // the writer-side shape agent-core used to produce resolves to nothing
         let legacy = json!({ "capabilities": { "functions": ["memory::store"] } });
         assert!(tools_from_record(&legacy).is_empty());
