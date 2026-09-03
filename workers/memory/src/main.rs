@@ -1,4 +1,5 @@
 use agentos_http_adapter::TriggerBus;
+use agentos_http_adapter::principal::{self, Principal};
 use agentos_http_adapter::state::{
     append_op, groups as state_groups, increment_op, set_op, update_errors,
     update_payload as state_update_payload, value_of as state_value, values as state_values,
@@ -241,13 +242,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn memory_agent(input: &Value) -> &str {
-    input
-        .get("agent")
-        .or_else(|| input.get("agentId"))
-        .and_then(Value::as_str)
-        .filter(|agent| !agent.is_empty())
-        .unwrap_or("default")
+/// The agent an operation falls back to when the OPERATOR names none. An agent
+/// principal never falls back: it acts on itself.
+const DEFAULT_AGENT: &str = "default";
+
+/// Who this call is from (contract T1). The bearer the operator has to present
+/// is the one `agentos_bus_auth` owns; nothing here reads a second one.
+fn principal_of(input: &Value) -> Result<Principal, Error> {
+    let expected = agentos_bus_auth::policy::expected_api_key();
+    Ok(principal::resolve(input, expected.as_deref())?)
+}
+
+/// Which agent this call may act on: the principal's own agent, or the agent it
+/// names when it is the operator or holds the exact `grant::act_as::<target>`
+/// grant. Every per-agent read and write goes through here; `agentId` in the
+/// payload is what the call is ABOUT, never who it is FROM.
+async fn acting_agent(iii: &dyn TriggerBus, input: &Value) -> Result<String, Error> {
+    let principal = principal_of(input)?;
+    principal::acting_agent(iii, &principal, input, DEFAULT_AGENT).await
+}
+
+/// Cron-fired maintenance has no principal by design (the engine's cron worker
+/// cannot present one); an agent principal is refused because the job touches
+/// every agent's scope. See `principal::refuse_agent_principal`.
+fn refuse_agent_maintenance(input: &Value, operation: &str) -> Result<(), Error> {
+    let expected = agentos_bus_auth::policy::expected_api_key();
+    principal::refuse_agent_principal(input, expected.as_deref(), operation)
 }
 
 fn memory_key(input: &Value) -> Result<&str, Error> {
@@ -274,15 +294,17 @@ async fn call_state(
 }
 
 async fn memory_kv_get(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
+    let agent = acting_agent(iii, &input).await?;
     call_state(
         iii,
         "state::get",
-        json!({ "scope": format!("agent-memory:{}", memory_agent(&input)), "key": memory_key(&input)? }),
+        json!({ "scope": format!("agent-memory:{agent}"), "key": memory_key(&input)? }),
     )
     .await
 }
 
 async fn memory_kv_set(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
+    let agent = acting_agent(iii, &input).await?;
     let value = input
         .get("value")
         .cloned()
@@ -291,37 +313,40 @@ async fn memory_kv_set(iii: &dyn TriggerBus, input: Value) -> Result<Value, Erro
     call_state(
         iii,
         "state::set",
-        json!({ "scope": format!("agent-memory:{}", memory_agent(&input)), "key": key, "value": value }),
+        json!({ "scope": format!("agent-memory:{agent}"), "key": key, "value": value }),
     )
     .await?;
     Ok(json!({ "stored": true, "key": key }))
 }
 
 async fn memory_kv_delete(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
+    let agent = acting_agent(iii, &input).await?;
     let key = memory_key(&input)?;
     call_state(
         iii,
         "state::delete",
-        json!({ "scope": format!("agent-memory:{}", memory_agent(&input)), "key": key }),
+        json!({ "scope": format!("agent-memory:{agent}"), "key": key }),
     )
     .await?;
     Ok(json!({ "deleted": true, "key": key }))
 }
 
 async fn memory_kv_list(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
+    let agent = acting_agent(iii, &input).await?;
     call_state(
         iii,
         "state::list",
-        json!({ "scope": format!("agent-memory:{}", memory_agent(&input)) }),
+        json!({ "scope": format!("agent-memory:{agent}") }),
     )
     .await
 }
 
 async fn list_memories(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
+    let agent = acting_agent(iii, &input).await?;
     let entries = call_state(
         iii,
         "state::list",
-        json!({ "scope": format!("memory:{}", memory_agent(&input)) }),
+        json!({ "scope": format!("memory:{agent}") }),
     )
     .await?;
     let memories = state_values(&entries)
@@ -332,14 +357,15 @@ async fn list_memories(iii: &dyn TriggerBus, input: Value) -> Result<Value, Erro
     Ok(json!({ "memories": memories }))
 }
 
+/// The agents whose session scopes a call may walk.
+///
+/// The operator naming nobody gets every agent (the TUI's sessions screen); an
+/// agent principal gets itself, or the one agent it is granted, never the list.
 async fn session_agents(iii: &dyn TriggerBus, input: &Value) -> Result<Vec<String>, Error> {
-    if let Some(agent) = input
-        .get("agent")
-        .or_else(|| input.get("agentId"))
-        .and_then(Value::as_str)
-        .filter(|agent| !agent.is_empty())
-    {
-        return Ok(vec![agent.to_string()]);
+    let principal = principal_of(input)?;
+    if !principal.is_operator() || principal::requested_agent(input).is_some() {
+        let agent = principal::acting_agent(iii, &principal, input, DEFAULT_AGENT).await?;
+        return Ok(vec![agent]);
     }
 
     let agents = call_state(iii, "state::list", json!({ "scope": "agents" })).await?;
@@ -444,7 +470,8 @@ async fn delete_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Err
 }
 
 async fn store_memory(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
-    let agent_id = input["agentId"].as_str().unwrap_or("default");
+    let agent_id = acting_agent(iii, &input).await?;
+    let agent_id = agent_id.as_str();
     let content = input["content"].as_str().unwrap_or("");
     let role = input["role"].as_str().unwrap_or("user");
     let session_id = input["sessionId"].as_str().map(String::from);
@@ -631,7 +658,7 @@ async fn append_session_message(
 /// read; this is the reader. Ordering is by the index timestamp, which is
 /// assigned per append, so a deduplicated repeat still lands in the right place.
 async fn session_history(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
-    let agent_id = memory_agent(&input).to_string();
+    let agent_id = acting_agent(iii, &input).await?;
     let session_id = input
         .get("sessionId")
         .or_else(|| input.get("session"))
@@ -721,7 +748,7 @@ async fn session_history(iii: &dyn TriggerBus, input: Value) -> Result<Value, Er
 }
 
 async fn recall_memory(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
-    let agent_id = input["agentId"].as_str().unwrap_or("default");
+    let agent_id = acting_agent(iii, &input).await?;
     let query = input["query"].as_str().unwrap_or("");
     let limit = input["limit"].as_u64().unwrap_or(10) as usize;
 
@@ -837,7 +864,7 @@ async fn recall_memory(iii: &dyn TriggerBus, input: Value) -> Result<Value, Erro
 }
 
 async fn kg_add(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
-    let agent_id = input["agentId"].as_str().unwrap_or("default");
+    let agent_id = acting_agent(iii, &input).await?;
     let entity = &input["entity"];
     let entity_id = entity["id"].as_str().unwrap_or("");
 
@@ -907,7 +934,7 @@ async fn kg_add(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
 }
 
 async fn kg_query(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
-    let agent_id = input["agentId"].as_str().unwrap_or("default");
+    let agent_id = acting_agent(iii, &input).await?;
     let entity_id = input["entityId"].as_str().unwrap_or("");
     let depth = input["depth"].as_u64().unwrap_or(2);
 
@@ -947,7 +974,12 @@ async fn kg_query(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     Ok(json!(results))
 }
 
+/// System-wide by design: fired by the engine's cron worker, which has no
+/// principal to present, so a bare payload is accepted. It walks EVERY
+/// `memory:*` scope and never reads `agentId`; an agent principal is refused
+/// because "evict my memories" is not what this does (contract T1).
 async fn evict_memories(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
+    refuse_agent_maintenance(&input, "memory::evict")?;
     let max_age_ms = input["maxAge"].as_u64().unwrap_or(30 * 86_400_000);
     let min_importance = input["minImportance"].as_f64().unwrap_or(0.2);
     let cap = input["cap"].as_u64().unwrap_or(10_000) as usize;
@@ -1053,7 +1085,9 @@ async fn evict_memories(iii: &dyn TriggerBus, input: Value) -> Result<Value, Err
     Ok(json!({ "evicted": total_evicted }))
 }
 
+/// System-wide by design, exactly like `evict_memories`.
 async fn consolidate(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
+    refuse_agent_maintenance(&input, "memory::consolidate")?;
     let decay_rate = input["decayRate"].as_f64().unwrap_or(0.05);
     let start = std::time::Instant::now();
 
@@ -1132,7 +1166,7 @@ fn memory_summary_payload(chunk: &str) -> Value {
 }
 
 async fn compact_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
-    let agent_id = input["agentId"].as_str().unwrap_or("default");
+    let agent_id = acting_agent(iii, &input).await?;
     let session_id = input["sessionId"].as_str().unwrap_or("default");
     let threshold = input["threshold"].as_u64().unwrap_or(30) as usize;
     let keep_recent = input["keepRecent"].as_u64().unwrap_or(10) as usize;
@@ -1259,7 +1293,7 @@ async fn compact_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Er
 }
 
 async fn repair_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
-    let agent_id = input["agentId"].as_str().unwrap_or("default");
+    let agent_id = acting_agent(iii, &input).await?;
     let session_id = input["sessionId"].as_str().unwrap_or("default");
 
     let session: Value = iii
@@ -2829,6 +2863,7 @@ mod tests {
     // test failure instead of a silent empty result.
 
     use agentos_http_adapter::fake::FakeBus;
+    use agentos_http_adapter::policy;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
@@ -2994,18 +3029,36 @@ mod tests {
         (bus, store)
     }
 
+    /// A payload as a trusted deputy sends it on behalf of `agent` (contract
+    /// T1): the principal is `agent`, and `agentId` names the same agent, which
+    /// is what agent-core sends for its own turns.
+    fn as_agent(agent: &str, fields: Value) -> Value {
+        let mut payload = fields;
+        payload["agentId"] = json!(agent);
+        payload["principal"] = principal::as_agent(agent);
+        payload
+    }
+
     async fn store(bus: &FakeBus, agent: &str, session: &str, role: &str, content: &str) -> Value {
         store_memory(
             bus,
-            json!({
-                "agentId": agent,
-                "sessionId": session,
-                "role": role,
-                "content": content,
-            }),
+            as_agent(
+                agent,
+                json!({
+                    "sessionId": session,
+                    "role": role,
+                    "content": content,
+                }),
+            ),
         )
         .await
         .expect("store_memory failed")
+    }
+
+    async fn recall(bus: &FakeBus, agent: &str, query: &str) -> Value {
+        recall_memory(bus, as_agent(agent, json!({ "query": query })))
+            .await
+            .expect("recall_memory failed")
     }
 
     #[tokio::test]
@@ -3017,9 +3070,7 @@ mod tests {
         assert_eq!(first["stored"], true);
         assert_eq!(second["stored"], true);
 
-        let recalled = recall_memory(&bus, json!({ "agentId": "a-1", "query": "pipeline" }))
-            .await
-            .expect("recall_memory failed");
+        let recalled = recall(&bus, "a-1", "pipeline").await;
         let recalled = recalled.as_array().expect("recall returns an array");
         assert_eq!(
             recalled.len(),
@@ -3043,9 +3094,7 @@ mod tests {
             "eviction must be able to deserialize the stored entries"
         );
 
-        let after = recall_memory(&bus, json!({ "agentId": "a-1", "query": "pipeline" }))
-            .await
-            .expect("recall_memory failed");
+        let after = recall(&bus, "a-1", "pipeline").await;
         assert_eq!(after, json!([]), "evicted memories must be gone");
     }
 
@@ -3055,9 +3104,7 @@ mod tests {
         let stored = store(&bus, "a-2", "s-1", "user", "remember the release date").await;
         let id = stored["id"].as_str().expect("stored id").to_string();
 
-        recall_memory(&bus, json!({ "agentId": "a-2", "query": "release" }))
-            .await
-            .expect("recall_memory failed");
+        recall(&bus, "a-2", "release").await;
 
         let entry = store_handle.get(&json!({ "scope": "memory:a-2", "key": id }));
         assert_eq!(entry["accessCount"], 1);
@@ -3072,7 +3119,7 @@ mod tests {
         // Another session for the same agent must not leak in.
         store(&bus, "a-3", "other", "user", "unrelated").await;
 
-        let history = session_history(&bus, json!({ "agentId": "a-3", "sessionId": "s-9" }))
+        let history = session_history(&bus, as_agent("a-3", json!({ "sessionId": "s-9" })))
             .await
             .expect("session_history failed");
 
@@ -3114,7 +3161,7 @@ mod tests {
         );
         assert_eq!(repeat["sessionIndexed"], true);
 
-        let history = session_history(&bus, json!({ "agentId": "a-4", "sessionId": "s-1" }))
+        let history = session_history(&bus, as_agent("a-4", json!({ "sessionId": "s-1" })))
             .await
             .expect("session_history failed");
 
@@ -3136,7 +3183,7 @@ mod tests {
 
         let history = session_history(
             &bus,
-            json!({ "agentId": "a-5", "sessionId": "s-1", "limit": 2 }),
+            as_agent("a-5", json!({ "sessionId": "s-1", "limit": 2 })),
         )
         .await
         .expect("session_history failed");
@@ -3153,7 +3200,7 @@ mod tests {
     #[tokio::test]
     async fn session_history_requires_a_session_id() {
         let (bus, _store) = state_bus();
-        let error = session_history(&bus, json!({ "agentId": "a-6" }))
+        let error = session_history(&bus, as_agent("a-6", json!({})))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("sessionId is required"));
@@ -3162,7 +3209,7 @@ mod tests {
     #[tokio::test]
     async fn session_history_is_empty_for_an_unknown_session() {
         let (bus, _store) = state_bus();
-        let history = session_history(&bus, json!({ "agentId": "a-7", "sessionId": "nope" }))
+        let history = session_history(&bus, as_agent("a-7", json!({ "sessionId": "nope" })))
             .await
             .expect("session_history failed");
         assert_eq!(history["messages"], json!([]));
@@ -3213,9 +3260,7 @@ mod tests {
         let (bus, _store) = state_bus();
         store(&bus, "a-10", "s-1", "user", "counter contract").await;
 
-        recall_memory(&bus, json!({ "agentId": "a-10", "query": "counter" }))
-            .await
-            .expect("recall_memory failed");
+        recall(&bus, "a-10", "counter").await;
 
         let increment = bus
             .calls_to("state::update")
@@ -3240,6 +3285,377 @@ mod tests {
 
         assert_eq!(stored["stored"], true);
         assert_eq!(stored["sessionIndexed"], false);
+    }
+
+    // --- tenancy (contract T1): who a call is FROM vs what it is ABOUT ---
+
+    /// `std::env::set_var` is process-global and `cargo test` runs tests in
+    /// parallel threads, so operator tests serialise on this lock and restore
+    /// the previous value. Same pattern as `agentos_bus_auth::client`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_api_key<T>(value: Option<&str>, body: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("AGENTOS_API_KEY");
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var("AGENTOS_API_KEY", value),
+                None => std::env::remove_var("AGENTOS_API_KEY"),
+            }
+        }
+        let result = body();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("AGENTOS_API_KEY", value),
+                None => std::env::remove_var("AGENTOS_API_KEY"),
+            }
+        }
+        result
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    /// What the HTTP adapter forwards for an authenticated edge request.
+    fn as_operator(token: &str, fields: Value) -> Value {
+        let mut payload = fields;
+        payload["headers"] = json!({ "authorization": format!("Bearer {token}") });
+        payload
+    }
+
+    /// A capability reader whose store grants `a-1` exactly `grant::act_as::a-2`,
+    /// and `a-wild` everything a wildcard can express. It answers through the
+    /// shared matcher, so what this proves is the real rule, not a stub's.
+    fn capability_reader(bus: &FakeBus) {
+        bus.on("security::check_capability", |input| {
+            let agent = input["agentId"].as_str().unwrap_or_default();
+            let resource = input["resource"].as_str().unwrap_or_default();
+            let tools: Vec<String> = match agent {
+                "a-1" => vec!["memory::*".into(), policy::act_as_grant("a-2")],
+                "a-wild" => vec!["*".into(), "memory::*".into(), "grant::*".into()],
+                _ => vec![],
+            };
+            if policy::capabilities_grant(&tools, resource) {
+                Ok(json!({ "allowed": true, "reason": "granted" }))
+            } else {
+                Err(Error::Handler(format!("Agent {agent} denied: {resource}")))
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn a_missing_principal_fails_closed_before_any_state_is_read() {
+        let (bus, _store) = state_bus();
+        capability_reader(&bus);
+        let bare = json!({ "agentId": "a-1", "sessionId": "s-1", "query": "x", "key": "k", "value": 1, "content": "c" });
+
+        let results = vec![
+            store_memory(&bus, bare.clone()).await,
+            recall_memory(&bus, bare.clone()).await,
+            session_history(&bus, bare.clone()).await,
+            list_sessions(&bus, bare.clone()).await,
+            delete_session(&bus, json!({ "id": "s-1", "agentId": "a-1" })).await,
+            list_memories(&bus, bare.clone()).await,
+            memory_kv_get(&bus, bare.clone()).await,
+            memory_kv_set(&bus, bare.clone()).await,
+            memory_kv_delete(&bus, bare.clone()).await,
+            memory_kv_list(&bus, bare.clone()).await,
+            kg_add(&bus, json!({ "agentId": "a-1", "entity": { "id": "e" } })).await,
+            kg_query(&bus, json!({ "agentId": "a-1", "entityId": "e" })).await,
+            compact_session(&bus, bare.clone()).await,
+            repair_session(&bus, bare.clone()).await,
+        ];
+        for result in results {
+            let error = result.expect_err("a payload agentId alone is not a principal");
+            assert!(
+                error.to_string().contains("principal required"),
+                "unexpected error: {error}"
+            );
+        }
+        assert!(
+            bus.calls().is_empty(),
+            "nothing may be read or written for an unidentified caller, got {:?}",
+            bus.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_a_cannot_recall_read_or_evict_agent_b() {
+        let (bus, _store) = state_bus();
+        capability_reader(&bus);
+        store(&bus, "a-2", "s-2", "user", "agent two's private note").await;
+        store(&bus, "a-3", "s-3", "user", "agent three's private note").await;
+        let before = bus.calls().len();
+
+        // a-3 holds no grant at all; a-1 holds one for a-2 but not for a-3.
+        let attempts = vec![
+            recall_memory(&bus, json!({ "principal": { "agentId": "a-3" }, "agentId": "a-2", "query": "note" })).await,
+            recall_memory(&bus, json!({ "principal": { "agentId": "a-1" }, "agentId": "a-3", "query": "note" })).await,
+            session_history(&bus, json!({ "principal": { "agentId": "a-3" }, "agentId": "a-2", "sessionId": "s-2" })).await,
+            list_sessions(&bus, json!({ "principal": { "agentId": "a-3" }, "agent": "a-2" })).await,
+            delete_session(&bus, json!({ "principal": { "agentId": "a-3" }, "agentId": "a-2", "id": "s-2" })).await,
+            list_memories(&bus, json!({ "principal": { "agentId": "a-3" }, "agentId": "a-2" })).await,
+            memory_kv_list(&bus, json!({ "principal": { "agentId": "a-3" }, "agentId": "a-2" })).await,
+            store_memory(&bus, json!({ "principal": { "agentId": "a-3" }, "agentId": "a-2", "content": "planted" })).await,
+        ];
+        for attempt in attempts {
+            let error = attempt.expect_err("cross-agent access without the grant");
+            let message = error.to_string();
+            assert!(
+                message.contains("grant::act_as::") && message.contains("may not act on agent"),
+                "unexpected error: {message}"
+            );
+        }
+
+        let after: Vec<_> = bus.calls().into_iter().skip(before).collect();
+        assert!(
+            after
+                .iter()
+                .all(|call| call.function_id == "security::check_capability"),
+            "only the capability reader may be consulted, got {after:?}"
+        );
+        assert!(
+            after.iter().all(|call| call.payload["resource"]
+                .as_str()
+                .is_some_and(|resource| resource.starts_with("grant::act_as::"))),
+            "the reader is asked for the exact act_as grant, got {after:?}"
+        );
+
+        // And a-2's data is intact and still its own.
+        let own = recall(&bus, "a-2", "note").await;
+        assert_eq!(own.as_array().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_trusted_worker_with_the_exact_grant_can_act_on_the_other_agent() {
+        let (bus, _store) = state_bus();
+        capability_reader(&bus);
+        store(&bus, "a-2", "s-2", "user", "agent two's shared note").await;
+
+        // a-1 holds grant::act_as::a-2.
+        let recalled = recall_memory(
+            &bus,
+            json!({ "principal": { "agentId": "a-1" }, "agentId": "a-2", "query": "shared" }),
+        )
+        .await
+        .expect("granted cross-agent recall");
+        assert_eq!(recalled[0]["content"], "agent two's shared note");
+
+        let history = session_history(
+            &bus,
+            json!({ "principal": { "agentId": "a-1" }, "agentId": "a-2", "sessionId": "s-2" }),
+        )
+        .await
+        .expect("granted cross-agent history");
+        assert_eq!(history["agentId"], "a-2");
+        assert_eq!(history["messages"].as_array().map(Vec::len), Some(1));
+
+        let asked: Vec<_> = bus
+            .calls_to("security::check_capability")
+            .into_iter()
+            .map(|call| call.payload)
+            .collect();
+        assert_eq!(asked.len(), 2);
+        assert!(
+            asked.iter().all(|payload| payload["agentId"] == "a-1"
+                && payload["resource"] == "grant::act_as::a-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn no_wildcard_capability_reaches_another_agent() {
+        let (bus, _store) = state_bus();
+        capability_reader(&bus);
+        store(&bus, "a-2", "s-2", "user", "not for wildcards").await;
+
+        // `a-wild` holds `*`, `memory::*` and `grant::*` — every wildcard a
+        // capability document can express — and still may not act as a-2.
+        let error = recall_memory(
+            &bus,
+            json!({ "principal": { "agentId": "a-wild" }, "agentId": "a-2", "query": "wildcards" }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("grant::act_as::a-2"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_principal_is_confined_to_its_own_scopes() {
+        let (bus, _store) = state_bus();
+        capability_reader(&bus);
+        store(&bus, "a-2", "s-2", "user", "in agent two's scope").await;
+        let before = bus.calls().len();
+
+        // No `agentId` at all: an agent principal acts on itself, never on
+        // "default" and never on every agent.
+        let sessions = list_sessions(&bus, json!({ "principal": { "agentId": "a-3" } }))
+            .await
+            .expect("own sessions");
+        assert_eq!(sessions, json!([]));
+        let missing = delete_session(
+            &bus,
+            json!({ "principal": { "agentId": "a-3" }, "id": "s-2" }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("session not found"), "{missing}");
+        let recalled = recall_memory(
+            &bus,
+            json!({ "principal": { "agentId": "a-3" }, "query": "scope" }),
+        )
+        .await
+        .expect("own recall");
+        assert_eq!(recalled, json!([]));
+
+        let touched: Vec<String> = bus
+            .calls()
+            .into_iter()
+            .skip(before)
+            .filter_map(|call| call.payload["scope"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            touched.iter().all(|scope| scope.ends_with(":a-3")),
+            "an agent principal may only touch its own scopes, got {touched:?}"
+        );
+        assert!(!touched.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_cron_path_still_evicts_and_consolidates_every_agent() {
+        let (bus, _store) = state_bus();
+        store(&bus, "a-1", "s-1", "user", "one").await;
+        store(&bus, "a-2", "s-2", "user", "two").await;
+
+        // Exactly what the engine's cron worker sends: a cron event, no headers,
+        // no principal. `cap: 0` forces every entry over the cap.
+        let cron_event = json!({ "cap": 0, "timestamp": 1_700_000_000_000_u64 });
+        let evicted = evict_memories(&bus, cron_event.clone())
+            .await
+            .expect("cron eviction");
+        assert_eq!(evicted["evicted"], 2);
+        assert_eq!(recall(&bus, "a-1", "one").await, json!([]));
+        assert_eq!(recall(&bus, "a-2", "two").await, json!([]));
+
+        let consolidated = consolidate(&bus, cron_event)
+            .await
+            .expect("cron consolidation");
+        assert_eq!(consolidated["memoriesDecayed"], 0);
+    }
+
+    #[tokio::test]
+    async fn an_agent_principal_may_not_run_system_wide_maintenance() {
+        let (bus, _store) = state_bus();
+        store(&bus, "a-1", "s-1", "user", "keep me").await;
+        store(&bus, "a-2", "s-2", "user", "keep me too").await;
+        let before = bus.calls().len();
+
+        // Before contract T1 an agent granted `memory::*` could reach this
+        // through a tool call and wipe every agent's memory.
+        for operation in ["memory::evict", "memory::consolidate"] {
+            let payload = json!({ "principal": { "agentId": "a-1" }, "cap": 0 });
+            let result = if operation == "memory::evict" {
+                evict_memories(&bus, payload).await
+            } else {
+                consolidate(&bus, payload).await
+            };
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("system-wide"), "{operation}: {error}");
+        }
+        assert_eq!(bus.calls().len(), before, "nothing may be touched");
+        assert_eq!(
+            recall(&bus, "a-2", "keep").await.as_array().map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_operator_names_any_agent_and_lists_every_agent() {
+        with_api_key(Some("operator-key"), || {
+            block_on(async {
+                let (bus, store_handle) = {
+                    // `agents` is what `agent::create` writes and what the
+                    // sessions screen walks when no agent is named.
+                    let (bus, store_handle) = state_bus();
+                    capability_reader(&bus);
+                    store_handle
+                        .set(&json!({ "scope": "agents", "key": "a-1", "value": { "id": "a-1" } }));
+                    store_handle
+                        .set(&json!({ "scope": "agents", "key": "a-2", "value": { "id": "a-2" } }));
+                    (bus, store_handle)
+                };
+                store(&bus, "a-1", "s-1", "user", "one").await;
+                store(&bus, "a-2", "s-2", "user", "two").await;
+
+                let recalled = recall_memory(
+                    &bus,
+                    as_operator("operator-key", json!({ "agentId": "a-2", "query": "two" })),
+                )
+                .await
+                .expect("operator recall");
+                assert_eq!(recalled[0]["content"], "two");
+
+                let sessions = list_sessions(&bus, as_operator("operator-key", json!({})))
+                    .await
+                    .expect("operator session list");
+                let ids: Vec<&str> = sessions
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .filter_map(|session| session["id"].as_str())
+                    .collect();
+                assert_eq!(ids, vec!["s-1", "s-2"]);
+
+                let default_kv = memory_kv_set(
+                    &bus,
+                    as_operator("operator-key", json!({ "key": "k", "value": 1 })),
+                )
+                .await
+                .expect("operator kv set without an agent");
+                assert_eq!(default_kv["stored"], true);
+                assert_eq!(
+                    store_handle.get(&json!({ "scope": "agent-memory:default", "key": "k" })),
+                    json!(1),
+                    "the operator naming nobody still means the default agent"
+                );
+                assert_eq!(
+                    bus.call_count("security::check_capability"),
+                    0,
+                    "the operator needs no grant"
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn a_wrong_bearer_or_an_unconfigured_key_is_refused() {
+        let refused = |key: Option<&str>, token: &str| {
+            with_api_key(key, || {
+                block_on(async {
+                    let (bus, _store) = state_bus();
+                    let error = recall_memory(
+                        &bus,
+                        as_operator(token, json!({ "agentId": "a-1", "query": "x" })),
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                    assert!(bus.calls().is_empty());
+                    error
+                })
+            })
+        };
+        assert!(refused(Some("operator-key"), "not-the-key").contains("Unauthorized"));
+        assert!(
+            refused(None, "operator-key").contains("Unauthorized"),
+            "a stack without a key has no operator"
+        );
     }
 
     #[test]
