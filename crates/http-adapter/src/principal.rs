@@ -57,10 +57,19 @@ pub const PRINCIPAL_KEY: &str = "principal";
 /// which a deputy therefore has to label before dispatching a call on behalf of
 /// an agent.
 ///
+/// `memory`, `vault`, `lifecycle` and `wasm` keep per-agent data or act on it.
+/// `agent` and `workflow` are DEPUTIES: `agent::chat` runs a whole turn as the
+/// agent it names and `workflow::run` dispatches steps as the agents the
+/// definition names, so a model tool call into either that went out unlabelled
+/// would let the model pick whose turn, memory and capabilities it runs with.
+/// Labelled, both bind what they run to the caller's principal and demand the
+/// exact `grant::act_as::<target>` for anyone else.
+///
 /// Deliberately a list rather than "everything": some upstream and in-tree
 /// request structs are `deny_unknown_fields` (`hand::*`), so an unconditional
 /// extra field would turn every such tool call into a deserialisation error.
-pub const PRINCIPAL_FAMILIES: [&str; 4] = ["memory", "vault", "lifecycle", "wasm"];
+pub const PRINCIPAL_FAMILIES: [&str; 6] =
+    ["memory", "vault", "lifecycle", "wasm", "agent", "workflow"];
 
 /// Who a call is from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,7 +548,15 @@ mod tests {
             "what the call is ABOUT is left for the handler to judge"
         );
 
-        for function_id in ["vault::get", "lifecycle::transition", "wasm::execute"] {
+        for function_id in [
+            "vault::get",
+            "lifecycle::transition",
+            "wasm::execute",
+            // the deputies: a model must not name whose turn or workflow runs
+            "agent::chat",
+            "workflow::run",
+            "workflow::create",
+        ] {
             assert!(resolves_principal(function_id), "{function_id}");
             assert_eq!(
                 attach_agent(function_id, json!({}), "a-1")["principal"],

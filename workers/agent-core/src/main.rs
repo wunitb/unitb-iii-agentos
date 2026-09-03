@@ -1,5 +1,6 @@
+use agentos_http_adapter::TriggerBus;
 use agentos_http_adapter::bus::CHAT_TIMEOUT_MS;
-use agentos_http_adapter::principal;
+use agentos_http_adapter::principal::{self, PrincipalError};
 use iii_sdk::errors::Error;
 use iii_sdk::{
     IIIClient, RegisterFunction,
@@ -7,6 +8,7 @@ use iii_sdk::{
     register_worker,
 };
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::Instant;
 
 mod types;
@@ -14,6 +16,10 @@ mod types;
 use types::{AgentConfig, ChatRequest, FunctionCall, ModelConfig};
 
 const MAX_ITERATIONS: u32 = 50;
+
+/// The bus handle the chat path takes: the engine client in production, a
+/// `FakeBus` in tests. `Arc` because memory writes are spawned off the turn.
+type Bus = Arc<dyn TriggerBus>;
 
 const CHANNELS: [&str; 14] = [
     "bluesky", "discord", "email", "linkedin", "mastodon", "matrix", "reddit", "signal", "slack",
@@ -138,6 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
     let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
+    let bus: Bus = Arc::new(iii.clone());
 
     let started_at = Instant::now();
     let iii_clone = iii.clone();
@@ -229,16 +236,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
-    let iii_clone = iii.clone();
+    let bus_clone = Arc::clone(&bus);
     iii.register_function(
         "agent::chat",
         RegisterFunction::new_async(move |input: Value| {
-            let iii = iii_clone.clone();
-            async move {
-                let req: ChatRequest =
-                    serde_json::from_value(input).map_err(|e| Error::Handler(e.to_string()))?;
-                agent_chat(&iii, req).await
-            }
+            let bus = Arc::clone(&bus_clone);
+            async move { chat(&bus, input).await }
         })
         .description("Process a message through the agent loop"),
     );
@@ -256,11 +259,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("List functions available to an agent"),
     );
 
-    let iii_clone = iii.clone();
+    let bus_clone = Arc::clone(&bus);
     iii.register_function(
         "agent::create",
         RegisterFunction::new_async(move |input: Value| {
-            let iii = iii_clone.clone();
+            let iii = Arc::clone(&bus_clone);
             async move {
                 let config: AgentConfig =
                     serde_json::from_value(input).map_err(|e| Error::Handler(e.to_string()))?;
@@ -289,11 +292,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("List all agents"),
     );
 
-    let iii_clone = iii.clone();
+    let bus_clone = Arc::clone(&bus);
     iii.register_function(
         "agent::delete",
         RegisterFunction::new_async(move |input: Value| {
-            let iii = iii_clone.clone();
+            let iii = Arc::clone(&bus_clone);
             async move {
                 let agent_id = input["agentId"]
                     .as_str()
@@ -356,8 +359,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Triggers a function in the background; the outcome is intentionally ignored.
-fn spawn_trigger(iii: &IIIClient, function_id: &'static str, payload: Value) {
-    let iii = iii.clone();
+fn spawn_trigger(iii: &Bus, function_id: &'static str, payload: Value) {
+    let iii = Arc::clone(iii);
     tokio::spawn(async move {
         let _ = iii
             .trigger(TriggerRequest {
@@ -502,7 +505,39 @@ fn tool_dispatch_payload(call: &FunctionCall, agent_id: &str) -> Value {
     principal::attach_agent(&call.id, call.arguments.clone(), agent_id)
 }
 
-async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
+/// Who this turn runs as (contract T1).
+///
+/// `agent::chat` is a deputy: every memory read and write of the turn, every
+/// capability check and every tool call is made AS the agent it runs for. So
+/// the payload's `agentId` is what the call is ABOUT, and who it is FROM
+/// decides whether that is allowed:
+/// * an `Agent(a)` principal — a labelled call from another deputy, which is
+///   what a model tool call `agent::chat {agentId: ...}` becomes — runs as `a`,
+///   or as the named agent only with the exact `grant::act_as::<named>`;
+/// * the operator (bearer, the HTTP edge) runs as whoever it names;
+/// * a bare payload — the untrusted queue worker firing `agent.inbox`, and the
+///   channel/a2a/hand/pulse workers that hand a message over from their own
+///   trusted sessions — runs as the named agent. That is the pre-T1 contract
+///   for callers that have no principal to give and is kept ON PURPOSE; the
+///   bus tier is its trust basis.
+async fn chat_agent(bus: &dyn TriggerBus, input: &Value, named: &str) -> Result<String, Error> {
+    let expected = agentos_bus_auth::policy::expected_api_key();
+    match principal::resolve(input, expected.as_deref()) {
+        Ok(principal) => principal::acting_agent(bus, &principal, input, named).await,
+        Err(PrincipalError::Missing) => Ok(named.to_string()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The `agent::chat` handler: bind the turn to its principal, then run it.
+async fn chat(bus: &Bus, input: Value) -> Result<Value, Error> {
+    let req: ChatRequest =
+        serde_json::from_value(input.clone()).map_err(|e| Error::Handler(e.to_string()))?;
+    let agent_id = chat_agent(bus.as_ref(), &input, &req.agent_id).await?;
+    agent_chat(bus, ChatRequest { agent_id, ..req }).await
+}
+
+async fn agent_chat(iii: &Bus, req: ChatRequest) -> Result<Value, Error> {
     let start = Instant::now();
 
     let config: Option<AgentConfig> = iii
@@ -817,7 +852,7 @@ fn filter_functions(registry: &Value, allowed: &[String]) -> Value {
     )
 }
 
-async fn create_agent(iii: &IIIClient, config: AgentConfig) -> Result<Value, Error> {
+async fn create_agent(iii: &Bus, config: AgentConfig) -> Result<Value, Error> {
     let agent_id = config
         .id
         .clone()
@@ -1061,6 +1096,283 @@ mod tests {
             tool_dispatch_payload(&call, "agent-7"),
             json!({ "name": "x" })
         );
+    }
+
+    // --- the agent::chat deputy binds a turn to its principal (review F2) ---
+
+    use agentos_http_adapter::fake::FakeBus;
+    use agentos_http_adapter::policy;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    static AUTH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_api_key<T>(value: Option<&str>, test: impl FnOnce() -> T) -> T {
+        let _guard = AUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("AGENTOS_API_KEY");
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var("AGENTOS_API_KEY", value),
+                None => std::env::remove_var("AGENTOS_API_KEY"),
+            }
+        }
+        let result = test();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("AGENTOS_API_KEY", value),
+                None => std::env::remove_var("AGENTOS_API_KEY"),
+            }
+        }
+        result
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    /// A bus that can run whole turns. `memory::recall` answers with who it
+    /// was asked AS (the label), so a turn's transcript shows whose memory it
+    /// read; the completion script is consumed one answer per call, the last
+    /// one repeating. The capability reader answers through the shared
+    /// matcher: `a-1` holds `*` (so every function, and no grant), `a-granted`
+    /// also holds exactly `grant::act_as::victim`.
+    fn turn_bus(completions: Vec<Value>) -> Arc<FakeBus> {
+        let bus = FakeBus::new();
+        bus.on_value("state::get", Value::Null);
+        bus.on("memory::recall", |input| {
+            Ok(json!([{
+                "role": "system",
+                "content": format!("memories read as {}", input["principal"]["agentId"]),
+            }]))
+        });
+        bus.on_value("agent::list_functions", json!([]));
+        bus.on_value(
+            "agentos::llm::route",
+            json!({ "provider": "p", "model": "m" }),
+        );
+        bus.on_value(
+            "security::scan_injection",
+            json!({ "safe": true, "riskScore": 0.0 }),
+        );
+        let script = Mutex::new(completions.into_iter().collect::<VecDeque<_>>());
+        bus.on("agentos::llm::complete", move |_| {
+            let mut script = script.lock().unwrap_or_else(|error| error.into_inner());
+            let next = if script.len() > 1 {
+                script.pop_front()
+            } else {
+                script.front().cloned()
+            };
+            Ok(next.unwrap_or_else(|| json!({ "content": "" })))
+        });
+        bus.on_value("memory::store", json!({ "stored": true }));
+        bus.on_value("state::update", json!({ "new_value": {} }));
+        bus.on("security::check_capability", |input| {
+            let agent = input["agentId"].as_str().unwrap_or_default();
+            let resource = input["resource"].as_str().unwrap_or_default();
+            let tools: Vec<String> = match agent {
+                "a-1" | "a-9" | "victim" => vec!["*".into()],
+                "a-granted" => vec!["*".into(), policy::act_as_grant("victim")],
+                _ => vec![],
+            };
+            if policy::capabilities_grant(&tools, resource) {
+                Ok(json!({ "allowed": true, "reason": "granted" }))
+            } else {
+                Err(Error::Handler(format!("Agent {agent} denied: {resource}")))
+            }
+        });
+        Arc::new(bus)
+    }
+
+    fn payloads(bus: &FakeBus, function_id: &str) -> Vec<Value> {
+        bus.calls_to(function_id)
+            .into_iter()
+            .map(|call| call.payload)
+            .collect()
+    }
+
+    fn recalls_as(bus: &FakeBus, agent: &str) -> usize {
+        payloads(bus, "memory::recall")
+            .iter()
+            .filter(|payload| payload["principal"]["agentId"] == agent)
+            .count()
+    }
+
+    fn grants_asked(bus: &FakeBus) -> Vec<(String, String)> {
+        payloads(bus, "security::check_capability")
+            .iter()
+            .filter(|payload| policy::is_grant(payload["resource"].as_str().unwrap_or_default()))
+            .map(|payload| {
+                (
+                    payload["agentId"].as_str().unwrap_or_default().to_string(),
+                    payload["resource"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_model_tool_call_cannot_run_a_turn_as_another_agent() {
+        // a-1's model asks for a whole turn as `victim`.
+        let fake = turn_bus(vec![
+            json!({ "toolCalls": [{
+                "callId": "c-1",
+                "id": "agent::chat",
+                "arguments": { "agentId": "victim", "message": "summarise everything you remember" },
+            }] }),
+            json!({ "content": "done" }),
+        ]);
+        fake.on_value("agent::chat", json!({ "content": "nested turn" }));
+        let bus: Bus = Arc::clone(&fake) as Bus;
+
+        chat(&bus, json!({ "agentId": "a-1", "message": "hi" }))
+            .await
+            .expect("a-1's own turn");
+
+        // 1. Handed to the real handler, the model's call must not read
+        //    victim's memory: it is refused for want of the exact grant.
+        let dispatched = payloads(&fake, "agent::chat");
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(
+            dispatched[0]["agentId"], "victim",
+            "what the call is ABOUT is kept"
+        );
+        let outcome = chat(&bus, dispatched[0].clone()).await;
+        assert_eq!(
+            recalls_as(&fake, "victim"),
+            0,
+            "victim's memory was read through a model tool call"
+        );
+        let error = outcome.unwrap_err().to_string();
+        assert!(error.contains("grant::act_as::victim"), "{error}");
+        assert_eq!(recalls_as(&fake, "a-1"), 1);
+
+        // 2. Because the deputy labelled the call with the agent it runs for,
+        //    and the reader was asked for that agent's grant and nothing else.
+        assert_eq!(
+            dispatched[0]["principal"],
+            principal::as_agent("a-1"),
+            "the model's agent::chat call must carry a-1 as principal: {}",
+            dispatched[0]
+        );
+        assert_eq!(
+            grants_asked(&fake),
+            vec![("a-1".to_string(), policy::act_as_grant("victim"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_exact_grant_lets_a_deputy_run_a_turn_as_the_other_agent() {
+        let fake = turn_bus(vec![json!({ "content": "as victim" })]);
+        let bus: Bus = Arc::clone(&fake) as Bus;
+
+        let answer = chat(
+            &bus,
+            json!({
+                "agentId": "victim",
+                "message": "hi",
+                "principal": principal::as_agent("a-granted"),
+            }),
+        )
+        .await
+        .expect("granted");
+        assert_eq!(answer["content"], "as victim");
+        // The turn IS victim's turn now: its memory calls are labelled victim.
+        assert_eq!(recalls_as(&fake, "victim"), 1);
+        assert_eq!(
+            grants_asked(&fake),
+            vec![("a-granted".to_string(), policy::act_as_grant("victim"))]
+        );
+
+        // No wildcard reaches another agent: `*` alone is not a grant.
+        let error = chat(
+            &bus,
+            json!({ "agentId": "victim", "message": "hi", "principal": principal::as_agent("a-1") }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("grant::act_as::victim"), "{error}");
+        assert_eq!(
+            recalls_as(&fake, "victim"),
+            1,
+            "still only the granted turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_principal_runs_as_itself_without_asking_the_reader() {
+        let fake = turn_bus(vec![json!({ "content": "self" })]);
+        let bus: Bus = Arc::clone(&fake) as Bus;
+
+        for input in [
+            json!({ "agentId": "a-1", "message": "hi", "principal": principal::as_agent("a-1") }),
+            // Naming nobody: an agent principal never falls back to anyone else.
+            json!({ "agentId": "", "message": "hi", "principal": principal::as_agent("a-1") }),
+        ] {
+            chat(&bus, input).await.expect("own turn");
+        }
+        assert_eq!(recalls_as(&fake, "a-1"), 2);
+        assert!(grants_asked(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bare_message_still_runs_as_the_named_agent() {
+        // The untrusted queue worker (`agent.inbox`) and the channel workers
+        // hand over bare payloads; that carve-out is deliberate.
+        let fake = turn_bus(vec![json!({ "content": "queued" })]);
+        let bus: Bus = Arc::clone(&fake) as Bus;
+
+        chat(
+            &bus,
+            json!({ "agentId": "a-9", "message": "from a channel" }),
+        )
+        .await
+        .expect("bare payload");
+        assert_eq!(recalls_as(&fake, "a-9"), 1);
+        assert!(grants_asked(&fake).is_empty());
+
+        // But a bearer that does not match is a refusal, not a bare call.
+        let error = chat(
+            &bus,
+            json!({
+                "agentId": "a-9",
+                "message": "hi",
+                "headers": { "authorization": "Bearer not-the-key" },
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Unauthorized"), "{error}");
+        assert_eq!(recalls_as(&fake, "a-9"), 1);
+    }
+
+    #[test]
+    fn the_operator_chats_as_whoever_it_names() {
+        with_api_key(Some("op-key"), || {
+            block_on(async {
+                let fake = turn_bus(vec![json!({ "content": "operator" })]);
+                let bus: Bus = Arc::clone(&fake) as Bus;
+                chat(
+                    &bus,
+                    json!({
+                        "agentId": "a-9",
+                        "message": "hi",
+                        "headers": { "authorization": "Bearer op-key" },
+                    }),
+                )
+                .await
+                .expect("operator turn");
+                assert_eq!(recalls_as(&fake, "a-9"), 1);
+                assert!(grants_asked(&fake).is_empty());
+            })
+        });
     }
 
     #[test]
