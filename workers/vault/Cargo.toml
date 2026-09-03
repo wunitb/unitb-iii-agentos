@@ -25,3 +25,6 @@ aes-gcm = "0.10"
 scrypt = "0.11"
 rand = "0.10"
 base64 = "0.23"
+
+[dev-dependencies]
+agentos-http-adapter = { workspace = true, features = ["fake-bus"] }

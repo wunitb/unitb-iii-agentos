@@ -23,3 +23,6 @@ tracing-subscriber.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
 toml.workspace = true
+
+[dev-dependencies]
+agentos-http-adapter = { workspace = true, features = ["fake-bus"] }

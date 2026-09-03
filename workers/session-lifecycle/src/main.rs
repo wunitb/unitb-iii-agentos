@@ -1,21 +1,50 @@
+use agentos_http_adapter::TriggerBus;
+use agentos_http_adapter::principal::{self, Principal};
 use iii_sdk::errors::Error;
 use iii_sdk::{
-    IIIClient, RegisterFunction,
+    RegisterFunction,
     protocol::{TriggerAction, TriggerRequest},
     register_worker,
 };
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 mod types;
 
 use types::{LifecycleState, Reaction};
 
+/// The bus handle the handlers take: the engine client in production, a
+/// `FakeBus` in tests. `Arc` because reactions fire from spawned tasks.
+type Bus = Arc<dyn TriggerBus>;
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-fn fire_void(iii: &IIIClient, function_id: &str, payload: Value) {
-    let iii = iii.clone();
+/// Who this call is from (contract T1), against the one bearer
+/// `agentos_bus_auth` owns.
+fn principal_of(input: &Value) -> Result<Principal, Error> {
+    let expected = agentos_bus_auth::policy::expected_api_key();
+    Ok(principal::resolve(input, expected.as_deref())?)
+}
+
+/// The agent a per-agent lifecycle call acts on, or `None` when the operator
+/// names nobody (which the caller maps to "required" or "the global scope").
+///
+/// An agent principal always resolves to an agent: itself, or the one agent it
+/// holds `grant::act_as::<target>` for; it can never reach the global scope.
+async fn acting_agent(iii: &dyn TriggerBus, input: &Value) -> Result<Option<String>, Error> {
+    let principal = principal_of(input)?;
+    if principal.is_operator() && principal::requested_agent(input).is_none() {
+        return Ok(None);
+    }
+    principal::acting_agent(iii, &principal, input, "")
+        .await
+        .map(Some)
+}
+
+fn fire_void(iii: &Bus, function_id: &str, payload: Value) {
+    let iii = Arc::clone(iii);
     let id = function_id.to_string();
     tokio::spawn(async move {
         let _ = iii
@@ -29,7 +58,7 @@ fn fire_void(iii: &IIIClient, function_id: &str, payload: Value) {
     });
 }
 
-async fn safe_state_get(iii: &IIIClient, scope: &str, key: &str) -> Option<Value> {
+async fn safe_state_get(iii: &Bus, scope: &str, key: &str) -> Option<Value> {
     iii.trigger(TriggerRequest {
         function_id: "state::get".into(),
         payload: json!({ "scope": scope, "key": key }),
@@ -41,7 +70,7 @@ async fn safe_state_get(iii: &IIIClient, scope: &str, key: &str) -> Option<Value
     .filter(|v| !v.is_null())
 }
 
-async fn safe_state_list(iii: &IIIClient, scope: &str) -> Vec<Value> {
+async fn safe_state_list(iii: &Bus, scope: &str) -> Vec<Value> {
     iii.trigger(TriggerRequest {
         function_id: "state::list".into(),
         payload: json!({ "scope": scope }),
@@ -120,17 +149,33 @@ fn update_rejection(result: &Value) -> Option<String> {
     Some(Value::Array(errors.clone()).to_string())
 }
 
-async fn transition(iii: &IIIClient, input: Value) -> Result<Value, Error> {
-    let agent_id = input["agentId"]
-        .as_str()
-        .filter(|s| !s.is_empty())
+/// `lifecycle::transition` as a bus/HTTP call: the agent comes from the
+/// principal (contract T1), then the transition is applied.
+async fn transition(iii: &Bus, input: Value) -> Result<Value, Error> {
+    let agent_id = acting_agent(iii.as_ref(), &input)
+        .await?
         .ok_or_else(|| Error::Handler("agentId required".into()))?;
     let new_state_str = input["newState"]
         .as_str()
         .ok_or_else(|| Error::Handler("newState required".into()))?;
+    let reason = input["reason"].as_str().unwrap_or("");
+    apply_transition(iii, &agent_id, new_state_str, reason).await
+}
+
+/// Apply one lifecycle transition for `agent_id` and fire its reactions.
+///
+/// No principal is resolved here: the caller has already decided who may act
+/// on `agent_id` (`transition` through the principal, `check_all` as the
+/// system-wide cron job).
+async fn apply_transition(
+    iii: &Bus,
+    agent_id: &str,
+    new_state_str: &str,
+    reason: &str,
+) -> Result<Value, Error> {
     let new_state = LifecycleState::from_str(new_state_str)
         .ok_or_else(|| Error::Handler(format!("invalid newState: {new_state_str}")))?;
-    let reason = input["reason"].as_str().unwrap_or("").to_string();
+    let reason = reason.to_string();
 
     let scope = format!("lifecycle:{agent_id}");
     let current = safe_state_get(iii, &scope, "state").await;
@@ -334,20 +379,22 @@ async fn transition(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     }))
 }
 
-async fn get_state(iii: &IIIClient, input: Value) -> Result<Value, Error> {
-    let agent_id = input["agentId"]
-        .as_str()
+async fn get_state(iii: &Bus, input: Value) -> Result<Value, Error> {
+    let agent_id = acting_agent(iii.as_ref(), &input)
+        .await?
         .ok_or_else(|| Error::Handler("agentId required".into()))?;
     let scope = format!("lifecycle:{agent_id}");
     let state = safe_state_get(iii, &scope, "state").await;
     Ok(state.unwrap_or_else(|| json!({ "state": "spawning", "transitionedAt": now_ms() })))
 }
 
-async fn add_reaction(iii: &IIIClient, input: Value) -> Result<Value, Error> {
-    // agentId is optional: an empty/missing id stores the rule under the
-    // global "lifecycle_reactions" scope, which `transition` already
-    // evaluates alongside the per-agent scope (see lines 133-136).
-    let agent_id = input["agentId"].as_str().filter(|s| !s.is_empty());
+async fn add_reaction(iii: &Bus, input: Value) -> Result<Value, Error> {
+    // agentId is optional FOR THE OPERATOR: naming nobody stores the rule under
+    // the global "lifecycle_reactions" scope, which `apply_transition`
+    // evaluates alongside the per-agent scope. An agent principal always lands
+    // in an agent scope — its own, or the one it is granted — because a global
+    // reaction fires for every agent.
+    let agent_id = acting_agent(iii.as_ref(), &input).await?;
     let from = input["from"]
         .as_str()
         .and_then(LifecycleState::from_str)
@@ -380,7 +427,7 @@ async fn add_reaction(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         attempts: 0,
     };
 
-    let scope = match agent_id {
+    let scope = match &agent_id {
         Some(id) => format!("lifecycle_reactions:{id}"),
         None => "lifecycle_reactions".to_string(),
     };
@@ -400,16 +447,22 @@ async fn add_reaction(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     Ok(json!({ "id": id, "registered": true }))
 }
 
-async fn list_reactions(iii: &IIIClient, input: Value) -> Result<Value, Error> {
-    let scope = match input["agentId"].as_str() {
-        Some(id) if !id.is_empty() => format!("lifecycle_reactions:{id}"),
-        _ => "lifecycle_reactions".to_string(),
+async fn list_reactions(iii: &Bus, input: Value) -> Result<Value, Error> {
+    let scope = match acting_agent(iii.as_ref(), &input).await? {
+        Some(id) => format!("lifecycle_reactions:{id}"),
+        None => "lifecycle_reactions".to_string(),
     };
     let entries = safe_state_list(iii, &scope).await;
     Ok(json!(stored_values(entries)))
 }
 
-async fn check_all(iii: &IIIClient) -> Result<Value, Error> {
+/// System-wide by design: fired by the engine's cron worker, which has no
+/// principal to present, so a bare payload is accepted. It walks EVERY agent
+/// and applies transitions in-process, as the system; an agent principal is
+/// refused (contract T1).
+async fn check_all(iii: &Bus, input: Value) -> Result<Value, Error> {
+    let expected = agentos_bus_auth::policy::expected_api_key();
+    principal::refuse_agent_principal(&input, expected.as_deref(), "lifecycle::check_all")?;
     let agents = safe_state_list(iii, "agents").await;
     let valid_agents = agent_ids_from_entries(&agents);
 
@@ -450,40 +503,26 @@ async fn check_all(iii: &IIIClient) -> Result<Value, Error> {
 
         let state_name = state["state"].as_str().unwrap_or("");
 
-        if circuit_broken && state_name == "working" {
-            let _ = iii
-                .trigger(TriggerRequest {
-                    function_id: "lifecycle::transition".into(),
-                    payload: json!({
-                        "agentId": &agent_id,
-                        "newState": "blocked",
-                        "reason": "Circuit breaker tripped"
-                    }),
-                    action: None,
-                    timeout_ms: None,
-                })
-                .await;
-            transitioned += 1;
-            continue;
-        }
-
-        if state_name == "working"
+        let reason = if circuit_broken && state_name == "working" {
+            Some("Circuit breaker tripped")
+        } else if state_name == "working"
             && let Some(transitioned_at) = state["transitionedAt"].as_i64()
             && now - transitioned_at > two_hours_ms
         {
-            let _ = iii
-                .trigger(TriggerRequest {
-                    function_id: "lifecycle::transition".into(),
-                    payload: json!({
-                        "agentId": &agent_id,
-                        "newState": "blocked",
-                        "reason": "Inactive for 2+ hours"
-                    }),
-                    action: None,
-                    timeout_ms: None,
-                })
-                .await;
-            transitioned += 1;
+            Some("Inactive for 2+ hours")
+        } else {
+            None
+        };
+        let Some(reason) = reason else {
+            continue;
+        };
+        // In-process, as the system: a bus round trip would need a principal
+        // this cron job cannot present.
+        match apply_transition(iii, &agent_id, "blocked", reason).await {
+            Ok(_) => transitioned += 1,
+            Err(error) => {
+                tracing::warn!(agent_id = %agent_id, %error, "check_all could not block a stuck agent")
+            }
         }
     }
 
@@ -496,8 +535,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
     let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
+    let bus: Bus = Arc::new(iii.clone());
 
-    let iii_ref = iii.clone();
+    let iii_ref = Arc::clone(&bus);
     iii.register_function(
         "lifecycle::transition",
         RegisterFunction::new_async(move |input: Value| {
@@ -507,7 +547,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("Move session to new state, validate transition, fire reactions"),
     );
 
-    let iii_ref = iii.clone();
+    let iii_ref = Arc::clone(&bus);
     iii.register_function(
         "lifecycle::get_state",
         RegisterFunction::new_async(move |input: Value| {
@@ -517,7 +557,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("Get current lifecycle state for a session"),
     );
 
-    let iii_ref = iii.clone();
+    let iii_ref = Arc::clone(&bus);
     iii.register_function(
         "lifecycle::add_reaction",
         RegisterFunction::new_async(move |input: Value| {
@@ -527,7 +567,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("Register a declarative reaction rule for state transitions"),
     );
 
-    let iii_ref = iii.clone();
+    let iii_ref = Arc::clone(&bus);
     iii.register_function(
         "lifecycle::list_reactions",
         RegisterFunction::new_async(move |input: Value| {
@@ -537,12 +577,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("List configured reaction rules"),
     );
 
-    let iii_ref = iii.clone();
+    let iii_ref = Arc::clone(&bus);
     iii.register_function(
         "lifecycle::check_all",
-        RegisterFunction::new_async(move |_input: Value| {
+        RegisterFunction::new_async(move |input: Value| {
             let iii = iii_ref.clone();
-            async move { check_all(&iii).await }
+            async move { check_all(&iii, input).await }
         })
         .description("Scan all sessions, detect state changes, auto-transition"),
     );
@@ -684,6 +724,389 @@ mod tests {
             vec!["agent-1".to_string(), "agent-2".to_string()]
         );
         assert!(agent_ids_from_entries(&[json!({ "key": "agent-1" })]).is_empty());
+    }
+
+    // --- tenancy (contract T1) through the real handlers, on a FakeBus ---
+
+    use agentos_http_adapter::fake::FakeBus;
+    use agentos_http_adapter::policy;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_api_key<T>(value: Option<&str>, body: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("AGENTOS_API_KEY");
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var("AGENTOS_API_KEY", value),
+                None => std::env::remove_var("AGENTOS_API_KEY"),
+            }
+        }
+        let result = body();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("AGENTOS_API_KEY", value),
+                None => std::env::remove_var("AGENTOS_API_KEY"),
+            }
+        }
+        result
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    /// In-memory `state::*` with the engine's real shapes (bare `state::list`
+    /// values, null for a missing key) and a capability reader whose store
+    /// grants `a-1` exactly `grant::act_as::a-2`, through the shared matcher.
+    #[derive(Default)]
+    struct StateStore(Mutex<BTreeMap<String, BTreeMap<String, Value>>>);
+
+    impl StateStore {
+        fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, BTreeMap<String, Value>>> {
+            self.0.lock().unwrap_or_else(|error| error.into_inner())
+        }
+        fn field(input: &Value, name: &str) -> String {
+            input[name].as_str().unwrap_or_default().to_string()
+        }
+        fn put(&self, scope: &str, key: &str, value: Value) {
+            self.lock()
+                .entry(scope.to_string())
+                .or_default()
+                .insert(key.to_string(), value);
+        }
+        fn get(&self, scope: &str, key: &str) -> Value {
+            self.lock()
+                .get(scope)
+                .and_then(|scope| scope.get(key))
+                .cloned()
+                .unwrap_or(Value::Null)
+        }
+    }
+
+    fn state_bus() -> (Arc<FakeBus>, Arc<StateStore>) {
+        let store = Arc::new(StateStore::default());
+        let bus = Arc::new(FakeBus::new());
+        let state = store.clone();
+        bus.on("state::get", move |input| {
+            Ok(state.get(
+                &StateStore::field(&input, "scope"),
+                &StateStore::field(&input, "key"),
+            ))
+        });
+        let state = store.clone();
+        bus.on("state::set", move |input| {
+            state.put(
+                &StateStore::field(&input, "scope"),
+                &StateStore::field(&input, "key"),
+                input["value"].clone(),
+            );
+            Ok(json!({ "stored": true }))
+        });
+        let state = store.clone();
+        bus.on("state::list", move |input| {
+            Ok(Value::Array(
+                state
+                    .lock()
+                    .get(&StateStore::field(&input, "scope"))
+                    .map(|scope| scope.values().cloned().collect())
+                    .unwrap_or_default(),
+            ))
+        });
+        let state = store.clone();
+        bus.on("state::update", move |input| {
+            // Enough of the engine for the history append: `ops` is required.
+            if input.get("ops").and_then(Value::as_array).is_none() {
+                return Err(Error::Handler(
+                    "serialization error: missing field `ops`".into(),
+                ));
+            }
+            let scope = StateStore::field(&input, "scope");
+            let key = StateStore::field(&input, "key");
+            let mut entry = state.get(&scope, &key);
+            if !entry.is_object() {
+                entry = json!({});
+            }
+            for op in input["ops"].as_array().into_iter().flatten() {
+                let path = op["path"].as_str().unwrap_or_default().to_string();
+                match op["type"].as_str() {
+                    Some("append") => {
+                        let target = entry[&path].as_array().cloned().unwrap_or_default();
+                        let mut target = target;
+                        target.push(op["value"].clone());
+                        entry[&path] = json!(target);
+                    }
+                    Some("increment") => {
+                        let current = entry[&path].as_i64().unwrap_or(0);
+                        entry[&path] = json!(current + op["by"].as_i64().unwrap_or(0));
+                    }
+                    _ => entry[&path] = op["value"].clone(),
+                }
+            }
+            state.put(&scope, &key, entry);
+            Ok(json!({ "errors": [] }))
+        });
+        bus.on_error("guard::stats", "no loop-guard in this test");
+        for void in ["hook::fire", "fn::agent_send", "recovery::recover"] {
+            bus.on_value(void, json!({ "ok": true }));
+        }
+        bus.on("security::check_capability", |input| {
+            let agent = input["agentId"].as_str().unwrap_or_default();
+            let resource = input["resource"].as_str().unwrap_or_default();
+            let tools: Vec<String> = match agent {
+                "a-1" => vec!["lifecycle::*".into(), policy::act_as_grant("a-2")],
+                "a-wild" => vec!["*".into(), "grant::*".into()],
+                _ => vec![],
+            };
+            if policy::capabilities_grant(&tools, resource) {
+                Ok(json!({ "allowed": true, "reason": "granted" }))
+            } else {
+                Err(Error::Handler(format!("Agent {agent} denied: {resource}")))
+            }
+        });
+        (bus, store)
+    }
+
+    fn as_bus(bus: &Arc<FakeBus>) -> Bus {
+        Arc::clone(bus) as Bus
+    }
+
+    fn as_agent(agent: &str, fields: Value) -> Value {
+        let mut payload = fields;
+        payload["principal"] = principal::as_agent(agent);
+        payload
+    }
+
+    fn as_operator(token: &str, fields: Value) -> Value {
+        let mut payload = fields;
+        payload["headers"] = json!({ "authorization": format!("Bearer {token}") });
+        payload
+    }
+
+    fn state_scopes_touched(bus: &FakeBus) -> Vec<String> {
+        bus.calls()
+            .iter()
+            .filter(|call| call.function_id.starts_with("state::"))
+            .filter_map(|call| call.payload["scope"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_missing_principal_fails_closed_before_any_state_is_read() {
+        let (bus, _store) = state_bus();
+        let iii = as_bus(&bus);
+        let bare = json!({ "agentId": "a-1", "newState": "working", "from": "spawning", "to": "working", "action": "notify" });
+        for result in [
+            transition(&iii, bare.clone()).await,
+            get_state(&iii, bare.clone()).await,
+            add_reaction(&iii, bare.clone()).await,
+            list_reactions(&iii, bare.clone()).await,
+        ] {
+            let error = result.expect_err("a payload agentId alone is not a principal");
+            assert!(error.to_string().contains("principal required"), "{error}");
+        }
+        assert!(bus.calls().is_empty(), "got {:?}", bus.calls());
+    }
+
+    #[tokio::test]
+    async fn agent_a_cannot_move_or_read_agent_b_without_the_exact_grant() {
+        let (bus, store) = state_bus();
+        let iii = as_bus(&bus);
+        store.put(
+            "lifecycle:a-2",
+            "state",
+            json!({ "state": "working", "transitionedAt": 1 }),
+        );
+        store.put(
+            "lifecycle:a-3",
+            "state",
+            json!({ "state": "working", "transitionedAt": 1 }),
+        );
+
+        // a-3 holds nothing; a-wild holds every wildcard; a-1 holds a-2 only.
+        for (agent, target) in [("a-3", "a-2"), ("a-wild", "a-2"), ("a-1", "a-3")] {
+            let error = transition(
+                &iii,
+                as_agent(agent, json!({ "agentId": target, "newState": "blocked" })),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(&format!("grant::act_as::{target}")),
+                "{agent}->{target}: {error}"
+            );
+            assert!(
+                get_state(&iii, as_agent(agent, json!({ "agentId": target })))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                list_reactions(&iii, as_agent(agent, json!({ "agentId": target })))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            state_scopes_touched(&bus).is_empty(),
+            "nothing read or written"
+        );
+        assert_eq!(store.get("lifecycle:a-2", "state")["state"], "working");
+
+        // With the grant, a-1 moves a-2.
+        let moved = transition(
+            &iii,
+            as_agent(
+                "a-1",
+                json!({ "agentId": "a-2", "newState": "blocked", "reason": "granted" }),
+            ),
+        )
+        .await
+        .expect("granted transition");
+        assert_eq!(moved["transitioned"], true);
+        assert_eq!(store.get("lifecycle:a-2", "state")["state"], "blocked");
+        let read = get_state(&iii, as_agent("a-1", json!({ "agentId": "a-2" })))
+            .await
+            .expect("granted read");
+        assert_eq!(read["state"], "blocked");
+    }
+
+    #[tokio::test]
+    async fn an_agent_principal_acts_on_itself_and_never_reaches_the_global_scope() {
+        let (bus, store) = state_bus();
+        let iii = as_bus(&bus);
+
+        // No agentId at all: its own scope, not "everyone".
+        let added = add_reaction(
+            &iii,
+            as_agent(
+                "a-1",
+                json!({ "from": "working", "to": "blocked", "action": "notify" }),
+            ),
+        )
+        .await
+        .expect("own reaction");
+        let id = added["id"].as_str().expect("id");
+        assert!(store.get("lifecycle_reactions:a-1", id).is_object());
+        assert!(
+            store.lock().get("lifecycle_reactions").is_none(),
+            "the global scope is untouched"
+        );
+
+        let listed = list_reactions(&iii, as_agent("a-1", json!({})))
+            .await
+            .expect("own list");
+        assert_eq!(listed.as_array().map(Vec::len), Some(1));
+
+        let moved = transition(&iii, as_agent("a-1", json!({ "newState": "working" })))
+            .await
+            .expect("own transition");
+        assert_eq!(moved["transitioned"], true);
+        assert_eq!(store.get("lifecycle:a-1", "state")["state"], "working");
+        // Global reactions are READ for every transition by design; nothing
+        // is ever WRITTEN outside the agent's own scopes.
+        let written: Vec<String> = bus
+            .calls()
+            .iter()
+            .filter(|call| matches!(call.function_id.as_str(), "state::set" | "state::update"))
+            .filter_map(|call| call.payload["scope"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            !written.is_empty() && written.iter().all(|scope| scope.ends_with(":a-1")),
+            "got {written:?}"
+        );
+    }
+
+    #[test]
+    fn the_operator_names_any_agent_and_owns_the_global_scope() {
+        with_api_key(Some("op-key"), || {
+            block_on(async {
+                let (bus, store) = state_bus();
+                let iii = as_bus(&bus);
+
+                let added = add_reaction(
+                    &iii,
+                    as_operator(
+                        "op-key",
+                        json!({ "from": "working", "to": "blocked", "action": "notify" }),
+                    ),
+                )
+                .await
+                .expect("global reaction");
+                let id = added["id"].as_str().expect("id");
+                assert!(store.get("lifecycle_reactions", id).is_object());
+
+                let required = transition(
+                    &iii,
+                    as_operator("op-key", json!({ "newState": "working" })),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+                assert!(required.contains("agentId required"), "{required}");
+
+                let moved = transition(
+                    &iii,
+                    as_operator("op-key", json!({ "agentId": "a-9", "newState": "working" })),
+                )
+                .await
+                .expect("operator transition");
+                assert_eq!(moved["transitioned"], true);
+                assert_eq!(bus.call_count("security::check_capability"), 0);
+
+                let wrong = get_state(&iii, as_operator("nope", json!({ "agentId": "a-9" })))
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(wrong.contains("Unauthorized"), "{wrong}");
+            })
+        });
+    }
+
+    #[tokio::test]
+    async fn the_cron_path_still_blocks_stuck_agents_and_refuses_an_agent_principal() {
+        let (bus, store) = state_bus();
+        let iii = as_bus(&bus);
+        store.put("agents", "a-1", json!({ "id": "a-1" }));
+        store.put("agents", "a-2", json!({ "id": "a-2" }));
+        let three_hours_ago = now_ms() - 3 * 60 * 60 * 1000;
+        store.put(
+            "lifecycle:a-1",
+            "state",
+            json!({ "state": "working", "transitionedAt": three_hours_ago }),
+        );
+        store.put(
+            "lifecycle:a-2",
+            "state",
+            json!({ "state": "working", "transitionedAt": now_ms() }),
+        );
+
+        let refused = check_all(&iii, as_agent("a-1", json!({})))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("system-wide"), "{refused}");
+        assert!(bus.calls().is_empty());
+
+        // Exactly what the cron worker sends: a cron event, nothing else.
+        let checked = check_all(&iii, json!({ "timestamp": 1_700_000_000_000_i64 }))
+            .await
+            .expect("cron check");
+        assert_eq!(checked["checked"], 2);
+        assert_eq!(checked["transitioned"], 1);
+        assert_eq!(store.get("lifecycle:a-1", "state")["state"], "blocked");
+        assert_eq!(store.get("lifecycle:a-2", "state")["state"], "working");
+        assert_eq!(
+            bus.call_count("lifecycle::transition"),
+            0,
+            "applied in-process as the system, not through a principal-less bus call"
+        );
     }
 
     #[test]

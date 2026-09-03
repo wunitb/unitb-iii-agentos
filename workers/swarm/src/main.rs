@@ -1,3 +1,4 @@
+use agentos_http_adapter::principal;
 use iii_sdk::errors::Error;
 use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
@@ -675,6 +676,22 @@ async fn consensus(iii: &IIIClient, req: ConsensusRequest) -> Result<Value, Erro
     }))
 }
 
+/// The `memory::store` that hands a member its own swarm findings.
+///
+/// Each member's findings go into that member's memory, so the store is made
+/// on behalf of the member (contract T1): the principal is the member itself,
+/// which needs no cross-agent grant. The swarm worker never writes into a
+/// memory it does not act for.
+fn findings_memory_payload(swarm_id: &str, agent_id: &str, summary: &str) -> Value {
+    json!({
+        "agentId": agent_id,
+        "principal": principal::as_agent(agent_id),
+        "sessionId": format!("swarm:{swarm_id}"),
+        "role": "system",
+        "content": format!("Swarm {swarm_id} findings: {summary}"),
+    })
+}
+
 async fn dissolve(iii: &IIIClient, req: DissolveRequest) -> Result<Value, Error> {
     let safe_swarm_id = sanitize_id(&req.swarm_id).map_err(Error::Handler)?;
 
@@ -706,12 +723,7 @@ async fn dissolve(iii: &IIIClient, req: DissolveRequest) -> Result<Value, Error>
                 fire_and_forget(
                     iii,
                     "memory::store",
-                    json!({
-                        "agentId": agent_id,
-                        "sessionId": format!("swarm:{safe_swarm_id}"),
-                        "role": "system",
-                        "content": format!("Swarm {safe_swarm_id} findings: {summary}"),
-                    }),
+                    findings_memory_payload(&safe_swarm_id, agent_id, &summary),
                 );
             }
         }
@@ -865,6 +877,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn findings_are_stored_on_behalf_of_the_member_that_owns_them() {
+        let payload = findings_memory_payload("swarm-1", "agent-2", "[]");
+        assert_eq!(payload["principal"], json!({ "agentId": "agent-2" }));
+        assert_eq!(payload["agentId"], "agent-2");
+        assert_eq!(payload["sessionId"], "swarm:swarm-1");
+        assert_eq!(payload["role"], "system");
+    }
 
     #[test]
     fn normalizes_http_route_id_into_body() {

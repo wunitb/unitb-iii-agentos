@@ -1,9 +1,11 @@
-use agentos_http_adapter::policy;
+use agentos_http_adapter::TriggerBus;
+use agentos_http_adapter::principal::Principal;
+use agentos_http_adapter::{policy, principal};
 use iii_sdk::errors::Error;
-use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
+use iii_sdk::{RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, path::PathBuf, time::Duration};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 mod types;
 
@@ -13,6 +15,10 @@ const MAX_STEP_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_STEP_RETRIES: u32 = 10;
 const MAX_LOOP_ITERATIONS: u32 = 100;
 const STATE_STARTUP_ATTEMPTS: usize = 5;
+
+/// The bus handle every handler takes: the engine client in production, a
+/// `FakeBus` in tests. `Arc` because concurrent steps are spawned.
+type Bus = Arc<dyn TriggerBus>;
 
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
@@ -281,12 +287,14 @@ fn requires_approval(function_id: &str) -> bool {
     policy::is_deny_by_default(function_id)
 }
 
-/// The principal a step runs as.
+/// The agent a step is DECLARED to run as — a candidate, not yet an authority.
 ///
 /// A step is never exempt: the step's own `agentId`, else the `agentId` of the
 /// run, else the workflow's recorded `createdBy`. `workflow.agents` is
 /// deliberately NOT consulted - it is self-declared by whoever wrote the
 /// definition, so honouring it would let a workflow name its own principal.
+/// So are all three sources above, which is why the candidate is then BOUND to
+/// the caller by [`bind_to_caller`] before anything runs as it.
 fn step_principal<'a>(
     step: &'a WorkflowStep,
     workflow: &'a Workflow,
@@ -309,6 +317,46 @@ fn missing_principal_reason(step: &WorkflowStep, workflow: &Workflow) -> String 
 
 fn missing_principal_error(step: &WorkflowStep, workflow: &Workflow) -> Error {
     Error::Handler(missing_principal_reason(step, workflow))
+}
+
+/// Who is running or registering this workflow (contract T1): the operator
+/// (bearer), or the agent a trusted deputy labelled the call with — which is
+/// what a model tool call `workflow::run` becomes. A bare bus payload has no
+/// principal to bind to and is refused: `workflow::run` is reachable from the
+/// untrusted tier (it is a cron target), and a cron event carries no
+/// `workflowId` anyway, so nothing that worked is lost.
+fn caller_principal(input: &Value) -> Result<Principal, Error> {
+    let expected = agentos_bus_auth::policy::expected_api_key();
+    Ok(principal::resolve(input, expected.as_deref())?)
+}
+
+/// Bind an agent a definition or run NAMES to the caller (review F1).
+///
+/// The step's `agentId`, the run's `agentId` and the workflow's `createdBy`
+/// are all caller-supplied, and before this the capability check ran AS the
+/// named agent and the dispatch was labelled with it — so any caller holding
+/// `workflow::*` read any agent's memory through a step. Now the operator may
+/// name anyone; an agent principal may name itself, or another agent only when
+/// it holds the exact `grant::act_as::<target>`, checked through the same
+/// `security::check_capability` reader as every other cross-agent access.
+async fn bind_to_caller(iii: &Bus, caller: &Principal, agent_id: &str) -> Result<(), Error> {
+    principal::acting_agent(
+        iii.as_ref(),
+        caller,
+        &json!({ "agentId": agent_id }),
+        agent_id,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// One run's fixed context, threaded through every dispatch site.
+struct Run<'a> {
+    workflow: &'a Workflow,
+    caller: &'a Principal,
+    /// The run's `agentId`, already bound to the caller; an agent principal's
+    /// run defaults to that agent itself.
+    fallback_agent_id: Option<&'a str>,
 }
 
 fn payload_digest(payload: &Value) -> String {
@@ -354,7 +402,7 @@ fn approval_denial(result: &Value) -> Option<String> {
     Some(format!("{decision}: {reason} (requestId {request_id})"))
 }
 
-async fn check_capability(iii: &IIIClient, agent_id: &str, function_id: &str) -> Result<(), Error> {
+async fn check_capability(iii: &Bus, agent_id: &str, function_id: &str) -> Result<(), Error> {
     let result = iii
         .trigger(TriggerRequest {
             function_id: "security::check_capability".to_string(),
@@ -411,20 +459,33 @@ fn plan_step_authorization<'a>(
     }
 }
 
-/// Authorize one step immediately before it is dispatched.
+/// The payload a step is dispatched with: the interpolated variables, labelled
+/// with the step's principal for the families that resolve one (contract T1).
+///
+/// The label OVERWRITES anything the definition or the variables put there —
+/// a workflow can no more name its own principal in a payload than in
+/// `workflow.agents` (see `step_principal`).
+fn dispatch_payload(step: &WorkflowStep, payload: Value, agent_id: &str) -> Value {
+    principal::attach_agent(&step.function_id, payload, agent_id)
+}
+
+/// Authorize one step immediately before it is dispatched, and answer the
+/// principal it runs as.
 ///
 /// The workflow worker holds a trusted engine session, so a step id reaches the
 /// bus with the worker's own authority. Every dispatch site must pass through
-/// here, or the definition itself becomes the authorization.
+/// here, or the definition itself becomes the authorization. Order: bind the
+/// declared agent to the caller, then the agent's capability for the step id,
+/// then (deny-by-default families) a blocking approval decision.
 async fn authorize_step(
-    iii: &IIIClient,
-    workflow: &Workflow,
+    iii: &Bus,
+    run: &Run<'_>,
     step: &WorkflowStep,
-    fallback_agent_id: Option<&str>,
     payload: &Value,
-) -> Result<(), Error> {
+) -> Result<String, Error> {
+    let workflow = run.workflow;
     let (agent_id, needs_approval) =
-        match plan_step_authorization(step, workflow, fallback_agent_id) {
+        match plan_step_authorization(step, workflow, run.fallback_agent_id) {
             StepAuthorization::Refused(reason) => return Err(Error::Handler(reason)),
             StepAuthorization::Checked {
                 agent_id,
@@ -432,10 +493,11 @@ async fn authorize_step(
             } => (agent_id, needs_approval),
         };
 
+    bind_to_caller(iii, run.caller, agent_id).await?;
     check_capability(iii, agent_id, &step.function_id).await?;
 
     if !needs_approval {
-        return Ok(());
+        return Ok(agent_id.to_string());
     }
 
     let result = iii
@@ -463,7 +525,7 @@ async fn authorize_step(
         })?;
 
     match approval_denial(&result) {
-        None => Ok(()),
+        None => Ok(agent_id.to_string()),
         Some(reason) => Err(Error::Handler(format!(
             "{agent_id} needs approval to call {}: {reason}",
             step.function_id
@@ -472,17 +534,16 @@ async fn authorize_step(
 }
 
 async fn trigger_step(
-    iii: &IIIClient,
-    workflow: &Workflow,
+    iii: &Bus,
+    run: &Run<'_>,
     step: &WorkflowStep,
     vars: &Map<String, Value>,
-    fallback_agent_id: Option<&str>,
 ) -> Result<Value, Error> {
-    let payload = step_payload(step, vars, fallback_agent_id)?;
-    authorize_step(iii, workflow, step, fallback_agent_id, &payload).await?;
+    let payload = step_payload(step, vars, run.fallback_agent_id)?;
+    let agent_id = authorize_step(iii, run, step, &payload).await?;
     iii.trigger(TriggerRequest {
         function_id: step.function_id.clone(),
-        payload,
+        payload: dispatch_payload(step, payload, &agent_id),
         action: None,
         timeout_ms: Some(step.timeout_ms),
     })
@@ -490,7 +551,7 @@ async fn trigger_step(
     .map_err(|error| Error::Handler(error.to_string()))
 }
 
-async fn state_get(iii: &IIIClient, scope: &str, key: &str) -> Result<Value, Error> {
+async fn state_get(iii: &Bus, scope: &str, key: &str) -> Result<Value, Error> {
     iii.trigger(TriggerRequest {
         function_id: "state::get".to_string(),
         payload: json!({ "scope": scope, "key": key }),
@@ -501,7 +562,7 @@ async fn state_get(iii: &IIIClient, scope: &str, key: &str) -> Result<Value, Err
     .map_err(|e| Error::Handler(e.to_string()))
 }
 
-async fn state_set(iii: &IIIClient, scope: &str, key: &str, value: Value) -> Result<(), Error> {
+async fn state_set(iii: &Bus, scope: &str, key: &str, value: Value) -> Result<(), Error> {
     iii.trigger(TriggerRequest {
         function_id: "state::set".to_string(),
         payload: json!({ "scope": scope, "key": key, "value": value }),
@@ -524,7 +585,7 @@ fn update_rejection(result: &Value) -> Option<String> {
     Some(Value::Array(errors.clone()).to_string())
 }
 
-async fn state_update(iii: &IIIClient, scope: &str, key: &str, ops: Value) -> Result<(), Error> {
+async fn state_update(iii: &Bus, scope: &str, key: &str, ops: Value) -> Result<(), Error> {
     let result = iii
         .trigger(TriggerRequest {
             function_id: "state::update".to_string(),
@@ -543,7 +604,7 @@ async fn state_update(iii: &IIIClient, scope: &str, key: &str, ops: Value) -> Re
 }
 
 async fn mark_run_failed(
-    iii: &IIIClient,
+    iii: &Bus,
     run_id: &str,
     error: &str,
     results: &[StepResult],
@@ -568,11 +629,30 @@ async fn mark_run_failed(
     .await
 }
 
-async fn create_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+/// `workflow::create` over the bus: the caller's principal is resolved first
+/// (a bare payload is refused) and an agent principal is recorded as the
+/// creator whatever the definition says — `createdBy` is the last-resort
+/// principal of a step, and a definition must not choose it.
+async fn create_workflow(iii: &Bus, input: Value) -> Result<Value, Error> {
+    let created_by = match caller_principal(&input) {
+        Ok(Principal::Agent(agent)) => Some(agent),
+        Ok(Principal::Operator) => None,
+        Err(error) => return Err(error),
+    };
+    store_workflow(iii, input, created_by.as_deref()).await
+}
+
+/// Validate and store a definition. `created_by` overrides the definition's
+/// own `createdBy`; `None` keeps what it says (the operator, or the in-process
+/// startup loader that reads the bundled YAML files).
+async fn store_workflow(iii: &Bus, input: Value, created_by: Option<&str>) -> Result<Value, Error> {
     let mut workflow_value = input;
     let object = workflow_value
         .as_object_mut()
         .ok_or_else(|| Error::Handler("workflow definition must be an object".to_string()))?;
+    if let Some(agent) = created_by {
+        object.insert("createdBy".to_string(), Value::String(agent.to_string()));
+    }
     if object
         .get("id")
         .and_then(Value::as_str)
@@ -660,19 +740,19 @@ fn concurrent_group_end(workflow: &Workflow, index: usize, completed: &HashSet<S
     reason = "step execution keeps shared workflow state explicit"
 )]
 async fn run_step(
-    iii: &IIIClient,
-    workflow: &Workflow,
+    iii: &Bus,
+    run: &Run<'_>,
     step: &WorkflowStep,
     vars: &mut Map<String, Value>,
     results: &mut Vec<StepResult>,
     start_ms: u128,
     i: &mut usize,
     completed: &HashSet<String>,
-    fallback_agent_id: Option<&str>,
 ) -> Result<(), Error> {
+    let workflow = run.workflow;
     match step.mode {
         StepMode::Sequential => {
-            let output = trigger_step(iii, workflow, step, vars, fallback_agent_id).await?;
+            let output = trigger_step(iii, run, step, vars).await?;
             record_step_result(step, output, vars, results, start_ms);
         }
         StepMode::Parallel | StepMode::Fanout => {
@@ -680,11 +760,12 @@ async fn run_step(
             let concurrent_steps = &workflow.steps[*i..=group_end];
             let mut handles = Vec::with_capacity(concurrent_steps.len());
             for concurrent_step in concurrent_steps {
-                let payload = step_payload(concurrent_step, vars, fallback_agent_id)?;
+                let payload = step_payload(concurrent_step, vars, run.fallback_agent_id)?;
                 // This branch dispatches without going through `trigger_step`,
                 // so it has to authorize the step itself.
-                authorize_step(iii, workflow, concurrent_step, fallback_agent_id, &payload).await?;
-                let iii = iii.clone();
+                let agent_id = authorize_step(iii, run, concurrent_step, &payload).await?;
+                let payload = dispatch_payload(concurrent_step, payload, &agent_id);
+                let iii = Arc::clone(iii);
                 let function_id = concurrent_step.function_id.clone();
                 let timeout_ms = concurrent_step.timeout_ms;
                 handles.push(tokio::spawn(async move {
@@ -736,8 +817,7 @@ async fn run_step(
                 "fanoutResults".to_string(),
                 vars.get("__fanout").cloned().unwrap_or(Value::Null),
             );
-            let output =
-                trigger_step(iii, workflow, step, &collect_vars, fallback_agent_id).await?;
+            let output = trigger_step(iii, run, step, &collect_vars).await?;
             record_step_result(step, output, vars, results, start_ms);
         }
         StepMode::Conditional => {
@@ -761,7 +841,7 @@ async fn run_step(
                 });
                 return Ok(());
             }
-            let output = trigger_step(iii, workflow, step, vars, fallback_agent_id).await?;
+            let output = trigger_step(iii, run, step, vars).await?;
             record_step_result(step, output, vars, results, start_ms);
         }
         StepMode::Loop => {
@@ -769,8 +849,7 @@ async fn run_step(
             for iteration in 0..step.max_iterations.unwrap_or(10) {
                 let mut iteration_vars = vars.clone();
                 iteration_vars.insert("iteration".to_string(), json!(iteration));
-                loop_output =
-                    trigger_step(iii, workflow, step, &iteration_vars, fallback_agent_id).await?;
+                loop_output = trigger_step(iii, run, step, &iteration_vars).await?;
                 if let Some(var) = &step.output_var {
                     vars.insert(var.clone(), loop_output.clone());
                 }
@@ -798,15 +877,12 @@ async fn run_step(
 /// This does NOT replace `authorize_step`: the approval decision depends on the
 /// resolved payload, which only exists at dispatch time, and a step reached by
 /// any other path must still be checked.
-async fn authorize_workflow(
-    iii: &IIIClient,
-    workflow: &Workflow,
-    fallback_agent_id: Option<&str>,
-) -> Result<(), Error> {
+async fn authorize_workflow(iii: &Bus, run: &Run<'_>) -> Result<(), Error> {
+    let workflow = run.workflow;
     let mut checked = HashSet::new();
     for step in &workflow.steps {
         if step.function_id == "agent::chat"
-            && step.agent_id.as_deref().or(fallback_agent_id).is_none()
+            && step.agent_id.as_deref().or(run.fallback_agent_id).is_none()
         {
             return Err(Error::Handler(format!(
                 "step {} requires agentId for agent::chat",
@@ -816,17 +892,21 @@ async fn authorize_workflow(
         // A step without a resolvable principal is refused, never skipped: the
         // workflow worker dispatches from its own trusted session, so an
         // unchecked step would run with the worker's authority.
-        let Some(agent_id) = step_principal(step, workflow, fallback_agent_id) else {
+        let Some(agent_id) = step_principal(step, workflow, run.fallback_agent_id) else {
             return Err(missing_principal_error(step, workflow));
         };
         if !checked.insert((agent_id, step.function_id.as_str())) {
             continue;
         }
+        bind_to_caller(iii, run.caller, agent_id).await?;
         check_capability(iii, agent_id, &step.function_id).await?;
     }
     Ok(())
 }
-async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+
+async fn run_workflow(iii: &Bus, input: Value) -> Result<Value, Error> {
+    // Before any state is read: a run with nobody to bind to is refused.
+    let caller = caller_principal(&input)?;
     let workflow_id = input
         .get("workflowId")
         .or_else(|| input.get("id"))
@@ -839,6 +919,15 @@ async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         .map(sanitize_id)
         .transpose()
         .map_err(Error::Handler)?;
+    // The run's agent is bound to the caller up front — it seeds `vars.agentId`
+    // and the run row, not only step principals. An agent's run is its own.
+    let agent_id = match (&caller, agent_id) {
+        (Principal::Agent(agent), None) => Some(agent.clone()),
+        (_, named) => named,
+    };
+    if let Some(agent) = agent_id.as_deref() {
+        bind_to_caller(iii, &caller, agent).await?;
+    }
     let user_input = input.get("input").cloned().unwrap_or(Value::Null);
 
     let workflow_value = state_get(iii, "workflows", &safe_workflow_id).await?;
@@ -855,7 +944,12 @@ async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
         .into_iter()
         .map(|index| workflow.steps[index].clone())
         .collect();
-    authorize_workflow(iii, &workflow, agent_id.as_deref()).await?;
+    let run = Run {
+        workflow: &workflow,
+        caller: &caller,
+        fallback_agent_id: agent_id.as_deref(),
+    };
+    authorize_workflow(iii, &run).await?;
 
     let run_id = uuid::Uuid::new_v4().to_string();
     let safe_run_id = sanitize_id(&run_id).map_err(Error::Handler)?;
@@ -906,14 +1000,13 @@ async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
         let step_outcome = run_step(
             iii,
-            &workflow,
+            &run,
             &step,
             &mut vars,
             &mut results,
             start_ms,
             &mut i,
             &completed,
-            agent_id.as_deref(),
         )
         .await;
 
@@ -939,14 +1032,13 @@ async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
                         let retry_start_ms = now_ms();
                         match run_step(
                             iii,
-                            &workflow,
+                            &run,
                             &step,
                             &mut vars,
                             &mut results,
                             retry_start_ms,
                             &mut i,
                             &completed,
-                            agent_id.as_deref(),
                         )
                         .await
                         {
@@ -1047,7 +1139,7 @@ async fn run_workflow(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     }))
 }
 
-async fn list_workflows(iii: &IIIClient) -> Result<Value, Error> {
+async fn list_workflows(iii: &Bus) -> Result<Value, Error> {
     iii.trigger(TriggerRequest {
         function_id: "state::list".to_string(),
         payload: json!({ "scope": "workflows" }),
@@ -1058,7 +1150,7 @@ async fn list_workflows(iii: &IIIClient) -> Result<Value, Error> {
     .map_err(|e| Error::Handler(e.to_string()))
 }
 
-async fn get_workflow(iii: &IIIClient, workflow_id: &str) -> Result<Value, Error> {
+async fn get_workflow(iii: &Bus, workflow_id: &str) -> Result<Value, Error> {
     let safe_workflow_id = sanitize_id(workflow_id).map_err(Error::Handler)?;
     let workflow = state_get(iii, "workflows", &safe_workflow_id).await?;
     if workflow.is_null() {
@@ -1099,7 +1191,7 @@ fn workflow_run_page(
     (page, total)
 }
 
-async fn list_runs(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn list_runs(iii: &Bus, input: Value) -> Result<Value, Error> {
     let workflow_id = input
         .get("workflowId")
         .or_else(|| input.get("id"))
@@ -1129,7 +1221,7 @@ async fn list_runs(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     }))
 }
 
-async fn get_run_state(iii: &IIIClient, run_id: &str) -> Result<Value, Error> {
+async fn get_run_state(iii: &Bus, run_id: &str) -> Result<Value, Error> {
     let safe_run_id = sanitize_id(run_id).map_err(Error::Handler)?;
     let run = state_get(iii, "workflow_runs", &safe_run_id).await?;
     if run.is_null() {
@@ -1199,7 +1291,7 @@ fn read_workflow_definitions(directory: &std::path::Path) -> Result<Vec<Workflow
 }
 
 async fn load_workflows_from_directory(
-    iii: &IIIClient,
+    iii: &Bus,
     directory: &std::path::Path,
 ) -> Result<usize, Error> {
     let workflows = read_workflow_definitions(directory)?;
@@ -1216,7 +1308,9 @@ async fn load_workflows_from_directory(
         for workflow in &workflows {
             let input = serde_json::to_value(workflow)
                 .map_err(|error| Error::Handler(error.to_string()))?;
-            match create_workflow(iii, input).await {
+            // In-process and bare: the bundled definitions are the operator's,
+            // read from disk, and record whatever `createdBy` they declare.
+            match store_workflow(iii, input, None).await {
                 Ok(_) => loaded += 1,
                 Err(error) => {
                     last_error = Some(error);
@@ -1241,42 +1335,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
     let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
+    let bus: Bus = Arc::new(iii.clone());
 
-    let iii_clone = iii.clone();
+    let bus_clone = Arc::clone(&bus);
     iii.register_function(
         "workflow::create",
         RegisterFunction::new_async(move |input: Value| {
-            let iii = iii_clone.clone();
+            let iii = Arc::clone(&bus_clone);
             async move { create_workflow(&iii, input).await }
         })
         .description("Register a workflow definition"),
     );
 
-    let iii_clone = iii.clone();
+    let bus_clone = Arc::clone(&bus);
     iii.register_function(
         "workflow::run",
         RegisterFunction::new_async(move |input: Value| {
-            let iii = iii_clone.clone();
+            let iii = Arc::clone(&bus_clone);
             async move { run_workflow(&iii, input).await }
         })
         .description("Execute a workflow"),
     );
 
-    let iii_clone = iii.clone();
+    let bus_clone = Arc::clone(&bus);
     iii.register_function(
         "workflow::list",
         RegisterFunction::new_async(move |_input: Value| {
-            let iii = iii_clone.clone();
+            let iii = Arc::clone(&bus_clone);
             async move { list_workflows(&iii).await }
         })
         .description("List all workflows"),
     );
 
-    let iii_clone = iii.clone();
+    let bus_clone = Arc::clone(&bus);
     iii.register_function(
         "workflow::get",
         RegisterFunction::new_async(move |input: Value| {
-            let iii = iii_clone.clone();
+            let iii = Arc::clone(&bus_clone);
             async move {
                 let workflow_id = input
                     .get("workflowId")
@@ -1289,21 +1384,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("Read a workflow by ID"),
     );
 
-    let iii_clone = iii.clone();
+    let bus_clone = Arc::clone(&bus);
     iii.register_function(
         "workflow::runs",
         RegisterFunction::new_async(move |input: Value| {
-            let iii = iii_clone.clone();
+            let iii = Arc::clone(&bus_clone);
             async move { list_runs(&iii, input).await }
         })
         .description("List runs for a workflow"),
     );
 
-    let iii_clone = iii.clone();
+    let bus_clone = Arc::clone(&bus);
     iii.register_function(
         "workflow::get_run_state",
         RegisterFunction::new_async(move |input: Value| {
-            let iii = iii_clone.clone();
+            let iii = Arc::clone(&bus_clone);
             async move {
                 let run_id = input
                     .get("runId")
@@ -1354,7 +1449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let workflow_dir = workflow_directory()?;
-    let loaded_workflows = load_workflows_from_directory(&iii, &workflow_dir).await?;
+    let loaded_workflows = load_workflows_from_directory(&bus, &workflow_dir).await?;
     tracing::info!(
         count = loaded_workflows,
         directory = %workflow_dir.display(),
@@ -1647,6 +1742,34 @@ mod tests {
     }
 
     #[test]
+    fn a_memory_step_is_dispatched_on_behalf_of_the_step_principal() {
+        let step = step_with("Remember", "memory::store", Some("agent-1"));
+        let mut vars = Map::new();
+        vars.insert("input".into(), json!("x"));
+        // The definition tries to name its own principal through a variable.
+        vars.insert("principal".into(), json!({ "agentId": "victim" }));
+        let payload = step_payload(&step, &vars, None).expect("payload");
+
+        let dispatched = dispatch_payload(&step, payload, "agent-1");
+        assert_eq!(dispatched["principal"], json!({ "agentId": "agent-1" }));
+        assert_eq!(dispatched["prompt"], "x");
+
+        // A nested workflow is a deputy too (review F2/F1): it is labelled, so
+        // the inner run binds its steps to this step's principal.
+        let step = step_with("Run", "workflow::run", Some("agent-1"));
+        let payload = step_payload(&step, &vars, None).expect("payload");
+        assert_eq!(
+            dispatch_payload(&step, payload, "agent-1")["principal"],
+            json!({ "agentId": "agent-1" })
+        );
+
+        // Families that resolve no principal are dispatched as built.
+        let step = step_with("Hand", "hand::run", Some("agent-1"));
+        let payload = step_payload(&step, &vars, None).expect("payload");
+        assert_eq!(dispatch_payload(&step, payload.clone(), "agent-1"), payload);
+    }
+
+    #[test]
     fn a_step_without_any_principal_is_refused_not_exempt() {
         let step = step_with("Escalate", "mcp::connect", None);
         let workflow = workflow_with(vec![step.clone()], None);
@@ -1690,6 +1813,363 @@ mod tests {
         assert_eq!(step_principal(&bare, &no_creator, Some("run")), Some("run"));
         assert_eq!(step_principal(&bare, &with_creator, None), Some("creator"));
         assert_eq!(step_principal(&bare, &no_creator, None), None);
+    }
+
+    // --- a run is bound to its caller (review F1) — through the real handlers ---
+
+    use agentos_http_adapter::fake::FakeBus;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    static AUTH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_api_key<T>(value: Option<&str>, test: impl FnOnce() -> T) -> T {
+        let _guard = AUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("AGENTOS_API_KEY");
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var("AGENTOS_API_KEY", value),
+                None => std::env::remove_var("AGENTOS_API_KEY"),
+            }
+        }
+        let result = test();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("AGENTOS_API_KEY", value),
+                None => std::env::remove_var("AGENTOS_API_KEY"),
+            }
+        }
+        result
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    /// In-memory `state::*` with the engine's real shapes (`state::get` of a
+    /// missing key is null, `state::list` a bare array, `state::update` takes
+    /// `ops` and applies `set` by top-level path).
+    #[derive(Default)]
+    struct StateStore(Mutex<BTreeMap<String, BTreeMap<String, Value>>>);
+
+    impl StateStore {
+        fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, BTreeMap<String, Value>>> {
+            self.0.lock().unwrap_or_else(|error| error.into_inner())
+        }
+        fn field(input: &Value, name: &str) -> String {
+            input[name].as_str().unwrap_or_default().to_string()
+        }
+    }
+
+    /// A bus with a state store, a `memory::recall` that answers with who it
+    /// was asked AS, and a capability reader answering through the shared
+    /// matcher: `a-1` and `a-2` hold `workflow::*` + `memory::*`; `a-granted`
+    /// additionally holds exactly `grant::act_as::a-2`.
+    fn workflow_bus() -> (Arc<FakeBus>, Arc<StateStore>) {
+        let store = Arc::new(StateStore::default());
+        let bus = Arc::new(FakeBus::new());
+        let state = store.clone();
+        bus.on("state::get", move |input| {
+            Ok(state
+                .lock()
+                .get(&StateStore::field(&input, "scope"))
+                .and_then(|scope| scope.get(&StateStore::field(&input, "key")))
+                .cloned()
+                .unwrap_or(Value::Null))
+        });
+        let state = store.clone();
+        bus.on("state::set", move |input| {
+            state
+                .lock()
+                .entry(StateStore::field(&input, "scope"))
+                .or_default()
+                .insert(StateStore::field(&input, "key"), input["value"].clone());
+            Ok(json!({ "stored": true }))
+        });
+        let state = store.clone();
+        bus.on("state::list", move |input| {
+            Ok(Value::Array(
+                state
+                    .lock()
+                    .get(&StateStore::field(&input, "scope"))
+                    .map(|scope| scope.values().cloned().collect())
+                    .unwrap_or_default(),
+            ))
+        });
+        let state = store.clone();
+        bus.on("state::update", move |input| {
+            let mut store = state.lock();
+            let scope = store.entry(StateStore::field(&input, "scope")).or_default();
+            let entry = scope
+                .entry(StateStore::field(&input, "key"))
+                .or_insert_with(|| json!({}));
+            for op in input["ops"].as_array().into_iter().flatten() {
+                if op["type"] == "set"
+                    && let Some(path) = op["path"].as_str()
+                {
+                    entry[path] = op["value"].clone();
+                }
+            }
+            Ok(json!({ "new_value": entry.clone() }))
+        });
+        bus.on("memory::recall", |input| {
+            Ok(json!({ "readAs": input["principal"]["agentId"], "about": input["agentId"] }))
+        });
+        bus.on("security::check_capability", |input| {
+            let agent = input["agentId"].as_str().unwrap_or_default();
+            let resource = input["resource"].as_str().unwrap_or_default();
+            let tools: Vec<String> = match agent {
+                "a-1" | "a-2" => vec!["workflow::*".into(), "memory::*".into()],
+                "a-granted" => vec![
+                    "workflow::*".into(),
+                    "memory::*".into(),
+                    policy::act_as_grant("a-2"),
+                ],
+                _ => vec![],
+            };
+            if policy::capabilities_grant(&tools, resource) {
+                Ok(json!({ "allowed": true, "reason": "granted" }))
+            } else {
+                Err(Error::Handler(format!("Agent {agent} denied: {resource}")))
+            }
+        });
+        (bus, store)
+    }
+
+    fn as_bus(bus: &Arc<FakeBus>) -> Bus {
+        Arc::clone(bus) as Bus
+    }
+
+    /// A stored definition whose one step reads memory as `step_agent`.
+    fn stored_recall_workflow(store: &StateStore, id: &str, step_agent: Option<&str>) {
+        let step = step_with("Recall", "memory::recall", step_agent);
+        let workflow = Workflow {
+            id: id.into(),
+            ..workflow_with(vec![step], None)
+        };
+        store.lock().entry("workflows".into()).or_default().insert(
+            id.into(),
+            serde_json::to_value(workflow).expect("definition"),
+        );
+    }
+
+    fn run_as(agent: &str, workflow_id: &str, run_agent: Option<&str>) -> Value {
+        let mut input =
+            json!({ "workflowId": workflow_id, "principal": principal::as_agent(agent) });
+        if let Some(run_agent) = run_agent {
+            input["agentId"] = json!(run_agent);
+        }
+        input
+    }
+
+    fn grants_asked(bus: &FakeBus) -> Vec<(String, String)> {
+        bus.calls_to("security::check_capability")
+            .into_iter()
+            .map(|call| call.payload)
+            .filter(|payload| policy::is_grant(payload["resource"].as_str().unwrap_or_default()))
+            .map(|payload| {
+                (
+                    payload["agentId"].as_str().unwrap_or_default().to_string(),
+                    payload["resource"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_step_cannot_run_as_another_agent_without_the_exact_grant() {
+        let (bus, store) = workflow_bus();
+        let iii = as_bus(&bus);
+        // The F1 scenario: a-1 (holding workflow::*) runs a definition whose
+        // step names a-2. Nothing here consults a-1's right to act as a-2.
+        stored_recall_workflow(&store, "wf-1", Some("a-2"));
+
+        let outcome = run_workflow(&iii, run_as("a-1", "wf-1", None)).await;
+        assert_eq!(
+            bus.call_count("memory::recall"),
+            0,
+            "a-2's memory was read through a workflow step run by a-1"
+        );
+        let error = outcome.unwrap_err().to_string();
+        assert!(error.contains("grant::act_as::a-2"), "{error}");
+        assert!(
+            store.lock().get("workflow_runs").is_none(),
+            "refused before a run row is written"
+        );
+        assert_eq!(
+            grants_asked(&bus),
+            vec![("a-1".to_string(), policy::act_as_grant("a-2"))]
+        );
+
+        // The same definition run by an agent holding the exact grant: the step
+        // runs AS a-2 (labelled a-2, a-2's capability for memory::recall).
+        let result = run_workflow(&iii, run_as("a-granted", "wf-1", None))
+            .await
+            .expect("granted");
+        assert_eq!(result["results"][0]["output"]["readAs"], "a-2");
+        let dispatched = &bus.calls_to("memory::recall")[0].payload;
+        assert_eq!(dispatched["principal"], principal::as_agent("a-2"));
+        assert!(
+            bus.calls_to("security::check_capability")
+                .iter()
+                .any(|call| call.payload["agentId"] == "a-2"
+                    && call.payload["resource"] == "memory::recall")
+        );
+        assert!(
+            grants_asked(&bus).contains(&("a-granted".to_string(), policy::act_as_grant("a-2")))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_run_agent_and_the_creator_are_bound_to_the_caller_too() {
+        let (bus, store) = workflow_bus();
+        let iii = as_bus(&bus);
+        // A step with no agentId falls back to the run's agentId ...
+        stored_recall_workflow(&store, "wf-bare", None);
+
+        // ... which a-1 may not set to a-2 without the grant.
+        let error = run_workflow(&iii, run_as("a-1", "wf-bare", Some("a-2")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("grant::act_as::a-2"), "{error}");
+        assert_eq!(bus.call_count("memory::recall"), 0);
+
+        // With no agentId at all, an agent's run is its own.
+        let result = run_workflow(&iii, run_as("a-1", "wf-bare", None))
+            .await
+            .expect("own run");
+        assert_eq!(result["results"][0]["output"]["readAs"], "a-1");
+        assert_eq!(result["vars"]["agentId"], "a-1");
+        assert!(
+            grants_asked(&bus).len() == 1,
+            "only the refused attempt asked the reader"
+        );
+
+        // And a definition whose `createdBy` names a-2 does not run as a-2 for
+        // a-1 either: the creator is just another caller-supplied candidate.
+        {
+            let mut store = store.lock();
+            let workflows = store.get_mut("workflows").expect("scope");
+            workflows.get_mut("wf-bare").expect("wf-bare")["createdBy"] = json!("a-2");
+        }
+        // a-1's run defaults to a-1 before `createdBy` is consulted, so this
+        // runs as a-1; the creator only matters for the operator's bare runs.
+        let result = run_workflow(&iii, run_as("a-1", "wf-bare", None))
+            .await
+            .expect("the creator does not override the caller");
+        assert_eq!(result["results"][0]["output"]["readAs"], "a-1");
+        assert_eq!(
+            bus.calls_to("memory::recall").last().unwrap().payload["principal"],
+            principal::as_agent("a-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_run_is_refused_before_any_state_is_read() {
+        let (bus, store) = workflow_bus();
+        let iii = as_bus(&bus);
+        stored_recall_workflow(&store, "wf-1", Some("a-2"));
+
+        // The untrusted-tier variant: no bearer, no principal, any agentId.
+        let outcome = run_workflow(&iii, json!({ "workflowId": "wf-1", "agentId": "a-2" })).await;
+        assert!(
+            bus.calls().is_empty(),
+            "a bare run must be refused before the bus is touched: {:?}",
+            bus.calls()
+        );
+        let error = outcome.unwrap_err().to_string();
+        assert!(error.contains("principal required"), "{error}");
+
+        // So is a bearer that does not match.
+        let outcome = run_workflow(
+            &iii,
+            json!({
+                "workflowId": "wf-1",
+                "headers": { "authorization": "Bearer not-the-key" },
+            }),
+        )
+        .await;
+        assert!(bus.calls().is_empty());
+        assert!(outcome.unwrap_err().to_string().contains("Unauthorized"));
+    }
+
+    #[test]
+    fn the_operator_runs_a_workflow_as_whoever_it_names() {
+        with_api_key(Some("op-key"), || {
+            block_on(async {
+                let (bus, store) = workflow_bus();
+                let iii = as_bus(&bus);
+                stored_recall_workflow(&store, "wf-1", Some("a-2"));
+
+                let result = run_workflow(
+                    &iii,
+                    json!({
+                        "workflowId": "wf-1",
+                        "headers": { "authorization": "Bearer op-key" },
+                    }),
+                )
+                .await
+                .expect("operator run");
+                assert_eq!(result["results"][0]["output"]["readAs"], "a-2");
+                assert!(grants_asked(&bus).is_empty(), "the operator needs no grant");
+            })
+        });
+    }
+
+    #[tokio::test]
+    async fn an_agent_registers_definitions_in_its_own_name_and_a_bare_create_is_refused() {
+        let (bus, store) = workflow_bus();
+        let iii = as_bus(&bus);
+        let definition = json!({
+            "id": "wf-new",
+            "name": "wf",
+            "description": "d",
+            "createdBy": "a-2",
+            "steps": [{
+                "name": "Recall",
+                "functionId": "memory::recall",
+                "mode": "sequential",
+                "errorMode": "fail",
+                "timeoutMs": 1000,
+            }],
+        });
+
+        let mut labelled = definition.clone();
+        labelled["principal"] = principal::as_agent("a-1");
+        create_workflow(&iii, labelled)
+            .await
+            .expect("create as a-1");
+        let stored = store.lock()["workflows"]["wf-new"].clone();
+        assert_eq!(
+            stored["createdBy"], "a-1",
+            "the definition's self-declared creator is replaced by the principal"
+        );
+        assert!(
+            stored.get("principal").is_none(),
+            "the label is not persisted"
+        );
+
+        let error = create_workflow(&iii, definition.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("principal required"), "{error}");
+
+        // The in-process startup loader keeps storing the bundled definitions
+        // as they are written.
+        let mut bundled = definition;
+        bundled["id"] = json!("wf-bundled");
+        store_workflow(&iii, bundled, None)
+            .await
+            .expect("bundled definition");
+        assert_eq!(store.lock()["workflows"]["wf-bundled"]["createdBy"], "a-2");
     }
 
     #[test]

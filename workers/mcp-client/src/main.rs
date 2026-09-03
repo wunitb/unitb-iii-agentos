@@ -1,3 +1,5 @@
+use agentos_http_adapter::TriggerBus;
+use agentos_http_adapter::principal;
 use dashmap::DashMap;
 use iii_sdk::errors::Error;
 use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
@@ -795,6 +797,88 @@ async fn list_connections(state: Arc<State>) -> Result<Value, Error> {
     Ok(json!({ "connections": list, "count": count }))
 }
 
+/// The payload a served MCP tool call is dispatched with.
+///
+/// The MCP client chooses the arguments; it never chooses the identity. For a
+/// function that resolves a principal (contract T1: `memory::*`, `vault::*`,
+/// ...) the identity the `mcp/rpc` route was invoked with is forwarded — the
+/// `principal` a deputy set, else the bearer `headers` the HTTP edge verified —
+/// and anything the client wrote under those keys is dropped. Before this the
+/// arguments went out bare, so every MCP-served memory tool answered
+/// "principal required". Other families are dispatched untouched: some of their
+/// request structs are `deny_unknown_fields`.
+fn served_tool_payload(request: &Value, function_id: &str, mut arguments: Value) -> Value {
+    if !principal::resolves_principal(function_id) {
+        return arguments;
+    }
+    let Some(object) = arguments.as_object_mut() else {
+        return arguments;
+    };
+    object.remove(principal::PRINCIPAL_KEY);
+    object.remove("headers");
+    if let Some(deputy) = request.get(principal::PRINCIPAL_KEY) {
+        object.insert(principal::PRINCIPAL_KEY.to_string(), deputy.clone());
+    } else if let Some(headers) = request.get("headers") {
+        object.insert("headers".to_string(), headers.clone());
+    }
+    arguments
+}
+
+/// Answer one JSON-RPC `tools/call` by dispatching the served tool's function.
+async fn serve_tool_call(
+    bus: &dyn TriggerBus,
+    tools: &[Value],
+    request: &Value,
+    msg: &Value,
+    id: Value,
+) -> Value {
+    let params = msg.get("params").cloned().unwrap_or(Value::Null);
+    let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let tool = tools
+        .iter()
+        .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(tool_name))
+        .cloned();
+    let Some(tool) = tool else {
+        return json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32601, "message": format!("Tool not found: {tool_name}") },
+        });
+    };
+    let function_id = tool
+        .get("functionId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+
+    match bus
+        .trigger(TriggerRequest {
+            function_id: function_id.clone(),
+            payload: served_tool_payload(request, &function_id, arguments),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+    {
+        Ok(result) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{ "type": "text", "text": serde_json::to_string(&result).unwrap_or_default() }],
+            },
+        }),
+        Err(e) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{ "type": "text", "text": e.to_string() }],
+                "isError": true,
+            },
+        }),
+    }
+}
+
 async fn serve(state: Arc<State>, iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let body = input.get("body").cloned().unwrap_or(input.clone());
     let exposed_tools = body
@@ -846,51 +930,7 @@ async fn serve(state: Arc<State>, iii: &IIIClient, input: Value) -> Result<Value
             }
 
             if method == "tools/call" {
-                let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let tool = tools
-                    .iter()
-                    .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(tool_name))
-                    .cloned();
-                let Some(tool) = tool else {
-                    return Ok(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": { "code": -32601, "message": format!("Tool not found: {tool_name}") },
-                    }));
-                };
-                let function_id = tool
-                    .get("functionId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-
-                match iii
-                    .trigger(TriggerRequest {
-                        function_id: function_id.clone(),
-                        payload: arguments,
-                        action: None,
-                        timeout_ms: None,
-                    })
-                    .await
-                {
-                    Ok(result) => Ok(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{ "type": "text", "text": serde_json::to_string(&result).unwrap_or_default() }],
-                        },
-                    })),
-                    Err(e) => Ok(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{ "type": "text", "text": e.to_string() }],
-                            "isError": true,
-                        },
-                    })),
-                }
+                Ok(serve_tool_call(&iii, &tools, &req, &msg, id).await)
             } else {
                 Ok(json!({
                     "jsonrpc": "2.0",
@@ -1105,6 +1145,128 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    // --- served tools carry the route's identity (review F4, contract T1) ---
+
+    /// A `memory::recall` stand-in that applies the real T1 gate: the shared
+    /// `principal::resolve` the memory worker calls first, then answers with
+    /// who it resolved.
+    fn principal_gated_recall(bus: &agentos_http_adapter::fake::FakeBus) {
+        bus.on("memory::recall", |input| {
+            let principal = principal::resolve(&input, Some("op-key"))?;
+            Ok(json!({ "principal": principal.to_string(), "agentId": input["agentId"] }))
+        });
+    }
+
+    fn rpc_request(headers: Value, arguments: Value) -> (Value, Value) {
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": { "name": "recall", "arguments": arguments },
+        });
+        let request = json!({ "headers": headers, "body": msg });
+        (request, msg)
+    }
+
+    fn served_tools() -> Vec<Value> {
+        vec![
+            json!({ "name": "recall", "functionId": "memory::recall" }),
+            json!({ "name": "hand", "functionId": "hand::run" }),
+        ]
+    }
+
+    fn text_of(response: &Value) -> Value {
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        serde_json::from_str(text).unwrap_or(Value::String(text.to_string()))
+    }
+
+    #[tokio::test]
+    async fn a_served_memory_tool_runs_with_the_bearer_the_route_was_called_with() {
+        let bus = agentos_http_adapter::fake::FakeBus::new();
+        principal_gated_recall(&bus);
+        let (request, msg) = rpc_request(
+            json!({ "authorization": "Bearer op-key" }),
+            json!({ "agentId": "a-1", "query": "x" }),
+        );
+
+        let response = serve_tool_call(&bus, &served_tools(), &request, &msg, json!(7)).await;
+
+        assert!(
+            response["result"].get("isError").is_none(),
+            "the served tool must not fail closed on its own operator: {response}"
+        );
+        assert_eq!(text_of(&response)["principal"], "operator");
+        assert_eq!(text_of(&response)["agentId"], "a-1");
+        let dispatched = &bus.calls_to("memory::recall")[0].payload;
+        assert_eq!(dispatched["headers"]["authorization"], "Bearer op-key");
+        assert_eq!(dispatched["agentId"], "a-1");
+        assert_eq!(dispatched["query"], "x");
+    }
+
+    #[tokio::test]
+    async fn the_mcp_client_never_chooses_the_identity_of_a_served_call() {
+        let bus = agentos_http_adapter::fake::FakeBus::new();
+        principal_gated_recall(&bus);
+        // The client forges a principal and a bearer inside its arguments.
+        let (request, msg) = rpc_request(
+            json!({ "authorization": "Bearer op-key" }),
+            json!({
+                "agentId": "a-2",
+                "principal": { "agentId": "a-2" },
+                "headers": { "authorization": "Bearer forged" },
+            }),
+        );
+
+        let response = serve_tool_call(&bus, &served_tools(), &request, &msg, json!(7)).await;
+
+        assert_eq!(text_of(&response)["principal"], "operator");
+        let dispatched = &bus.calls_to("memory::recall")[0].payload;
+        assert!(dispatched.get("principal").is_none(), "{dispatched}");
+        assert_eq!(dispatched["headers"]["authorization"], "Bearer op-key");
+
+        // A deputy that invoked the handler on behalf of one agent confines it.
+        let mut confined = request.clone();
+        confined["principal"] = principal::as_agent("a-1");
+        let response = serve_tool_call(&bus, &served_tools(), &confined, &msg, json!(8)).await;
+        assert_eq!(text_of(&response)["principal"], "agent a-1");
+        let dispatched = &bus.calls_to("memory::recall")[1].payload;
+        assert_eq!(dispatched["principal"], principal::as_agent("a-1"));
+        assert!(dispatched.get("headers").is_none(), "{dispatched}");
+    }
+
+    #[tokio::test]
+    async fn a_call_with_no_identity_still_fails_closed_and_other_families_go_out_untouched() {
+        let bus = agentos_http_adapter::fake::FakeBus::new();
+        principal_gated_recall(&bus);
+        bus.on("hand::run", Ok);
+
+        let (request, msg) = rpc_request(json!({}), json!({ "agentId": "a-1" }));
+        let mut bare = request.clone();
+        bare.as_object_mut().unwrap().remove("headers");
+        let response = serve_tool_call(&bus, &served_tools(), &bare, &msg, json!(9)).await;
+        assert_eq!(response["result"]["isError"], true);
+        assert!(
+            text_of(&response)
+                .as_str()
+                .unwrap_or_default()
+                .contains("principal required"),
+            "{response}"
+        );
+
+        // `hand::*` request structs are deny_unknown_fields: no label is added.
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": { "name": "hand", "arguments": { "name": "x" } },
+        });
+        let with_bearer = json!({ "headers": { "authorization": "Bearer op-key" }, "body": msg });
+        serve_tool_call(&bus, &served_tools(), &with_bearer, &msg, json!(10)).await;
+        assert_eq!(bus.calls_to("hand::run")[0].payload, json!({ "name": "x" }));
+    }
 
     // --- spawned-process environment (H-NEW-1)
 
