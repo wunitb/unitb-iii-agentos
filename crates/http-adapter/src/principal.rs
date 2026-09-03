@@ -110,7 +110,7 @@ impl fmt::Display for PrincipalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PrincipalError::Missing => f.write_str(
-                "principal required: present the AgentOS bearer or a principal.agentId set by a trusted worker",
+                "Unauthorized: principal required (present the AgentOS bearer, or a principal.agentId set by a trusted worker)",
             ),
             PrincipalError::Unauthorized => f.write_str("Unauthorized"),
             PrincipalError::Malformed => {
