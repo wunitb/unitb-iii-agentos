@@ -1,4 +1,5 @@
 use agentos_http_adapter::bus::CHAT_TIMEOUT_MS;
+use agentos_http_adapter::principal;
 use iii_sdk::errors::Error;
 use iii_sdk::{
     IIIClient, RegisterFunction,
@@ -50,7 +51,7 @@ async fn missing_channel_secrets(
         let secret = iii
             .trigger(TriggerRequest {
                 function_id: "vault::get".to_string(),
-                payload: json!({ "key": key }),
+                payload: vault_read_payload(key),
                 action: None,
                 timeout_ms: Some(CHAT_TIMEOUT_MS),
             })
@@ -63,6 +64,14 @@ async fn missing_channel_secrets(
         }
     }
     Ok(missing)
+}
+
+/// A `vault::get` made by this worker for channel readiness — system-wide
+/// work, so it presents the operator bearer (contract T1). Without a
+/// configured key `headers` is null and the vault refuses, which is the same
+/// fail-closed answer as before; the env fallback then applies.
+fn vault_read_payload(key: &str) -> Value {
+    json!({ "key": key, "headers": agentos_bus_auth::handshake_headers() })
 }
 
 async fn channel_statuses(iii: &IIIClient) -> Result<Value, Error> {
@@ -450,6 +459,49 @@ fn session_id_or_default(session_id: Option<String>, agent_id: &str) -> String {
     session_id.unwrap_or_else(|| format!("default:{agent_id}"))
 }
 
+/// `memory::recall` for the agent this turn runs as (contract T1): the agent
+/// is the principal, so the memory worker can refuse a payload that names
+/// anyone else.
+fn memory_recall_payload(agent_id: &str, message: &str) -> Value {
+    json!({
+        "agentId": agent_id,
+        "principal": principal::as_agent(agent_id),
+        "query": message,
+        "limit": 20,
+    })
+}
+
+/// `memory::store` for one turn of the agent this turn runs as.
+fn memory_store_payload(
+    agent_id: &str,
+    session_id: &str,
+    role: &str,
+    content: &str,
+    token_usage: Option<&Value>,
+) -> Value {
+    let mut payload = json!({
+        "agentId": agent_id,
+        "principal": principal::as_agent(agent_id),
+        "sessionId": session_id,
+        "role": role,
+        "content": content,
+    });
+    if let Some(usage) = token_usage {
+        payload["tokenUsage"] = usage.clone();
+    }
+    payload
+}
+
+/// The payload a model-chosen tool call is dispatched with.
+///
+/// The arguments are the model's; the principal is NOT. Whatever `principal`
+/// the model wrote is overwritten with the agent this turn runs as, so a
+/// model cannot pick whose memory a `memory::recall` reads — the memory worker
+/// then judges the model's `agentId` against that principal.
+fn tool_dispatch_payload(call: &FunctionCall, agent_id: &str) -> Value {
+    principal::attach_agent(&call.id, call.arguments.clone(), agent_id)
+}
+
 async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
     let start = Instant::now();
 
@@ -470,11 +522,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
     let memories: Value = iii
         .trigger(TriggerRequest {
             function_id: "memory::recall".to_string(),
-            payload: json!({
-                "agentId": &req.agent_id,
-                "query": &req.message,
-                "limit": 20,
-            }),
+            payload: memory_recall_payload(&req.agent_id, &req.message),
             action: None,
             timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
@@ -588,7 +636,7 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
             match iii
                 .trigger(TriggerRequest {
                     function_id: tc.id.to_string(),
-                    payload: tc.arguments.clone(),
+                    payload: tool_dispatch_payload(tc, &req.agent_id),
                     action: None,
                     timeout_ms: Some(CHAT_TIMEOUT_MS),
                 })
@@ -636,24 +684,22 @@ async fn agent_chat(iii: &IIIClient, req: ChatRequest) -> Result<Value, Error> {
     spawn_trigger(
         iii,
         "memory::store",
-        json!({
-            "agentId": &req.agent_id,
-            "sessionId": &session_id,
-            "role": "user",
-            "content": &req.message,
-        }),
+        memory_store_payload(&req.agent_id, &session_id, "user", &req.message, None),
     );
 
     spawn_trigger(
         iii,
         "memory::store",
-        json!({
-            "agentId": &req.agent_id,
-            "sessionId": &session_id,
-            "role": "assistant",
-            "content": response.get("content").and_then(|v| v.as_str()).unwrap_or(""),
-            "tokenUsage": response.get("usage"),
-        }),
+        memory_store_payload(
+            &req.agent_id,
+            &session_id,
+            "assistant",
+            response
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            response.get("usage"),
+        ),
     );
 
     // The engine's `state::update` takes `ops`, and an increment carries `by`, not
@@ -945,6 +991,89 @@ mod tests {
     #[test]
     fn test_max_iterations_constant() {
         assert_eq!(MAX_ITERATIONS, 50);
+    }
+
+    // --- tenancy plumbing (contract T1) ---
+
+    #[test]
+    fn memory_calls_carry_the_turn_agent_as_principal() {
+        let recall = memory_recall_payload("agent-7", "what did we decide?");
+        assert_eq!(recall["principal"], json!({ "agentId": "agent-7" }));
+        assert_eq!(recall["agentId"], "agent-7");
+        assert_eq!(recall["limit"], 20);
+
+        let store = memory_store_payload(
+            "agent-7",
+            "s-1",
+            "assistant",
+            "we decided X",
+            Some(&json!({ "total": 3 })),
+        );
+        assert_eq!(store["principal"], json!({ "agentId": "agent-7" }));
+        assert_eq!(store["sessionId"], "s-1");
+        assert_eq!(store["tokenUsage"]["total"], 3);
+        assert!(
+            memory_store_payload("agent-7", "s-1", "user", "hi", None)
+                .get("tokenUsage")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_model_cannot_choose_the_principal_of_its_tool_call() {
+        // The model names another agent AND forges a principal for it.
+        let call = FunctionCall {
+            call_id: "c-1".to_string(),
+            id: "memory::recall".to_string(),
+            arguments: json!({
+                "agentId": "victim",
+                "principal": { "agentId": "victim" },
+                "query": "secrets",
+            }),
+        };
+        let payload = tool_dispatch_payload(&call, "agent-7");
+        assert_eq!(payload["principal"], json!({ "agentId": "agent-7" }));
+        assert_eq!(
+            payload["agentId"], "victim",
+            "what the call is ABOUT is left for the memory worker to refuse"
+        );
+        assert_eq!(payload["query"], "secrets");
+
+        for id in ["vault::get", "lifecycle::transition", "wasm::execute"] {
+            let call = FunctionCall {
+                call_id: "c".to_string(),
+                id: id.to_string(),
+                arguments: json!({ "principal": { "agentId": "victim" } }),
+            };
+            assert_eq!(
+                tool_dispatch_payload(&call, "agent-7")["principal"],
+                json!({ "agentId": "agent-7" }),
+                "{id}"
+            );
+        }
+        // Families that do not resolve a principal are dispatched untouched.
+        let call = FunctionCall {
+            call_id: "c".to_string(),
+            id: "hand::run".to_string(),
+            arguments: json!({ "name": "x" }),
+        };
+        assert_eq!(
+            tool_dispatch_payload(&call, "agent-7"),
+            json!({ "name": "x" })
+        );
+    }
+
+    #[test]
+    fn channel_vault_reads_present_the_worker_bearer_or_nothing() {
+        let payload = vault_read_payload("SLACK_BOT_TOKEN");
+        assert_eq!(payload["key"], "SLACK_BOT_TOKEN");
+        match agentos_bus_auth::handshake_headers() {
+            Some(headers) => assert_eq!(
+                payload["headers"]["authorization"],
+                json!(headers["authorization"])
+            ),
+            None => assert!(payload["headers"].is_null()),
+        }
     }
 
     #[test]
