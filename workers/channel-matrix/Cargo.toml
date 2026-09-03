@@ -21,3 +21,7 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
 reqwest = { workspace = true, features = ["json"] }
+subtle.workspace = true
+
+[dev-dependencies]
+agentos-http-adapter = { workspace = true, features = ["fake-bus"] }

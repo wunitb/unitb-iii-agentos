@@ -1,10 +1,13 @@
+use agentos_http_adapter::TriggerBus;
 use iii_sdk::errors::Error;
 use iii_sdk::protocol::TriggerAction;
-use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
+use iii_sdk::{RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 
 const TELEGRAM_MAX_LEN: usize = 4096;
+const SECRET_TOKEN_KEY: &str = "TELEGRAM_SECRET_TOKEN";
 
 fn split_message(text: &str, max_len: usize) -> Vec<String> {
     if text.chars().count() <= max_len {
@@ -35,32 +38,33 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
 }
 
 fn safe_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+/// One header by case-insensitive name. The engine lowercases header names;
+/// matching case-insensitively costs nothing and survives an engine change.
+fn header<'a>(req: &'a Value, name: &str) -> Option<&'a str> {
+    req.get("headers")?
+        .as_object()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .and_then(|(_, value)| value.as_str())
 }
 
 fn verify_telegram_update(secret_token: &str, input: &Value) -> bool {
     if secret_token.is_empty() {
         return false;
     }
-    let header = input
-        .get("headers")
-        .and_then(|h| h.get("x-telegram-bot-api-secret-token"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if header.is_empty() {
+    let provided = header(input, "x-telegram-bot-api-secret-token").unwrap_or_default();
+    if provided.is_empty() {
         return false;
     }
-    safe_eq(header, secret_token)
+    // Telegram authenticates webhooks with this shared-secret header rather
+    // than a body signature, so there is no raw request body to read here.
+    safe_eq(provided, secret_token)
 }
 
-async fn resolve_agent(iii: &IIIClient, channel: &str, channel_id: &str) -> String {
+async fn resolve_agent(iii: &dyn TriggerBus, channel: &str, channel_id: &str) -> String {
     let result = iii
         .trigger(TriggerRequest {
             function_id: "state::get".to_string(),
@@ -82,7 +86,8 @@ async fn resolve_agent(iii: &IIIClient, channel: &str, channel_id: &str) -> Stri
     }
 }
 
-async fn get_secret(iii: &IIIClient, key: &str) -> String {
+/// Get a secret from `vault::get` first, falling back to env var.
+async fn get_secret(iii: &dyn TriggerBus, key: &str) -> String {
     let result = iii
         .trigger(TriggerRequest {
             function_id: "vault::get".to_string(),
@@ -100,8 +105,19 @@ async fn get_secret(iii: &IIIClient, key: &str) -> String {
     std::env::var(key).unwrap_or_default()
 }
 
+/// The inbound verification secret at boot, or `None` when neither the vault
+/// nor the environment has one. `main` registers the webhook route only on
+/// `Some`: a route that cannot verify its caller is refused, not exposed.
+/// (`vault::get` fails instantly with `function_not_found` while the vault
+/// worker is still starting, so this falls through to the environment — the
+/// path `agentos up` and `dev-up.sh` populate — without waiting.)
+async fn startup_secret(iii: &dyn TriggerBus, key: &str) -> Option<String> {
+    let value = get_secret(iii, key).await;
+    (!value.is_empty()).then_some(value)
+}
+
 async fn send_message(
-    iii: &IIIClient,
+    iii: &dyn TriggerBus,
     client: &reqwest::Client,
     chat_id: i64,
     text: &str,
@@ -139,11 +155,11 @@ async fn send_message(
 }
 
 async fn webhook_handler(
-    iii: &IIIClient,
+    iii: &dyn TriggerBus,
     client: &reqwest::Client,
     input: Value,
 ) -> Result<Value, Error> {
-    let secret_token = get_secret(iii, "TELEGRAM_SECRET_TOKEN").await;
+    let secret_token = get_secret(iii, SECRET_TOKEN_KEY).await;
     if !verify_telegram_update(&secret_token, &input) {
         return Ok(json!({
             "status_code": 401,
@@ -234,12 +250,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("Handle Telegram webhook"),
     );
 
-    agentos_http_adapter::register_http_trigger(
-        &iii,
-        "channel::telegram::webhook".to_string(),
-        json!({ "http_method": "POST", "api_path": "webhook/telegram" }),
-        None,
-    )?;
+    // The route is registered only when the token that authenticates Telegram
+    // deliveries exists. Without it every delivery would be refused anyway,
+    // and an unauthenticated route is not worth exposing. The handler re-reads
+    // the token per request, so a rotation takes effect without a restart.
+    if startup_secret(&iii, SECRET_TOKEN_KEY).await.is_some() {
+        agentos_http_adapter::register_http_trigger(
+            &iii,
+            "channel::telegram::webhook".to_string(),
+            json!({ "http_method": "POST", "api_path": "webhook/telegram" }),
+            None,
+        )?;
+        tracing::info!("telegram webhook route registered (secret token verified)");
+    } else {
+        tracing::error!(
+            "{SECRET_TOKEN_KEY} is not configured: POST /webhook/telegram is NOT registered. \
+             Set the webhook secret token and restart."
+        );
+    }
 
     tracing::info!("channel-telegram worker started");
     tokio::signal::ctrl_c().await?;
@@ -250,6 +278,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentos_http_adapter::fake::FakeBus;
+
+    const SECRET: &str = "telegram-webhook-secret";
+
+    fn request(token: Option<&str>) -> Value {
+        let mut headers = json!({ "content-type": "application/json" });
+        if let Some(token) = token {
+            headers["x-telegram-bot-api-secret-token"] = json!(token);
+        }
+        json!({
+            "method": "POST",
+            "headers": headers,
+            "body": {
+                "update_id": 123,
+                "message": {
+                    "message_id": 456,
+                    "from": { "id": 7 },
+                    "chat": { "id": 42 },
+                    "text": "hello"
+                }
+            }
+        })
+    }
+
+    fn bus_with_secret(secret: &str) -> FakeBus {
+        let bus = FakeBus::new();
+        let secret = secret.to_string();
+        bus.on("vault::get", move |payload| {
+            let key = payload["key"].as_str().unwrap_or_default();
+            Ok(json!({
+                "value": if key == "TELEGRAM_SECRET_TOKEN" {
+                    secret.clone()
+                } else {
+                    String::new()
+                }
+            }))
+        });
+        bus.on_value("state::get", json!({ "agentId": "default" }));
+        bus.on_value("agent::chat", json!({ "content": "" }));
+        bus.on_value("security::audit", json!({}));
+        bus
+    }
 
     #[test]
     fn safe_eq_matches_equal_strings() {
@@ -284,6 +354,51 @@ mod tests {
     fn verify_rejects_mismatched_token() {
         let body = json!({ "headers": { "x-telegram-bot-api-secret-token": "wrong" } });
         assert!(!verify_telegram_update("secret", &body));
+    }
+
+    #[tokio::test]
+    async fn valid_token_reaches_agent_chat() {
+        let bus = bus_with_secret(SECRET);
+        let response = webhook_handler(&bus, &reqwest::Client::new(), request(Some(SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(response["status_code"], 200);
+        let chats = bus.calls_to("agent::chat");
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].payload["message"], "hello");
+        assert_eq!(chats[0].payload["sessionId"], "telegram:42");
+    }
+
+    #[tokio::test]
+    async fn wrong_or_missing_token_is_rejected_before_dispatch() {
+        for token in [Some("wrong"), None] {
+            let bus = bus_with_secret(SECRET);
+            let response = webhook_handler(&bus, &reqwest::Client::new(), request(token))
+                .await
+                .unwrap();
+            assert_eq!(response["status_code"], 401);
+            assert_eq!(bus.call_count("agent::chat"), 0);
+            assert_eq!(bus.call_count("state::get"), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_secret_refuses_delivery_and_route() {
+        let bus = bus_with_secret("");
+        let response = webhook_handler(&bus, &reqwest::Client::new(), request(Some(SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(response["status_code"], 401);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+        assert_eq!(startup_secret(&bus, "TELEGRAM_SECRET_TOKEN").await, None);
+
+        let configured = bus_with_secret(SECRET);
+        assert_eq!(
+            startup_secret(&configured, "TELEGRAM_SECRET_TOKEN")
+                .await
+                .as_deref(),
+            Some(SECRET)
+        );
     }
 
     #[test]

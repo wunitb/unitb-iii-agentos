@@ -175,7 +175,6 @@ name = "agentos-channel-bluesky"
 version = "0.1.0"
 dependencies = [
  "agentos-bus-auth",
- "agentos-http-adapter",
  "anyhow",
  "chrono",
  "iii-sdk",
@@ -194,6 +193,8 @@ dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
+ "ed25519-dalek",
+ "hex",
  "iii-sdk",
  "reqwest",
  "serde",
@@ -208,7 +209,6 @@ name = "agentos-channel-email"
 version = "0.1.0"
 dependencies = [
  "agentos-bus-auth",
- "agentos-http-adapter",
  "anyhow",
  "hex",
  "iii-sdk",
@@ -245,7 +245,6 @@ name = "agentos-channel-mastodon"
 version = "0.1.0"
 dependencies = [
  "agentos-bus-auth",
- "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
  "reqwest",
@@ -267,6 +266,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -278,7 +278,6 @@ name = "agentos-channel-reddit"
 version = "0.1.0"
 dependencies = [
  "agentos-bus-auth",
- "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
  "reqwest",
@@ -294,7 +293,6 @@ name = "agentos-channel-signal"
 version = "0.1.0"
 dependencies = [
  "agentos-bus-auth",
- "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
  "reqwest",
@@ -331,10 +329,14 @@ dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
+ "data-encoding",
+ "hmac",
  "iii-sdk",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -351,6 +353,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -382,10 +385,13 @@ dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
+ "hex",
+ "hmac",
  "iii-sdk",
  "reqwest",
  "serde",
  "serde_json",
+ "sha1",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -405,6 +411,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
  "tokio",
  "tracing",
  "tracing-subscriber",

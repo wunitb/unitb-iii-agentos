@@ -107,6 +107,16 @@ async fn send_mail(iii: &IIIClient, to: &str, subject: &str, text: &str) -> Resu
     Ok(())
 }
 
+/// Email has no inbound path here. This worker speaks SMTP outbound only; it
+/// has no IMAP poller, and the generic `{from, to, subject, text}` JSON it
+/// accepts matches no provider's inbound-parse webhook (SendGrid Inbound
+/// Parse posts multipart form data and signs nothing; Mailgun signs
+/// `timestamp`/`token`/`signature` with a webhook signing key; Postmark
+/// relies on HTTP basic auth in the URL). A `POST /webhook/email` route
+/// therefore had nothing it could verify, so no HTTP route is registered.
+/// `channel::email::webhook` stays on the bus for a provider-specific
+/// receiver or an IMAP poller that hands messages in over the authenticated
+/// bus; a real inbound integration needs that provider's verifier first.
 /// Handle inbound email webhook (e.g. SendGrid Inbound Parse / Mailgun routes).
 /// Mirrors `channel::email::webhook` in src/channels/email.ts.
 async fn handle_webhook(iii: &IIIClient, req: Value) -> Result<Value, Error> {
@@ -192,15 +202,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let iii = iii_clone.clone();
             async move { handle_webhook(&iii, input).await }
         })
-        .description("Handle inbound email webhook"),
+        .description("Handle an inbound email (bus-only: no HTTP route; no provider webhook or IMAP receiver exists)"),
     );
-
-    agentos_http_adapter::register_http_trigger(
-        &iii,
-        "channel::email::webhook".to_string(),
-        json!({ "http_method": "POST", "api_path": "webhook/email" }),
-        None,
-    )?;
 
     tracing::info!("channel-email worker started");
     tokio::signal::ctrl_c().await?;
@@ -211,6 +214,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guard: this worker registers NO HTTP route. See the module note above
+    /// the handler: the provider has no inbound webhook, so a route here can
+    /// never verify its caller. Bringing one back requires a verifier first.
+    #[test]
+    fn registers_no_inbound_http_route() {
+        let source = include_str!("main.rs");
+        let call = concat!("register_http_", "trigger(");
+        assert!(
+            !source.contains(call),
+            "an HTTP route without a provider verifier was reintroduced"
+        );
+        assert!(!source.contains(concat!("agentos_http_", "adapter")));
+    }
 
     #[test]
     fn missing_from_returns_ok_without_dispatch() {

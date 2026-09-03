@@ -1,18 +1,80 @@
+use agentos_http_adapter::TriggerBus;
 use hmac::{Hmac, Mac};
+use iii_sdk::channels::{ChannelReader, StreamChannelRef};
 use iii_sdk::errors::Error;
-use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
+use iii_sdk::{RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
 use sha2::Sha256;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
 
 const SLACK_API_BASE: &str = "https://slack.com/api";
 const MAX_MESSAGE_LEN: usize = 4000;
+const SIGNING_SECRET_KEY: &str = "SLACK_SIGNING_SECRET";
+
+/// Upper bound on a provider delivery we are willing to read before verifying it.
+const MAX_RAW_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// The engine streams the body from local memory; anything slower is a fault.
+const RAW_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Engine WebSocket base: the same address `main` connects to.
+fn engine_ws_url() -> String {
+    std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string())
+}
+
+/// The request body exactly as the provider sent it.
+///
+/// iii 0.22.1 hands HTTP handlers a `body` that is already parsed and
+/// re-serialised (verified: `{ "b" : 2 , "a" : 1 }` arrives as `{"a":1,"b":2}`),
+/// so no signature can be checked against it. The original bytes are exposed as
+/// the `request_body` stream channel (verified live on 0.22.1, with and without
+/// bus RBAC armed: the channel is keyed by its own access key, not the bus
+/// credential). A `rawBody` string, when present, wins so an adapter that has
+/// already drained the channel — or a test — can hand the bytes over directly.
+/// Absent both, the caller refuses the request: nothing here guesses.
+async fn raw_request_body(req: &Value) -> Result<Vec<u8>, String> {
+    if let Some(raw) = req.get("rawBody").and_then(Value::as_str) {
+        return Ok(raw.as_bytes().to_vec());
+    }
+    let Some(channel) = req.get("request_body") else {
+        return Err("raw request body unavailable (no rawBody, no request_body channel)".into());
+    };
+    let channel: StreamChannelRef = serde_json::from_value(channel.clone())
+        .map_err(|e| format!("request_body channel ref is malformed: {e}"))?;
+    let reader = ChannelReader::new(&engine_ws_url(), &channel);
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = tokio::time::timeout(RAW_BODY_READ_TIMEOUT, reader.next_binary())
+            .await
+            .map_err(|_| "timed out reading the request_body channel".to_string())?
+            .map_err(|e| format!("request_body channel read failed: {e}"))?;
+        let Some(chunk) = chunk else {
+            return Ok(bytes);
+        };
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > MAX_RAW_BODY_BYTES {
+            return Err(format!("request body exceeds {MAX_RAW_BODY_BYTES} bytes"));
+        }
+    }
+}
+
+/// One header by case-insensitive name. The engine lowercases header names;
+/// matching case-insensitively costs nothing and survives an engine change.
+fn header<'a>(req: &'a Value, name: &str) -> Option<&'a str> {
+    req.get("headers")?
+        .as_object()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .and_then(|(_, value)| value.as_str())
+}
+
+fn reject(status: u16, error: &str) -> Value {
+    json!({ "status_code": status, "body": { "error": error } })
+}
 
 /// Get a secret from `vault::get` first, falling back to env var.
-/// Mirrors `src/shared/secrets.ts::createSecretGetter`.
-async fn get_secret(iii: &IIIClient, key: &str) -> String {
+async fn get_secret(iii: &dyn TriggerBus, key: &str) -> String {
     let result = iii
         .trigger(TriggerRequest {
             function_id: "vault::get".to_string(),
@@ -31,9 +93,20 @@ async fn get_secret(iii: &IIIClient, key: &str) -> String {
     std::env::var(key).unwrap_or_default()
 }
 
+/// The inbound verification secret at boot, or `None` when neither the vault
+/// nor the environment has one. `main` registers the webhook route only on
+/// `Some`: a route that cannot verify its caller is refused, not exposed.
+/// (`vault::get` fails instantly with `function_not_found` while the vault
+/// worker is still starting, so this falls through to the environment — the
+/// path `agentos up` and `dev-up.sh` populate — without waiting.)
+async fn startup_secret(iii: &dyn TriggerBus, key: &str) -> Option<String> {
+    let value = get_secret(iii, key).await;
+    (!value.is_empty()).then_some(value)
+}
+
 /// Resolve which agent should handle a given Slack channel message.
 /// Mirrors `src/shared/utils.ts::resolveAgent`.
-async fn resolve_agent(iii: &IIIClient, channel_id: &str) -> String {
+async fn resolve_agent(iii: &dyn TriggerBus, channel_id: &str) -> String {
     let key = format!("slack:{channel_id}");
     let result = iii
         .trigger(TriggerRequest {
@@ -82,44 +155,53 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
     chunks
 }
 
-/// Verify Slack request signature per https://api.slack.com/authentication/verifying-requests-from-slack
-/// Returns Err(reason) if invalid; Ok(()) if valid.
+/// Verify Slack's request signature: `v0=` followed by the lowercase hex
+/// HMAC-SHA256 of `v0:{timestamp}:{raw_body}`, keyed by the signing secret
+/// (https://api.slack.com/authentication/verifying-requests-from-slack).
+/// The timestamp must be within five minutes and `Mac::verify_slice` performs
+/// the digest comparison in constant time.
 fn verify_slack_signature(
     signing_secret: &str,
     timestamp: &str,
     signature: &str,
-    raw_body: &str,
+    raw_body: &[u8],
 ) -> Result<(), String> {
-    let ts: i64 = timestamp
-        .parse()
-        .map_err(|_| "Invalid timestamp".to_string())?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    verify_slack_signature_at(signing_secret, timestamp, signature, raw_body, now)
+}
+
+fn verify_slack_signature_at(
+    signing_secret: &str,
+    timestamp: &str,
+    signature: &str,
+    raw_body: &[u8],
+    now: i64,
+) -> Result<(), String> {
+    if signing_secret.is_empty() {
+        return Err("SLACK_SIGNING_SECRET not configured".into());
+    }
+    let ts: i64 = timestamp
+        .parse()
+        .map_err(|_| "Invalid timestamp".to_string())?;
     if (now - ts).abs() > 300 {
         return Err("Stale Slack timestamp".to_string());
     }
 
-    let base = format!("v0:{timestamp}:{raw_body}");
+    let provided_hex = signature
+        .trim()
+        .strip_prefix("v0=")
+        .ok_or_else(|| "Invalid Slack signature version".to_string())?;
+    let provided =
+        hex::decode(provided_hex).map_err(|_| "X-Slack-Signature digest is not hex".to_string())?;
     let mut mac = HmacSha256::new_from_slice(signing_secret.as_bytes())
         .map_err(|e| format!("HMAC init error: {e}"))?;
-    mac.update(base.as_bytes());
-    let computed = format!("v0={}", hex::encode(mac.finalize().into_bytes()));
-
-    // Constant-time compare via the underlying digest length when available;
-    // fallback to manual length-check + xor accumulator.
-    if computed.len() != signature.len() {
-        return Err("Invalid Slack signature".to_string());
-    }
-    let mut diff: u8 = 0;
-    for (a, b) in computed.bytes().zip(signature.bytes()) {
-        diff |= a ^ b;
-    }
-    if diff != 0 {
-        return Err("Invalid Slack signature".to_string());
-    }
-    Ok(())
+    mac.update(format!("v0:{timestamp}:").as_bytes());
+    mac.update(raw_body);
+    mac.verify_slice(&provided)
+        .map_err(|_| "Invalid Slack signature".to_string())
 }
 
 /// POST to `chat.postMessage`. Splits text > 4000 chars into multiple messages.
@@ -167,20 +249,56 @@ async fn slack_post_message(
     Ok(last)
 }
 
+/// Authenticate one delivery and return the parsed body it was signed over.
+///
+/// Order matters: the secret, both headers and the raw bytes are all checked
+/// BEFORE any JSON is parsed, and the body handed back is parsed from the
+/// verified bytes — never from the engine's pre-parsed `body`, which was not
+/// what Slack signed. Every failure is a refusal (`Err(response)`).
+async fn authenticate(iii: &dyn TriggerBus, req: &Value) -> Result<Value, Value> {
+    let signing_secret = get_secret(iii, SIGNING_SECRET_KEY).await;
+    if signing_secret.is_empty() {
+        return Err(reject(503, "SLACK_SIGNING_SECRET not configured"));
+    }
+    let timestamp = header(req, "x-slack-request-timestamp").unwrap_or_default();
+    let signature = header(req, "x-slack-signature").unwrap_or_default();
+    if timestamp.is_empty() || signature.is_empty() {
+        return Err(reject(401, "Missing Slack signature headers"));
+    }
+    let raw = match raw_request_body(req).await {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::warn!(error = %e, "slack: refusing delivery without its raw body");
+            return Err(reject(
+                400,
+                "Raw request body unavailable for signature verification",
+            ));
+        }
+    };
+    if let Err(e) = verify_slack_signature(&signing_secret, timestamp, signature, &raw) {
+        tracing::warn!(error = %e, "slack signature rejected");
+        return Err(reject(401, "Invalid Slack signature"));
+    }
+    serde_json::from_slice(&raw).map_err(|_| reject(400, "Body is not valid JSON"))
+}
+
 /// Handle Slack Events API webhook delivery.
 /// Mirrors `channel::slack::events` in src/channels/slack.ts.
 ///
 /// Behavior:
-///   1. `url_verification` -> echo back the challenge.
-///   2. Otherwise require `SLACK_SIGNING_SECRET` and verify the request signature.
+///   1. Require `SLACK_SIGNING_SECRET` and authenticate the raw request.
+///   2. A verified `url_verification` echoes its challenge.
 ///   3. For non-bot `message` events: dispatch to `agent::chat` and post the reply.
 ///   4. Always return 200 for accepted events so Slack does not retry.
 async fn handle_events(
-    iii: &IIIClient,
+    iii: &dyn TriggerBus,
     client: &reqwest::Client,
     req: Value,
 ) -> Result<Value, Error> {
-    let body = req.get("body").cloned().unwrap_or_else(|| req.clone());
+    let body = match authenticate(iii, &req).await {
+        Ok(body) => body,
+        Err(response) => return Ok(response),
+    };
 
     if body.get("type").and_then(|v| v.as_str()) == Some("url_verification") {
         let challenge = body
@@ -191,45 +309,6 @@ async fn handle_events(
         return Ok(json!({
             "status_code": 200,
             "body": { "challenge": challenge }
-        }));
-    }
-
-    let signing_secret = get_secret(iii, "SLACK_SIGNING_SECRET").await;
-    if signing_secret.is_empty() {
-        return Ok(json!({
-            "status_code": 500,
-            "body": { "error": "SLACK_SIGNING_SECRET not configured" }
-        }));
-    }
-
-    let headers = req.get("headers").cloned().unwrap_or(json!({}));
-    let timestamp = headers
-        .get("x-slack-request-timestamp")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let signature = headers
-        .get("x-slack-signature")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-
-    if timestamp.is_empty() || signature.is_empty() {
-        return Ok(json!({
-            "status_code": 401,
-            "body": { "error": "Missing Slack signature headers" }
-        }));
-    }
-
-    let Some(raw_body) = req.get("rawBody").and_then(|v| v.as_str()) else {
-        return Ok(json!({
-            "status_code": 400,
-            "body": { "error": "Missing rawBody for Slack signature verification" }
-        }));
-    };
-
-    if let Err(e) = verify_slack_signature(&signing_secret, timestamp, signature, raw_body) {
-        return Ok(json!({
-            "status_code": 401,
-            "body": { "error": e }
         }));
     }
 
@@ -308,7 +387,7 @@ async fn handle_events(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
+    let ws_url = engine_ws_url();
     let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
     let client = reqwest::Client::new();
 
@@ -357,14 +436,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("Post a message to a Slack channel via chat.postMessage"),
     );
 
-    // HTTP trigger: Slack delivers events to this endpoint.
-    // Path matches the TS port for backwards compatibility.
-    agentos_http_adapter::register_http_trigger(
-        &iii,
-        "channel::slack::events".to_string(),
-        json!({ "http_method": "POST", "api_path": "webhook/slack/events" }),
-        None,
-    )?;
+    // The route is registered only when the secret that verifies Slack's
+    // signature exists. Without it every delivery would be refused anyway, and
+    // an unverifiable route is not worth exposing. The handler re-reads the
+    // secret per request, so a rotation takes effect without a restart.
+    if startup_secret(&iii, SIGNING_SECRET_KEY).await.is_some() {
+        agentos_http_adapter::register_http_trigger(
+            &iii,
+            "channel::slack::events".to_string(),
+            json!({ "http_method": "POST", "api_path": "webhook/slack/events" }),
+            None,
+        )?;
+        tracing::info!("slack webhook route registered (HMAC-SHA256 signature verified)");
+    } else {
+        tracing::error!(
+            "{SIGNING_SECRET_KEY} is not configured: POST /webhook/slack/events is NOT registered. \
+             Set the app signing secret and restart."
+        );
+    }
 
     tracing::info!("channel-slack worker started");
     tokio::signal::ctrl_c().await?;
@@ -375,6 +464,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentos_http_adapter::fake::FakeBus;
+
+    const SECRET: &str = "slack-signing-secret";
+    const URL_VERIFICATION: &str =
+        r#"{"type":"url_verification","challenge":"abc123","token":"deprecated"}"#;
+    const MESSAGE: &str = r#"{"type":"event_callback","event":{"type":"message","user":"U1","text":"hello","channel":"C1","ts":"1710000000.000100"}}"#;
 
     #[test]
     fn split_short_text_returns_single_chunk() {
@@ -408,10 +503,10 @@ mod tests {
         assert_eq!(joined, text);
     }
 
-    fn sign(secret: &str, ts: &str, body: &str) -> String {
-        let base = format!("v0:{ts}:{body}");
+    fn sign(secret: &str, ts: &str, body: &[u8]) -> String {
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(base.as_bytes());
+        mac.update(format!("v0:{ts}:").as_bytes());
+        mac.update(body);
         format!("v0={}", hex::encode(mac.finalize().into_bytes()))
     }
 
@@ -423,56 +518,225 @@ mod tests {
             .to_string()
     }
 
+    fn request(raw: &str, signature: Option<&str>, timestamp: Option<&str>) -> Value {
+        let mut headers = json!({ "content-type": "application/json" });
+        if let Some(signature) = signature {
+            headers["x-slack-signature"] = json!(signature);
+        }
+        if let Some(timestamp) = timestamp {
+            headers["x-slack-request-timestamp"] = json!(timestamp);
+        }
+        json!({
+            "method": "POST",
+            "headers": headers,
+            "rawBody": raw,
+            // The engine's parsed body is deliberately present. Signed routes
+            // must ignore it and parse the verified raw bytes instead.
+            "body": serde_json::from_str::<Value>(raw).unwrap_or(Value::Null),
+        })
+    }
+
+    fn bus_with_secret(secret: &str) -> FakeBus {
+        let bus = FakeBus::new();
+        let secret = secret.to_string();
+        bus.on("vault::get", move |payload| {
+            let key = payload["key"].as_str().unwrap_or_default();
+            Ok(json!({
+                "value": if key == "SLACK_SIGNING_SECRET" {
+                    secret.clone()
+                } else {
+                    String::new()
+                }
+            }))
+        });
+        bus.on_value("state::get", json!({ "agentId": "default" }));
+        bus.on_value("agent::chat", json!({ "content": "" }));
+        bus
+    }
+
+    #[test]
+    fn slack_documentation_signature_vector_verifies() {
+        // Published Slack vector from
+        // https://api.slack.com/authentication/verifying-requests-from-slack.
+        let secret = "8f742231b10e8888abcd99yyyzzz85a5";
+        let timestamp = "1531420618";
+        let body = b"token=xyzz0WbapA4vBCDEFasx0q6G&team_id=T1DC2JH3J&team_domain=testteamnow&channel_id=G8PSS9T3V&channel_name=foobar&user_id=U2CERLKJA&user_name=roadrunner&command=%2Fwebhook-collect&text=&response_url=https%3A%2F%2Fhooks.slack.com%2Fcommands%2FT1DC2JH3J%2F397700885554%2F96rGlfmibIGlgcZRskXaIFfN&trigger_id=398738663015.47445629121.803a0bc887a14d10d2c447fce8b6703c";
+        let signature = "v0=a2114d57b48eac39b9ad189dd8316235a7b4a8d21a10bd27519666489c69b503";
+        assert_eq!(sign(secret, timestamp, body), signature);
+        assert!(
+            verify_slack_signature_at(secret, timestamp, signature, body, 1_531_420_618).is_ok()
+        );
+    }
+
     #[test]
     fn signature_verifies_when_correct() {
-        let secret = "shhh";
-        let body = r#"{"type":"event_callback"}"#;
+        let body = br#"{"type":"event_callback"}"#;
         let ts = now_ts();
-        let sig = sign(secret, &ts, body);
-        assert!(verify_slack_signature(secret, &ts, &sig, body).is_ok());
+        let sig = sign(SECRET, &ts, body);
+        assert!(verify_slack_signature(SECRET, &ts, &sig, body).is_ok());
     }
 
     #[test]
     fn signature_rejects_when_body_tampered() {
-        let secret = "shhh";
         let ts = now_ts();
-        let sig = sign(secret, &ts, r#"{"type":"event_callback"}"#);
-        let result = verify_slack_signature(secret, &ts, &sig, r#"{"type":"tampered"}"#);
+        let sig = sign(SECRET, &ts, br#"{"type":"event_callback"}"#);
+        let result = verify_slack_signature(SECRET, &ts, &sig, br#"{"type":"tampered"}"#);
         assert!(result.is_err());
     }
 
     #[test]
     fn signature_rejects_stale_timestamp() {
-        let secret = "shhh";
-        let body = r#"{"type":"event_callback"}"#;
+        let body = br#"{"type":"event_callback"}"#;
         let ts = "1000000000";
-        let sig = sign(secret, ts, body);
-        let result = verify_slack_signature(secret, ts, &sig, body);
+        let sig = sign(SECRET, ts, body);
+        let result = verify_slack_signature(SECRET, ts, &sig, body);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Stale"));
     }
 
     #[test]
     fn signature_rejects_garbage_signature() {
-        let body = r#"{"type":"event_callback"}"#;
+        let body = br#"{"type":"event_callback"}"#;
         let ts = now_ts();
-        let result = verify_slack_signature("shhh", &ts, "v0=deadbeef", body);
+        let result = verify_slack_signature(SECRET, &ts, "v0=deadbeef", body);
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn url_verification_echoes_challenge_without_signing_secret() {
-        // Construct a minimal mock III by skipping the network handshake:
-        // we test handle_events through public-shape JSON instead.
-        // Since handle_events takes &IIIClient, and we cannot easily mock it without
-        // a running engine, we route around by calling the inner branch directly.
-        let body = json!({
-            "type": "url_verification",
-            "challenge": "abc123"
-        });
-        // Replicate the early-return branch logic to verify the contract.
-        assert_eq!(body["type"], "url_verification");
-        assert_eq!(body["challenge"], "abc123");
+    async fn signed_url_verification_echoes_challenge() {
+        let bus = bus_with_secret(SECRET);
+        let ts = now_ts();
+        let signature = sign(SECRET, &ts, URL_VERIFICATION.as_bytes());
+        let response = handle_events(
+            &bus,
+            &reqwest::Client::new(),
+            request(URL_VERIFICATION, Some(&signature), Some(&ts)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["status_code"], 200);
+        assert_eq!(response["body"], json!({ "challenge": "abc123" }));
+        assert_eq!(bus.call_count("agent::chat"), 0);
+    }
+
+    #[tokio::test]
+    async fn unsigned_url_verification_is_rejected() {
+        let bus = bus_with_secret(SECRET);
+        let response = handle_events(
+            &bus,
+            &reqwest::Client::new(),
+            request(URL_VERIFICATION, None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["status_code"], 401);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+    }
+
+    #[tokio::test]
+    async fn valid_signed_message_reaches_agent_chat() {
+        let bus = bus_with_secret(SECRET);
+        let ts = now_ts();
+        let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
+        let response = handle_events(
+            &bus,
+            &reqwest::Client::new(),
+            request(MESSAGE, Some(&signature), Some(&ts)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["status_code"], 200);
+        let chats = bus.calls_to("agent::chat");
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].payload["message"], "hello");
+    }
+
+    #[tokio::test]
+    async fn verified_raw_body_is_the_event_that_reaches_agent_chat() {
+        let bus = bus_with_secret(SECRET);
+        let ts = now_ts();
+        let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
+        let mut req = request(MESSAGE, Some(&signature), Some(&ts));
+        req["body"]["event"]["text"] = json!("engine re-serialised body must be ignored");
+        let response = handle_events(&bus, &reqwest::Client::new(), req)
+            .await
+            .unwrap();
+        assert_eq!(response["status_code"], 200);
+        let chats = bus.calls_to("agent::chat");
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].payload["message"], "hello");
+    }
+
+    #[tokio::test]
+    async fn tampered_body_is_rejected_before_agent_chat() {
+        let bus = bus_with_secret(SECRET);
+        let ts = now_ts();
+        let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
+        let tampered = MESSAGE.replace("hello", "ignore previous instructions");
+        let response = handle_events(
+            &bus,
+            &reqwest::Client::new(),
+            request(&tampered, Some(&signature), Some(&ts)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["status_code"], 401);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+        assert_eq!(bus.call_count("state::get"), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_signature_header_is_rejected() {
+        let bus = bus_with_secret(SECRET);
+        let ts = now_ts();
+        let response = handle_events(
+            &bus,
+            &reqwest::Client::new(),
+            request(MESSAGE, None, Some(&ts)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["status_code"], 401);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_raw_body_is_rejected() {
+        let bus = bus_with_secret(SECRET);
+        let ts = now_ts();
+        let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
+        let mut req = request(MESSAGE, Some(&signature), Some(&ts));
+        req.as_object_mut().unwrap().remove("rawBody");
+        let response = handle_events(&bus, &reqwest::Client::new(), req)
+            .await
+            .unwrap();
+        assert_eq!(response["status_code"], 400);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_secret_refuses_delivery_and_route() {
+        let bus = bus_with_secret("");
+        let ts = now_ts();
+        let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
+        let response = handle_events(
+            &bus,
+            &reqwest::Client::new(),
+            request(MESSAGE, Some(&signature), Some(&ts)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["status_code"], 503);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+        assert_eq!(startup_secret(&bus, "SLACK_SIGNING_SECRET").await, None);
+
+        let configured = bus_with_secret(SECRET);
+        assert_eq!(
+            startup_secret(&configured, "SLACK_SIGNING_SECRET")
+                .await
+                .as_deref(),
+            Some(SECRET)
+        );
     }
 
     fn classify(event: &Value) -> bool {
