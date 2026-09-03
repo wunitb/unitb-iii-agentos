@@ -59,7 +59,7 @@ export default function Hero() {
               <span className="opacity-50">·</span>
               <span>301 functions</span>
               <span className="opacity-50">·</span>
-              <span>1940 tests</span>
+              <span>1998 tests</span>
               <span className="opacity-50">·</span>
               <span>iii-sdk 0.22.1</span>
             </div>

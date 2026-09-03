@@ -17,3 +17,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 wasmtime = "36.0.13"
 dashmap.workspace = true
+
+[dev-dependencies]
+agentos-http-adapter = { workspace = true, features = ["fake-bus"] }

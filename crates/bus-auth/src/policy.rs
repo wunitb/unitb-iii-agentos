@@ -284,6 +284,18 @@ pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
     "memory::session::list",
     "memory::session::repair",
     "memory::store",
+    // session-lifecycle — per-agent state, moved or read on behalf of a
+    // `principal` whose ONLY trust basis is the bus tier (contract T1: the
+    // handler believes `principal.agentId` because a credential-less session
+    // cannot reach it). Without these entries a local process could send
+    // `lifecycle::transition {principal: {agentId: "a-2"}, newState:
+    // "terminated"}` and park any agent in a terminal state. (B)(C)
+    // `lifecycle::check_all` is absent on purpose: it is a cron target fired
+    // by the untrusted registry worker, and it refuses an agent principal.
+    "lifecycle::add_reaction",
+    "lifecycle::get_state",
+    "lifecycle::list_reactions",
+    "lifecycle::transition",
     // worker management — `worker::add` + `worker::start` make the engine fetch
     // and run a registry binary, which is process spawn by another name. (A)
     // The read half (list/status/logs/schema/validate) stays reachable: it is
@@ -811,6 +823,7 @@ mod tests {
             "coder",        // (A) the second surface of the shell binary
             "council",      // (B) override rewrites a decision
             "hand",         // (A) trigger runs an automation on demand
+            "lifecycle",    // (B)(C) per-agent state keyed on a bus-tier-trusted principal
             "memory",       // (C) no tenancy on any of these ids
             "orchestrator", // (A) executes a plan and writes host files
             "policy",       // (B) set_rules rewrites the rule set
@@ -842,6 +855,37 @@ mod tests {
                 "{id} is neither a contract I1 family nor a justified exception"
             );
         }
+    }
+
+    /// Contract T1 trusts `principal.agentId` on the strength of the bus tier
+    /// alone, so every id that resolves one must be unreachable without a
+    /// credential — except the cron-fired maintenance entry, which refuses an
+    /// agent principal itself and is fired by a worker that cannot authenticate.
+    #[test]
+    fn the_per_agent_lifecycle_ids_are_denied_to_the_untrusted_tier() {
+        for id in [
+            "lifecycle::transition",
+            "lifecycle::get_state",
+            "lifecycle::add_reaction",
+            "lifecycle::list_reactions",
+        ] {
+            assert!(
+                UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&id),
+                "{id} resolves a principal from the payload and must not be callable \
+                 from a credential-less session"
+            );
+        }
+        assert!(
+            !UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&"lifecycle::check_all"),
+            "lifecycle::check_all is a cron target fired by the untrusted registry worker"
+        );
+        let untrusted = auth_result(&headers(json!({})), Some("secret"));
+        assert!(
+            untrusted["forbidden_functions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("lifecycle::transition"))
+        );
     }
 
     /// The bypass a whole-tree review found: `workflow::run` is allowed because
