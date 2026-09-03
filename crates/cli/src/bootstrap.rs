@@ -1038,6 +1038,11 @@ pub(crate) fn start_bus_auth_for_foreground(
     let config = std::fs::read_to_string(config_path).unwrap_or_default();
     let armed = config.contains(BUS_RBAC_MARKER);
 
+    // Checked before the health probe short-circuits, for the same reason as in
+    // `bus_auth_stage`: a running daemon proves nothing about the config this
+    // run is about to gate.
+    check_armed_config(Some(config.as_str()), config_path)?;
+
     if TcpStream::connect_timeout(&addr, HEALTH_PROBE_TIMEOUT).is_ok() {
         println!(
             "{} bus-auth daemon already listening on {addr}",
@@ -1444,6 +1449,32 @@ fn up_stages(
     }
 }
 
+/// Refuses a config whose `rbac:` block the daemon could not honour.
+///
+/// The same inspection `agentos-bus-authd` runs at startup, hoisted into the CLI
+/// so it also runs when a daemon is already listening. The engine cannot report
+/// any of this: the nested `rbac` struct is not `deny_unknown_fields`, so it
+/// ignores a misspelled key and admits every bus connection.
+pub(crate) fn check_armed_config(config: Option<&str>, config_path: &Path) -> Result<()> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    match agentos_bus_auth::config::inspect(config) {
+        agentos_bus_auth::config::GateStatus::Inconsistent(problems) => anyhow::bail!(
+            "{} arms bus RBAC in a way {BUS_AUTH_BINARY} cannot honour, and the engine would NOT \
+             tell you: the nested `rbac` struct is not deny_unknown_fields, so it ignores what it \
+             does not know and admits every bus connection.\n{}",
+            config_path.display(),
+            problems
+                .iter()
+                .map(|problem| format!("  - {problem}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Starts (or reuses) the bus-auth daemon and reports what happened. A missing
 /// binary is fatal only when the active config arms the gate: an armed config
 /// without a daemon cannot boot at all, and failing here names the cause
@@ -1470,6 +1501,13 @@ fn bus_auth_stage(
             paths.config_path.display()
         )?;
     }
+
+    // BEFORE the health probe: a daemon that is already up was started against
+    // whatever the config said THEN. The check belongs to "this config is about
+    // to be gated", not to "a daemon was just spawned" — otherwise editing a
+    // typo into `rbac:` and re-running `up` against a still-running daemon
+    // validates nothing.
+    check_armed_config(config.as_deref(), &paths.config_path)?;
 
     if effects.bus_auth_healthy() {
         stage_ok(out, "Bus auth", &format!("already listening on {addr}"))?;
@@ -2068,10 +2106,7 @@ mod tests {
                 bus_auth_healthy_from: Some(0),
                 bus_auth_probes: Cell::new(0),
                 bus_auth_exits: false,
-                engine_config: Some(
-                    "workers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n      rbac:\n        auth_function_id: agentos::bus_auth\n  - name: iii-bridge\n    config:\n      url: ws://127.0.0.1:49129\n"
-                        .to_string(),
-                ),
+                engine_config: Some(armed_config("ws://127.0.0.1:49129")),
                 agent_keys: Some(vec!["default".to_string()]),
                 capability_keys: Some(vec!["default".to_string()]),
                 identity_probes: Cell::new(0),
@@ -3741,11 +3776,23 @@ mod tests {
     // bus RBAC: the auth daemon starts before the engine
     // -----------------------------------------------------------------------
 
-    /// A `config.yaml` with the RBAC block, optionally pointing the bridge
-    /// somewhere else than the daemon.
+    /// A `config.yaml` with a COMPLETE RBAC block, optionally pointing the
+    /// bridge somewhere else than the daemon.
+    ///
+    /// Complete on purpose: `bus_auth_stage` now refuses a half-armed gate, and
+    /// a fixture that arms one hook out of four would be asserting a config the
+    /// product rejects.
     fn armed_config(bridge_url: &str) -> String {
+        let mut rbac = String::new();
+        let mut forward = String::new();
+        for (key, id) in agentos_bus_auth::policy::ARMED_HOOKS {
+            rbac.push_str(&format!("        {key}: {id}\n"));
+            forward.push_str(&format!(
+                "        - local_function: {id}\n          remote_function: {id}\n"
+            ));
+        }
         format!(
-            "workers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n      rbac:\n        auth_function_id: agentos::bus_auth\n  - name: iii-bridge\n    config:\n      url: {bridge_url}\n"
+            "workers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n      rbac:\n{rbac}        expose_functions:\n          - match(\"*\")\n  - name: iii-bridge\n    config:\n      url: {bridge_url}\n      forward:\n{forward}"
         )
     }
 

@@ -172,10 +172,20 @@ impl Fixture {
     /// `agentos-bus-authd` that records its argv and environment, then holds
     /// the port the way the real daemon does.
     fn with_bus_auth(&self, addr: &str) {
+        // A COMPLETE arm: `up` refuses a config that names some hooks and not
+        // others, because the engine would ignore the difference in silence.
+        let mut rbac = String::new();
+        let mut forward = String::new();
+        for (key, id) in agentos_bus_auth::policy::ARMED_HOOKS {
+            rbac.push_str(&format!("        {key}: {id}\n"));
+            forward.push_str(&format!(
+                "        - local_function: {id}\n          remote_function: {id}\n"
+            ));
+        }
         fs::write(
             self.runtime.join("config.yaml"),
             format!(
-                "workers:\n  - name: iii-worker-manager\n    config:\n      rbac:\n        auth_function_id: agentos::bus_auth\n  - name: iii-bridge\n    config:\n      url: ws://{addr}\n"
+                "workers:\n  - name: iii-worker-manager\n    config:\n      rbac:\n{rbac}        expose_functions:\n          - match(\"*\")\n  - name: iii-bridge\n    config:\n      url: ws://{addr}\n      forward:\n{forward}"
             ),
         )
         .expect("write armed config");
@@ -692,6 +702,61 @@ fn up_starts_the_bus_auth_daemon_with_the_generated_key() {
     );
     assert!(stdout.contains(&format!("listening on {addr}")), "{stdout}");
 
+    fixture.cleanup();
+}
+
+/// The guard has to be a property of "this config is about to be gated", not of
+/// "a daemon was just spawned".
+///
+/// Before this, `up` returned as soon as the health probe found a listener, so
+/// editing a typo into `rbac:` and re-running against a daemon that was still up
+/// validated nothing — the exact silent-disarm this check exists to catch.
+#[test]
+fn up_refuses_a_typoed_gate_even_when_a_daemon_is_already_listening() {
+    let fixture = Fixture::new("bus-auth-typo-live");
+    let addr = free_loopback_addr();
+    let addr = addr.as_str();
+    fixture.with_bus_auth(addr);
+
+    let config = fixture.runtime.join("config.yaml");
+    let armed = fs::read_to_string(&config).expect("read the armed config");
+    fs::write(
+        &config,
+        armed.replace("        auth_function_id:", "        auth_function_idd:"),
+    )
+    .expect("write the typo'd config");
+
+    // A daemon is already up: the CLI only probes the port, so a plain listener
+    // is indistinguishable from the real thing.
+    let held = TcpListener::bind(addr).expect("hold the daemon port");
+
+    let cli = fixture.cli();
+    let output = Command::new(&cli)
+        .args(["up", "--no-tui", "--timeout", "2"])
+        .env("PATH", fixture.path_with_engine())
+        .env("HOME", &fixture.home)
+        .env("AGENTOS_HOME", &fixture.home)
+        .env("AGENTOS_CONFIG", &config)
+        .env("AGENTOS_BUS_AUTH_ADDR", addr)
+        .env_remove("AGENTOS_API_KEY")
+        .current_dir(&fixture.root)
+        .output()
+        .expect("run agentos up");
+
+    assert!(
+        !output.status.success(),
+        "up accepted a config whose gate is disarmed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("rbac.auth_function_idd"), "{stderr}");
+    assert!(
+        stderr.contains("the engine would NOT tell you"),
+        "the message has to say why nothing else reports this: {stderr}"
+    );
+    assert!(!fixture.worker_pid.exists(), "workers started anyway");
+
+    drop(held);
     fixture.cleanup();
 }
 

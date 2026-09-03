@@ -17,7 +17,7 @@
 //! that. This can: the daemon reads the config it is about to gate and refuses
 //! to start when the two disagree.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde_yaml::Value;
@@ -30,9 +30,6 @@ pub const CONFIG_PATH_ENV: &str = "AGENTOS_CONFIG";
 /// `iii-worker-manager`'s own default port (`WorkerManagerConfig::default_port`).
 /// Used only when the config does not pin one.
 const DEFAULT_ENGINE_BUS_PORT: u16 = 49134;
-
-/// Hosts that mean "this machine" in an `iii-bridge` url.
-const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", "[::]"];
 
 /// What the daemon found in the config it was pointed at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,81 +110,122 @@ pub fn inspect(yaml: &str) -> GateStatus {
         .map(Vec::as_slice)
         .unwrap_or_default();
 
-    let Some(rbac) =
-        worker_config(workers, "iii-worker-manager").and_then(|config| config.get("rbac").cloned())
-    else {
+    let managers = worker_entries(workers, WORKER_MANAGER);
+    let armed: Vec<(&str, &serde_yaml::Mapping, u16)> = managers
+        .iter()
+        .filter_map(|(name, config)| {
+            let rbac = config.get("rbac")?.as_mapping()?;
+            Some((name.as_str(), rbac, entry_port(config)))
+        })
+        .collect();
+
+    let malformed: Vec<&str> = managers
+        .iter()
+        .filter(|(_, config)| config.get("rbac").is_some_and(|rbac| !rbac.is_mapping()))
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    if armed.is_empty() && malformed.is_empty() {
         return GateStatus::NotArmed;
-    };
+    }
 
     let mut problems = Vec::new();
-    let Some(rbac) = rbac.as_mapping() else {
-        problems.push("`rbac:` is present but is not a mapping".to_string());
-        return GateStatus::Inconsistent(problems);
+    // Name every problem when more than one manager is declared, so "which
+    // one" is never a guess.
+    let label = |name: &str| -> String {
+        if managers.len() > 1 {
+            format!("`{name}` ")
+        } else {
+            String::new()
+        }
     };
+    for name in malformed {
+        problems.push(format!(
+            "{}`rbac:` is present but is not a mapping",
+            label(name)
+        ));
+    }
 
-    // 1. Keys the engine does not know. It ignores them without a word, so this
-    //    is the only place a typo can surface.
-    for key in rbac.keys() {
-        let Some(key) = key.as_str() else { continue };
-        if !RBAC_CONFIG_KEYS.contains(&key) {
+    for (name, rbac, _) in &armed {
+        let at = label(name);
+
+        // 1. Keys the engine does not know. It ignores them without a word, so
+        //    this is the only place a typo can surface.
+        for key in rbac.keys() {
+            let Some(key) = key.as_str() else { continue };
+            if !RBAC_CONFIG_KEYS.contains(&key) {
+                problems.push(format!(
+                    "{at}`rbac.{key}` is not a key the engine knows ({}). The nested rbac struct is \
+                     not deny_unknown_fields, so the engine ignores it silently and the gate it was \
+                     meant to arm stays off",
+                    RBAC_CONFIG_KEYS.join(", ")
+                ));
+            }
+        }
+
+        // 2. Every hook this daemon serves must be armed, and must name the id
+        //    the daemon actually answers.
+        for (key, expected) in ARMED_HOOKS {
+            match rbac.get(Value::from(*key)).and_then(Value::as_str) {
+                Some(id) if id == *expected => {}
+                Some(id) => problems.push(format!(
+                    "{at}`rbac.{key}` names `{id}`, but this daemon serves `{expected}`; the engine \
+                     would call a function nothing answers and refuse every bus connection"
+                )),
+                None => problems.push(format!(
+                    "{at}`rbac.{key}` is missing; `{expected}` would never be called and that \
+                     surface stays ungated"
+                )),
+            }
+        }
+
+        // 3. `expose_functions` is what keeps ordinary calls working once
+        //    `rbac:` exists: with the key absent the engine denies every
+        //    non-infrastructure id to every session, armed or not.
+        if !rbac.contains_key(Value::from("expose_functions")) {
             problems.push(format!(
-                "`rbac.{key}` is not a key the engine knows ({}). The nested rbac struct is not \
-                 deny_unknown_fields, so the engine ignores it silently and the gate it was meant \
-                 to arm stays off",
-                RBAC_CONFIG_KEYS.join(", ")
+                "{at}`rbac.expose_functions` is missing; with an `rbac:` block present the engine \
+                 denies every function that is not in a session's exact allow list"
             ));
         }
     }
 
-    // 2. Every hook this daemon serves must be armed, and must name the id the
-    //    daemon actually answers.
-    for (key, expected) in ARMED_HOOKS {
-        match rbac.get(Value::from(*key)).and_then(Value::as_str) {
-            Some(id) if id == *expected => {}
-            Some(id) => problems.push(format!(
-                "`rbac.{key}` names `{id}`, but this daemon serves `{expected}`; the engine would \
-                 call a function nothing answers and refuse every bus connection"
-            )),
-            None => problems.push(format!(
-                "`rbac.{key}` is missing; `{expected}` would never be called and that surface stays \
-                 ungated"
-            )),
-        }
-    }
-
-    // 3. `expose_functions` is what keeps ordinary calls working once `rbac:`
-    //    exists: with the key absent the engine denies every non-infrastructure
-    //    id to every session, armed or not.
-    if !rbac.contains_key(Value::from("expose_functions")) {
+    // 4. The bridge is how the engine reaches this daemon at all.
+    let bridges = worker_entries(workers, BRIDGE);
+    if bridges.is_empty() {
         problems.push(
-            "`rbac.expose_functions` is missing; with an `rbac:` block present the engine denies \
-             every function that is not in a session's exact allow list"
+            "no `iii-bridge` worker entry: the hooks are named but nothing forwards them to this \
+             daemon, so every bus connection is refused"
                 .to_string(),
         );
     }
 
-    // 4. The bridge is how the engine reaches this daemon at all.
-    match worker_config(workers, "iii-bridge") {
-        None => problems.push(
-            "no `iii-bridge` worker entry: the hooks are named but nothing forwards them to this \
-             daemon, so every bus connection is refused"
-                .to_string(),
-        ),
-        Some(bridge) => {
-            let url = bridge
-                .get("url")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if url.is_empty() {
-                problems.push("`iii-bridge.url` is missing".to_string());
-            } else if targets_the_engine_bus(url, engine_bus_port(workers)) {
-                problems.push(format!(
-                    "`iii-bridge.url` is `{url}`, which is the engine's OWN bus (port {}): the \
-                     gate would depend on the listener it gates, and the stack deadlocks",
-                    engine_bus_port(workers)
-                ));
+    let mut forwarded: BTreeSet<(&str, &str)> = BTreeSet::new();
+    for (name, bridge) in &bridges {
+        let at = if bridges.len() > 1 {
+            format!("`{name}` ")
+        } else {
+            String::new()
+        };
+        let url = bridge
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if url.is_empty() {
+            problems.push(format!("{at}`iii-bridge.url` is missing"));
+        } else {
+            for (manager, _, port) in &armed {
+                if targets_the_engine_bus(url, *port) {
+                    problems.push(format!(
+                        "{at}`iii-bridge.url` is `{url}`, which is the OWN bus of `{manager}` (port \
+                         {port}): the gate would depend on the listener it gates, and the stack \
+                         deadlocks"
+                    ));
+                }
             }
-            let forwarded: BTreeSet<(&str, &str)> = bridge
+        }
+        forwarded.extend(
+            bridge
                 .get("forward")
                 .and_then(Value::as_sequence)
                 .map(Vec::as_slice)
@@ -198,15 +236,16 @@ pub fn inspect(yaml: &str) -> GateStatus {
                         entry.get("local_function")?.as_str()?,
                         entry.get("remote_function")?.as_str()?,
                     ))
-                })
-                .collect();
-            for (key, expected) in ARMED_HOOKS {
-                if !forwarded.contains(&(expected, expected)) {
-                    problems.push(format!(
-                        "`iii-bridge.forward` has no `{expected}` -> `{expected}` entry, so the \
-                         `rbac.{key}` hook resolves to nothing"
-                    ));
-                }
+                }),
+        );
+    }
+    if !bridges.is_empty() {
+        for (key, expected) in ARMED_HOOKS {
+            if !forwarded.contains(&(expected, expected)) {
+                problems.push(format!(
+                    "no `iii-bridge` forwards `{expected}` -> `{expected}`, so the `rbac.{key}` hook \
+                     resolves to nothing"
+                ));
             }
         }
     }
@@ -218,14 +257,55 @@ pub fn inspect(yaml: &str) -> GateStatus {
     }
 }
 
-/// The port `iii-worker-manager` binds, from the config, or the engine's default.
+/// Base names of the two entries this check reads.
 ///
-/// Read rather than assumed: the previous version of this check substring-matched
-/// the literal `49134`, so it went blind on any stack that moved the port — and
-/// loose in the other direction, since `ws://10.0.49134.1:3000` contains it too.
-fn engine_bus_port(workers: &[Value]) -> u16 {
-    worker_config(workers, "iii-worker-manager")
-        .and_then(|config| config.get("port"))
+/// The engine allows several instances of one worker: `WorkerEntry::worker_type`
+/// strips a `#instance` suffix (`engine/src/workers/config.rs:457-461`), and
+/// upstream's own docs teach `iii-worker-manager#rbac`. A checker that matched
+/// only the bare name found nothing on such a config and stayed silently inert —
+/// which is why matching is by base name here, and why every armed entry is
+/// validated rather than the first one.
+const WORKER_MANAGER: &str = "iii-worker-manager";
+const BRIDGE: &str = "iii-bridge";
+
+/// Every `(display name, config mapping)` whose worker type is `base`.
+///
+/// The display name mirrors `assign_instance_ids` in the engine
+/// (`engine/src/workers/config.rs`): duplicate names keep the first occurrence
+/// as written and get `#1`, `#2` … appended after that, so a problem message
+/// names the entry the engine will name in its own logs.
+fn worker_entries<'a>(workers: &'a [Value], base: &str) -> Vec<(String, &'a Value)> {
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut found = Vec::new();
+    for entry in workers {
+        let Some(name) = entry.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let count = seen.entry(name).or_insert(0);
+        let display = if *count > 0 {
+            format!("{name}#{count}")
+        } else {
+            name.to_string()
+        };
+        *count += 1;
+        let worker_type = name.split('#').next().unwrap_or(name);
+        if worker_type == base
+            && let Some(config) = entry.get("config")
+        {
+            found.push((display, config));
+        }
+    }
+    found
+}
+
+/// The port one `iii-worker-manager` entry binds, or the engine's default.
+///
+/// Read rather than assumed: an earlier version substring-matched the literal
+/// `49134`, so it went blind on any stack that moved the port — and loose in the
+/// other direction, since `ws://10.0.49134.1:3000` contains it too.
+fn entry_port(config: &Value) -> u16 {
+    config
+        .get("port")
         .and_then(|port| port.as_u64().or_else(|| port.as_str()?.parse::<u64>().ok()))
         .and_then(|port| u16::try_from(port).ok())
         .unwrap_or(DEFAULT_ENGINE_BUS_PORT)
@@ -241,7 +321,71 @@ fn targets_the_engine_bus(url: &str, engine_port: u16) -> bool {
     let Some((host, port)) = split_ws_authority(url) else {
         return false;
     };
-    port == Some(engine_port) && LOOPBACK_HOSTS.contains(&host)
+    port == Some(engine_port) && host_means_this_machine(host)
+}
+
+/// True when `host` resolves to this machine for the purpose of the deadlock
+/// check: `localhost` in any case, any loopback or unspecified IP, and the
+/// `inet_aton` spellings glibc still accepts.
+///
+/// A table of literal strings missed `LOCALHOST`, `127.0.0.2`,
+/// `127.000.000.001` and `0x7f000001` — all of which the bridge's own resolver
+/// would happily connect to. This is an operator footgun, not an attacker path,
+/// but a check that only recognises the spelling in our own docs is not a check.
+fn host_means_this_machine(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        return address.is_loopback() || address.is_unspecified();
+    }
+    // `127.1`, `127.000.000.001`, `0x7f000001`, `2130706433`: Rust's parser
+    // rejects them, getaddrinfo does not.
+    inet_aton(host).is_some_and(|address| address.is_loopback() || address.is_unspecified())
+}
+
+/// The historical `inet_aton` forms: 1-4 parts, each decimal, octal (`0…`) or
+/// hex (`0x…`), with the last part filling the remaining bytes.
+fn inet_aton(host: &str) -> Option<std::net::Ipv4Addr> {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let mut value: u32 = 0;
+    for (index, part) in parts.iter().enumerate() {
+        let number = parse_inet_part(part)?;
+        if index + 1 == parts.len() {
+            // The last part fills every byte the earlier parts did not.
+            let remaining = 4 - index;
+            let limit = if remaining >= 4 {
+                u32::MAX as u64
+            } else {
+                (1u64 << (8 * remaining)) - 1
+            };
+            if number > limit {
+                return None;
+            }
+            value |= number as u32;
+        } else {
+            if number > u8::MAX as u64 {
+                return None;
+            }
+            value |= (number as u32) << (8 * (3 - index));
+        }
+    }
+    Some(std::net::Ipv4Addr::from(value))
+}
+
+fn parse_inet_part(part: &str) -> Option<u64> {
+    let lower = part.to_ascii_lowercase();
+    if let Some(hex) = lower.strip_prefix("0x") {
+        return (!hex.is_empty()).then(|| u64::from_str_radix(hex, 16).ok())?;
+    }
+    if lower.len() > 1 && lower.starts_with('0') {
+        return u64::from_str_radix(&lower[1..], 8).ok();
+    }
+    lower.parse::<u64>().ok()
 }
 
 /// `(host, port)` of a `ws://`/`wss://` url, without pulling in a URL parser.
@@ -267,14 +411,6 @@ fn split_ws_authority(url: &str) -> Option<(&str, Option<u16>)> {
         Some((host, port)) => Some((host, port.parse().ok())),
         None => Some((authority, None)),
     }
-}
-
-/// The `config:` mapping of the named worker entry.
-fn worker_config<'a>(workers: &'a [Value], name: &str) -> Option<&'a Value> {
-    workers
-        .iter()
-        .find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
-        .and_then(|entry| entry.get("config"))
 }
 
 #[cfg(test)]
@@ -372,7 +508,7 @@ mod tests {
         assert!(
             problems(&no_forward)
                 .iter()
-                .any(|problem| problem.contains("has no `agentos::bus_on_trigger_type`")),
+                .any(|problem| problem.contains("forwards `agentos::bus_on_trigger_type`")),
             "the forward list and the rbac block have to agree"
         );
 
@@ -380,7 +516,7 @@ mod tests {
         assert!(
             problems(&self_gating)
                 .iter()
-                .any(|problem| problem.contains("the engine's OWN bus")),
+                .any(|problem| problem.contains("OWN bus of `iii-worker-manager`")),
             "a bridge pointed at the gated listener is a deadlock"
         );
 
@@ -408,9 +544,9 @@ mod tests {
             )
             .replace("ws://127.0.0.1:49129", "ws://127.0.0.1:39534");
         assert!(
-            problems(&moved).iter().any(
-                |problem| problem.contains("the engine's OWN bus") && problem.contains("39534")
-            ),
+            problems(&moved).iter().any(|problem| {
+                problem.contains("OWN bus of `iii-worker-manager`") && problem.contains("39534")
+            }),
             "a bridge aimed at a non-default bus port is the same deadlock"
         );
 
@@ -436,34 +572,37 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_bus_port_is_read_from_the_config() {
-        let workers = |yaml: &str| -> Vec<Value> {
-            serde_yaml::from_str::<Value>(yaml)
-                .expect("test yaml")
+    fn the_engine_bus_port_is_read_from_the_entry() {
+        let port_of = |yaml: &str| -> u16 {
+            let document: Value = serde_yaml::from_str(yaml).expect("test yaml");
+            let workers = document
                 .get("workers")
                 .and_then(Value::as_sequence)
                 .cloned()
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let entries = worker_entries(&workers, WORKER_MANAGER);
+            entry_port(entries.first().expect("one manager entry").1)
         };
         assert_eq!(
-            engine_bus_port(&workers(
-                "workers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n"
-            )),
+            port_of("workers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n"),
             49134,
             "an unpinned port is the engine's own default"
         );
         assert_eq!(
-            engine_bus_port(&workers(
-                "workers:\n  - name: iii-worker-manager\n    config:\n      port: 39534\n"
-            )),
+            port_of("workers:\n  - name: iii-worker-manager\n    config:\n      port: 39534\n"),
             39534
         );
         assert_eq!(
-            engine_bus_port(&workers(
-                "workers:\n  - name: iii-worker-manager\n    config:\n      port: \"39534\"\n"
-            )),
+            port_of("workers:\n  - name: iii-worker-manager\n    config:\n      port: \"39534\"\n"),
             39534,
             "yaml may quote it"
+        );
+        assert_eq!(
+            port_of(
+                "workers:\n  - name: iii-worker-manager#rbac\n    config:\n      port: 39534\n"
+            ),
+            39534,
+            "an instance suffix is still an iii-worker-manager"
         );
     }
 
@@ -491,11 +630,135 @@ mod tests {
             !targets_the_engine_bus("ws://gateway.example:49134", 49134),
             "a remote host on the same port number is not this engine's socket"
         );
+
+        // P2: the host table used to be literal strings, so these were missed.
+        for spelling in [
+            "ws://LOCALHOST:49134",
+            "ws://127.0.0.2:49134",
+            "ws://127.000.000.001:49134",
+            "ws://0x7f000001:49134",
+            "ws://2130706433:49134",
+            "ws://127.1:49134",
+            "ws://[::1]:49134",
+            "ws://[0:0:0:0:0:0:0:1]:49134",
+        ] {
+            assert!(
+                targets_the_engine_bus(spelling, 49134),
+                "{spelling} is this machine, whatever the spelling"
+            );
+        }
+        for elsewhere in [
+            "ws://126.0.0.1:49134",
+            "ws://0x08080808:49134",
+            "ws://example.com:49134",
+            "ws://127.0.0.1.example.com:49134",
+        ] {
+            assert!(
+                !targets_the_engine_bus(elsewhere, 49134),
+                "{elsewhere} is not this machine"
+            );
+        }
         assert!(
             !targets_the_engine_bus("http://127.0.0.1:49134", 49134),
             "not a websocket url at all"
         );
     }
+    /// P1-a: `.find` validated only the FIRST manager, so an armed second entry
+    /// was reported as "not armed" — an affirmative claim that is false.
+    #[test]
+    fn every_worker_manager_entry_is_validated_not_just_the_first() {
+        let two = format!(
+            "workers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n{}",
+            armed_entry_yaml("iii-worker-manager", "auth_function_idd")
+        );
+        let reported = problems(&two);
+        assert!(
+            reported
+                .iter()
+                .any(|problem| problem.contains("rbac.auth_function_idd")),
+            "the armed SECOND manager must be checked: {reported:?}"
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|problem| problem.starts_with("`iii-worker-manager#1` ")),
+            "the engine renames a duplicate entry to `#1`, and so must the message: {reported:?}"
+        );
+    }
+
+    /// Upstream's documented multi-instance form. Matching the bare name only
+    /// made the whole check silently inert on a config shaped this way.
+    #[test]
+    fn an_instance_suffixed_manager_is_still_a_manager() {
+        let suffixed = format!(
+            "workers:\n  - name: state\n    config: {{}}\n{}",
+            armed_entry_yaml("iii-worker-manager#rbac", "auth_function_idd")
+        );
+        assert!(
+            problems(&suffixed)
+                .iter()
+                .any(|problem| problem.contains("rbac.auth_function_idd")),
+            "`iii-worker-manager#rbac` is an iii-worker-manager"
+        );
+
+        // And a correctly armed suffixed manager still reads as armed.
+        let good = format!(
+            "workers:\n{}{}",
+            armed_entry_yaml("iii-worker-manager#rbac", "auth_function_id"),
+            bridge_entry_yaml("ws://127.0.0.1:49129")
+        );
+        assert_eq!(inspect(&good), GateStatus::Armed);
+    }
+
+    /// A second manager on its own port is its own deadlock surface.
+    #[test]
+    fn the_self_gating_check_covers_every_armed_manager() {
+        let two = format!(
+            "workers:\n  - name: iii-worker-manager\n    config:\n      port: 49134\n{}{}",
+            armed_entry_yaml_with_port("iii-worker-manager#rbac", "auth_function_id", 39534),
+            bridge_entry_yaml("ws://127.0.0.1:39534")
+        );
+        assert!(
+            problems(&two).iter().any(|problem| {
+                problem.contains("OWN bus of `iii-worker-manager#rbac`")
+                    && problem.contains("39534")
+            }),
+            "the bridge points at the second manager's own listener"
+        );
+    }
+
+    /// A fully armed entry, with one hook key spelled as the caller asks.
+    fn armed_entry_yaml(name: &str, auth_key: &str) -> String {
+        armed_entry_yaml_with_port(name, auth_key, 49134)
+    }
+
+    fn armed_entry_yaml_with_port(name: &str, auth_key: &str, port: u16) -> String {
+        let mut entry = format!(
+            "  - name: {name}\n    config:\n      host: 127.0.0.1\n      port: {port}\n      rbac:\n"
+        );
+        for (key, id) in ARMED_HOOKS {
+            let key = if *key == "auth_function_id" {
+                auth_key
+            } else {
+                key
+            };
+            entry.push_str(&format!("        {key}: {id}\n"));
+        }
+        entry.push_str("        expose_functions:\n          - match(\"*\")\n");
+        entry
+    }
+
+    fn bridge_entry_yaml(url: &str) -> String {
+        let mut entry =
+            format!("  - name: iii-bridge\n    config:\n      url: {url}\n      forward:\n");
+        for (_, id) in ARMED_HOOKS {
+            entry.push_str(&format!(
+                "        - local_function: {id}\n          remote_function: {id}\n"
+            ));
+        }
+        entry
+    }
+
     #[test]
     fn a_missing_expose_functions_is_reported() {
         let narrowed =
