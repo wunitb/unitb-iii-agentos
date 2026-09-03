@@ -437,7 +437,8 @@ async fn vault_set(state: SharedState, iii: &Bus, input: Value) -> Result<Value,
     }
 
     st.touch();
-    drop(st);
+    // `st` is held across the state calls so no credential read or write
+    // interleaves with a rotation (see `vault_rotate`).
 
     let (iv, ciphertext, tag) = encrypt(&crypto_key, &value)?;
     let now = now_ms();
@@ -493,7 +494,8 @@ async fn vault_get(state: SharedState, iii: &Bus, input: Value) -> Result<Value,
         .clone()
         .ok_or_else(|| Error::Handler("Vault is locked. Call vault::init first.".into()))?;
     st.touch();
-    drop(st);
+    // `st` is held across the state calls so no credential read or write
+    // interleaves with a rotation (see `vault_rotate`).
 
     let entry = state_get(iii, "vault", &key)
         .await
@@ -538,7 +540,8 @@ async fn vault_list(state: SharedState, iii: &Bus, input: Value) -> Result<Value
         ));
     }
     st.touch();
-    drop(st);
+    // `st` is held across the state calls so no credential read or write
+    // interleaves with a rotation (see `vault_rotate`).
 
     let keys: Vec<Value> = stored_credentials(state_list(iii, "vault").await)
         .into_iter()
@@ -575,7 +578,8 @@ async fn vault_delete(state: SharedState, iii: &Bus, input: Value) -> Result<Val
         ));
     }
     st.touch();
-    drop(st);
+    // `st` is held across the state calls so no credential read or write
+    // interleaves with a rotation (see `vault_rotate`).
 
     if key == "__meta" {
         return Err(Error::Handler("Cannot delete vault metadata".into()));
@@ -594,6 +598,44 @@ async fn vault_delete(state: SharedState, iii: &Bus, input: Value) -> Result<Val
     }))
 }
 
+/// Put the re-keyed credentials (and `__meta`, defensively: it is written last,
+/// so a failure there may or may not have applied) back from `vault_backup`
+/// after a failed rotation. Answers the entries that could NOT be restored,
+/// with the error for each; an empty list means the store is what it was.
+async fn roll_back_rotation(iii: &Bus, written: &[String]) -> Vec<(String, String)> {
+    let mut unrestored = Vec::new();
+    let keys = written
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once("__meta"));
+    for key in keys {
+        let outcome = match state_get(iii, "vault_backup", key).await {
+            Some(backup) => state_set(iii, "vault", key, backup).await,
+            None => Err(Error::Handler("no backup copy".into())),
+        };
+        if let Err(error) = outcome {
+            tracing::error!(%key, %error, "vault rotation rollback failed for an entry");
+            unrestored.push((key.to_string(), error.to_string()));
+        }
+    }
+    unrestored
+}
+
+/// Re-key every credential under a new password.
+///
+/// The vault mutex is held from the first read to the in-memory key switch.
+/// Rotation is N sequential `state::set` calls, and the engine offers no
+/// transaction across them; a `vault::set` that ran in between would encrypt
+/// with the OLD key and be orphaned under the new `__meta` (unreadable after
+/// the switch). Every credential operation takes the same lock, so holding it
+/// here serialises them behind the rotation instead. The cost is scrypt and
+/// the state writes under the lock, which the vault's one-tenant design can
+/// afford.
+///
+/// A failed write rolls the store back from `vault_backup`; a rollback that
+/// itself fails is REPORTED in the error and the audit entry (with the keys
+/// still to restore), never swallowed — the operator's recovery is
+/// `vault::restore {password: <current>}`, which reads the same backup.
 async fn vault_rotate(state: SharedState, iii: &Bus, input: Value) -> Result<Value, Error> {
     require_auth(&input)?;
     let body = body_or_self(&input);
@@ -621,7 +663,7 @@ async fn vault_rotate(state: SharedState, iii: &Bus, input: Value) -> Result<Val
             MIN_PASSWORD_LEN
         )));
     }
-    drop(st);
+    // `st` stays locked until the key switch below (see the doc comment).
 
     let meta = state_get(iii, "vault", "__meta")
         .await
@@ -665,43 +707,54 @@ async fn vault_rotate(state: SharedState, iii: &Bus, input: Value) -> Result<Val
         updates.push((k, new_value));
     }
 
-    let rotation_result: Result<(), Error> = async {
-        for (k, v) in &updates {
-            state_set(iii, "vault", k, v.clone()).await?;
+    // Written in order; on a failure only the entries actually written (plus
+    // `__meta`, defensively) are rolled back, so the report names what changed.
+    let mut written: Vec<String> = Vec::with_capacity(updates.len());
+    let mut rotation_result: Result<(), Error> = Ok(());
+    for (k, v) in &updates {
+        if let Err(error) = state_set(iii, "vault", k, v.clone()).await {
+            rotation_result = Err(error);
+            break;
         }
+        written.push(k.clone());
+    }
+    if rotation_result.is_ok() {
         let new_meta = json!({
             "salt": B64.encode(&new_salt),
             "createdAt": meta.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(now_ms()),
             "rotatedAt": now_ms(),
         });
-        state_set(iii, "vault", "__meta", new_meta).await?;
-        Ok(())
+        rotation_result = state_set(iii, "vault", "__meta", new_meta).await;
     }
-    .await;
 
     if let Err(err) = rotation_result {
-        for (k, _) in &credentials {
-            if let Some(backup) = state_get(iii, "vault_backup", k).await
-                && let Err(error) = state_set(iii, "vault", k, backup).await
-            {
-                tracing::error!(key = %k, %error, "vault rotation rollback failed for a credential");
-            }
-        }
-        if let Some(backup_meta) = state_get(iii, "vault_backup", "__meta").await {
-            let _ = state_set(iii, "vault", "__meta", backup_meta).await;
-        }
+        let unrestored = roll_back_rotation(iii, &written).await;
+        let rolled_back = unrestored.is_empty();
         audit_void(
             iii,
             "vault_rotation_failed",
-            json!({ "error": err.to_string(), "rolledBack": true }),
+            json!({
+                "error": err.to_string(),
+                "rolledBack": rolled_back,
+                "unrestored": unrestored.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+            }),
         );
+        if rolled_back {
+            return Err(Error::Handler(format!(
+                "Vault rotation failed, rolled back: {err}"
+            )));
+        }
+        let detail = unrestored
+            .iter()
+            .map(|(key, error)| format!("{key} ({error})"))
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(Error::Handler(format!(
-            "Vault rotation failed, rolled back: {}",
-            err
+            "Vault rotation failed: {err}; rollback incomplete, still to restore from vault_backup: \
+             {detail}. Run vault::restore with the current password."
         )));
     }
 
-    let mut st = state.lock().await;
     st.crypto_key = Some(new_key);
     st.salt_b64 = Some(B64.encode(&new_salt));
     st.touch();
@@ -729,7 +782,8 @@ async fn vault_backup(state: SharedState, iii: &Bus, input: Value) -> Result<Val
         ));
     }
     st.touch();
-    drop(st);
+    // `st` is held across the state calls so no credential read or write
+    // interleaves with a rotation (see `vault_rotate`).
 
     let meta = state_get(iii, "vault", "__meta")
         .await
@@ -762,6 +816,10 @@ async fn vault_restore(state: SharedState, iii: &Bus, input: Value) -> Result<Va
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    // Held across the whole restore: it must not interleave with a rotation
+    // or a credential write (see `vault_rotate`).
+    let mut st = state.lock().await;
+
     let backup_meta = state_get(iii, "vault_backup", "__meta")
         .await
         .ok_or_else(|| Error::Handler("No vault backup found".into()))?;
@@ -789,7 +847,6 @@ async fn vault_restore(state: SharedState, iii: &Bus, input: Value) -> Result<Va
             .map_err(|e| Error::Handler(format!("salt decode: {e}")))?;
         let key = derive_key(&pw, &salt)?;
 
-        let mut st = state.lock().await;
         st.crypto_key = Some(key);
         st.salt_b64 = Some(salt_b64.to_string());
         if st.auto_lock_ms == 0 {
@@ -1721,6 +1778,332 @@ mod tests {
                     .await
                     .expect("restore");
                 assert_eq!(restored["restored"], 2);
+            })
+        });
+    }
+
+    // --- F5: rotation is atomic against the store and against other writers ---
+
+    /// A `state::set` failure injected by scope, key and occurrence: the Nth
+    /// write of that key after installation (counting from 1) fails.
+    fn failing_state_set(bus: &FakeBus, store: &Arc<StateStore>, failures: &[(&str, &str, usize)]) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let failures: Vec<(String, String, usize)> = failures
+            .iter()
+            .map(|(scope, key, nth)| (scope.to_string(), key.to_string(), *nth))
+            .collect();
+        let counts: Arc<Mutex<BTreeMap<(String, String), usize>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let armed = Arc::new(AtomicUsize::new(1));
+        let state = Arc::clone(store);
+        bus.on("state::set", move |input| {
+            let scope = StateStore::field(&input, "scope");
+            let key = StateStore::field(&input, "key");
+            let nth = {
+                let mut counts = counts.lock().unwrap_or_else(|error| error.into_inner());
+                let count = counts.entry((scope.clone(), key.clone())).or_insert(0);
+                *count += 1;
+                *count
+            };
+            if armed.load(Ordering::SeqCst) == 1
+                && failures
+                    .iter()
+                    .any(|(s, k, n)| *s == scope && *k == key && *n == nth)
+            {
+                return Err(Error::Handler(format!(
+                    "injected: state store refused write #{nth} of {scope}/{key}"
+                )));
+            }
+            state
+                .lock()
+                .entry(scope)
+                .or_default()
+                .insert(key, input["value"].clone());
+            Ok(json!({ "stored": true }))
+        });
+    }
+
+    async fn settle_spawned_audits() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn rotate_input(current: &str, new: &str) -> Value {
+        as_operator(
+            "op-key",
+            json!({ "currentPassword": current, "newPassword": new }),
+        )
+    }
+
+    async fn unlocked_with(state: &SharedState, iii: &Bus, entries: &[(&str, &str)]) {
+        vault_init(
+            state.clone(),
+            iii,
+            as_operator("op-key", json!({ "password": "correct horse battery" })),
+        )
+        .await
+        .expect("init");
+        for (key, value) in entries {
+            vault_set(
+                state.clone(),
+                iii,
+                as_operator("op-key", json!({ "key": key, "value": value })),
+            )
+            .await
+            .expect("set");
+        }
+    }
+
+    async fn read(state: &SharedState, iii: &Bus, key: &str) -> Result<Value, Error> {
+        vault_get(
+            state.clone(),
+            iii,
+            as_operator("op-key", json!({ "key": key })),
+        )
+        .await
+    }
+
+    #[test]
+    fn a_rotation_that_fails_mid_loop_rolls_back_and_the_store_stays_readable() {
+        with_api_key(Some("op-key"), || {
+            block_on(async {
+                let (bus, store) = state_bus();
+                let iii = as_bus(&bus);
+                let state = fresh_state();
+                unlocked_with(&state, &iii, &[("ONE", "first"), ("TWO", "second")]).await;
+                let before = store.lock().get("vault").cloned().expect("vault scope");
+                let old_salt = before["__meta"]["salt"].clone();
+
+                // ONE's re-key write succeeds; TWO's fails.
+                failing_state_set(&bus, &store, &[("vault", "TWO", 1)]);
+
+                let error = vault_rotate(
+                    state.clone(),
+                    &iii,
+                    rotate_input("correct horse battery", "another long password"),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains("rolled back"), "{error}");
+                assert!(error.contains("injected"), "the cause is reported: {error}");
+
+                // Every entry is byte-for-byte what it was, under the old salt.
+                let after = store.lock().get("vault").cloned().expect("vault scope");
+                assert_eq!(
+                    after["ONE"], before["ONE"],
+                    "ONE was re-keyed and must be restored"
+                );
+                assert_eq!(after["TWO"], before["TWO"]);
+                assert_eq!(after["__meta"]["salt"], old_salt);
+
+                // And readable with the key still in memory: nothing switched.
+                assert_eq!(
+                    read(&state, &iii, "ONE").await.expect("ONE")["value"],
+                    "first"
+                );
+                assert_eq!(
+                    read(&state, &iii, "TWO").await.expect("TWO")["value"],
+                    "second"
+                );
+
+                settle_spawned_audits().await;
+                let audit = bus
+                    .calls_to("security::audit")
+                    .into_iter()
+                    .map(|call| call.payload)
+                    .find(|payload| payload["type"] == "vault_rotation_failed")
+                    .expect("the failure is audited");
+                assert_eq!(audit["detail"]["rolledBack"], true);
+                assert_eq!(audit["detail"]["unrestored"], json!([]));
+
+                // A retry with the same passwords now succeeds: the store was
+                // left consistent, not half-rotated.
+                let rotated = vault_rotate(
+                    state.clone(),
+                    &iii,
+                    rotate_input("correct horse battery", "another long password"),
+                )
+                .await
+                .expect("retry");
+                assert_eq!(rotated["rotated"], 2);
+                assert_eq!(
+                    read(&state, &iii, "TWO").await.expect("TWO")["value"],
+                    "second"
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn a_rollback_that_fails_is_reported_not_swallowed() {
+        with_api_key(Some("op-key"), || {
+            block_on(async {
+                let (bus, store) = state_bus();
+                let iii = as_bus(&bus);
+                let state = fresh_state();
+                unlocked_with(&state, &iii, &[("ONE", "first"), ("TWO", "second")]).await;
+
+                // TWO's re-key write fails, and then the rollback of ONE (its
+                // second write since the fault was installed: re-key, restore)
+                // fails as well.
+                failing_state_set(&bus, &store, &[("vault", "TWO", 1), ("vault", "ONE", 2)]);
+
+                let error = vault_rotate(
+                    state.clone(),
+                    &iii,
+                    rotate_input("correct horse battery", "another long password"),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    !error.contains("rolled back:"),
+                    "a rollback that failed must not be reported as done: {error}"
+                );
+                assert!(error.contains("rollback incomplete"), "{error}");
+                assert!(
+                    error.contains("ONE"),
+                    "the unrestored key is named: {error}"
+                );
+                assert!(
+                    error.contains("vault::restore"),
+                    "the recovery is named: {error}"
+                );
+
+                settle_spawned_audits().await;
+                let audit = bus
+                    .calls_to("security::audit")
+                    .into_iter()
+                    .map(|call| call.payload)
+                    .find(|payload| payload["type"] == "vault_rotation_failed")
+                    .expect("the failure is audited");
+                assert_eq!(audit["detail"]["rolledBack"], false);
+                assert_eq!(audit["detail"]["unrestored"], json!(["ONE"]));
+
+                // The in-memory key did not switch, so TWO (never re-keyed) still
+                // reads, and the backup holds ONE for `vault::restore`.
+                assert_eq!(
+                    read(&state, &iii, "TWO").await.expect("TWO")["value"],
+                    "second"
+                );
+                let restored = vault_restore(
+                    state.clone(),
+                    &iii,
+                    as_operator("op-key", json!({ "password": "correct horse battery" })),
+                )
+                .await
+                .expect("restore from the backup the rotation wrote first");
+                assert_eq!(restored["restored"], 2);
+                assert_eq!(
+                    read(&state, &iii, "ONE").await.expect("ONE")["value"],
+                    "first"
+                );
+            })
+        });
+    }
+
+    /// A bus that parks the first credential write of a rotation until the
+    /// test releases it, so another handler can be driven in the gap.
+    struct GatedBus {
+        inner: Arc<FakeBus>,
+        armed: std::sync::atomic::AtomicBool,
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl TriggerBus for GatedBus {
+        fn trigger(&self, request: TriggerRequest) -> agentos_http_adapter::bus::BusFuture<'_> {
+            Box::pin(async move {
+                let is_credential_write = request.function_id == "state::set"
+                    && request.payload["scope"] == "vault"
+                    && request.payload["key"] != "__meta";
+                if is_credential_write
+                    && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.reached.notify_one();
+                    self.release.notified().await;
+                }
+                self.inner.trigger(request).await
+            })
+        }
+    }
+
+    #[test]
+    fn no_credential_write_interleaves_with_a_rotation() {
+        with_api_key(Some("op-key"), || {
+            block_on(async {
+                let (fake, _store) = state_bus();
+                let gated = Arc::new(GatedBus {
+                    inner: Arc::clone(&fake),
+                    armed: std::sync::atomic::AtomicBool::new(false),
+                    reached: tokio::sync::Notify::new(),
+                    release: tokio::sync::Notify::new(),
+                });
+                let iii: Bus = Arc::clone(&gated) as Bus;
+                let state = fresh_state();
+                unlocked_with(&state, &iii, &[("ONE", "first")]).await;
+
+                // Park the rotation at its first re-key write, after it has
+                // listed the credentials and before it switches the key.
+                gated.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+                let rotation = tokio::spawn({
+                    let state = state.clone();
+                    let iii = Arc::clone(&iii);
+                    async move {
+                        vault_rotate(
+                            state,
+                            &iii,
+                            rotate_input("correct horse battery", "another long password"),
+                        )
+                        .await
+                    }
+                });
+                gated.reached.notified().await;
+
+                // A credential write arriving now must wait for the rotation to
+                // finish; if it ran, it would encrypt with the OLD key and be
+                // orphaned the moment `__meta` switches.
+                let write = tokio::spawn({
+                    let state = state.clone();
+                    let iii = Arc::clone(&iii);
+                    async move {
+                        vault_set(
+                            state,
+                            &iii,
+                            as_operator("op-key", json!({ "key": "THREE", "value": "third" })),
+                        )
+                        .await
+                    }
+                });
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    fake.calls_to("state::set")
+                        .iter()
+                        .all(|call| call.payload["key"] != "THREE"),
+                    "a credential write ran in the middle of a rotation"
+                );
+
+                gated.release.notify_one();
+                let rotated = rotation.await.expect("join").expect("rotate");
+                assert_eq!(rotated["rotated"], 1);
+                write
+                    .await
+                    .expect("join")
+                    .expect("the parked write completes after the rotation");
+
+                // Written after the switch, so under the key now in memory.
+                assert_eq!(
+                    read(&state, &iii, "THREE").await.expect("THREE")["value"],
+                    "third"
+                );
+                assert_eq!(
+                    read(&state, &iii, "ONE").await.expect("ONE")["value"],
+                    "first"
+                );
             })
         });
     }
