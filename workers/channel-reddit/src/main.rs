@@ -142,6 +142,13 @@ async fn send_message(
     Ok(())
 }
 
+/// Reddit has no webhooks or push delivery of any kind; the API is poll-only
+/// (`/message/unread`, `/r/<sub>/comments`, `/r/<sub>/new`, the `stream`
+/// helpers in client libraries are polling loops). A `POST /webhook/reddit`
+/// route therefore had nothing it could verify — anything that reached it
+/// was, by construction, not Reddit — so no HTTP route is registered.
+/// `channel::reddit::webhook` stays on the bus for a poller that hands
+/// comments in over the authenticated bus.
 async fn webhook_handler(
     iii: &IIIClient,
     client: &reqwest::Client,
@@ -246,15 +253,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let token_cache = token_clone.clone();
             async move { webhook_handler(&iii, &client, &token_cache, input).await }
         })
-        .description("Handle Reddit webhook"),
+        .description("Handle a Reddit comment (bus-only: Reddit has no webhooks; poll the API)"),
     );
-
-    agentos_http_adapter::register_http_trigger(
-        &iii,
-        "channel::reddit::webhook".to_string(),
-        json!({ "http_method": "POST", "api_path": "webhook/reddit" }),
-        None,
-    )?;
 
     tracing::info!("channel-reddit worker started");
     tokio::signal::ctrl_c().await?;
@@ -265,6 +265,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    /// Guard: this worker registers NO HTTP route. See the module note above
+    /// the handler: the provider has no inbound webhook, so a route here can
+    /// never verify its caller. Bringing one back requires a verifier first.
+    #[test]
+    fn registers_no_inbound_http_route() {
+        let source = include_str!("main.rs");
+        let call = concat!("register_http_", "trigger(");
+        assert!(
+            !source.contains(call),
+            "an HTTP route without a provider verifier was reintroduced"
+        );
+        assert!(!source.contains(concat!("agentos_http_", "adapter")));
+    }
 
     fn pick_session_anchor(link_id: &str, name: &str) -> String {
         if !link_id.is_empty() {

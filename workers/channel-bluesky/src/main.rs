@@ -188,6 +188,13 @@ async fn send_message(
     Ok(())
 }
 
+/// Bluesky has no webhooks. Inbound is the relay firehose / Jetstream
+/// WebSocket (`com.atproto.sync.subscribeRepos`) or polling
+/// `app.bsky.notification.listNotifications`. A `POST /webhook/bluesky`
+/// route therefore had nothing it could verify — anything that reached it
+/// was, by construction, not Bluesky — so no HTTP route is registered.
+/// `channel::bluesky::webhook` stays on the bus for a firehose consumer or
+/// poller that hands posts in over the authenticated bus.
 async fn webhook_handler(
     iii: &IIIClient,
     client: &reqwest::Client,
@@ -282,15 +289,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let session_lock = session_clone.clone();
             async move { webhook_handler(&iii, &client, &session_lock, input).await }
         })
-        .description("Handle Bluesky AT Protocol webhook"),
+        .description("Handle a Bluesky post (bus-only: Bluesky has no webhooks; consume Jetstream or poll notifications)"),
     );
-
-    agentos_http_adapter::register_http_trigger(
-        &iii,
-        "channel::bluesky::webhook".to_string(),
-        json!({ "http_method": "POST", "api_path": "webhook/bluesky" }),
-        None,
-    )?;
 
     // Eager-authenticate at startup so the session DID is known before the
     // first webhook arrives. Without this, self-reply suppression
@@ -318,6 +318,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guard: this worker registers NO HTTP route. See the module note above
+    /// the handler: the provider has no inbound webhook, so a route here can
+    /// never verify its caller. Bringing one back requires a verifier first.
+    #[test]
+    fn registers_no_inbound_http_route() {
+        let source = include_str!("main.rs");
+        let call = concat!("register_http_", "trigger(");
+        assert!(
+            !source.contains(call),
+            "an HTTP route without a provider verifier was reintroduced"
+        );
+        assert!(!source.contains(concat!("agentos_http_", "adapter")));
+    }
 
     #[test]
     fn split_short_returns_single() {
