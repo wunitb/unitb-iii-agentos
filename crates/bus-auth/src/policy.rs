@@ -361,12 +361,18 @@ pub const UNTRUSTED_REGISTRATION_PREFIXES: &[&str] = &[
 /// `queue`, which the engine's own unauthenticatable registry workers register
 /// — the identical residual risk as the function-id policy, and stated in the
 /// module docs.
-/// `cron` and `queue` are in the list but were NOT in the capture: the `cron`
-/// registry worker on the capture host connects without ever registering its
-/// type (which is why the engine logs `[PENDING] ... trigger type cron is not
-/// registered` for our scheduled jobs), and `queue` provides `durable:subscriber`
-/// instead. They stay listed because a healthy worker of either kind registers
-/// them, and refusing that would take down scheduling for an unverified saving.
+/// `cron` and `queue` are in the list but were NOT in the capture: the shipped
+/// `cron` registry worker connects without ever registering a `cron` trigger
+/// type, and `queue` registers `durable:subscriber` instead. Confirmed twice —
+/// on the capture stack and on an independent 14-worker boot that enumerated 26
+/// trigger types with no `cron` among them. When AgentOS's own cron worker is
+/// also running, its jobs are then parked and the engine says so
+/// (`[PENDING] Trigger ... (function cron::cleanup_stale_sessions) was NOT
+/// activated: trigger type cron is not registered`); with no scheduled jobs
+/// there is nothing to park and that line does not appear.
+///
+/// Both stay listed because a healthy worker of either kind registers them, and
+/// refusing that would take scheduling down for an unverified saving.
 pub const UNTRUSTED_TRIGGER_TYPE_IDS: &[&str] = &[
     "cron",
     "directory::agents::on-change",

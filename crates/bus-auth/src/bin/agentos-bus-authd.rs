@@ -88,16 +88,30 @@ async fn main() -> anyhow::Result<()> {
 /// operator can be told. A config that is not armed at all, or that cannot be
 /// found, is not an error: the shipped default is unarmed.
 fn check_config(explicit: Option<&str>) -> anyhow::Result<()> {
-    let Some(path) = config::discover(explicit) else {
+    let Some(source) = config::discover(explicit) else {
         tracing::info!(
             "no engine config found (pass --config=<path> or set {}); the armed-gate check was skipped",
             config::CONFIG_PATH_ENV
         );
         return Ok(());
     };
-    let Ok(document) = std::fs::read_to_string(&path) else {
-        tracing::info!(path = %path.display(), "engine config unreadable; the armed-gate check was skipped");
-        return Ok(());
+    let path = source.path().to_path_buf();
+    let document = match std::fs::read_to_string(&path) {
+        Ok(document) => document,
+        // A path someone NAMED and this daemon cannot read is a typo away from
+        // switching the whole check off, which is the defect class this check
+        // exists to catch. Only the `./config.yaml` probe may be skipped.
+        Err(error) if source.is_named() => anyhow::bail!(
+            "cannot read {} ({error}). It was named by --config= or {}, and this daemon will not \
+             gate a config it cannot check: a typo in that path would silently disable the check \
+             that catches typos.",
+            path.display(),
+            config::CONFIG_PATH_ENV
+        ),
+        Err(error) => {
+            tracing::info!(path = %path.display(), %error, "engine config unreadable; the armed-gate check was skipped");
+            return Ok(());
+        }
     };
     match config::inspect(&document) {
         GateStatus::NotArmed => {
@@ -106,6 +120,16 @@ fn check_config(explicit: Option<&str>) -> anyhow::Result<()> {
         }
         GateStatus::Armed => {
             tracing::info!(path = %path.display(), "bus RBAC is armed and names the hooks this daemon serves");
+            Ok(())
+        }
+        // The engine parses the same file and refuses to boot on it, so this is
+        // loud without being fatal here.
+        GateStatus::Unknown(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "engine config could not be parsed, so the armed-gate check could not run; the engine will refuse this file too"
+            );
             Ok(())
         }
         GateStatus::Inconsistent(problems) => anyhow::bail!(
