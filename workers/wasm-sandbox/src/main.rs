@@ -1,3 +1,5 @@
+use agentos_http_adapter::TriggerBus;
+use agentos_http_adapter::principal::{self, PrincipalError};
 use dashmap::DashMap;
 use iii_sdk::errors::Error;
 use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
@@ -204,7 +206,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The agent the sandbox's host calls act as (contract T1).
+///
+/// Before this rule the sandbox believed the request's `agentId` and presented
+/// it to `security::check_capability` — the caller chose whose capabilities it
+/// was judged against. Now the agent comes from the principal: a deputy's
+/// `principal.agentId` (agent-core overwrites the model's), or the agent the
+/// operator names. A bare payload runs the module with NO agent — pure
+/// computation still works — and every host call is then refused by the
+/// capability reader, which is the fail-closed answer. A wrong bearer or a
+/// malformed principal refuses the run outright.
+async fn sandbox_agent(iii: &dyn TriggerBus, input: &Value) -> Result<Option<String>, Error> {
+    let expected = agentos_bus_auth::policy::expected_api_key();
+    let principal = match principal::resolve(input, expected.as_deref()) {
+        Ok(principal) => principal,
+        Err(PrincipalError::Missing) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let agent = principal::acting_agent(iii, &principal, input, "").await?;
+    Ok(Some(agent).filter(|agent| !agent.is_empty()))
+}
+
+/// The payload a guest's `host_call` is dispatched with: the guest's `args`,
+/// labelled with the sandbox agent as principal for the families that resolve
+/// one. The guest cannot pick the principal; a guest that names another
+/// `agentId` is then judged by the memory worker against this one.
+fn host_call_payload(function_id: &str, args: Value, agent: Option<&str>) -> Value {
+    match agent {
+        Some(agent) => principal::attach_agent(function_id, args, agent),
+        None => args,
+    }
+}
+
 async fn execute_wasm(iii: &IIIClient, cache: &ModuleCache, input: Value) -> Result<Value, Error> {
+    let agent_id = sandbox_agent(iii, &input).await?.unwrap_or_default();
     let req: ExecuteRequest =
         serde_json::from_value(input).map_err(|e| Error::Handler(e.to_string()))?;
 
@@ -217,7 +252,18 @@ async fn execute_wasm(iii: &IIIClient, cache: &ModuleCache, input: Value) -> Res
     let fuel = req.fuel.unwrap_or(DEFAULT_FUEL);
     let timeout_secs = req.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
     let memory_pages = req.memory_pages.unwrap_or(DEFAULT_MEMORY_PAGES);
-    let agent_id = req.agent_id.clone().unwrap_or_default();
+    if req
+        .agent_id
+        .as_deref()
+        .is_some_and(|named| named != agent_id)
+    {
+        // `sandbox_agent` already refused a cross-agent name without the grant;
+        // this is the no-principal case, where the name means nothing.
+        tracing::warn!(
+            named = req.agent_id.as_deref().unwrap_or_default(),
+            "wasm::execute names an agentId without a principal; running with no agent"
+        );
+    }
 
     let iii_clone = iii.clone();
     let agent_id_clone = agent_id.clone();
@@ -312,9 +358,10 @@ async fn execute_wasm(iii: &IIIClient, cache: &ModuleCache, input: Value) -> Res
                     return json!({ "error": "capability denied" }).to_string();
                 }
 
+                let sandbox_agent = (!agent.is_empty()).then_some(agent.as_str());
                 match iii_inner.trigger(TriggerRequest {
                     function_id: func_id.to_string(),
-                    payload: args,
+                    payload: host_call_payload(&func_id, args, sandbox_agent),
                     action: None,
                     timeout_ms: None,
                 }).await {
@@ -634,6 +681,108 @@ mod tests {
         .unwrap();
         let agent_id = req.agent_id.unwrap_or_default();
         assert_eq!(agent_id, "");
+    }
+
+    // --- tenancy (contract T1): who the sandbox acts as ---
+
+    use agentos_http_adapter::fake::FakeBus;
+
+    fn reader_granting(bus: &FakeBus, agent: &str, grant: &str) {
+        let agent = agent.to_string();
+        let grant = grant.to_string();
+        bus.on("security::check_capability", move |input| {
+            if input["agentId"] == agent.as_str() && input["resource"] == grant.as_str() {
+                Ok(json!({ "allowed": true, "reason": "granted" }))
+            } else {
+                Err(Error::Handler(format!("Agent {} denied", input["agentId"])))
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn the_sandbox_acts_as_the_principal_never_as_the_named_agent() {
+        let bus = FakeBus::new();
+        reader_granting(&bus, "agent-1", "grant::act_as::agent-2");
+
+        // A deputy's principal wins over the request's agentId.
+        let own = sandbox_agent(
+            &bus,
+            &json!({ "moduleId": "m", "input": {}, "principal": { "agentId": "agent-1" } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(own.as_deref(), Some("agent-1"));
+        let same = sandbox_agent(
+            &bus,
+            &json!({ "agentId": "agent-1", "principal": { "agentId": "agent-1" } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(same.as_deref(), Some("agent-1"));
+        assert!(
+            bus.calls().is_empty(),
+            "no grant is consulted for the agent itself"
+        );
+
+        // Naming another agent needs the exact grant.
+        let granted = sandbox_agent(
+            &bus,
+            &json!({ "agentId": "agent-2", "principal": { "agentId": "agent-1" } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(granted.as_deref(), Some("agent-2"));
+        let error = sandbox_agent(
+            &bus,
+            &json!({ "agentId": "agent-3", "principal": { "agentId": "agent-1" } }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("grant::act_as::agent-3"), "{error}");
+
+        // The confused deputy this closes: a bare `agentId` names nobody.
+        let bare = sandbox_agent(
+            &bus,
+            &json!({ "moduleId": "m", "input": {}, "agentId": "victim" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bare, None,
+            "a request agentId without a principal is not an identity"
+        );
+        assert!(
+            sandbox_agent(&bus, &json!({ "principal": {} }))
+                .await
+                .is_err(),
+            "malformed"
+        );
+    }
+
+    #[test]
+    fn host_calls_are_labelled_with_the_sandbox_agent() {
+        let guest_args =
+            json!({ "query": "x", "agentId": "victim", "principal": { "agentId": "victim" } });
+        let labelled = host_call_payload("memory::recall", guest_args.clone(), Some("agent-1"));
+        assert_eq!(labelled["principal"], json!({ "agentId": "agent-1" }));
+        assert_eq!(
+            labelled["agentId"], "victim",
+            "left for the memory worker to refuse"
+        );
+        assert_eq!(
+            host_call_payload("memory::recall", guest_args.clone(), None),
+            guest_args,
+            "with no agent the guest's forged principal is still not ours to bless; the memory worker judges it"
+        );
+        assert_eq!(
+            host_call_payload(
+                "embedding::generate",
+                json!({ "text": "t" }),
+                Some("agent-1")
+            ),
+            json!({ "text": "t" })
+        );
     }
 
     #[test]
