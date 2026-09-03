@@ -414,6 +414,7 @@ dependencies = [
 name = "agentos-cli"
 version = "0.1.0"
 dependencies = [
+ "agentos-bus-auth",
  "anyhow",
  "clap",
  "clap_complete",
