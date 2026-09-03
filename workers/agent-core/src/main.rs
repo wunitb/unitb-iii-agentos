@@ -19,22 +19,44 @@ const CHANNELS: [&str; 14] = [
     "teams", "telegram", "twitch", "webex", "whatsapp",
 ];
 
+/// Every secret a channel needs to be usable: the outbound credential its
+/// worker replies with, and the inbound one its worker verifies deliveries
+/// with. The inbound keys matter to readiness because each worker registers
+/// its `/webhook/<channel>` route only when that key exists at boot (see the
+/// `startup_secret` gate in each `workers/channel-*/src/main.rs`); without it
+/// the worker connects, logs one `tracing::error!`, and the route is a 404 —
+/// which used to read as "ready" here. Listing the key makes `missingSecrets`
+/// name the reason.
+///
+/// Teams is the exception: its route is armed by EITHER `TEAMS_APP_ID` (Bot
+/// Connector JWT) OR `TEAMS_WEBHOOK_SECRET` (Outgoing Webhook HMAC), so only
+/// the Azure Bot pair is required here and the webhook secret stays optional.
 fn channel_secrets(channel: &str) -> Option<&'static [&'static str]> {
     match channel {
         "bluesky" => Some(&["BLUESKY_HANDLE", "BLUESKY_PASSWORD"]),
-        "discord" => Some(&["DISCORD_BOT_TOKEN"]),
+        "discord" => Some(&["DISCORD_BOT_TOKEN", "DISCORD_PUBLIC_KEY"]),
         "email" => Some(&["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS"]),
-        "linkedin" => Some(&["LINKEDIN_TOKEN"]),
+        "linkedin" => Some(&["LINKEDIN_TOKEN", "LINKEDIN_CLIENT_SECRET"]),
         "mastodon" => Some(&["MASTODON_INSTANCE", "MASTODON_TOKEN"]),
-        "matrix" => Some(&["MATRIX_HOMESERVER", "MATRIX_TOKEN"]),
+        "matrix" => Some(&["MATRIX_HOMESERVER", "MATRIX_TOKEN", "MATRIX_HS_TOKEN"]),
         "reddit" => Some(&["REDDIT_CLIENT_ID", "REDDIT_SECRET", "REDDIT_REFRESH_TOKEN"]),
         "signal" => Some(&["SIGNAL_API_URL", "SIGNAL_PHONE"]),
         "slack" => Some(&["SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET"]),
         "teams" => Some(&["TEAMS_APP_ID", "TEAMS_APP_PASSWORD"]),
-        "telegram" => Some(&["TELEGRAM_BOT_TOKEN"]),
-        "twitch" => Some(&["TWITCH_CLIENT_ID", "TWITCH_TOKEN", "TWITCH_BOT_USER_ID"]),
-        "webex" => Some(&["WEBEX_TOKEN"]),
-        "whatsapp" => Some(&["WHATSAPP_PHONE_ID", "WHATSAPP_TOKEN"]),
+        "telegram" => Some(&["TELEGRAM_BOT_TOKEN", "TELEGRAM_SECRET_TOKEN"]),
+        "twitch" => Some(&[
+            "TWITCH_CLIENT_ID",
+            "TWITCH_TOKEN",
+            "TWITCH_BOT_USER_ID",
+            "TWITCH_EVENTSUB_SECRET",
+        ]),
+        "webex" => Some(&["WEBEX_TOKEN", "WEBEX_WEBHOOK_SECRET"]),
+        "whatsapp" => Some(&[
+            "WHATSAPP_PHONE_ID",
+            "WHATSAPP_TOKEN",
+            "WHATSAPP_APP_SECRET",
+            "WHATSAPP_VERIFY_TOKEN",
+        ]),
         _ => None,
     }
 }
@@ -861,6 +883,43 @@ mod tests {
 
     use super::*;
     use types::{Capabilities, ModelConfig, Resources};
+
+    #[test]
+    fn readiness_requires_the_key_each_worker_arms_its_webhook_route_with() {
+        // One row per channel worker that withholds its `/webhook/<channel>`
+        // route unless a secret exists at boot (the `startup_secret` gate in
+        // its main). Before these were listed, readiness reported such a
+        // channel as ready while the route was a 404.
+        for (channel, inbound_key) in [
+            ("discord", "DISCORD_PUBLIC_KEY"),
+            ("linkedin", "LINKEDIN_CLIENT_SECRET"),
+            ("matrix", "MATRIX_HS_TOKEN"),
+            ("slack", "SLACK_SIGNING_SECRET"),
+            ("teams", "TEAMS_APP_ID"),
+            ("telegram", "TELEGRAM_SECRET_TOKEN"),
+            ("twitch", "TWITCH_EVENTSUB_SECRET"),
+            ("webex", "WEBEX_WEBHOOK_SECRET"),
+            ("whatsapp", "WHATSAPP_APP_SECRET"),
+            ("whatsapp", "WHATSAPP_VERIFY_TOKEN"),
+        ] {
+            let required = channel_secrets(channel).expect(channel);
+            assert!(
+                required.contains(&inbound_key),
+                "{channel}: {inbound_key} arms the inbound route but readiness does not require it"
+            );
+        }
+        // Teams arms its route with either credential; only the Azure Bot pair
+        // is required, so an Outgoing-Webhook-only or Bot-only deployment is
+        // not reported as missing the other.
+        let teams = channel_secrets("teams").unwrap();
+        assert!(!teams.contains(&"TEAMS_WEBHOOK_SECRET"));
+        assert!(teams.contains(&"TEAMS_APP_PASSWORD"));
+        // Every listed channel is one the status table knows.
+        for channel in CHANNELS {
+            assert!(channel_secrets(channel).is_some(), "{channel}");
+        }
+        assert!(channel_secrets("irc").is_none());
+    }
 
     #[test]
     fn llm_route_and_complete_payloads_use_top_level_strings() {

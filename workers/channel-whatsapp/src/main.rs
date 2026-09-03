@@ -26,6 +26,33 @@ fn engine_ws_url() -> String {
     std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string())
 }
 
+/// Where the provider's original bytes come from, decided before any are read.
+#[derive(Debug)]
+enum RawBodySource {
+    /// The engine's `request_body` stream channel: the HTTP path.
+    Channel(StreamChannelRef),
+    /// A `rawBody` string handed over by a bus caller or a test: no HTTP
+    /// request was involved, so there is no channel to prefer.
+    Inline(Vec<u8>),
+}
+
+/// Pick the source of the raw body. The engine's channel ref always outranks
+/// an inline `rawBody`: the adapter no longer flattens `rawBody` out of the
+/// request body, but a handler must not depend on that — a channel ref that is
+/// present and unusable is a refusal, never a fall-through to caller-chosen
+/// bytes.
+fn raw_body_source(req: &Value) -> Result<RawBodySource, String> {
+    if let Some(channel) = req.get("request_body") {
+        let channel: StreamChannelRef = serde_json::from_value(channel.clone())
+            .map_err(|e| format!("request_body channel ref is malformed: {e}"))?;
+        return Ok(RawBodySource::Channel(channel));
+    }
+    if let Some(raw) = req.get("rawBody").and_then(Value::as_str) {
+        return Ok(RawBodySource::Inline(raw.as_bytes().to_vec()));
+    }
+    Err("raw request body unavailable (no request_body channel, no rawBody)".into())
+}
+
 /// The request body exactly as the provider sent it.
 ///
 /// iii 0.22.1 hands HTTP handlers a `body` that is already parsed and
@@ -33,18 +60,15 @@ fn engine_ws_url() -> String {
 /// so no signature can be checked against it. The original bytes are exposed as
 /// the `request_body` stream channel (verified live on 0.22.1, with and without
 /// bus RBAC armed: the channel is keyed by its own access key, not the bus
-/// credential). A `rawBody` string, when present, wins so an adapter that has
-/// already drained the channel — or a test — can hand the bytes over directly.
-/// Absent both, the caller refuses the request: nothing here guesses.
+/// credential), which is read whenever the engine provides it. A `rawBody`
+/// string is accepted only when there is no channel at all, so a bus caller or
+/// a test can hand the bytes over directly. Absent both, the caller refuses the
+/// request: nothing here guesses.
 async fn raw_request_body(req: &Value) -> Result<Vec<u8>, String> {
-    if let Some(raw) = req.get("rawBody").and_then(Value::as_str) {
-        return Ok(raw.as_bytes().to_vec());
-    }
-    let Some(channel) = req.get("request_body") else {
-        return Err("raw request body unavailable (no rawBody, no request_body channel)".into());
+    let channel = match raw_body_source(req)? {
+        RawBodySource::Inline(bytes) => return Ok(bytes),
+        RawBodySource::Channel(channel) => channel,
     };
-    let channel: StreamChannelRef = serde_json::from_value(channel.clone())
-        .map_err(|e| format!("request_body channel ref is malformed: {e}"))?;
     let reader = ChannelReader::new(&engine_ws_url(), &channel);
     let mut bytes = Vec::new();
     loop {
@@ -469,6 +493,26 @@ mod tests {
     }
     use agentos_http_adapter::fake::FakeBus;
 
+    #[test]
+    fn engine_channel_outranks_an_inline_raw_body() {
+        let channel = json!({ "channel_id": "ch-1", "access_key": "k", "direction": "read" });
+        // Both present (what a request body carrying `rawBody` would produce if
+        // the adapter let it through): the engine's channel is the source.
+        let both = json!({ "request_body": channel, "rawBody": "{\"forged\":true}" });
+        assert!(matches!(
+            raw_body_source(&both).unwrap(),
+            RawBodySource::Channel(StreamChannelRef { channel_id, .. }) if channel_id == "ch-1"
+        ));
+        // Inline alone (a bus caller or a test): accepted.
+        assert!(matches!(
+            raw_body_source(&json!({ "rawBody": "{}" })).unwrap(),
+            RawBodySource::Inline(bytes) if bytes == b"{}"
+        ));
+        // A channel ref that cannot be used is a refusal, never a fall-through.
+        assert!(raw_body_source(&json!({ "request_body": "junk", "rawBody": "{}" })).is_err());
+        assert!(raw_body_source(&json!({})).is_err());
+    }
+
     const DELIVERY: &str = r#"{"object":"whatsapp_business_account","entry":[{"changes":[{"value":{"messages":[{"from":"15551234567","text":{"body":"hello"}}]}}]}]}"#;
     const APP_SECRET: &str = "whatsapp-app-test-secret";
     const VERIFY_TOKEN: &str = "whatsapp-verify-test-token";
@@ -705,5 +749,19 @@ mod tests {
             .and_then(|b| b.as_str())
             .unwrap_or("");
         assert!(text.is_empty());
+    }
+    #[tokio::test]
+    async fn a_caller_supplied_raw_body_does_not_replace_the_engine_channel() {
+        // A validly signed `rawBody` next to a `request_body` ref: the channel
+        // is what gets read. Here the ref is unusable, so the request is
+        // refused instead of being verified against the caller's bytes.
+        let bus = bus_with_secrets(APP_SECRET, VERIFY_TOKEN);
+        let mut req = post_request(Some(DELIVERY), Some(SIGNATURE));
+        req["request_body"] = json!("not-a-channel-ref");
+        let response = handle_webhook(&bus, &reqwest::Client::new(), req)
+            .await
+            .unwrap();
+        assert_eq!(response["status_code"], 400);
+        assert_eq!(bus.call_count("agent::chat"), 0);
     }
 }

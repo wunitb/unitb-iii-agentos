@@ -28,6 +28,33 @@ fn engine_ws_url() -> String {
     std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string())
 }
 
+/// Where the provider's original bytes come from, decided before any are read.
+#[derive(Debug)]
+enum RawBodySource {
+    /// The engine's `request_body` stream channel: the HTTP path.
+    Channel(StreamChannelRef),
+    /// A `rawBody` string handed over by a bus caller or a test: no HTTP
+    /// request was involved, so there is no channel to prefer.
+    Inline(Vec<u8>),
+}
+
+/// Pick the source of the raw body. The engine's channel ref always outranks
+/// an inline `rawBody`: the adapter no longer flattens `rawBody` out of the
+/// request body, but a handler must not depend on that — a channel ref that is
+/// present and unusable is a refusal, never a fall-through to caller-chosen
+/// bytes.
+fn raw_body_source(req: &Value) -> Result<RawBodySource, String> {
+    if let Some(channel) = req.get("request_body") {
+        let channel: StreamChannelRef = serde_json::from_value(channel.clone())
+            .map_err(|e| format!("request_body channel ref is malformed: {e}"))?;
+        return Ok(RawBodySource::Channel(channel));
+    }
+    if let Some(raw) = req.get("rawBody").and_then(Value::as_str) {
+        return Ok(RawBodySource::Inline(raw.as_bytes().to_vec()));
+    }
+    Err("raw request body unavailable (no request_body channel, no rawBody)".into())
+}
+
 /// The request body exactly as the provider sent it.
 ///
 /// iii 0.22.1 hands HTTP handlers a `body` that is already parsed and
@@ -35,18 +62,15 @@ fn engine_ws_url() -> String {
 /// so no signature can be checked against it. The original bytes are exposed as
 /// the `request_body` stream channel (verified live on 0.22.1, with and without
 /// bus RBAC armed: the channel is keyed by its own access key, not the bus
-/// credential). A `rawBody` string, when present, wins so an adapter that has
-/// already drained the channel — or a test — can hand the bytes over directly.
-/// Absent both, the caller refuses the request: nothing here guesses.
+/// credential), which is read whenever the engine provides it. A `rawBody`
+/// string is accepted only when there is no channel at all, so a bus caller or
+/// a test can hand the bytes over directly. Absent both, the caller refuses the
+/// request: nothing here guesses.
 async fn raw_request_body(req: &Value) -> Result<Vec<u8>, String> {
-    if let Some(raw) = req.get("rawBody").and_then(Value::as_str) {
-        return Ok(raw.as_bytes().to_vec());
-    }
-    let Some(channel) = req.get("request_body") else {
-        return Err("raw request body unavailable (no rawBody, no request_body channel)".into());
+    let channel = match raw_body_source(req)? {
+        RawBodySource::Inline(bytes) => return Ok(bytes),
+        RawBodySource::Channel(channel) => channel,
     };
-    let channel: StreamChannelRef = serde_json::from_value(channel.clone())
-        .map_err(|e| format!("request_body channel ref is malformed: {e}"))?;
     let reader = ChannelReader::new(&engine_ws_url(), &channel);
     let mut bytes = Vec::new();
     loop {
@@ -418,6 +442,26 @@ mod tests {
     use agentos_http_adapter::fake::FakeBus;
     use ed25519_dalek::{Signer, SigningKey};
 
+    #[test]
+    fn engine_channel_outranks_an_inline_raw_body() {
+        let channel = json!({ "channel_id": "ch-1", "access_key": "k", "direction": "read" });
+        // Both present (what a request body carrying `rawBody` would produce if
+        // the adapter let it through): the engine's channel is the source.
+        let both = json!({ "request_body": channel, "rawBody": "{\"forged\":true}" });
+        assert!(matches!(
+            raw_body_source(&both).unwrap(),
+            RawBodySource::Channel(StreamChannelRef { channel_id, .. }) if channel_id == "ch-1"
+        ));
+        // Inline alone (a bus caller or a test): accepted.
+        assert!(matches!(
+            raw_body_source(&json!({ "rawBody": "{}" })).unwrap(),
+            RawBodySource::Inline(bytes) if bytes == b"{}"
+        ));
+        // A channel ref that cannot be used is a refusal, never a fall-through.
+        assert!(raw_body_source(&json!({ "request_body": "junk", "rawBody": "{}" })).is_err());
+        assert!(raw_body_source(&json!({})).is_err());
+    }
+
     /// The PING Discord sends when an Interactions Endpoint URL is saved
     /// (https://discord.com/developers/docs/interactions/overview#setting-up-an-endpoint-acknowledging-ping-requests).
     const INTERACTION_PING: &str = r#"{"app_permissions":"0","application_id":"1234567890","entitlements":[],"id":"9876543210","token":"aW50ZXJhY3Rpb246OTg3NjU0MzIxMDp0b2tlbg","type":1,"user":{"avatar":null,"discriminator":"0","global_name":null,"id":"1111","public_flags":0,"username":"discord"},"version":1}"#;
@@ -493,6 +537,41 @@ mod tests {
                 &signature
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn rfc_8032_published_vectors_verify_through_the_discord_path() {
+        // Discord publishes no fixed (key, timestamp, body, signature) vector:
+        // the interactions guide shows code with `APPLICATION_PUBLIC_KEY` as a
+        // placeholder, and discord-interactions-js generates a key pair per
+        // test run. The scheme is Ed25519 over `timestamp || body`, so the
+        // primitive — hex key and signature decoding, `verify_strict` — is
+        // pinned here to RFC 8032 §7.1's published test vectors instead
+        // (https://www.rfc-editor.org/rfc/rfc8032#section-7.1), split across
+        // the two inputs the way the handler concatenates them.
+        //
+        // TEST 2: message 0x72 ("r").
+        let public_key = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c";
+        let signature = "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00";
+        assert!(verify_discord_signature(public_key, "r", b"", signature).is_ok());
+        assert!(verify_discord_signature(public_key, "", b"r", signature).is_ok());
+        assert!(verify_discord_signature(public_key, "r", b"r", signature).is_err());
+        assert!(verify_discord_signature(public_key, "", b"", signature).is_err());
+        // TEST 3: message 0xaf82 (not UTF-8, so it can only be the body).
+        let public_key = "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025";
+        let signature = "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a";
+        assert!(verify_discord_signature(public_key, "", &[0xaf, 0x82], signature).is_ok());
+        assert!(verify_discord_signature(public_key, "", &[0xaf, 0x83], signature).is_err());
+        // TEST 2's key does not verify TEST 3's signature.
+        assert!(
+            verify_discord_signature(
+                "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+                "",
+                &[0xaf, 0x82],
+                signature
+            )
+            .is_err()
         );
     }
 
@@ -695,5 +774,21 @@ mod tests {
         let chunks = split_message(&text, 2000);
         assert!(chunks.len() >= 2);
         assert!(chunks[0].ends_with(&"a".repeat(1500)));
+    }
+    #[tokio::test]
+    async fn a_caller_supplied_raw_body_does_not_replace_the_engine_channel() {
+        // A validly signed `rawBody` next to a `request_body` ref: the channel
+        // is what gets read. Here the ref is unusable, so the request is
+        // refused instead of being verified against the caller's bytes.
+        let (signing, public_hex) = keypair();
+        let bus = bus_with_key(&public_hex);
+        let signature = sign(&signing, TIMESTAMP, MESSAGE_CREATE);
+        let mut req = request(MESSAGE_CREATE, Some(&signature), Some(TIMESTAMP));
+        req["request_body"] = json!("not-a-channel-ref");
+        let response = webhook_handler(&bus, &reqwest::Client::new(), req)
+            .await
+            .unwrap();
+        assert_eq!(response["status_code"], 400);
+        assert_eq!(bus.call_count("agent::chat"), 0);
     }
 }

@@ -3,9 +3,16 @@ use iii_sdk::errors::Error;
 use iii_sdk::protocol::TriggerAction;
 use iii_sdk::{RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 
 const MATRIX_MAX_LEN: usize = 4096;
+
+/// How many handled transaction ids are remembered, oldest evicted first.
+/// A homeserver retries a transaction only until it sees our 200, and sends
+/// them linearised, so the id being retried is always among the most recent.
+const SEEN_TRANSACTION_CAP: usize = 4096;
 
 /// Name of the secret that authenticates the homeserver: the `hs_token` from
 /// the application service registration file. The homeserver sends it as
@@ -82,6 +89,51 @@ fn matrix_error(status: u16, errcode: &str, error: &str) -> Value {
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
+/// Transactions already handled, by `txnId`.
+///
+/// The spec's transaction API (https://spec.matrix.org/latest/application-service-api/#pushing-events):
+/// "Homeserver retries with the same transaction ID of T. […] If the AS had
+/// processed these events already, it can NO-OP this request (and it knows if
+/// it is the same events based on the transaction ID)", and homeservers "MUST
+/// NOT alter (e.g. add more) events they were going to send within that
+/// transaction ID on retries". So a repeated `txnId` is the same batch: it is
+/// answered `200 {}` without being dispatched again. Bounded by
+/// [`SEEN_TRANSACTION_CAP`].
+#[derive(Default)]
+struct TransactionLog {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+type SharedTransactionLog = Arc<Mutex<TransactionLog>>;
+
+impl TransactionLog {
+    /// Record `txn_id` as handled. `false` when it already was.
+    fn first_sight(&mut self, txn_id: &str) -> bool {
+        if self.seen.contains(txn_id) {
+            return false;
+        }
+        while self.order.len() >= SEEN_TRANSACTION_CAP {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.seen.insert(txn_id.to_owned());
+        self.order.push_back(txn_id.to_owned());
+        true
+    }
+}
+
+/// The transaction id of a `PUT …/transactions/{txnId}` call, as the adapter
+/// delivers a path parameter: under `path_params` or scalarised at the top
+/// level. `None` for the ping route.
+fn transaction_id(req: &Value) -> Option<&str> {
+    req.pointer("/path_params/txnId")
+        .or_else(|| req.get("txnId"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
 }
 
 async fn resolve_agent(iii: &dyn TriggerBus, channel: &str, channel_id: &str) -> String {
@@ -307,7 +359,9 @@ async fn handle_event(
 /// (https://spec.matrix.org/latest/application-service-api/):
 ///
 /// * `PUT …/_matrix/app/v1/transactions/{txnId}` — a batch of events. Answered
-///   `200 {}` after every event is handled. (Also served at the pre-v1 path
+///   `200 {}` after every event is handled; a repeated `txnId` (the
+///   homeserver's retry of a batch we already handled) is answered `200 {}`
+///   at once, see [`TransactionLog`]. (Also served at the pre-v1 path
 ///   `…/transactions/{txnId}`, which homeservers fall back to.)
 /// * `POST …/_matrix/app/v1/ping` — the homeserver checking that the
 ///   connection and its `hs_token` work. Answered `200 {}`.
@@ -318,6 +372,7 @@ async fn handle_event(
 async fn webhook_handler(
     iii: &dyn TriggerBus,
     client: &reqwest::Client,
+    handled: &SharedTransactionLog,
     input: Value,
 ) -> Result<Value, Error> {
     let hs_token = get_secret(iii, HS_TOKEN_KEY).await;
@@ -333,6 +388,21 @@ async fn webhook_handler(
 
     let path = input.get("path").and_then(Value::as_str).unwrap_or("");
     if path.ends_with("/ping") {
+        return Ok(json!({ "status_code": 200, "body": {} }));
+    }
+
+    // Recorded before dispatch, so a retry that overlaps a slow first attempt
+    // is a no-op too. The homeserver only retries until it sees a 200.
+    if let Some(txn_id) = transaction_id(&input)
+        && !handled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .first_sight(txn_id)
+    {
+        tracing::info!(
+            txn_id,
+            "matrix: transaction already handled, acknowledging without dispatch"
+        );
         return Ok(json!({ "status_code": 200, "body": {} }));
     }
 
@@ -358,14 +428,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
     let client = reqwest::Client::new();
 
+    let handled: SharedTransactionLog = Arc::new(Mutex::new(TransactionLog::default()));
+
     let iii_clone = iii.clone();
     let client_clone = client.clone();
+    let handled_clone = handled.clone();
     iii.register_function(
         "channel::matrix::webhook",
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_clone.clone();
             let client = client_clone.clone();
-            async move { webhook_handler(&iii, &client, input).await }
+            let handled = handled_clone.clone();
+            async move { webhook_handler(&iii, &client, &handled, input).await }
         })
         .description("Handle Matrix application service transactions"),
     );
@@ -445,6 +519,10 @@ mod tests {
         })
     }
 
+    fn fresh_log() -> SharedTransactionLog {
+        Arc::new(Mutex::new(TransactionLog::default()))
+    }
+
     fn bus_with_token(token: &str) -> FakeBus {
         let bus = FakeBus::new();
         let token = token.to_string();
@@ -522,6 +600,7 @@ mod tests {
         let response = webhook_handler(
             &bus,
             &reqwest::Client::new(),
+            &fresh_log(),
             request(
                 "/webhook/matrix/_matrix/app/v1/transactions/:txnId",
                 "PUT",
@@ -549,6 +628,7 @@ mod tests {
             let response = webhook_handler(
                 &bus,
                 &reqwest::Client::new(),
+                &fresh_log(),
                 request(
                     "/webhook/matrix/_matrix/app/v1/transactions/:txnId",
                     "PUT",
@@ -572,6 +652,7 @@ mod tests {
         let ok = webhook_handler(
             &bus,
             &reqwest::Client::new(),
+            &fresh_log(),
             request(
                 "/webhook/matrix/_matrix/app/v1/ping",
                 "POST",
@@ -587,6 +668,7 @@ mod tests {
         let forbidden = webhook_handler(
             &bus,
             &reqwest::Client::new(),
+            &fresh_log(),
             request(
                 "/webhook/matrix/_matrix/app/v1/ping",
                 "POST",
@@ -613,6 +695,7 @@ mod tests {
         let response = webhook_handler(
             &bus,
             &reqwest::Client::new(),
+            &fresh_log(),
             request(
                 "/webhook/matrix/_matrix/app/v1/transactions/:txnId",
                 "PUT",
@@ -632,6 +715,7 @@ mod tests {
         let response = webhook_handler(
             &bus,
             &reqwest::Client::new(),
+            &fresh_log(),
             request(
                 "/webhook/matrix/_matrix/app/v1/transactions/:txnId",
                 "PUT",
@@ -672,5 +756,108 @@ mod tests {
         let text = "a".repeat(5000);
         let chunks = split_message(&text, 4096);
         assert!(chunks.len() >= 2);
+    }
+    #[tokio::test]
+    async fn a_retried_transaction_is_acknowledged_without_a_second_dispatch() {
+        let bus = bus_with_token(HS_TOKEN);
+        let handled = fresh_log();
+        let delivery = request(
+            "/webhook/matrix/_matrix/app/v1/transactions/:txnId",
+            "PUT",
+            transaction(),
+            Some(&format!("Bearer {HS_TOKEN}")),
+        );
+
+        // A forged attempt with the same txnId must not poison the log: the
+        // credential is checked first, so nothing unauthenticated is recorded.
+        let forged = webhook_handler(
+            &bus,
+            &reqwest::Client::new(),
+            &handled,
+            request(
+                "/webhook/matrix/_matrix/app/v1/transactions/:txnId",
+                "PUT",
+                transaction(),
+                Some("Bearer not-the-hs-token"),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(forged["status_code"], 403);
+        assert_eq!(handled.lock().unwrap().order.len(), 0);
+
+        let first = webhook_handler(&bus, &reqwest::Client::new(), &handled, delivery.clone())
+            .await
+            .unwrap();
+        assert_eq!(first["status_code"], 200);
+        assert_eq!(bus.call_count("agent::chat"), 1);
+
+        // "Homeserver retries with the same transaction ID of T": same 200, no
+        // second dispatch.
+        let retry = webhook_handler(&bus, &reqwest::Client::new(), &handled, delivery)
+            .await
+            .unwrap();
+        assert_eq!(retry["status_code"], 200);
+        assert_eq!(retry["body"], json!({}));
+        assert_eq!(bus.call_count("agent::chat"), 1);
+
+        // A new transaction id is a new batch.
+        let mut next = request(
+            "/webhook/matrix/_matrix/app/v1/transactions/:txnId",
+            "PUT",
+            transaction(),
+            Some(&format!("Bearer {HS_TOKEN}")),
+        );
+        next["path_params"]["txnId"] = json!("36");
+        let second = webhook_handler(&bus, &reqwest::Client::new(), &handled, next)
+            .await
+            .unwrap();
+        assert_eq!(second["status_code"], 200);
+        assert_eq!(bus.call_count("agent::chat"), 2);
+    }
+
+    #[test]
+    fn transaction_id_is_read_the_way_the_adapter_delivers_a_path_parameter() {
+        assert_eq!(
+            transaction_id(&json!({ "path_params": { "txnId": "35" } })),
+            Some("35")
+        );
+        assert_eq!(transaction_id(&json!({ "txnId": "35" })), Some("35"));
+        assert_eq!(
+            transaction_id(&json!({ "path_params": { "txnId": "" } })),
+            None
+        );
+        assert_eq!(
+            transaction_id(&json!({ "path": "/webhook/matrix/_matrix/app/v1/ping" })),
+            None
+        );
+    }
+
+    #[test]
+    fn transaction_log_is_bounded_and_evicts_the_oldest() {
+        let mut log = TransactionLog::default();
+        assert!(log.first_sight("t-0"));
+        assert!(!log.first_sight("t-0"));
+        for i in 1..SEEN_TRANSACTION_CAP {
+            assert!(log.first_sight(&format!("t-{i}")));
+        }
+        assert_eq!(log.order.len(), SEEN_TRANSACTION_CAP);
+        assert!(!log.first_sight("t-0"), "still full, still remembered");
+        assert!(log.first_sight("t-overflow"));
+        assert_eq!(log.order.len(), SEEN_TRANSACTION_CAP);
+        assert!(
+            log.first_sight("t-0"),
+            "the oldest id was evicted to make room"
+        );
+        assert_eq!(log.order.len(), SEEN_TRANSACTION_CAP);
+        assert!(
+            log.first_sight("t-1"),
+            "re-recording t-0 evicted the next oldest"
+        );
+        assert!(
+            !log.first_sight("t-3"),
+            "everything younger is still remembered"
+        );
+        assert!(!log.first_sight("t-overflow"));
     }
 }

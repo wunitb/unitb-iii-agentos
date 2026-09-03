@@ -111,6 +111,17 @@ fn normalize_cron_expression(expression: &str) -> Result<String, Error> {
     }
 }
 
+/// Body and query keys that never reach the top level of the payload.
+///
+/// The channel workers take the provider's original bytes from the engine's
+/// `request_body` stream channel, or from a `rawBody` string when a bus caller
+/// (or a test) hands the bytes over directly. Neither is something an HTTP
+/// client may supply: a top-level `{"rawBody": ...}` in the request body, or a
+/// `?rawBody=` query parameter, would otherwise become `payload.rawBody` and
+/// let the caller choose which bytes a signature is checked against. The keys
+/// stay under `body` / `query`, where nothing reads them as transport fields.
+const RESERVED_BODY_KEYS: &[&str] = &["rawBody", "request_body"];
+
 fn normalize_http_request(request: Value) -> Value {
     let Value::Object(mut payload) = request else {
         return request;
@@ -132,12 +143,18 @@ fn normalize_http_request(request: Value) -> Value {
 
     if let Some(fields) = body {
         for (key, value) in fields {
+            if RESERVED_BODY_KEYS.contains(&key.as_str()) {
+                continue;
+            }
             payload.entry(key).or_insert(value);
         }
     }
 
     if let Some(fields) = query {
         for (key, value) in fields {
+            if RESERVED_BODY_KEYS.contains(&key.as_str()) {
+                continue;
+            }
             payload
                 .entry(key)
                 .or_insert_with(|| scalar_query_value(value));
@@ -325,6 +342,46 @@ mod tests {
         assert_eq!(payload["query"]["limit"], json!(["10"]));
         assert_eq!(payload["headers"]["authorization"], json!("Bearer token"));
         assert_eq!(payload["body"]["agentId"], json!("body-agent"));
+    }
+
+    #[test]
+    fn body_cannot_supply_the_raw_body_transport_fields() {
+        // An HTTP client controls the JSON body. The bytes a channel worker
+        // verifies come from the engine's `request_body` channel or, off the
+        // HTTP path, from a `rawBody` string a bus caller passes — never from
+        // a body key an attacker chose.
+        let request = json!({
+            "body": {
+                "rawBody": "{\"forged\":true}",
+                "request_body": { "channel_id": "x", "access_key": "y", "direction": "read" },
+                "message": "hello",
+            },
+            "headers": {},
+            "method": "POST",
+            "request_body": { "channel_id": "real", "access_key": "k", "direction": "read" },
+        });
+
+        let payload = normalize_http_request(request);
+
+        assert!(payload.get("rawBody").is_none());
+        assert_eq!(payload["request_body"]["channel_id"], json!("real"));
+        assert_eq!(payload["message"], json!("hello"));
+        // The body itself is untouched; only the flattening skips the keys.
+        assert_eq!(payload["body"]["rawBody"], json!("{\"forged\":true}"));
+
+        // Without a channel ref in the envelope the key still does not appear.
+        let payload = normalize_http_request(json!({ "body": { "rawBody": "x" } }));
+        assert!(payload.get("rawBody").is_none());
+        assert!(payload.get("request_body").is_none());
+
+        // A query string is flattened the same way and is refused the same way.
+        let payload = normalize_http_request(json!({
+            "query_params": { "rawBody": ["x"], "request_body": ["y"], "code": ["1"] },
+        }));
+        assert!(payload.get("rawBody").is_none());
+        assert!(payload.get("request_body").is_none());
+        assert_eq!(payload["code"], json!("1"));
+        assert_eq!(payload["query"]["rawBody"], json!(["x"]));
     }
 
     #[test]
