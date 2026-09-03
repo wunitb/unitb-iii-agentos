@@ -117,6 +117,15 @@ async fn send_message(
     Ok(())
 }
 
+/// Signal has no inbound webhook. The signal-cli-rest-api this worker sends
+/// through exposes incoming messages only as `GET /v1/receive/<number>` (a
+/// poll) or, in json-rpc mode, a WebSocket on the same path
+/// (https://github.com/bbernhard/signal-cli-rest-api/blob/master/doc/EXAMPLES.md);
+/// it never calls back. A `POST /webhook/signal` route therefore had nothing
+/// it could verify — anything that reached it was, by construction, not
+/// Signal — so no HTTP route is registered. `channel::signal::webhook` stays
+/// on the bus for a receiver that polls or streams `/v1/receive` and hands
+/// envelopes in over the authenticated bus.
 async fn handle_webhook(
     iii: &IIIClient,
     client: &reqwest::Client,
@@ -233,15 +242,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let client = client_clone.clone();
             async move { handle_webhook(&iii, &client, input).await }
         })
-        .description("Handle Signal REST API bridge webhook"),
+        .description("Handle a Signal envelope (bus-only: signal-cli-rest-api has no webhook; poll or stream /v1/receive)"),
     );
-
-    agentos_http_adapter::register_http_trigger(
-        &iii,
-        "channel::signal::webhook".to_string(),
-        json!({ "http_method": "POST", "api_path": "webhook/signal" }),
-        None,
-    )?;
 
     tracing::info!("channel-signal worker started");
     tokio::signal::ctrl_c().await?;
@@ -252,6 +254,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guard: this worker registers NO HTTP route. See the module note above
+    /// the handler: the provider has no inbound webhook, so a route here can
+    /// never verify its caller. Bringing one back requires a verifier first.
+    #[test]
+    fn registers_no_inbound_http_route() {
+        let source = include_str!("main.rs");
+        let call = concat!("register_http_", "trigger(");
+        assert!(
+            !source.contains(call),
+            "an HTTP route without a provider verifier was reintroduced"
+        );
+        assert!(!source.contains(concat!("agentos_http_", "adapter")));
+    }
 
     #[test]
     fn ignores_empty_envelope() {

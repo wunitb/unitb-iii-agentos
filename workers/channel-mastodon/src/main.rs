@@ -135,6 +135,17 @@ async fn send_message(
     Ok(())
 }
 
+/// Mastodon delivers a bot's mentions over the streaming API
+/// (`/api/v1/streaming/user`, WebSocket or SSE) or by polling
+/// `/api/v1/notifications`; there is no per-app webhook for them. The two
+/// push-shaped features that exist are not this: Web Push subscriptions are
+/// end-to-end encrypted for browser/mobile clients, and admin webhooks
+/// (4.0+, `X-Hub-Signature`) carry instance-admin events for all users. The
+/// `{account, status}` payload this handler reads is a streaming
+/// `notification` object. A `POST /webhook/mastodon` route therefore had
+/// nothing it could verify, so no HTTP route is registered;
+/// `channel::mastodon::webhook` stays on the bus for a streaming client that
+/// hands notifications in over the authenticated bus.
 async fn webhook_handler(
     iii: &IIIClient,
     client: &reqwest::Client,
@@ -222,15 +233,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let client = client_clone.clone();
             async move { webhook_handler(&iii, &client, input).await }
         })
-        .description("Handle Mastodon webhook"),
+        .description("Handle a Mastodon mention (bus-only: mentions arrive over the streaming API, not a webhook)"),
     );
-
-    agentos_http_adapter::register_http_trigger(
-        &iii,
-        "channel::mastodon::webhook".to_string(),
-        json!({ "http_method": "POST", "api_path": "webhook/mastodon" }),
-        None,
-    )?;
 
     tracing::info!("channel-mastodon worker started");
     tokio::signal::ctrl_c().await?;
@@ -241,6 +245,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guard: this worker registers NO HTTP route. See the module note above
+    /// the handler: the provider has no inbound webhook, so a route here can
+    /// never verify its caller. Bringing one back requires a verifier first.
+    #[test]
+    fn registers_no_inbound_http_route() {
+        let source = include_str!("main.rs");
+        let call = concat!("register_http_", "trigger(");
+        assert!(
+            !source.contains(call),
+            "an HTTP route without a provider verifier was reintroduced"
+        );
+        assert!(!source.contains(concat!("agentos_http_", "adapter")));
+    }
 
     #[test]
     fn strip_html_removes_tags() {

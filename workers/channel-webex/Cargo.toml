@@ -21,3 +21,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 reqwest = { workspace = true, features = ["json"] }
+hmac.workspace = true
+hex.workspace = true
+# HMAC-SHA1 is what Webex signs with (X-Spark-Signature); sha1 0.10 is already
+# in the lockfile through tungstenite, so this adds an edge, not a crate.
+sha1 = "0.10"
+
+[dev-dependencies]
+agentos-http-adapter = { workspace = true, features = ["fake-bus"] }
