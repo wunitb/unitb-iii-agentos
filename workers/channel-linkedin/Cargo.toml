@@ -24,3 +24,6 @@ hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
 reqwest = { workspace = true, features = ["json"] }
+
+[dev-dependencies]
+agentos-http-adapter = { workspace = true, features = ["fake-bus"] }

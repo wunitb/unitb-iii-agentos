@@ -1,7 +1,9 @@
+use agentos_http_adapter::TriggerBus;
 use hmac::{Hmac, Mac};
+use iii_sdk::channels::{ChannelReader, StreamChannelRef};
 use iii_sdk::errors::Error;
 use iii_sdk::protocol::TriggerAction;
-use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
+use iii_sdk::{RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use std::time::Duration;
@@ -13,16 +15,81 @@ const MAX_MESSAGE_LEN: usize = 4096;
 const MESSAGE_EVENT_KEY: &str = "com.linkedin.voyager.messaging.event.MessageEvent";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const NOTIFICATION_DEDUPE_TTL_SECS: u64 = 24 * 60 * 60;
+const CLIENT_SECRET_KEY: &str = "LINKEDIN_CLIENT_SECRET";
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+/// Upper bound on a provider delivery we are willing to read before verifying it.
+const MAX_RAW_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// The engine streams the body from local memory; anything slower is a fault.
+const RAW_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Engine WebSocket base: the same address `main` connects to.
+fn engine_ws_url() -> String {
+    std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string())
+}
+
+/// The request body exactly as the provider sent it.
+///
+/// iii 0.22.1 hands HTTP handlers a `body` that is already parsed and
+/// re-serialised (verified: `{ "b" : 2 , "a" : 1 }` arrives as `{"a":1,"b":2}`),
+/// so no signature can be checked against it. The original bytes are exposed as
+/// the `request_body` stream channel (verified live on 0.22.1, with and without
+/// bus RBAC armed: the channel is keyed by its own access key, not the bus
+/// credential). A `rawBody` string, when present, wins so an adapter that has
+/// already drained the channel — or a test — can hand the bytes over directly.
+/// Absent both, the caller refuses the request: nothing here guesses.
+async fn raw_request_body(req: &Value) -> Result<Vec<u8>, String> {
+    if let Some(raw) = req.get("rawBody").and_then(Value::as_str) {
+        return Ok(raw.as_bytes().to_vec());
     }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let Some(channel) = req.get("request_body") else {
+        return Err("raw request body unavailable (no rawBody, no request_body channel)".into());
+    };
+    let channel: StreamChannelRef = serde_json::from_value(channel.clone())
+        .map_err(|e| format!("request_body channel ref is malformed: {e}"))?;
+    let reader = ChannelReader::new(&engine_ws_url(), &channel);
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = tokio::time::timeout(RAW_BODY_READ_TIMEOUT, reader.next_binary())
+            .await
+            .map_err(|_| "timed out reading the request_body channel".to_string())?
+            .map_err(|e| format!("request_body channel read failed: {e}"))?;
+        let Some(chunk) = chunk else {
+            return Ok(bytes);
+        };
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > MAX_RAW_BODY_BYTES {
+            return Err(format!("request body exceeds {MAX_RAW_BODY_BYTES} bytes"));
+        }
     }
-    diff == 0
+}
+
+/// One header by case-insensitive name. The engine lowercases header names;
+/// matching case-insensitively costs nothing and survives an engine change.
+fn header<'a>(req: &'a Value, name: &str) -> Option<&'a str> {
+    req.get("headers")?
+        .as_object()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .and_then(|(_, value)| value.as_str())
+}
+
+fn reject(status: u16, error: &str) -> Value {
+    json!({ "status_code": status, "body": { "error": error } })
+}
+
+/// A query parameter as the adapter delivers it: under `query` (a string, or a
+/// single-element list when the engine reports repeated keys) or scalarised at
+/// the top level of the payload.
+fn query_param<'a>(req: &'a Value, name: &str) -> Option<&'a str> {
+    let nested = req
+        .get("query")
+        .or_else(|| req.get("query_params"))
+        .and_then(|query| query.get(name))
+        .and_then(|value| match value {
+            Value::Array(items) if items.len() == 1 => items[0].as_str(),
+            other => other.as_str(),
+        });
+    nested.or_else(|| req.get(name).and_then(Value::as_str))
 }
 
 /// Compute hex-encoded HMAC-SHA256 over `body` using `secret` as the key.
@@ -33,19 +100,26 @@ fn hmac_sha256_hex(secret: &str, body: &[u8]) -> Result<String, String> {
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
-/// Verify LinkedIn `X-LI-Signature` header per
-/// https://learn.microsoft.com/en-us/linkedin/shared/api-guide/webhook-validation
-/// Header value is `hmacsha256={hex}`.
-fn verify_linkedin_signature(secret: &str, raw_body: &str, signature: &str) -> Result<(), String> {
+/// Verify LinkedIn's `X-LI-Signature`: lowercase hex HMAC-SHA256 of
+/// `b"hmacsha256=" || raw_body`, keyed by the client secret. The header itself
+/// contains only the digest
+/// (https://learn.microsoft.com/en-us/linkedin/shared/api-guide/webhook-validation).
+/// The comparison is `Mac::verify_slice`, which is constant-time.
+fn verify_linkedin_signature(secret: &str, raw_body: &[u8], signature: &str) -> Result<(), String> {
     if secret.is_empty() {
-        return Err("LinkedIn client secret not configured".into());
+        return Err("LINKEDIN_CLIENT_SECRET not configured".into());
     }
-    let computed = hmac_sha256_hex(secret, raw_body.as_bytes())?;
-    let expected = format!("hmacsha256={computed}");
-    if !constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
-        return Err("Invalid LinkedIn signature".into());
+    let provided = hex::decode(signature.trim())
+        .map_err(|_| "X-LI-Signature is not lowercase hex".to_string())?;
+    if signature.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err("X-LI-Signature is not lowercase hex".into());
     }
-    Ok(())
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|e| format!("HMAC init error: {e}"))?;
+    mac.update(b"hmacsha256=");
+    mac.update(raw_body);
+    mac.verify_slice(&provided)
+        .map_err(|_| "Invalid LinkedIn signature".to_string())
 }
 
 fn split_message(text: &str, max_len: usize) -> Vec<String> {
@@ -70,7 +144,7 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
     chunks
 }
 
-async fn get_secret(iii: &IIIClient, key: &str) -> String {
+async fn get_secret(iii: &dyn TriggerBus, key: &str) -> String {
     let result = iii
         .trigger(TriggerRequest {
             function_id: "vault::get".to_string(),
@@ -88,7 +162,48 @@ async fn get_secret(iii: &IIIClient, key: &str) -> String {
     std::env::var(key).unwrap_or_default()
 }
 
-async fn resolve_agent(iii: &IIIClient, channel: &str, channel_id: &str) -> String {
+/// The inbound verification secret at boot, or `None` when neither the vault
+/// nor the environment has one. `main` registers the webhook route only on
+/// `Some`: a route that cannot verify its caller is refused, not exposed.
+/// (`vault::get` fails instantly with `function_not_found` while the vault
+/// worker is still starting, so this falls through to the environment — the
+/// path `agentos up` and `dev-up.sh` populate — without waiting.)
+async fn startup_secret(iii: &dyn TriggerBus, key: &str) -> Option<String> {
+    let value = get_secret(iii, key).await;
+    (!value.is_empty()).then_some(value)
+}
+
+/// Authenticate a POST delivery and return the parsed body it was signed over.
+///
+/// Order matters: the secret, signature header and raw bytes are all checked
+/// BEFORE any JSON is parsed. The body handed back is parsed from the verified
+/// bytes — never from the engine's pre-parsed `body`. Every failure is a refusal.
+async fn authenticate(iii: &dyn TriggerBus, req: &Value) -> Result<Value, Value> {
+    let secret = get_secret(iii, CLIENT_SECRET_KEY).await;
+    if secret.is_empty() {
+        return Err(reject(503, "LINKEDIN_CLIENT_SECRET not configured"));
+    }
+    let Some(signature) = header(req, "x-li-signature").filter(|s| !s.is_empty()) else {
+        return Err(reject(401, "Missing X-LI-Signature header"));
+    };
+    let raw = match raw_request_body(req).await {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::warn!(error = %e, "linkedin: refusing delivery without its raw body");
+            return Err(reject(
+                400,
+                "Raw request body unavailable for signature verification",
+            ));
+        }
+    };
+    if let Err(e) = verify_linkedin_signature(&secret, &raw, signature) {
+        tracing::warn!(error = %e, "linkedin signature rejected");
+        return Err(reject(401, "Invalid LinkedIn signature"));
+    }
+    serde_json::from_slice(&raw).map_err(|_| reject(400, "Body is not valid JSON"))
+}
+
+async fn resolve_agent(iii: &dyn TriggerBus, channel: &str, channel_id: &str) -> String {
     let result = iii
         .trigger(TriggerRequest {
             function_id: "state::get".to_string(),
@@ -111,7 +226,7 @@ async fn resolve_agent(iii: &IIIClient, channel: &str, channel_id: &str) -> Stri
 }
 
 async fn send_message(
-    iii: &IIIClient,
+    iii: &dyn TriggerBus,
     client: &reqwest::Client,
     thread_id: &str,
     text: &str,
@@ -164,7 +279,7 @@ fn extract_message_text(msg_event: &Value) -> Option<String> {
 
 /// Check whether `notification_id` was already processed via the `state::*`
 /// dedup scope. Returns true if newly recorded, false if duplicate.
-async fn record_notification_id(iii: &IIIClient, notification_id: &str) -> bool {
+async fn record_notification_id(iii: &dyn TriggerBus, notification_id: &str) -> bool {
     if notification_id.is_empty() {
         return true;
     }
@@ -199,7 +314,7 @@ async fn record_notification_id(iii: &IIIClient, notification_id: &str) -> bool 
 }
 
 async fn process_element(
-    iii: &IIIClient,
+    iii: &dyn TriggerBus,
     client: &reqwest::Client,
     element: &Value,
 ) -> Result<(), Error> {
@@ -281,44 +396,31 @@ async fn process_element(
 }
 
 async fn webhook_handler(
-    iii: &IIIClient,
+    iii: &dyn TriggerBus,
     client: &reqwest::Client,
     input: Value,
 ) -> Result<Value, Error> {
     let method = input
         .get("method")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .unwrap_or("POST")
         .to_uppercase();
-    let query = input.get("query").cloned().unwrap_or_else(|| json!({}));
 
-    // GET challenge handshake.
+    // LinkedIn's GET challenge is query-authenticated and has no signed body.
     if method == "GET" {
-        let challenge = query
-            .get("challengeCode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let challenge = query_param(&input, "challengeCode").unwrap_or("");
         if challenge.is_empty() {
-            return Ok(json!({
-                "status_code": 400,
-                "body": { "error": "Missing challengeCode" }
-            }));
+            return Ok(reject(400, "Missing challengeCode"));
         }
-        let secret = get_secret(iii, "LINKEDIN_CLIENT_SECRET").await;
+        let secret = get_secret(iii, CLIENT_SECRET_KEY).await;
         if secret.is_empty() {
-            return Ok(json!({
-                "status_code": 500,
-                "body": { "error": "LINKEDIN_CLIENT_SECRET not configured" }
-            }));
+            return Ok(reject(503, "LINKEDIN_CLIENT_SECRET not configured"));
         }
         let response = match hmac_sha256_hex(&secret, challenge.as_bytes()) {
             Ok(hex) => hex,
             Err(e) => {
                 tracing::error!(error = %e, "linkedin: challenge HMAC failed");
-                return Ok(json!({
-                    "status_code": 500,
-                    "body": { "error": "Challenge HMAC failed" }
-                }));
+                return Ok(reject(500, "Challenge HMAC failed"));
             }
         };
         return Ok(json!({
@@ -330,37 +432,10 @@ async fn webhook_handler(
         }));
     }
 
-    // Verify X-LI-Signature on POST.
-    let raw_body = input.get("rawBody").and_then(|v| v.as_str());
-    let signature = input
-        .get("headers")
-        .and_then(|h| h.get("x-li-signature"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if let Some(raw) = raw_body {
-        let secret = get_secret(iii, "LINKEDIN_CLIENT_SECRET").await;
-        if secret.is_empty() {
-            return Ok(json!({
-                "status_code": 500,
-                "body": { "error": "LINKEDIN_CLIENT_SECRET not configured" }
-            }));
-        }
-        if signature.is_empty() {
-            return Ok(json!({
-                "status_code": 401,
-                "body": { "error": "Missing X-LI-Signature header" }
-            }));
-        }
-        if let Err(e) = verify_linkedin_signature(&secret, raw, signature) {
-            tracing::warn!(error = %e, "linkedin signature rejected");
-            return Ok(json!({
-                "status_code": 401,
-                "body": { "error": "Invalid LinkedIn signature" }
-            }));
-        }
-    }
-
-    let body = input.get("body").cloned().unwrap_or(input);
+    let body = match authenticate(iii, &input).await {
+        Ok(body) => body,
+        Err(response) => return Ok(response),
+    };
 
     let elements: Vec<Value> = body
         .get("elements")
@@ -384,7 +459,7 @@ async fn webhook_handler(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-    let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
+    let ws_url = engine_ws_url();
     let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
     let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
 
@@ -400,18 +475,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("Handle LinkedIn messaging webhook"),
     );
 
-    agentos_http_adapter::register_http_trigger(
-        &iii,
-        "channel::linkedin::webhook".to_string(),
-        json!({ "http_method": "POST", "api_path": "webhook/linkedin" }),
-        None,
-    )?;
-    agentos_http_adapter::register_http_trigger(
-        &iii,
-        "channel::linkedin::webhook".to_string(),
-        json!({ "http_method": "GET", "api_path": "webhook/linkedin" }),
-        None,
-    )?;
+    if startup_secret(&iii, CLIENT_SECRET_KEY).await.is_some() {
+        agentos_http_adapter::register_http_trigger(
+            &iii,
+            "channel::linkedin::webhook".to_string(),
+            json!({ "http_method": "POST", "api_path": "webhook/linkedin" }),
+            None,
+        )?;
+        agentos_http_adapter::register_http_trigger(
+            &iii,
+            "channel::linkedin::webhook".to_string(),
+            json!({ "http_method": "GET", "api_path": "webhook/linkedin" }),
+            None,
+        )?;
+        tracing::info!("linkedin webhook routes registered (X-LI-Signature verified)");
+    } else {
+        tracing::error!(
+            "LINKEDIN_CLIENT_SECRET is not configured: LinkedIn webhook routes are NOT registered"
+        );
+    }
 
     tracing::info!("channel-linkedin worker started");
     tokio::signal::ctrl_c().await?;
@@ -422,6 +504,181 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_params_are_read_in_every_shape_the_adapter_produces() {
+        let nested = json!({ "query": { "k": "v" } });
+        assert_eq!(query_param(&nested, "k"), Some("v"));
+        let listed = json!({ "query_params": { "k": ["v"] } });
+        assert_eq!(query_param(&listed, "k"), Some("v"));
+        let scalarised = json!({ "k": "v" });
+        assert_eq!(query_param(&scalarised, "k"), Some("v"));
+        assert_eq!(
+            query_param(&json!({ "query": { "k": ["a", "b"] } }), "k"),
+            None
+        );
+        assert_eq!(query_param(&json!({}), "k"), None);
+    }
+    use agentos_http_adapter::fake::FakeBus;
+
+    const DELIVERY: &str = r#"{"elements":[{"notificationId":"n1","entityUrn":"urn:li:msg:thread1","from":"urn:li:person:u1","event":{"com.linkedin.voyager.messaging.event.MessageEvent":{"messageBody":{"text":"hello"}}}}]}"#;
+    const SECRET: &str = "linkedin-client-test-secret";
+    const SIGNATURE: &str = "122d08d3b6b55e1847e717bdde67b0219ae0f4f2d77fa07a623cdb9cdd1db04f";
+
+    fn sign_post(secret: &str, body: &[u8]) -> String {
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(b"hmacsha256=");
+        mac.update(body);
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    fn post_request(raw: Option<&str>, signature: Option<&str>) -> Value {
+        let mut headers = json!({ "content-type": "application/json" });
+        if let Some(signature) = signature {
+            headers["x-li-signature"] = json!(signature);
+        }
+        let mut req = json!({
+            "method": "POST",
+            "headers": headers,
+            "body": serde_json::from_str::<Value>(raw.unwrap_or(DELIVERY)).unwrap(),
+        });
+        if let Some(raw) = raw {
+            req["rawBody"] = json!(raw);
+        }
+        req
+    }
+
+    fn bus_with_secret(secret: &str) -> FakeBus {
+        let bus = FakeBus::new();
+        let secret = secret.to_string();
+        bus.on("vault::get", move |payload| {
+            let key = payload["key"].as_str().unwrap_or_default();
+            Ok(json!({ "value": if key == CLIENT_SECRET_KEY { secret.clone() } else { String::new() } }))
+        });
+        bus.on_value("state::get", json!({}));
+        bus.on_value("state::set", json!({}));
+        bus.on_value("agent::chat", json!({ "content": "" }));
+        bus.on_value("security::audit", json!({}));
+        bus
+    }
+
+    #[test]
+    fn known_good_post_signature_verifies() {
+        // Computed independently with Python's hmac/hashlib over
+        // b"hmacsha256=" || DELIVERY, keyed by SECRET.
+        assert_eq!(sign_post(SECRET, DELIVERY.as_bytes()), SIGNATURE);
+        assert!(verify_linkedin_signature(SECRET, DELIVERY.as_bytes(), SIGNATURE).is_ok());
+    }
+
+    #[test]
+    fn bare_body_or_prefixed_header_scheme_is_rejected() {
+        let bare_body_digest = hmac_sha256_hex(SECRET, DELIVERY.as_bytes()).unwrap();
+        assert!(verify_linkedin_signature(SECRET, DELIVERY.as_bytes(), &bare_body_digest).is_err());
+        assert!(
+            verify_linkedin_signature(
+                SECRET,
+                DELIVERY.as_bytes(),
+                &format!("hmacsha256={SIGNATURE}")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn tampered_body_fails_signature_verification() {
+        let tampered = DELIVERY.replace("hello", "forged");
+        assert!(verify_linkedin_signature(SECRET, tampered.as_bytes(), SIGNATURE).is_err());
+    }
+
+    #[tokio::test]
+    async fn valid_delivery_reaches_agent_but_forgery_does_not() {
+        let bus = bus_with_secret(SECRET);
+        let valid = webhook_handler(
+            &bus,
+            &reqwest::Client::new(),
+            post_request(Some(DELIVERY), Some(SIGNATURE)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(valid["status_code"], 200);
+        assert_eq!(bus.call_count("agent::chat"), 1);
+
+        let tampered = DELIVERY.replace("hello", "forged");
+        let forged = webhook_handler(
+            &bus,
+            &reqwest::Client::new(),
+            post_request(Some(&tampered), Some(SIGNATURE)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(forged["status_code"], 401);
+        assert_eq!(bus.call_count("agent::chat"), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_signature_header_is_rejected() {
+        let bus = bus_with_secret(SECRET);
+        let response = webhook_handler(
+            &bus,
+            &reqwest::Client::new(),
+            post_request(Some(DELIVERY), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["status_code"], 401);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_raw_body_is_rejected() {
+        let bus = bus_with_secret(SECRET);
+        let response = webhook_handler(
+            &bus,
+            &reqwest::Client::new(),
+            post_request(None, Some(SIGNATURE)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["status_code"], 400);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_secret_refuses_delivery_and_startup() {
+        let bus = bus_with_secret("");
+        let response = webhook_handler(
+            &bus,
+            &reqwest::Client::new(),
+            post_request(Some(DELIVERY), Some(SIGNATURE)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["status_code"], 503);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+        assert_eq!(startup_secret(&bus, CLIENT_SECRET_KEY).await, None);
+    }
+
+    #[tokio::test]
+    async fn get_challenge_remains_json_hmac() {
+        let bus = bus_with_secret(SECRET);
+        let response = webhook_handler(
+            &bus,
+            &reqwest::Client::new(),
+            json!({
+                "method": "GET",
+                "query": { "challengeCode": "challenge-123" }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["status_code"], 200);
+        assert_eq!(response["body"]["challengeCode"], "challenge-123");
+        // Computed independently with Python's hmac/hashlib over challengeCode.
+        assert_eq!(
+            response["body"]["challengeResponse"],
+            "6789db0b29ee94adaa98a816dc583d86e0eea6df1799517f702f40bd912b5020"
+        );
+    }
 
     #[test]
     fn split_short_text_returns_single_chunk() {
