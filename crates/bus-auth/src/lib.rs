@@ -22,6 +22,7 @@
 //! protocol and `iii-bridge` forwards `agentos::bus_auth` to it.
 
 pub mod client;
+pub mod config;
 pub mod daemon;
 pub mod policy;
 

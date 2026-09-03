@@ -15,8 +15,11 @@ workers:
   # gateway to the whole stack. Verified live: with host 127.0.0.1 the socket is
   # refused from this machine's LAN and tailnet addresses; with 0.0.0.0 it is
   # reachable from both. Valid keys are port, host, middleware_function_id,
-  # rbac, handshake_timeout_ms — the struct is deny_unknown_fields, so a typo
-  # fails the boot instead of being ignored.
+  # rbac, handshake_timeout_ms — THIS struct is deny_unknown_fields, so a typo
+  # here fails the boot instead of being ignored. The nested `rbac:` mapping is
+  # NOT: the engine ignores any key it does not know, so a typo inside it
+  # silently disarms the gate. `agentos-bus-authd` checks that file for you and
+  # refuses to start on a mismatch (crates/bus-auth/src/config.rs).
   - name: iii-worker-manager
     config:
       host: 127.0.0.1

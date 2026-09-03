@@ -1,0 +1,40 @@
+# Trigger type ids the engine's own workers register on a credential-less session.
+#
+# Captured from a LIVE armed boot, not written by hand. Every id here was seen by
+# `agentos::bus_on_trigger_type` with `context.agentosBusTier = "untrusted"`.
+#
+# Why this file decides a security boundary: `TriggerRegistry::register_trigger_type`
+# inserts unconditionally and then REPLAYS every existing binding of that type to
+# the newcomer. Measured on an armed stack before this hook existed, an
+# unauthenticated socket that claimed `http` received all 7 route bindings and a
+# route registered afterwards by a trusted worker returned 404. Anything NOT in
+# this list is registered by an in-process engine worker (`http`, `stream`,
+# `subscribe`, `log`, `trace`, `configuration`, `engine::*`) and never reaches the
+# hook at all, so keeping the list tight is what makes those types unclaimable.
+#
+# Regenerate (iii 0.22.1, ~40 s):
+#   1. cargo +1.90 build -p agentos-bus-auth
+#   2. AGENTOS_API_KEY=<key> RUST_LOG=debug agentos-bus-authd --listen=127.0.0.1:49129
+#   3. boot `iii` with config.yaml + bus-rbac.overlay.yaml merged in
+#   4. sed -n 's/.*allowed trigger type registration trigger_type_id=\([^ ]*\).*/\1/p' \
+#        authd.log | sort -u      # and confirm `refused trigger type` never appears
+#
+# Captured 2026-09-03 - engine 0.22.1 - workers as pinned in iii.lock
+# (16 ids from: state, queue, llm-router, session-manager,
+# iii-directory, iii-worker-ops)
+directory::agents::on-change
+directory::skills::on-change
+directory::system-prompts::on-change
+durable:subscriber
+router::models::changed
+router::provider::changed
+router::ready
+session::created
+session::deleted
+session::message-added
+session::message-updated
+session::meta-updated
+session::status-changed
+session::store::events
+state
+worker

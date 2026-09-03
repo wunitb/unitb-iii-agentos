@@ -416,3 +416,56 @@ fn first_quoted_id(window: &str) -> Option<String> {
     }
     None
 }
+
+/// Every trigger type the shipped registry workers register must survive the
+/// trigger-TYPE hook, for the same reason `registry_surface.txt` exists: a hook
+/// that refuses a legitimate registration takes the stack down quietly.
+#[test]
+fn every_shipped_trigger_type_stays_registrable_without_a_credential() {
+    let fixture = include_str!("trigger_type_surface.txt");
+    let untrusted = serde_json::json!({
+        agentos_bus_auth::policy::TIER_CONTEXT_KEY: agentos_bus_auth::policy::TIER_UNTRUSTED,
+    });
+
+    let ids: Vec<&str> = fixture
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    assert!(
+        ids.len() >= 10,
+        "the capture holds only {} trigger types - an emptied fixture must not pass",
+        ids.len()
+    );
+
+    let refused: Vec<&str> = ids
+        .iter()
+        .copied()
+        .filter(|id| !agentos_bus_auth::policy::trigger_type_registration_allowed(id, &untrusted))
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "an armed stack would refuse these trigger types and lose whatever they carry:\n  {}",
+        refused.join("\n  ")
+    );
+
+    // The types an IN-PROCESS engine worker registers never reach the hook, so
+    // admitting them here would only ever help an attacker.
+    for in_process in [
+        "http",
+        "stream",
+        "stream:join",
+        "stream:leave",
+        "subscribe",
+        "log",
+        "trace",
+        "configuration",
+        "engine::functions-available",
+        "engine::workers-available",
+    ] {
+        assert!(
+            !agentos_bus_auth::policy::trigger_type_registration_allowed(in_process, &untrusted),
+            "{in_process} is registered in-process; a credential-less session must not claim it"
+        );
+    }
+}

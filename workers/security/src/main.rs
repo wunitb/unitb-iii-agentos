@@ -1734,9 +1734,7 @@ mod tests {
 /// definition of them in the tree.
 #[cfg(test)]
 mod config_tree_guards {
-    use agentos_bus_auth::policy::{
-        AUTH_FUNCTION_ID, FUNCTION_REGISTRATION_HOOK_ID, TRIGGER_REGISTRATION_HOOK_ID,
-    };
+    use agentos_bus_auth::policy::ARMED_HOOKS;
 
     /// Engine bus default port. `iii-bridge` must never point at it: the bridge
     /// serves the auth function that gates this very listener, so aiming it here
@@ -1746,6 +1744,23 @@ mod config_tree_guards {
     fn config_yaml() -> String {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.yaml");
         std::fs::read_to_string(path).expect("config.yaml is readable from the worker crate")
+    }
+
+    /// The document with every comment removed.
+    ///
+    /// These guards assert on CONFIGURATION, and `config.yaml` documents the
+    /// engine's own rbac keys in prose right above the entry it describes. A
+    /// scan of raw text cannot tell a warning about `rbac:` from an armed
+    /// `rbac:`, and the version that could not was the one that failed.
+    fn without_comments(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| match line.find('#') {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The `- name: X` entry block, from that line to the next `- name:`.
@@ -1792,16 +1807,35 @@ mod config_tree_guards {
         // engine refuses every worker connection after the bridge timeout. The
         // documented `iii --config config.yaml` path starts no daemon, so an armed
         // default breaks a clean clone - measured, in CI run 33628742702.
-        let source = config_yaml();
+        let source = without_comments(&config_yaml());
         assert!(
             !source.contains("rbac:"),
-            "config.yaml arms bus RBAC; it belongs in config/bus-rbac.overlay.yaml \
+            "config.yaml arms bus RBAC; it belongs in bus-rbac.overlay.yaml \
              so that `iii --config config.yaml` still boots without the daemon"
         );
         assert!(
             !source.contains("- name: iii-bridge\n"),
             "the iii-bridge entry only exists to serve the RBAC hooks; it belongs \
              with the overlay"
+        );
+    }
+
+    /// The guard above reads configuration, not prose: `config.yaml` warns the
+    /// operator about the nested `rbac:` mapping in a comment, and that must not
+    /// read as an armed gate — nor may a real one hide behind a comment.
+    #[test]
+    fn the_armed_gate_guard_reads_configuration_and_not_comments() {
+        assert!(
+            config_yaml().contains("rbac:"),
+            "config.yaml is expected to MENTION rbac: in its warning comment"
+        );
+        assert!(
+            !without_comments("workers:\n  # rbac: not armed, just described\n").contains("rbac:")
+        );
+        assert!(
+            without_comments("workers:\n      rbac:\n        auth_function_id: x\n")
+                .contains("rbac:"),
+            "an armed block must still be seen"
         );
     }
 
@@ -1829,14 +1863,15 @@ mod config_tree_guards {
             "iii-bridge.url must not be the engine's own bus ({ENGINE_BUS_PORT}); that deadlocks by construction"
         );
 
-        for id in [
-            AUTH_FUNCTION_ID,
-            FUNCTION_REGISTRATION_HOOK_ID,
-            TRIGGER_REGISTRATION_HOOK_ID,
-        ] {
+        // Every hook the daemon serves, from its own table: adding a hook there
+        // and forgetting the overlay is exactly how the trigger-TYPE surface
+        // stayed ungated.
+        for (key, id) in ARMED_HOOKS {
             assert!(
-                manager.contains(id),
-                "rbac block does not reference {id}; the hook it belongs to is unarmed"
+                manager.contains(&format!("{key}: {id}")),
+                "the overlay does not set `{key}: {id}`; that hook is unarmed and the \
+                 engine will not say so - the nested rbac struct ignores what it does \
+                 not know"
             );
             assert!(
                 bridge.contains(&format!("local_function: {id}")),
@@ -1848,10 +1883,6 @@ mod config_tree_guards {
                 "iii-bridge does not map {id} to the daemon"
             );
         }
-        assert!(
-            manager.contains(&format!("auth_function_id: {AUTH_FUNCTION_ID}")),
-            "auth_function_id must name {AUTH_FUNCTION_ID}"
-        );
     }
 
     #[test]

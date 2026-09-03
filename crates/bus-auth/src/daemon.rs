@@ -27,8 +27,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::policy::{
-    AUTH_FUNCTION_ID, FUNCTION_REGISTRATION_HOOK_ID, TRIGGER_REGISTRATION_HOOK_ID, auth_result,
-    function_registration_allowed, tier_of_context, trigger_registration_allowed,
+    AUTH_FUNCTION_ID, FUNCTION_REGISTRATION_HOOK_ID, TRIGGER_REGISTRATION_HOOK_ID,
+    TRIGGER_TYPE_REGISTRATION_HOOK_ID, auth_result, function_registration_allowed, tier_of_context,
+    trigger_registration_allowed, trigger_type_registration_allowed,
 };
 
 /// Default loopback address the daemon listens on.
@@ -129,6 +130,31 @@ fn invoke(function_id: &str, data: &Value, expected_key: Option<&str>) -> Result
                     "refused trigger registration"
                 );
                 Err(denied("trigger_registration_denied", target))
+            }
+        }
+        TRIGGER_TYPE_REGISTRATION_HOOK_ID => {
+            let target = data
+                .get("trigger_type_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let context = data.get("context").cloned().unwrap_or(Value::Null);
+            if trigger_type_registration_allowed(target, &context) {
+                tracing::debug!(
+                    trigger_type_id = %target,
+                    tier = %tier_of_context(&context),
+                    "allowed trigger type registration"
+                );
+                Ok(json!({ "trigger_type_id": target }))
+            } else {
+                // Loud, not debug: claiming a trigger type hands the claimant
+                // every existing binding of that type and silently strands the
+                // ones registered after it.
+                tracing::warn!(
+                    trigger_type_id = %target,
+                    tier = %tier_of_context(&context),
+                    "refused trigger type registration"
+                );
+                Err(denied("trigger_type_registration_denied", target))
             }
         }
         // The bridge announces itself on connect; anything else is not ours.
@@ -306,6 +332,47 @@ mod tests {
             }),
         ));
         assert_eq!(allowed["result"]["function_id"], json!("state::ui-content"));
+    }
+
+    /// Claiming a trigger type hands the claimant every existing binding of that
+    /// type and strands the ones registered after it, so the hook has to answer
+    /// with an error, not a permissive object.
+    #[test]
+    fn the_trigger_type_hook_refuses_an_in_process_type_and_admits_a_registry_one() {
+        let denied = reply(&invoke_frame(
+            TRIGGER_TYPE_REGISTRATION_HOOK_ID,
+            json!({
+                "trigger_type_id": "http",
+                "description": "route table capture",
+                "context": { TIER_CONTEXT_KEY: TIER_UNTRUSTED },
+            }),
+        ));
+        assert_eq!(
+            denied["error"]["code"],
+            json!("trigger_type_registration_denied")
+        );
+        assert!(
+            denied.get("result").is_none(),
+            "an object result is what the engine reads as ALLOW"
+        );
+
+        let allowed = reply(&invoke_frame(
+            TRIGGER_TYPE_REGISTRATION_HOOK_ID,
+            json!({
+                "trigger_type_id": "state",
+                "context": { TIER_CONTEXT_KEY: TIER_UNTRUSTED },
+            }),
+        ));
+        assert_eq!(allowed["result"], json!({ "trigger_type_id": "state" }));
+
+        let trusted = reply(&invoke_frame(
+            TRIGGER_TYPE_REGISTRATION_HOOK_ID,
+            json!({
+                "trigger_type_id": "http",
+                "context": { TIER_CONTEXT_KEY: TIER_TRUSTED },
+            }),
+        ));
+        assert_eq!(trusted["result"], json!({ "trigger_type_id": "http" }));
     }
 
     #[test]

@@ -161,6 +161,7 @@ dependencies = [
  "futures-util",
  "iii-sdk",
  "serde_json",
+ "serde_yaml",
  "subtle",
  "tokio",
  "tokio-tungstenite",
