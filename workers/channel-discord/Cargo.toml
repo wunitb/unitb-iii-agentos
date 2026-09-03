@@ -20,3 +20,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 reqwest = { workspace = true, features = ["json"] }
+# Discord signs interactions and webhook events with Ed25519 (X-Signature-Ed25519).
+ed25519-dalek.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+agentos-http-adapter = { workspace = true, features = ["fake-bus"] }
