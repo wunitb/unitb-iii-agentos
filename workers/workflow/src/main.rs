@@ -1,4 +1,4 @@
-use agentos_http_adapter::policy;
+use agentos_http_adapter::{policy, principal};
 use iii_sdk::errors::Error;
 use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Map, Value, json};
@@ -411,7 +411,18 @@ fn plan_step_authorization<'a>(
     }
 }
 
-/// Authorize one step immediately before it is dispatched.
+/// The payload a step is dispatched with: the interpolated variables, labelled
+/// with the step's principal for the families that resolve one (contract T1).
+///
+/// The label OVERWRITES anything the definition or the variables put there —
+/// a workflow can no more name its own principal in a payload than in
+/// `workflow.agents` (see `step_principal`).
+fn dispatch_payload(step: &WorkflowStep, payload: Value, agent_id: &str) -> Value {
+    principal::attach_agent(&step.function_id, payload, agent_id)
+}
+
+/// Authorize one step immediately before it is dispatched, and answer the
+/// principal it runs as.
 ///
 /// The workflow worker holds a trusted engine session, so a step id reaches the
 /// bus with the worker's own authority. Every dispatch site must pass through
@@ -422,7 +433,7 @@ async fn authorize_step(
     step: &WorkflowStep,
     fallback_agent_id: Option<&str>,
     payload: &Value,
-) -> Result<(), Error> {
+) -> Result<String, Error> {
     let (agent_id, needs_approval) =
         match plan_step_authorization(step, workflow, fallback_agent_id) {
             StepAuthorization::Refused(reason) => return Err(Error::Handler(reason)),
@@ -435,7 +446,7 @@ async fn authorize_step(
     check_capability(iii, agent_id, &step.function_id).await?;
 
     if !needs_approval {
-        return Ok(());
+        return Ok(agent_id.to_string());
     }
 
     let result = iii
@@ -463,7 +474,7 @@ async fn authorize_step(
         })?;
 
     match approval_denial(&result) {
-        None => Ok(()),
+        None => Ok(agent_id.to_string()),
         Some(reason) => Err(Error::Handler(format!(
             "{agent_id} needs approval to call {}: {reason}",
             step.function_id
@@ -479,10 +490,10 @@ async fn trigger_step(
     fallback_agent_id: Option<&str>,
 ) -> Result<Value, Error> {
     let payload = step_payload(step, vars, fallback_agent_id)?;
-    authorize_step(iii, workflow, step, fallback_agent_id, &payload).await?;
+    let agent_id = authorize_step(iii, workflow, step, fallback_agent_id, &payload).await?;
     iii.trigger(TriggerRequest {
         function_id: step.function_id.clone(),
-        payload,
+        payload: dispatch_payload(step, payload, &agent_id),
         action: None,
         timeout_ms: Some(step.timeout_ms),
     })
@@ -683,7 +694,10 @@ async fn run_step(
                 let payload = step_payload(concurrent_step, vars, fallback_agent_id)?;
                 // This branch dispatches without going through `trigger_step`,
                 // so it has to authorize the step itself.
-                authorize_step(iii, workflow, concurrent_step, fallback_agent_id, &payload).await?;
+                let agent_id =
+                    authorize_step(iii, workflow, concurrent_step, fallback_agent_id, &payload)
+                        .await?;
+                let payload = dispatch_payload(concurrent_step, payload, &agent_id);
                 let iii = iii.clone();
                 let function_id = concurrent_step.function_id.clone();
                 let timeout_ms = concurrent_step.timeout_ms;
@@ -1644,6 +1658,25 @@ mod tests {
             agents: vec![],
             steps,
         }
+    }
+
+    #[test]
+    fn a_memory_step_is_dispatched_on_behalf_of_the_step_principal() {
+        let step = step_with("Remember", "memory::store", Some("agent-1"));
+        let mut vars = Map::new();
+        vars.insert("input".into(), json!("x"));
+        // The definition tries to name its own principal through a variable.
+        vars.insert("principal".into(), json!({ "agentId": "victim" }));
+        let payload = step_payload(&step, &vars, None).expect("payload");
+
+        let dispatched = dispatch_payload(&step, payload, "agent-1");
+        assert_eq!(dispatched["principal"], json!({ "agentId": "agent-1" }));
+        assert_eq!(dispatched["prompt"], "x");
+
+        // Families that resolve no principal are dispatched as built.
+        let step = step_with("Run", "workflow::run", Some("agent-1"));
+        let payload = step_payload(&step, &vars, None).expect("payload");
+        assert_eq!(dispatch_payload(&step, payload.clone(), "agent-1"), payload);
     }
 
     #[test]
