@@ -29,6 +29,31 @@ pub fn is_deny_by_default(function_id: &str) -> bool {
     !family.is_empty() && DENY_BY_DEFAULT_FAMILIES.contains(&family)
 }
 
+/// Namespace of capability GRANTS — entries that name a permission, not a
+/// function (contract T1).
+///
+/// Nothing registers a `grant::*` id and nothing can be triggered under it; the
+/// entry exists only so a reader can ask "does this agent hold this grant?"
+/// through the same `security::check_capability` path and the same
+/// [`capabilities_grant`] matcher as every tool entry. A grant is exact-id only:
+/// `*`, `grant::*` and `grant::act_as::*` grant nothing, because a wildcard that
+/// reached a grant would hand out cross-agent access by accident.
+pub const GRANT_NAMESPACE: &str = "grant";
+
+/// True when `id` names a grant rather than a callable.
+pub fn is_grant(id: &str) -> bool {
+    id.split("::").next() == Some(GRANT_NAMESPACE) && id.len() > GRANT_NAMESPACE.len()
+}
+
+/// The grant that lets an agent act on ANOTHER agent's stored content
+/// (memory, sessions, lifecycle state): `grant::act_as::<target agent id>`.
+///
+/// One entry per target; there is deliberately no "act as anyone" spelling.
+/// A worker that acts system-wide presents the operator bearer instead.
+pub fn act_as_grant(target_agent_id: &str) -> String {
+    format!("{GRANT_NAMESPACE}::act_as::{target_agent_id}")
+}
+
 /// Match one capability pattern against one function id.
 ///
 /// `*` is a wildcard segment. A trailing `*` covers every remaining segment, so
@@ -62,12 +87,13 @@ pub fn capability_matches(pattern: &str, function_id: &str) -> bool {
 
 /// True when `patterns` grant `function_id`.
 ///
-/// Deny-by-default ids need an exact-id entry; no wildcard reaches them.
+/// Deny-by-default ids and grants need an exact-id entry; no wildcard reaches
+/// them.
 pub fn capabilities_grant(patterns: &[String], function_id: &str) -> bool {
     if function_id.is_empty() {
         return false;
     }
-    if is_deny_by_default(function_id) {
+    if is_deny_by_default(function_id) || is_grant(function_id) {
         return patterns.iter().any(|pattern| pattern == function_id);
     }
     patterns
@@ -130,6 +156,38 @@ mod tests {
                 "{function_id} not granted by its exact id"
             );
         }
+    }
+
+    #[test]
+    fn grants_are_exact_only_and_never_reached_by_a_wildcard() {
+        let grant = act_as_grant("agent-b");
+        assert_eq!(grant, "grant::act_as::agent-b");
+        assert!(is_grant(&grant));
+        assert!(!is_grant("grant"), "the bare namespace names nothing");
+        assert!(!is_grant("grants::act_as::x"));
+        assert!(!is_grant("memory::grant::x"));
+        assert!(
+            !is_deny_by_default(&grant),
+            "a grant is not a callable family; it must not widen the I1 deny set"
+        );
+
+        for wildcard in [
+            "*",
+            "grant::*",
+            "grant::act_as::*",
+            "grant::act_as::agent-*",
+        ] {
+            assert!(
+                !capabilities_grant(&[wildcard.to_string()], &grant),
+                "{wildcard} must not grant {grant}"
+            );
+        }
+        assert!(!capabilities_grant(&[act_as_grant("agent-c")], &grant));
+        assert!(capabilities_grant(std::slice::from_ref(&grant), &grant));
+        assert!(
+            !capabilities_grant(std::slice::from_ref(&grant), "grant::act_as::agent-b::x"),
+            "an exact entry grants exactly one target"
+        );
     }
 
     #[test]

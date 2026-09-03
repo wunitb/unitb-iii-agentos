@@ -11,6 +11,7 @@ use subtle::ConstantTimeEq;
 
 pub mod bus;
 pub mod policy;
+pub mod principal;
 pub mod state;
 
 #[cfg(any(test, feature = "fake-bus"))]
