@@ -257,7 +257,8 @@ pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
     "hand::trigger",
     "task::spawn_workers",
     // Externally reachable deputies. Pulse tick stays allowed because it is an
-    // engine registration target whose worker validates trusted engine metadata.
+    // engine registration target; its handler must derive the target from
+    // worker-held authorized state and treat invocation metadata as untrusted input.
     // The control/status surface and all swarm/A2A dispatch stay principal-only. (A)(B)(C)
     "pulse::register",
     "pulse::invoke",
@@ -732,7 +733,7 @@ mod tests {
         }
         assert!(
             !UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&"pulse::tick"),
-            "pulse::tick is a registry target; its worker validates engine metadata"
+            "pulse::tick is a registry target; its handler must not trust invocation metadata"
         );
     }
 
@@ -930,7 +931,7 @@ mod tests {
             "memory",        // (C) no tenancy on any of these ids
             "orchestrator",  // (A) executes a plan and writes host files
             "policy",        // (B) set_rules rewrites the rule set
-            "pulse",         // (A)(B)(C) external deputy control; tick validates metadata
+            "pulse",         // (A)(B)(C) external control; tick uses worker-held state
             "realm",         // (B) import overwrites a realm document
             "security",      // (B) capabilities, audit chain, signing oracle
             "skillkit",      // (A) install/run spawn npx
