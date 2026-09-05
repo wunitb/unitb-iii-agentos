@@ -300,8 +300,34 @@ export function rustStringConstants(text: string): Map<string, string> {
 }
 
 /**
- * Ids registered by one Rust source: string literals, plus identifiers resolved
- * through `constants`. An identifier with no known value is skipped here and
+ * A deliberately narrow static binding: a unique no-arg factory whose entire
+ * body is ("literal id", handler), destructured immediately before registration.
+ * Dynamic bodies, intervening statements, qualified calls and shadowed factory
+ * names stay unresolved. This is not a general Rust evaluator.
+ */
+function rustLiteralTupleBindings(text: string): Map<number, string> {
+  const factories = new Map<string, string>();
+  for (const match of text.matchAll(
+    /\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*->\s*\(\s*&(?:'static\s+)?str\s*,\s*[A-Za-z_][A-Za-z0-9_:]*\s*\)\s*\{\s*\(\s*"([^"\\]+)"\s*,\s*[A-Za-z_][A-Za-z0-9_:]*\s*\)\s*\}/g,
+  )) {
+    const name = match[1]!;
+    const declarations = [...text.matchAll(new RegExp(`\\bfn\\s+${name}\\b`, "g"))];
+    const shadowed = new RegExp(`\\blet\\s+(?:mut\\s+)?${name}\\b|\\b${name}\\s*:(?!:)`).test(text);
+    if (declarations.length === 1 && !shadowed) factories.set(name, match[2]!);
+  }
+  const bindings = new Map<number, string>();
+  for (const match of text.matchAll(
+    /\blet\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*[A-Za-z_][A-Za-z0-9_]*\s*\)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*;\s*[A-Za-z_][A-Za-z0-9_.]*\.register_function\(\s*&?\1\s*,/g,
+  )) {
+    const id = factories.get(match[2]!);
+    if (id !== undefined) bindings.set(match.index + match[0].lastIndexOf("register_function("), id);
+  }
+  return bindings;
+}
+
+/**
+ * Ids registered by one Rust source: string literals, const/static identifiers,
+ * and the narrow adjacent tuple binding above. An unknown identifier is skipped and
  * reported by `collectUnresolvedRegistrations()`.
  */
 export function rustRegistrationIds(
@@ -309,6 +335,7 @@ export function rustRegistrationIds(
   constants: Map<string, string>,
 ): Array<{ id: string; line: number }> {
   const found: Array<{ id: string; line: number }> = [];
+  const tupleBindings = rustLiteralTupleBindings(text);
   for (const match of text.matchAll(/register_function\(\s*&?([A-Za-z_][A-Za-z0-9_:]*|"[^"]+")/g)) {
     const token = match[1]!;
     const line = lineOf(text, match.index);
@@ -317,18 +344,19 @@ export function rustRegistrationIds(
       continue;
     }
     const bare = token.includes("::") ? token.slice(token.lastIndexOf(":") + 1) : token;
-    const resolved = constants.get(bare);
+    const resolved = constants.get(bare) ?? tupleBindings.get(match.index);
     if (resolved !== undefined) found.push({ id: resolved, line });
   }
   return found;
 }
 
 /**
- * Every function id this workspace registers, from all three shapes it uses:
+ * Every function id this workspace registers, from the static shapes it uses:
  *
  *  - a literal in Rust: `register_function("agent::chat", ...)`;
  *  - a `const`/`static &str` in Rust: `register_function(STREAM_JOIN_FUNCTION, ...)`,
  *    resolved from the same file first and then the rest of the crate;
+ *  - a literal id/handler tuple factory bound immediately before registration;
  *  - a literal in the Python worker: `iii.register_function("embedding::generate", ...)`.
  *
  * Two call sites build their id at runtime — `workers/hand-runner` per hand and

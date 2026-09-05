@@ -121,6 +121,41 @@ describe("registration extractor", () => {
     ]);
   });
 
+  it("resolves an adjacent id/handler binding from a pure literal tuple factory", () => {
+    const source = [
+      "fn connect_binding() -> (&'static str, ConnectHandler) {",
+      '    ("mcp::connect", reject_direct_connect)',
+      "}",
+      "fn main() {",
+      "    let (connect_id, connect_handler) = connect_binding();",
+      "    iii.register_function(connect_id, connect_handler);",
+      "}",
+    ].join("\n");
+    expect(rustRegistrationIds(source, new Map()).map((site) => site.id)).toEqual(["mcp::connect"]);
+    expect(rustRegistrationIds(source.replace('"mcp::connect"', '"mcp::replacement"'), new Map())
+      .map((site) => site.id)).toEqual(["mcp::replacement"]);
+  });
+
+  it("does not infer tuple ids from dynamic factories, intervening rebindings, or shadowed factories", () => {
+    const factory = `fn connect_binding() -> (&'static str, Handler) { ("mcp::connect", reject) }`;
+    const binding = "let (connect_id, handler) = connect_binding();";
+    const registration = "iii.register_function(connect_id, handler);";
+    for (const source of [
+      `fn connect_binding() -> (&'static str, Handler) { if enabled() { ("mcp::connect", reject) } else { other_binding() } } fn main() { ${binding} ${registration} }`,
+      `${factory} fn main() { ${binding} let connect_id = runtime_id(); ${registration} }`,
+      `${factory} fn main(connect_binding: Factory) { ${binding} ${registration} }`,
+      `${factory} fn main() { let connect_binding = runtime_factory(); ${binding} ${registration} }`,
+    ]) {
+      expect(rustRegistrationIds(source, new Map())).toEqual([]);
+    }
+  });
+
+  it("counts the actual manifest-only MCP public binding instead of exempting it", () => {
+    expect(counts.functionRegistrations.some((site) =>
+      site.file === "workers/mcp-client/src/main.rs" && site.id === "mcp::connect",
+    )).toBe(true);
+  });
+
   it("counts a const-declared id wherever the tree actually has one", () => {
     // Bidirectional: the extractor must find what the source declares, and must
     // not invent what it does not. Green on a branch with the worker and without.
