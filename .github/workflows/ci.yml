@@ -520,9 +520,14 @@ jobs:
         env:
           AGENTOS_E2E: "1"
           III_URL: ws://localhost:49134
-        run: >-
-          bunx vitest --run --config vitest.e2e.config.ts e2e/full-stack.test.ts
-          --testNamePattern="local fake Anthropic provider|realm::create|mission::create|security::scan_injection|wasm::list_modules"
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/agentos-fake-provider-results.json"
+          rm -f -- "$report"
+          bunx vitest --run --config vitest.e2e.config.ts e2e/full-stack.test.ts \
+            --testNamePattern="local fake Anthropic provider|realm::create|mission::create|security::scan_injection|wasm::list_modules" \
+            --reporter=json --outputFile="$report"
+          bun scripts/assert-e2e-results.ts "$report"
 
       - name: "assert wasm:: + sandbox:: coexist (no namespace clash)"
         run: |

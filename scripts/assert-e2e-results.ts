@@ -3,6 +3,7 @@
 import { readFileSync } from "node:fs";
 
 const requiredTitle = "agent::chat — local fake Anthropic provider";
+const requiredFullName = `AgentOS full-stack E2E ${requiredTitle}`;
 
 function fail(message: string): never {
   console.error(`e2e result gate: ${message}`);
@@ -48,7 +49,8 @@ for (const entry of report.testResults) {
   }
 }
 
-if (matches.length !== 1 || matches[0].status !== "passed") {
+if (matches.length !== 1 || matches[0].status !== "passed"
+    || matches[0].fullName !== requiredFullName) {
   fail("expected exactly one passed actual fake-provider chat test in e2e/full-stack.test.ts");
 }
 console.log("e2e result gate: actual fake-provider chat test passed");

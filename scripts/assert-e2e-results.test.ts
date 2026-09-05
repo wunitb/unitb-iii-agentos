@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,8 +9,9 @@ import { describe, expect, it } from "vitest";
 const execFileAsync = promisify(execFile);
 const script = fileURLToPath(new URL("./assert-e2e-results.ts", import.meta.url));
 const title = "agent::chat — local fake Anthropic provider";
+const fullName = `AgentOS full-stack E2E ${title}`;
 
-function report(assertions: unknown[] = [{ title, status: "passed" }]) {
+function report(assertions: unknown[] = [{ title, fullName, status: "passed" }]) {
   return {
     success: true,
     numFailedTests: 0,
@@ -45,14 +46,14 @@ describe("fake-provider result gate", () => {
 
   it("rejects skipped, pending, todo and failed real chat tests", async () => {
     for (const status of ["skipped", "pending", "todo", "failed"]) {
-      expect((await check(report([{ title, status }]))).code).not.toBe(0);
+      expect((await check(report([{ title, fullName, status }]))).code).not.toBe(0);
     }
   });
 
   it("does not confuse the always-on preflight with the actual chat test", async () => {
     const result = await check(report([
       { title: "local fake Anthropic provider configuration preflight", status: "passed" },
-      { title, status: "skipped" },
+      { title, fullName, status: "skipped" },
     ]));
     expect(result.code).not.toBe(0);
   });
@@ -63,7 +64,7 @@ describe("fake-provider result gate", () => {
     wrongFile.testResults[0].name = "/fixture/e2e/another.test.ts";
     expect((await check(wrongFile)).code).not.toBe(0);
     expect((await check(report([
-      { title, status: "passed" }, { title, status: "passed" },
+      { title, fullName, status: "passed" }, { title, fullName, status: "passed" },
     ]))).code).not.toBe(0);
   });
 
@@ -73,6 +74,24 @@ describe("fake-provider result gate", () => {
     ]) {
       expect((await check({ ...report(), ...override })).code).not.toBe(0);
     }
+  });
+
+  it("requires the exact suite and leaf fullName, not just the leaf title", async () => {
+    for (const wrongName of [undefined, title, `Unrelated suite ${title}`]) {
+      const result = await check(report([{ title, fullName: wrongName, status: "passed" }]));
+      expect(result.code).not.toBe(0);
+    }
+  });
+
+  it("CI produces JSON and applies the actual-chat gate to that same report", async () => {
+    const ci = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+    const start = ci.indexOf("      - name: credential-free worker integration tests");
+    expect(start).toBeGreaterThan(-1);
+    const step = ci.slice(start, ci.indexOf("\n      - name:", start + 1));
+    expect(step).toContain('--reporter=json');
+    expect(step).toContain('--outputFile="$report"');
+    expect(step).toContain('bun scripts/assert-e2e-results.ts "$report"');
+    expect(step.indexOf('bun scripts/assert-e2e-results.ts')).toBeGreaterThan(step.indexOf('bunx vitest'));
   });
 
   it("fails closed on invalid report structure without echoing report contents", async () => {
