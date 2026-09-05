@@ -1,14 +1,12 @@
 use agentos_http_adapter::{CHAT_TIMEOUT_MS, TriggerBus, principal};
+use chrono::{DateTime, Timelike, Utc};
+use cron::Schedule;
 use iii_sdk::errors::Error;
 use iii_sdk::{
     IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker, trigger::Trigger,
 };
 use serde_json::{Value, json};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 use tokio::sync::Mutex;
 
 mod types;
@@ -45,21 +43,54 @@ fn expected_bearer() -> Option<String> {
 /// table below is the authority for scheduled work in this process. Handles
 /// and the boot token are deliberately treated as public replay material.
 ///
-/// One minute is the narrowest dependency-free bound that preserves the normal
-/// five-field cron cadence. Six-field sub-minute schedules are therefore
-/// coalesced. A leaked current handle cannot choose its target and cannot
-/// start overlapping or more-than-once-per-minute runs. It can shift a run to
-/// any time after this rate limit opens and can raise the cadence of a slower
-/// cron schedule up to that hard cap; this is bounded replay, not provenance.
-const MIN_TICK_INTERVAL: Duration = Duration::from_secs(60);
+/// A claim is admitted only for the authorized schedule's most recent UTC due
+/// slot and only within this five-second late-delivery window. Older due slots are not
+/// caught up. A known pair can shift one run inside the window, but cannot
+/// choose work, overlap a run, replay a claimed slot, or create an off-schedule
+/// run. This remains bounded replay control, not scheduler-origin proof.
+const SCHEDULER_JITTER_MILLIS: i64 = 5_000;
+
+fn normalize_cron_expression(expression: &str) -> Result<String, Error> {
+    let fields = expression.split_whitespace().collect::<Vec<_>>();
+    match fields.len() {
+        5 => Ok(format!("0 {}", fields.join(" "))),
+        6 => Ok(fields.join(" ")),
+        count => Err(Error::Handler(format!(
+            "cron expression requires 5 or 6 fields, received {count}"
+        ))),
+    }
+}
+
+fn parse_authorized_schedule(expression: &str) -> Result<Schedule, Error> {
+    let normalized = normalize_cron_expression(expression)?;
+    Schedule::from_str(&normalized)
+        .map_err(|error| Error::Handler(format!("invalid UTC cron expression: {error}")))
+}
+
+fn most_recent_due_slot(schedule: &Schedule, now: DateTime<Utc>) -> Option<i64> {
+    let floor = now.with_nanosecond(0)?;
+    let jitter = chrono::Duration::milliseconds(SCHEDULER_JITTER_MILLIS);
+    for seconds_back in 0..=(SCHEDULER_JITTER_MILLIS / 1_000 + 1) {
+        let candidate = floor - chrono::Duration::seconds(seconds_back);
+        let lateness = now.signed_duration_since(candidate);
+        if lateness > jitter {
+            continue;
+        }
+        if schedule.includes(candidate) {
+            return Some(candidate.timestamp());
+        }
+    }
+    None
+}
 
 type ScheduledJobs = Arc<Mutex<HashMap<String, ScheduledJob>>>;
 
 struct ScheduledJob {
     config: PulseConfig,
+    schedule: Schedule,
     boot_token: String,
     in_flight: bool,
-    last_started: Option<Instant>,
+    last_claimed_slot: Option<i64>,
     trigger: Option<Trigger>,
 }
 
@@ -93,7 +124,7 @@ async fn claim_scheduled_job(
     jobs: &ScheduledJobs,
     handle: &str,
     token: &str,
-    now: Instant,
+    now: DateTime<Utc>,
 ) -> Result<Option<PulseConfig>, Error> {
     let mut jobs = jobs.lock().await;
     let job = jobs.get_mut(handle).ok_or_else(|| {
@@ -104,24 +135,27 @@ async fn claim_scheduled_job(
             "pulse::tick process boot token is stale".into(),
         ));
     }
+    let due_slot = most_recent_due_slot(&job.schedule, now).ok_or_else(|| {
+        Error::Handler("pulse::tick arrived outside the configured due-slot window".into())
+    })?;
     if !job.config.enabled {
         return Ok(None);
+    }
+    if job
+        .last_claimed_slot
+        .is_some_and(|claimed| claimed >= due_slot)
+    {
+        return Err(Error::Handler(
+            "pulse::tick due slot was already claimed".into(),
+        ));
     }
     if job.in_flight {
         return Err(Error::Handler(
             "pulse::tick job is already in flight".into(),
         ));
     }
-    if job
-        .last_started
-        .is_some_and(|last| now.saturating_duration_since(last) < MIN_TICK_INTERVAL)
-    {
-        return Err(Error::Handler(
-            "pulse::tick replay arrived before the minimum interval".into(),
-        ));
-    }
     job.in_flight = true;
-    job.last_started = Some(now);
+    job.last_claimed_slot = Some(due_slot);
     Ok(Some(job.config.clone()))
 }
 
@@ -133,13 +167,15 @@ async fn finish_scheduled_job(jobs: &ScheduledJobs, handle: &str) {
 
 #[cfg(test)]
 async fn install_test_job(jobs: &ScheduledJobs, handle: &str, token: &str, config: PulseConfig) {
+    let schedule = parse_authorized_schedule(&config.cron).expect("test schedule");
     jobs.lock().await.insert(
         handle.to_string(),
         ScheduledJob {
             config,
+            schedule,
             boot_token: token.to_string(),
             in_flight: false,
-            last_started: None,
+            last_claimed_slot: None,
             trigger: None,
         },
     );
@@ -241,6 +277,7 @@ async fn register_pulse(
     jobs: &ScheduledJobs,
     boot_token: &str,
 ) -> Result<Value, Error> {
+    let schedule = parse_authorized_schedule(&req.cron)?;
     let config = PulseConfig {
         agent_id: req.agent_id.clone(),
         realm_id: req.realm_id.clone(),
@@ -293,9 +330,10 @@ async fn register_pulse(
         handle,
         ScheduledJob {
             config: config.clone(),
+            schedule,
             boot_token: boot_token.to_string(),
             in_flight: false,
-            last_started: None,
+            last_claimed_slot: None,
             trigger: Some(trigger),
         },
     );
@@ -434,18 +472,18 @@ async fn tick(iii: &dyn TriggerBus, config: PulseConfig) -> Result<Value, Error>
 /// worker process. iii 0.22.1 forwards caller-supplied invocation metadata
 /// unchanged, so metadata and `_caller_worker_id` are not scheduler identity.
 ///
-/// The handle/token may be visible. The in-flight flag and one-minute start
-/// interval bound replay, but a holder can shift timing and can raise a slower
-/// schedule to the one-per-minute cap. This is not cron-origin proof, not
-/// durable across worker restart, and
-/// not at-most-once across crashes. The engine triggers and this table are
-/// process-local; the operator must re-register schedules after restart.
+/// The handle/token may be visible. Due-slot claims and the in-flight flag
+/// bound replay; a holder can shift one authorized run within the configured
+/// five-second jitter window. This is not cron-origin proof, not durable across worker
+/// restart, and not at-most-once across crashes. The engine triggers and this
+/// table are process-local; the operator must re-register schedules after
+/// restart. Schedule evaluation is UTC, matching pinned cron worker 0.21.10.
 async fn tick_from_trigger(
     iii: &dyn TriggerBus,
     input: Value,
     metadata: Option<Value>,
     jobs: &ScheduledJobs,
-    now: Instant,
+    now: DateTime<Utc>,
 ) -> Result<Value, Error> {
     principal::refuse_agent_principal(&input, expected_bearer().as_deref(), "pulse::tick")?;
     let (handle, token) = metadata_handle_and_token(metadata.as_ref())?;
@@ -553,7 +591,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scheduled_jobs = ScheduledJobs::default();
     let boot_token = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
     tracing::warn!(
-        "pulse schedules are process-local and must be re-registered after worker restart"
+        jitter_millis = SCHEDULER_JITTER_MILLIS,
+        "pulse schedules use UTC due-slot claims with bounded late jitter and no catch-up; schedules are process-local and must be re-registered after worker restart"
     );
 
     let iii_clone = iii.clone();
@@ -609,7 +648,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RegisterFunction::new_async(move |input: Value, metadata: Option<Value>| {
             let iii = iii_clone.clone();
             let jobs = Arc::clone(&jobs_for_tick);
-            async move { tick_from_trigger(&iii, input, metadata, &jobs, Instant::now()).await }
+            async move { tick_from_trigger(&iii, input, metadata, &jobs, Utc::now()).await }
         })
         .description("Internal: cron-triggered pulse execution"),
     );
@@ -716,7 +755,7 @@ mod tests {
             json!({}),
             Some(json!({ "agentId": "victim", "realmId": "forged-realm" })),
             &jobs,
-            Instant::now(),
+            test_now(),
         )
         .await
         .unwrap_err()
@@ -730,11 +769,17 @@ mod tests {
         );
     }
 
+    fn test_now() -> DateTime<Utc> {
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 9, 6, 12, 0, 0)
+            .single()
+            .expect("fixed UTC test time")
+    }
+
     fn scheduled_config(agent: &str) -> PulseConfig {
         PulseConfig {
             agent_id: agent.to_string(),
             realm_id: "realm".to_string(),
-            cron: "* * * * *".to_string(),
+            cron: "* * * * * *".to_string(),
             enabled: true,
             context_mode: ContextMode::Thin,
             timeout_secs: None,
@@ -752,6 +797,124 @@ mod tests {
         json!({ "jobHandle": handle, "bootToken": token })
     }
 
+    #[test]
+    fn pulse_parser_keeps_public_five_six_field_utc_grammar() {
+        let five = parse_authorized_schedule("*/5 * * * *").unwrap();
+        let six = parse_authorized_schedule("*/2 * * * * *").unwrap();
+        let base = test_now();
+        assert!(five.includes(base));
+        assert!(!five.includes(base + chrono::Duration::seconds(2)));
+        assert!(six.includes(base + chrono::Duration::seconds(2)));
+        assert!(parse_authorized_schedule("0 0 0 * * * 2026").is_err());
+        assert!(parse_authorized_schedule("TZ=Asia/Bangkok 0 0 * * * *").is_err());
+    }
+
+    #[test]
+    fn due_slot_is_late_only_bounded_and_drops_catch_up_backlog() {
+        let minutely = parse_authorized_schedule("0 * * * * *").unwrap();
+        let base = test_now();
+        assert_eq!(
+            most_recent_due_slot(
+                &minutely,
+                base + chrono::Duration::milliseconds(SCHEDULER_JITTER_MILLIS)
+            ),
+            Some(base.timestamp())
+        );
+        assert_eq!(
+            most_recent_due_slot(
+                &minutely,
+                base + chrono::Duration::milliseconds(SCHEDULER_JITTER_MILLIS + 1)
+            ),
+            None
+        );
+        assert_eq!(
+            most_recent_due_slot(&minutely, base - chrono::Duration::milliseconds(1)),
+            None,
+            "an early call must not claim the upcoming slot"
+        );
+
+        let every_two_seconds = parse_authorized_schedule("*/2 * * * * *").unwrap();
+        assert_eq!(
+            most_recent_due_slot(
+                &every_two_seconds,
+                base + chrono::Duration::milliseconds(4_900)
+            ),
+            Some((base + chrono::Duration::seconds(4)).timestamp()),
+            "only the newest due slot is claimable; no catch-up backlog"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_sub_minute_slots_are_not_coalesced_to_one_minute() {
+        let jobs = ScheduledJobs::default();
+        let mut config = scheduled_config("scheduled");
+        config.cron = "*/2 * * * * *".to_string();
+        install_test_job(&jobs, "known", "boot", config).await;
+        let bus = FakeBus::new();
+        bus.on_value("state::get", json!({ "enabled": false }));
+        let now = test_now();
+
+        tick_from_trigger(
+            &bus,
+            json!({}),
+            Some(scheduled_metadata("known", "boot")),
+            &jobs,
+            now,
+        )
+        .await
+        .unwrap();
+        let second = tick_from_trigger(
+            &bus,
+            json!({}),
+            Some(scheduled_metadata("known", "boot")),
+            &jobs,
+            now + chrono::Duration::seconds(2),
+        )
+        .await;
+
+        assert!(
+            second.is_ok(),
+            "configured two-second slot was coalesced: {second:?}"
+        );
+        assert_eq!(bus.call_count("state::get"), 2);
+    }
+
+    #[tokio::test]
+    async fn a_known_pair_cannot_amplify_a_slower_schedule() {
+        let jobs = ScheduledJobs::default();
+        let mut config = scheduled_config("scheduled");
+        config.cron = "0 0 * * * *".to_string();
+        install_test_job(&jobs, "known", "boot", config).await;
+        let bus = FakeBus::new();
+        bus.on_value("state::get", json!({ "enabled": false }));
+        let now = test_now();
+
+        tick_from_trigger(
+            &bus,
+            json!({}),
+            Some(scheduled_metadata("known", "boot")),
+            &jobs,
+            now,
+        )
+        .await
+        .unwrap();
+        let replay = tick_from_trigger(
+            &bus,
+            json!({}),
+            Some(scheduled_metadata("known", "boot")),
+            &jobs,
+            now + chrono::Duration::seconds(61),
+        )
+        .await;
+
+        assert!(replay.is_err(), "known pair amplified an hourly schedule");
+        assert_eq!(
+            bus.call_count("state::get"),
+            1,
+            "off-slot replay reached state"
+        );
+    }
+
     #[tokio::test]
     async fn unknown_missing_and_stale_tick_handles_stop_before_the_bus() {
         let empty = ScheduledJobs::default();
@@ -762,7 +925,7 @@ mod tests {
         ] {
             let bus = FakeBus::new();
             assert!(
-                tick_from_trigger(&bus, json!({}), metadata, &empty, std::time::Instant::now())
+                tick_from_trigger(&bus, json!({}), metadata, &empty, test_now())
                     .await
                     .is_err()
             );
@@ -777,7 +940,7 @@ mod tests {
                 json!({}),
                 Some(scheduled_metadata("known", "old")),
                 &jobs,
-                std::time::Instant::now(),
+                test_now(),
             )
             .await
             .is_err()
@@ -802,7 +965,7 @@ mod tests {
                 json!({ "agentId": "victim", "realmId": "forged" }),
                 Some(metadata),
                 &jobs,
-                std::time::Instant::now(),
+                test_now(),
             )
             .await
             .is_err()
@@ -811,11 +974,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_inside_the_minimum_interval_stops_before_the_bus() {
+    async fn duplicate_claim_in_the_same_due_slot_stops_before_the_bus() {
         let jobs = scheduled_jobs("known", "boot", "scheduled").await;
         let bus = FakeBus::new();
         bus.on_value("state::get", json!({ "enabled": false }));
-        let now = std::time::Instant::now();
+        let now = test_now();
 
         let first = tick_from_trigger(
             &bus,
@@ -838,7 +1001,7 @@ mod tests {
                 json!({}),
                 Some(scheduled_metadata("known", "boot")),
                 &jobs,
-                now + MIN_TICK_INTERVAL / 2,
+                now + chrono::Duration::milliseconds(500),
             )
             .await
             .is_err()
@@ -861,7 +1024,7 @@ mod tests {
             json!({ "agentId": "victim", "realmId": "forged" }),
             Some(scheduled_metadata("known", "boot")),
             &jobs,
-            std::time::Instant::now(),
+            test_now(),
         )
         .await
         .unwrap();
@@ -886,7 +1049,7 @@ mod tests {
             json!({}),
             Some(scheduled_metadata("known", "boot")),
             &jobs,
-            std::time::Instant::now(),
+            test_now(),
         )
         .await
         .unwrap();
@@ -938,7 +1101,7 @@ mod tests {
     async fn concurrent_duplicate_uses_the_real_tick_claim_and_never_reaches_the_bus() {
         let jobs = scheduled_jobs("known", "boot", "scheduled").await;
         let bus = Arc::new(PausingBus::default());
-        let now = Instant::now();
+        let now = test_now();
         let first = tokio::spawn({
             let jobs = Arc::clone(&jobs);
             let bus = Arc::clone(&bus);
@@ -964,7 +1127,7 @@ mod tests {
             json!({}),
             Some(scheduled_metadata("known", "boot")),
             &jobs,
-            now + MIN_TICK_INTERVAL,
+            now + chrono::Duration::seconds(1),
         )
         .await;
         assert!(duplicate.is_err());
@@ -993,7 +1156,7 @@ mod tests {
                 json!({}),
                 Some(scheduled_metadata("known", "boot")),
                 &jobs,
-                std::time::Instant::now(),
+                test_now(),
             )
             .await
             .is_err()
