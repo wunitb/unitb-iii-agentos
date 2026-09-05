@@ -173,6 +173,26 @@ enum VimMode {
     Insert,
 }
 
+#[derive(Debug, PartialEq)]
+enum ChatOutcome {
+    Success(String),
+    Failure(String),
+}
+
+#[derive(Debug, PartialEq)]
+struct ChatCompletion {
+    generation: u64,
+    placeholder: usize,
+    outcome: ChatOutcome,
+}
+
+struct PendingChat {
+    generation: u64,
+    placeholder: usize,
+    receiver: tokio::sync::oneshot::Receiver<ChatCompletion>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 struct App {
     screen: Screen,
     selected: usize,
@@ -238,6 +258,8 @@ struct App {
     worker_count: usize,
     worker_catalog: Vec<worker_picker::WorkerCard>,
     worker_picker_selected: usize,
+    chat_generation: u64,
+    pending_chat: Option<PendingChat>,
 }
 
 /// Session identity for one TUI conversation: unique per process and per
@@ -319,6 +341,8 @@ impl App {
             worker_count: 0,
             worker_catalog: vec![],
             worker_picker_selected: 0,
+            chat_generation: 0,
+            pending_chat: None,
         }
     }
 
@@ -377,13 +401,17 @@ impl App {
         headers
     }
 
-    fn client() -> reqwest::Client {
-        let api_key = std::env::var("AGENTOS_API_KEY").ok();
+    fn client_with_api_key(api_key: Option<&str>) -> reqwest::Client {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
-            .default_headers(Self::api_headers(api_key.as_deref()))
+            .default_headers(Self::api_headers(api_key))
             .build()
             .unwrap_or_default()
+    }
+
+    fn client() -> reqwest::Client {
+        let api_key = std::env::var("AGENTOS_API_KEY").ok();
+        Self::client_with_api_key(api_key.as_deref())
     }
 
     fn action_client() -> reqwest::Client {
@@ -876,6 +904,7 @@ impl App {
                 }
             }
             "clear" => {
+                self.cancel_pending_chat();
                 // A cleared transcript is a new conversation: rotate the
                 // session so the server does not keep recalling the old one.
                 self.chat_messages.clear();
@@ -894,75 +923,160 @@ impl App {
         }
     }
 
-    async fn send_chat(&mut self) {
-        if self.chat_input.trim().is_empty() {
-            return;
+    async fn submit_chat_input(&mut self) {
+        if self.chat_input.starts_with('/') {
+            let parsed = slash::parse(&self.chat_input);
+            self.handle_slash(parsed).await;
+            self.chat_input.clear();
+            self.slash_completions.clear();
+        } else if self.start_chat() {
+            self.slash_completions.clear();
         }
+    }
+
+    fn start_chat(&mut self) -> bool {
+        let api_key = std::env::var("AGENTOS_API_KEY").ok();
+        self.start_chat_with(API_BASE, api_key.as_deref())
+    }
+
+    fn start_chat_with(&mut self, api_base: &str, api_key: Option<&str>) -> bool {
+        if self.pending_chat.is_some() {
+            self.status =
+                "A chat request is already active. Press Esc to stop waiting locally.".into();
+            return false;
+        }
+        if self.chat_input.trim().is_empty() {
+            return false;
+        }
+
         let msg = self.chat_input.clone();
         self.chat_input.clear();
         self.chat_messages.push(("user".into(), msg.clone()));
+        let placeholder = self.chat_messages.len();
+        self.chat_messages
+            .push(("assistant".into(), "(thinking...)".into()));
 
+        self.chat_generation = self.chat_generation.wrapping_add(1);
+        let generation = self.chat_generation;
         self.chat_streaming = true;
         self.spinner_active = true;
         self.spinner_verb = "thinking".into();
         self.streaming_start = Some(std::time::Instant::now());
         self.streaming_tokens = 0;
 
-        self.chat_messages
-            .push(("assistant".into(), "(thinking...)".into()));
-
         let agent_id = if self.chat_agent.is_empty() {
             self.agents
                 .first()
-                .and_then(|a| a["id"].as_str().or(a["name"].as_str()))
+                .and_then(|agent| agent["id"].as_str().or(agent["name"].as_str()))
                 .unwrap_or("default")
                 .to_string()
         } else {
             self.chat_agent.clone()
         };
-
-        let client = Self::client();
+        let client = Self::client_with_api_key(api_key);
         let body = chat_request_body(&msg, &agent_id, &self.chat_realm, &self.chat_session);
+        let url = format!("{api_base}/api/chat/stream");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let outcome = perform_chat_request(client, url, body).await;
+            let _ = sender.send(ChatCompletion {
+                generation,
+                placeholder,
+                outcome,
+            });
+        });
+        self.pending_chat = Some(PendingChat {
+            generation,
+            placeholder,
+            receiver,
+            task,
+        });
+        true
+    }
 
-        let send_result = client
-            .post(format!("{}/api/chat/stream", API_BASE))
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(CHAT_REQUEST_TIMEOUT_SECS))
-            .send()
-            .await;
+    fn poll_chat_reply(&mut self) {
+        let received = match self.pending_chat.as_mut() {
+            Some(pending) => match pending.receiver.try_recv() {
+                Ok(completion) => Some(completion),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Some(ChatCompletion {
+                    generation: pending.generation,
+                    placeholder: pending.placeholder,
+                    outcome: ChatOutcome::Failure(
+                        "Local chat task ended before returning a result.".into(),
+                    ),
+                }),
+            },
+            None => return,
+        };
 
-        match send_result {
-            Ok(resp) if resp.status().is_success() => {
-                let text = resp.text().await.unwrap_or_default();
-                let content = parse_chat_response(&text);
+        if let Some(pending) = self.pending_chat.take() {
+            pending.task.abort();
+        }
+        if let Some(completion) = received {
+            self.apply_chat_completion(completion);
+        }
+    }
+
+    fn apply_chat_completion(&mut self, completion: ChatCompletion) {
+        if completion.generation != self.chat_generation {
+            return;
+        }
+        let Some(message) = self.chat_messages.get_mut(completion.placeholder) else {
+            return;
+        };
+        match completion.outcome {
+            ChatOutcome::Success(content) => {
                 self.streaming_tokens = content.len() / 4;
-                if let Some(last) = self.chat_messages.last_mut() {
-                    *last = ("assistant".into(), content);
-                }
+                *message = ("assistant".into(), content);
             }
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let body = resp.text().await.unwrap_or_default();
-                if let Some(last) = self.chat_messages.last_mut() {
-                    *last = ("system".into(), chat_error_message(status, &body));
-                }
-            }
-            Err(e) => {
-                let hint = if e.is_connect() {
-                    "Engine not reachable. Run: iii --config config.yaml"
-                } else if e.is_timeout() {
-                    "Request timed out. Engine or llm-router may be hung."
-                } else {
-                    "Network error."
-                };
-                if let Some(last) = self.chat_messages.last_mut() {
-                    *last = ("system".into(), format!("{}: {}", hint, e));
-                }
+            ChatOutcome::Failure(error) => {
+                *message = ("system".into(), error);
             }
         }
-
         self.chat_streaming = false;
         self.spinner_active = false;
+        self.streaming_start = None;
+    }
+
+    fn cancel_pending_chat(&mut self) -> bool {
+        let Some(pending) = self.pending_chat.take() else {
+            return false;
+        };
+        pending.task.abort();
+        self.chat_generation = self.chat_generation.wrapping_add(1);
+        if let Some(message) = self.chat_messages.get_mut(pending.placeholder) {
+            *message = (
+                "system".into(),
+                "Local wait cancelled; remote execution may continue.".into(),
+            );
+        }
+        self.chat_streaming = false;
+        self.spinner_active = false;
+        self.streaming_start = None;
+        self.status = "Stopped waiting locally; the server may still finish the request.".into();
+        true
+    }
+
+    fn abort_owned_chat_task(&mut self) {
+        if let Some(pending) = self.pending_chat.take() {
+            pending.task.abort();
+            self.chat_generation = self.chat_generation.wrapping_add(1);
+        }
+        self.chat_streaming = false;
+        self.spinner_active = false;
+        self.streaming_start = None;
+    }
+
+    fn type_chat_char(&mut self, character: char) {
+        self.chat_input.push(character);
+        self.refresh_slash_completions();
+    }
+
+    fn spinner_tick(&mut self) {
+        if self.spinner_active {
+            self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+        }
     }
 
     async fn approve_selected(&mut self) {
@@ -1048,6 +1162,43 @@ impl App {
             Screen::Lifecycle => self.lifecycle_states.len(),
             Screen::Orchestrator => self.orchestrator_plans.len(),
             _ => 0,
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.abort_owned_chat_task();
+    }
+}
+
+async fn perform_chat_request(client: reqwest::Client, url: String, body: Value) -> ChatOutcome {
+    let send_result = client
+        .post(url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(CHAT_REQUEST_TIMEOUT_SECS))
+        .send()
+        .await;
+
+    match send_result {
+        Ok(response) if response.status().is_success() => {
+            let text = response.text().await.unwrap_or_default();
+            ChatOutcome::Success(parse_chat_response(&text))
+        }
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            ChatOutcome::Failure(chat_error_message(status, &body))
+        }
+        Err(error) => {
+            let hint = if error.is_connect() {
+                "Engine not reachable. Run: iii --config config.yaml"
+            } else if error.is_timeout() {
+                "Request timed out. Engine or llm-router may be hung."
+            } else {
+                "Network error."
+            };
+            ChatOutcome::Failure(format!("{hint}: {error}"))
         }
     }
 }
@@ -1188,6 +1339,9 @@ fn parse_chat_response(body: &str) -> String {
 }
 
 fn navigate_to(app: &mut App, screen: Screen) {
+    if app.screen == Screen::Chat && screen != Screen::Chat {
+        app.cancel_pending_chat();
+    }
     app.screen = screen;
     app.selected = 0;
     app.scroll_offset = 0;
@@ -1211,6 +1365,7 @@ async fn main() -> Result<()> {
     let mut last_health = std::time::Instant::now();
 
     while app.running {
+        app.poll_chat_reply();
         terminal.draw(|f| draw(f, &app))?;
 
         if last_health.elapsed() > std::time::Duration::from_secs(10) {
@@ -1355,9 +1510,6 @@ async fn main() -> Result<()> {
                 let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 if is_ctrl {
                     match key.code {
-                        KeyCode::Char('k') => {
-                            app.status = "Kill all agents — not implemented (confirm first)".into();
-                        }
                         KeyCode::Char('r') => {
                             app.pending_chord = None;
                             app.chord_timeout = None;
@@ -1465,6 +1617,9 @@ async fn main() -> Result<()> {
                     },
                     VimMode::Insert => match key.code {
                         KeyCode::Esc => {
+                            if app.cancel_pending_chat() {
+                                continue;
+                            }
                             if app.chat_input.is_empty() {
                                 app.vim_mode = VimMode::Normal;
                             } else {
@@ -1473,14 +1628,7 @@ async fn main() -> Result<()> {
                             }
                         }
                         KeyCode::Enter => {
-                            if app.chat_input.starts_with('/') {
-                                let parsed = slash::parse(&app.chat_input);
-                                app.handle_slash(parsed).await;
-                            } else {
-                                app.send_chat().await;
-                            }
-                            app.chat_input.clear();
-                            app.slash_completions.clear();
+                            app.submit_chat_input().await;
                         }
                         KeyCode::Backspace => {
                             app.chat_input.pop();
@@ -1509,8 +1657,7 @@ async fn main() -> Result<()> {
                             }
                         }
                         KeyCode::Char(c) => {
-                            app.chat_input.push(c);
-                            app.refresh_slash_completions();
+                            app.type_chat_char(c);
                         }
                         _ => {}
                     },
@@ -1685,11 +1832,10 @@ async fn main() -> Result<()> {
             }
         }
 
-        if app.spinner_active {
-            app.spinner_frame = (app.spinner_frame + 1) % SPINNER_FRAMES.len();
-        }
+        app.spinner_tick();
     }
 
+    app.abort_owned_chat_task();
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
     Ok(())
@@ -1796,7 +1942,7 @@ fn draw(f: &mut Frame, app: &App) {
     let help = match app.screen {
         Screen::Chat => {
             if app.pending_chord.is_some() {
-                " Ctrl+X pressed — waiting for chord: k:Kill r:Recovery e:Export "
+                " Ctrl+X pressed — waiting for chord: r:Recovery e:Export "
             } else {
                 match app.vim_mode {
                     VimMode::Normal => {
@@ -3515,6 +3661,95 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct FakeChatServer {
+        base_url: String,
+        request: tokio::sync::oneshot::Receiver<String>,
+        release: Option<tokio::sync::oneshot::Sender<()>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for FakeChatServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn fake_chat_server(status: u16, body: &'static str, delayed: bool) -> FakeChatServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback fake server");
+        let address = listener.local_addr().expect("fake server address");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept fake request");
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.expect("read fake request");
+                assert!(read > 0, "client closed before sending request headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| {
+                        value
+                            .trim()
+                            .parse::<usize>()
+                            .expect("numeric content-length")
+                    })
+                })
+                .unwrap_or_default();
+            while request.len() < header_end + content_length {
+                let mut chunk = [0_u8; 1024];
+                let read = stream
+                    .read(&mut chunk)
+                    .await
+                    .expect("read fake request body");
+                assert!(read > 0, "client closed before sending request body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
+            if delayed {
+                let _ = release_rx.await;
+            }
+            let reason = if status == 200 {
+                "OK"
+            } else {
+                "Internal Server Error"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        FakeChatServer {
+            base_url: format!("http://{address}"),
+            request: request_rx,
+            release: Some(release_tx),
+            task,
+        }
+    }
+
+    async fn wait_for_chat(app: &mut App) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while app.chat_streaming {
+                app.poll_chat_reply();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("chat completion stayed bounded");
+    }
 
     #[test]
     fn test_screen_all_count() {
@@ -3537,6 +3772,231 @@ mod tests {
                 .get(AUTHORIZATION)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn delayed_chat_keeps_input_and_render_ticks_live() {
+        let mut fake = fake_chat_server(200, r#"{"content":"finished"}"#, true).await;
+        let mut app = App::new();
+        app.show_first_run = false;
+        app.chat_input = "hello".into();
+
+        assert!(app.start_chat_with(&fake.base_url, Some("test-bearer")));
+        let request = (&mut fake.request).await.expect("fake server saw request");
+        assert!(
+            request.starts_with("POST /api/chat/stream HTTP/1.1"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-bearer"),
+            "{request}"
+        );
+
+        app.type_chat_char('x');
+        app.spinner_tick();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("render while reply is delayed");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_eq!(app.chat_input, "x");
+        assert!(rendered.contains("thinking"), "{rendered}");
+        assert!(app.chat_streaming);
+
+        fake.release
+            .take()
+            .expect("release delayed response")
+            .send(())
+            .ok();
+        wait_for_chat(&mut app).await;
+        assert_eq!(
+            app.chat_messages,
+            vec![
+                ("user".into(), "hello".into()),
+                ("assistant".into(), "finished".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_error_replaces_the_matching_placeholder() {
+        let mut fake = fake_chat_server(
+            500,
+            r#"{"error":"provider_error: fake provider refused"}"#,
+            false,
+        )
+        .await;
+        let mut app = App::new();
+        app.chat_input = "fail".into();
+
+        assert!(app.start_chat_with(&fake.base_url, None));
+        let _ = (&mut fake.request).await.expect("fake server saw request");
+        wait_for_chat(&mut app).await;
+
+        assert_eq!(app.chat_messages[0], ("user".into(), "fail".into()));
+        assert_eq!(app.chat_messages[1].0, "system");
+        assert!(app.chat_messages[1].1.contains("fake provider refused"));
+        assert!(!app.chat_streaming);
+        assert!(!app.spinner_active);
+        fake.release.take();
+    }
+
+    #[tokio::test]
+    async fn navigating_away_stops_local_wait_and_blocks_late_writeback() {
+        let mut fake = fake_chat_server(200, r#"{"content":"late"}"#, true).await;
+        let mut app = App::new();
+        app.chat_input = "leave chat".into();
+        assert!(app.start_chat_with(&fake.base_url, None));
+        let _ = (&mut fake.request).await.expect("fake server saw request");
+        let placeholder = app.chat_messages.len() - 1;
+
+        navigate_to(&mut app, Screen::Dashboard);
+        assert_eq!(app.screen, Screen::Dashboard);
+        assert!(!app.chat_streaming);
+        assert!(
+            app.chat_messages[placeholder]
+                .1
+                .contains("remote execution may continue")
+        );
+
+        fake.release
+            .take()
+            .expect("release delayed response")
+            .send(())
+            .ok();
+        tokio::task::yield_now().await;
+        app.poll_chat_reply();
+        assert!(!app.chat_messages.iter().any(|(_, text)| text == "late"));
+    }
+
+    #[tokio::test]
+    async fn local_cancel_is_honest_and_rejects_stale_completion() {
+        let mut fake = fake_chat_server(200, r#"{"content":"stale answer"}"#, true).await;
+        let mut app = App::new();
+        app.chat_input = "cancel me".into();
+        assert!(app.start_chat_with(&fake.base_url, None));
+        let _ = (&mut fake.request).await.expect("fake server saw request");
+        let cancelled_generation = app.chat_generation;
+        let placeholder = app.chat_messages.len() - 1;
+
+        assert!(app.cancel_pending_chat());
+        assert!(!app.chat_streaming);
+        assert!(
+            app.chat_messages[placeholder]
+                .1
+                .contains("Local wait cancelled")
+        );
+        assert!(
+            app.chat_messages[placeholder]
+                .1
+                .contains("remote execution may continue")
+        );
+
+        app.apply_chat_completion(ChatCompletion {
+            generation: cancelled_generation,
+            placeholder,
+            outcome: ChatOutcome::Success("stale answer".into()),
+        });
+        assert!(
+            app.chat_messages[placeholder]
+                .1
+                .contains("Local wait cancelled")
+        );
+        assert!(
+            !app.chat_messages
+                .iter()
+                .any(|(_, text)| text == "stale answer")
+        );
+
+        fake.release
+            .take()
+            .expect("release delayed response")
+            .send(())
+            .ok();
+        tokio::task::yield_now().await;
+        app.poll_chat_reply();
+        assert!(
+            !app.chat_messages
+                .iter()
+                .any(|(_, text)| text == "stale answer")
+        );
+    }
+
+    #[tokio::test]
+    async fn second_chat_is_refused_while_one_is_active_without_losing_draft() {
+        let mut fake = fake_chat_server(200, r#"{"content":"first"}"#, true).await;
+        let mut app = App::new();
+        app.chat_input = "first".into();
+        assert!(app.start_chat_with(&fake.base_url, None));
+        let _ = (&mut fake.request).await.expect("fake server saw request");
+
+        app.chat_input = "second".into();
+        app.submit_chat_input().await;
+        assert_eq!(app.chat_input, "second");
+        assert_eq!(app.chat_messages.len(), 2);
+
+        fake.release
+            .take()
+            .expect("release delayed response")
+            .send(())
+            .ok();
+        wait_for_chat(&mut app).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_app_aborts_its_owned_chat_task() {
+        let mut fake = fake_chat_server(200, r#"{"content":"late"}"#, true).await;
+        let mut app = App::new();
+        app.chat_input = "quit".into();
+        assert!(app.start_chat_with(&fake.base_url, None));
+        let _ = (&mut fake.request).await.expect("fake server saw request");
+        let abort_handle = app
+            .pending_chat
+            .as_ref()
+            .expect("owned chat task")
+            .task
+            .abort_handle();
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !abort_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned request task was not aborted on app drop");
+    }
+
+    #[test]
+    fn kill_all_is_not_advertised_in_chat_footer_or_help() {
+        let mut app = App::new();
+        app.show_first_run = false;
+        app.pending_chord = Some('x');
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw footer");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("Kill"), "{rendered}");
+        assert!(!help_overlay::KEYMAP.iter().any(|binding| {
+            binding.keys.contains("Ctrl+K") || binding.action.to_ascii_lowercase().contains("kill")
+        }));
     }
 
     #[test]
