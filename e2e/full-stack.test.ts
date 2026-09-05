@@ -5,7 +5,7 @@ import { createServer, type IncomingHttpHeaders } from "node:http";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { IIIClient } from "iii-sdk";
 
 const shouldRunE2E = process.env.AGENTOS_E2E === "1";
@@ -125,6 +125,50 @@ function errorCode(error: unknown): string {
   return String(error.code);
 }
 
+type TriggerCaller = (
+  fn: string,
+  payload: unknown,
+  timeoutMs?: number,
+) => Promise<any>;
+
+async function withOperatorAgent<T>(
+  caller: TriggerCaller,
+  agentId: string,
+  headers: ReturnType<typeof operatorPayloadHeaders>,
+  run: () => Promise<T>,
+): Promise<T> {
+  const created = await caller("agent::create", {
+    headers,
+    body: {
+      id: agentId,
+      name: agentId,
+      capabilities: { functions: [] },
+    },
+  });
+  let primaryFailure: unknown;
+  try {
+    if (created?.agentId !== agentId) {
+      throw new Error("agent::create did not return the requested fixture agent");
+    }
+    return await run();
+  } catch (error) {
+    primaryFailure = error;
+    throw error;
+  } finally {
+    try {
+      const deleted = await caller("agent::delete", { headers, agentId });
+      if (deleted?.deleted !== true) {
+        throw new Error("agent::delete did not confirm fixture cleanup");
+      }
+    } catch (cleanupError) {
+      if (primaryFailure === undefined) throw cleanupError;
+      console.error(
+        `agent fixture cleanup also failed (code=${errorCode(cleanupError) || "unknown"})`,
+      );
+    }
+  }
+}
+
 type RecordedAnthropicRequest = {
   method: string;
   url: string;
@@ -232,6 +276,75 @@ describe("full-stack E2E client configuration", () => {
 
     const rebound = await startFakeAnthropicProvider();
     await rebound.close();
+  });
+
+  it("local fake Anthropic provider agent fixture creates and deletes as operator", async () => {
+    const calls: { fn: string; payload: any }[] = [];
+    const caller = async (fn: string, payload: any) => {
+      calls.push({ fn, payload });
+      if (fn === "agent::create") return { agentId: "fixture-agent" };
+      if (fn === "agent::chat") return { content: "chat-result" };
+      if (fn === "agent::delete") return { deleted: true };
+      throw new Error(`unexpected function ${fn}`);
+    };
+    const headers = { authorization: "Bearer literal-bus-test-key" };
+
+    const result = await withOperatorAgent(
+      caller,
+      "fixture-agent",
+      headers,
+      () => caller("agent::chat", { headers, agentId: "fixture-agent" }),
+    );
+
+    expect(result).toEqual({ content: "chat-result" });
+    expect(calls).toEqual([
+      {
+        fn: "agent::create",
+        payload: {
+          headers,
+          body: {
+            id: "fixture-agent",
+            name: "fixture-agent",
+            capabilities: { functions: [] },
+          },
+        },
+      },
+      {
+        fn: "agent::chat",
+        payload: { headers, agentId: "fixture-agent" },
+      },
+      {
+        fn: "agent::delete",
+        payload: { headers, agentId: "fixture-agent" },
+      },
+    ]);
+  });
+
+  it("local fake Anthropic provider agent cleanup cannot mask the primary failure", async () => {
+    const cleanupLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    const caller = async (fn: string) => {
+      if (fn === "agent::create") return { agentId: "fixture-agent" };
+      if (fn === "agent::delete") throw new Error("cleanup failure");
+      throw new Error(`unexpected function ${fn}`);
+    };
+
+    try {
+      await expect(
+        withOperatorAgent(
+          caller,
+          "fixture-agent",
+          { authorization: "Bearer literal-bus-test-key" },
+          async () => {
+            throw new Error("primary failure");
+          },
+        ),
+      ).rejects.toThrow("primary failure");
+      expect(cleanupLog).toHaveBeenCalledWith(
+        "agent fixture cleanup also failed (code=unknown)",
+      );
+    } finally {
+      cleanupLog.mockRestore();
+    }
   });
 
   it("local fake Anthropic provider client configuration applies bus credentials safely", () => {
@@ -542,33 +655,42 @@ suite("AgentOS full-stack E2E", () => {
     const agentId = `agent-e2e-fake-provider-${runId}`;
     let primaryFailure: unknown;
     try {
-      const response = await call<{ content: string; durationMs: number }>(
-        "agent::chat",
-        {
-          agentId,
-          headers: operatorPayloadHeaders(),
-          sessionId: `fake-provider-${runId}`,
-          provider: "anthropic",
-          model: "claude-haiku-4-5-20251001",
-          message: "Reply with the deterministic fake-provider answer.",
-        },
-        30_000,
-      );
-      expect(response.content).toBe("deterministic fake-provider answer");
+      await withOperatorAgent(
+        call,
+        agentId,
+        operatorPayloadHeaders(),
+        async () => {
+          const response = await call<{ content: string; durationMs: number }>(
+            "agent::chat",
+            {
+              agentId,
+              headers: operatorPayloadHeaders(),
+              sessionId: `fake-provider-${runId}`,
+              provider: "anthropic",
+              model: "claude-haiku-4-5-20251001",
+              message: "Reply with the deterministic fake-provider answer.",
+            },
+            30_000,
+          );
+          expect(response.content).toBe("deterministic fake-provider answer");
 
-      expect(fake.requests).toHaveLength(1);
-      const request = fake.requests[0];
-      expect(request.method).toBe("POST");
-      expect(request.url).toBe("/v1/messages");
-      expect(request.headers.host).toBe("127.0.0.1:39091");
-      expect(request.remoteAddress).toBe("127.0.0.1");
-      expect(request.headers["x-api-key"] === fakeAnthropicApiKey).toBe(true);
-      expect(request.headers["anthropic-version"]).toBe("2023-06-01");
-      expect(request.body.model).toBe("claude-haiku-4-5-20251001");
-      expect(request.body.messages.at(-1)).toEqual({
-        role: "user",
-        content: "Reply with the deterministic fake-provider answer.",
-      });
+          expect(fake.requests).toHaveLength(1);
+          const request = fake.requests[0];
+          expect(request.method).toBe("POST");
+          expect(request.url).toBe("/v1/messages");
+          expect(request.headers.host).toBe("127.0.0.1:39091");
+          expect(request.remoteAddress).toBe("127.0.0.1");
+          expect(request.headers["x-api-key"] === fakeAnthropicApiKey).toBe(
+            true,
+          );
+          expect(request.headers["anthropic-version"]).toBe("2023-06-01");
+          expect(request.body.model).toBe("claude-haiku-4-5-20251001");
+          expect(request.body.messages.at(-1)).toEqual({
+            role: "user",
+            content: "Reply with the deterministic fake-provider answer.",
+          });
+        },
+      );
     } catch (error) {
       primaryFailure = error;
       throw error;
@@ -589,18 +711,26 @@ suite("AgentOS full-stack E2E", () => {
       console.warn("live Anthropic evidence disabled; skipping live call assertion");
       return;
     }
-    const r = await call<{ content: string; durationMs: number }>(
-      "agent::chat",
-      {
-        agentId: "agent-e2e",
-        headers: operatorPayloadHeaders(),
-        message: "What is 17 times 23? Reply with just the number.",
-      },
-      115_000,
+    const runId = Date.now();
+    const agentId = `agent-e2e-live-${runId}`;
+    const r = await withOperatorAgent(
+      call,
+      agentId,
+      operatorPayloadHeaders(),
+      () =>
+        call<{ content: string; durationMs: number }>(
+          "agent::chat",
+          {
+            agentId,
+            headers: operatorPayloadHeaders(),
+            message: "What is 17 times 23? Reply with just the number.",
+          },
+          115_000,
+        ),
     );
     expect(r.content).toContain("391");
     expect(r.durationMs).toBeGreaterThan(0);
-  }, 120_000);
+  }, 130_000);
 
   it("agentos::llm::usage — tracks tokens across calls", async () => {
     if (!liveAnthropicEvidenceEnabled()) {
