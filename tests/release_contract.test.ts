@@ -219,6 +219,25 @@ describe("public setup documentation", () => {
     expect(install).not.toContain("iii --config config.yaml");
   });
 
+  test("documents Linux detached lifecycle separately from macOS foreground lifecycle", () => {
+    const readme = read("README.md");
+    const installGuide = read("INSTALL_STACK.md");
+    const website = read("website/components/Install.tsx");
+    for (const document of [readme, installGuide, website]) {
+      expect(document).toContain("Linux");
+      expect(document).toContain("macOS");
+      expect(document).toContain("agentos up");
+      expect(document).toContain("agentos start");
+      expect(document).toContain("agentos tui");
+      expect(document).toContain("runtime proof");
+    }
+    expect(website).toContain("--grace-seconds");
+    expect(readme).toContain("--grace-seconds");
+    expect(readme).toContain("0..60");
+    expect(readme).toContain("default 5");
+    expect(readme).toContain("runtime proof");
+  });
+
   test("root security, release, and contribution entry points exist", () => {
     for (const path of ["SECURITY.md", "RELEASING.md", "CONTRIBUTING.md"]) {
       expect(Bun.file(join(root, path)).size, `${path} is empty or absent`).toBeGreaterThan(0);

@@ -71,8 +71,12 @@ $EDITOR .env   # set CODEX_PROXY_API_KEY for http://127.0.0.1:8317/v1
 # 4. build the workspace
 cargo build --workspace --release
 
-# 5. bring the stack up: engine, workers, then the chat TUI
+# 5a. Linux: start an owned detached stack, then the chat TUI
 ./target/release/agentos up
+
+# 5b. macOS: keep the stack in the foreground; open the TUI separately
+./target/release/agentos start
+# in another terminal: ./target/release/agentos tui
 ```
 
 Step 3 is about the **model** credential only. Leave `AGENTOS_API_KEY` and
@@ -100,17 +104,17 @@ creates it for you:
 
 | you run | it does |
 |---|---|
-| `agentos up`, `agentos onboard`, `agentos start` | If `AGENTOS_API_KEY` or `AUDIT_HMAC_KEY` is absent or empty in the active `.env`, generate a distinct fresh 32-byte random key for each, fill its declared line **in place**, set the file to mode `0600`, and print the path. Existing non-empty values are never overwritten. Writing in place matters: `scripts/dev-up.sh` refuses a `duplicate dotenv variable`. |
+| Linux `agentos up`, or Linux/macOS `agentos onboard` / `agentos start` | If `AGENTOS_API_KEY` or `AUDIT_HMAC_KEY` is absent or empty in the active `.env`, generate a distinct fresh 32-byte random key for each, fill its declared line **in place**, set the file to mode `0600`, and print the path. Existing non-empty values are never overwritten. Writing in place matters: `scripts/dev-up.sh` refuses a `duplicate dotenv variable`. |
 | any command | **Never** invents a provider credential. `CODEX_PROXY_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and friends are yours to supply; AgentOS only reads them. |
 | `agentos doctor` | Reports, explicitly and separately: (a) whether `AGENTOS_API_KEY` is present, (b) which provider credential is present, (c) the default route that results — the first provider in the preference order above whose credential is present, or `provider_credential_missing` when none is. A missing `AGENTOS_API_KEY` is reported as *the cause*, not as "missing identities". |
 | `agentos start` | Loads the same active `.env` as `agentos up` and generates the key the same way. There is exactly one configuration path. |
 
 So the shortest honest first run is: install iii, put one model credential in
-`.env`, `cargo build --workspace --release`, `agentos up`. The bearer token
-appears in `.env` on its own, mode `0600`, and `agentos doctor` tells you which
-of the three things above is missing when something does not work.
+`.env`, build, then use `agentos up` on Linux or foreground `agentos start` on
+macOS. The bearer token appears in `.env` on its own, mode `0600`, and
+`agentos doctor` names what is missing.
 
-`agentos up` runs one ordered policy and never builds or installs anything: it
+On Linux, `agentos up` runs one ordered policy and never builds or installs anything: it
 resolves the config, verifies the iii binary (missing → `bash scripts/install-iii.sh`),
 starts `agentos-bus-authd` before an RBAC-armed engine, refuses to reuse an engine
 whose live gate cannot be verified, or boots `iii --config config.yaml` detached
@@ -124,7 +128,14 @@ baseline, its identity, and only the keys declared for it in
 next one; `--timeout` (default 30s) bounds the engine wait and then the worker wait.
 
 ```bash
-agentos up --no-tui   # engine + workers only; leaves them running, no TUI
+# Linux owned detached lifecycle
+agentos up --no-tui
+agentos stop --grace-seconds 5   # accepted range 0..60 seconds; default 5
+
+# macOS foreground lifecycle (Ctrl+C stops the owned children)
+agentos start
+# another terminal: agentos tui
+
 agentos doctor        # readiness report; diagnostic only, changes nothing
 ```
 
@@ -137,7 +148,7 @@ use, and the resulting default route.
 unverifiable-engine refusal for development. It consumes an already-initialized
 `.env`; run a CLI first-run command to generate the machine keys before using it.
 
-Engine boots on port 49134. `agentos up` starts the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source registers 301 literal function ids, which resolve to 301 distinct function ids (`bun run counts`). The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
+Engine boots on port 49134. Linux `agentos up` and foreground `agentos start` start the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source registers 301 literal function ids, which resolve to 301 distinct function ids (`bun run counts`). The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
 
 Prefer driving by HTTP? Same thing without the TUI:
 
@@ -157,12 +168,15 @@ AGENTOS_E2E_MODEL=claude-sonnet-4-20250514 bun run test:e2e
 
 The full-stack release installer supports Linux `x86_64` and `aarch64`, and
 macOS `aarch64`. Upstream iii `v0.22.1` does not publish the required
-`iii-worker` runtime for macOS `x86_64`:
+`iii-worker` runtime for macOS `x86_64`. Only the Linux owned detached
+`up`/`stop` lifecycle has runtime proof; building a macOS artifact is not proof
+that detached lifecycle works there. macOS `aarch64` uses foreground `start`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/wunitb/unitb-iii-agentos/main/scripts/install.sh | bash
 agentos init --quick
-agentos up
+agentos up      # Linux detached lifecycle
+# macOS instead: agentos start; then run `agentos tui` in another terminal
 ```
 
 The installer needs network access, `curl`, `tar`, and `sha256sum` or `shasum`.

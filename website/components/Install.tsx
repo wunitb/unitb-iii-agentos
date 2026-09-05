@@ -19,8 +19,20 @@ const STEPS = [
     cmd: "cargo build --workspace --release",
   },
   {
-    label: "Start through the guarded launcher",
+    label: "Linux — owned detached lifecycle",
     cmd: "./target/release/agentos up",
+  },
+  {
+    label: "Linux — stop owned groups later (0..60s, default 5)",
+    cmd: "./target/release/agentos stop --grace-seconds 5",
+  },
+  {
+    label: "macOS — foreground stack",
+    cmd: "./target/release/agentos start",
+  },
+  {
+    label: "macOS — separate terminal UI",
+    cmd: "./target/release/agentos tui",
   },
 ];
 
@@ -43,7 +55,7 @@ export default function Install() {
         <SectionHeader num="11" label="Install" />
 
         <h2 className="h-display text-[36px] md:text-[48px] mb-12 max-w-[20ch]">
-          Five steps. <em>Plug and play.</em>
+          Build once. <em>Choose your host lifecycle.</em>
         </h2>
 
         <ol className="border-t border-l border-line">
@@ -65,6 +77,12 @@ export default function Install() {
             </li>
           ))}
         </ol>
+
+        <p className="mt-5 max-w-[80ch] font-mono text-[11px] text-fg-3">
+          Only the Linux owned detached lifecycle has runtime proof. The macOS
+          artifact proves compilation and package shape; use foreground start and
+          a separate TUI there.
+        </p>
 
         <div className="mt-8 grid sm:grid-cols-3 gap-6 text-[12.5px] text-fg-3 font-mono">
           <div>
