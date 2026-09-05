@@ -51,6 +51,91 @@ fn relative(root: &Path, path: &Path) -> String {
         .into_owned()
 }
 
+#[test]
+fn direct_ci_engine_boots_start_bus_auth_first_and_disable_builtin_daemons() {
+    let workflow = std::fs::read_to_string(repository_root().join(".github/workflows/ci.yml"))
+        .expect("read ci.yml");
+    let lines: Vec<&str> = workflow.lines().collect();
+    let boots: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains("iii --config config.yaml"))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(boots.len(), 2, "guard every direct iii boot in ci.yml");
+
+    for boot in boots {
+        let block_start = (0..boot)
+            .rev()
+            .find(|index| lines[*index].trim() == "run: |")
+            .expect("engine boot is inside a multiline run block");
+        let before_boot = lines[block_start..boot].join("\n");
+        assert!(
+            before_boot.contains("agentos-bus-authd"),
+            "direct iii boot at line {} does not start bus auth first",
+            boot + 1
+        );
+        assert!(
+            before_boot.contains("/dev/tcp/127.0.0.1/49129"),
+            "direct iii boot at line {} does not wait for bus auth",
+            boot + 1
+        );
+        assert!(
+            before_boot.contains("IIIWORKER_DISABLE_BUILTIN_DAEMONS=1"),
+            "direct iii boot at line {} can expose worker::* mutations",
+            boot + 1
+        );
+    }
+
+    assert_eq!(
+        workflow.matches("kill \"$BUS_AUTH_PID\"").count(),
+        2,
+        "both direct-boot jobs must clean up their bus-auth daemon"
+    );
+}
+
+#[test]
+fn bare_ci_boots_use_a_non_secret_audit_key_instead_of_the_development_fallback() {
+    let workflow = std::fs::read_to_string(repository_root().join(".github/workflows/ci.yml"))
+        .expect("read ci.yml");
+    const CI_AUDIT_KEY: &str =
+        "AUDIT_HMAC_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert_eq!(
+        workflow.matches(CI_AUDIT_KEY).count(),
+        2,
+        "both bare iii CI boots bypass key generation and need the explicit test key"
+    );
+}
+
+#[test]
+fn e2e_smoke_is_prepared_for_the_loopback_fake_provider() {
+    let workflow = std::fs::read_to_string(repository_root().join(".github/workflows/ci.yml"))
+        .expect("read ci.yml");
+    assert!(workflow.contains("ANTHROPIC_API_KEY: ci-fake-key"));
+    assert!(workflow.contains("AGENTOS_ANTHROPIC_BASE_URL: http://127.0.0.1:39091"));
+    assert!(
+        workflow.contains("fake provider"),
+        "the e2e-smoke test-name pattern must select WP-E's fake-provider test"
+    );
+}
+
+#[test]
+fn boot_smoke_pins_default_armed_security_properties() {
+    let script = std::fs::read_to_string(repository_root().join("scripts/boot-smoke.sh"))
+        .expect("read boot-smoke.sh");
+    for marker in [
+        "boot deadlocked",
+        "UNTRUSTED_DENIED_FUNCTION_IDS",
+        "WORKER_MUTATION_FUNCTION_IDS",
+        "configuration::set",
+        "agent::chat",
+        "IIIWORKER_DISABLE_BUILTIN_DAEMONS=1",
+        "unset AGENTOS_API_KEY",
+    ] {
+        assert!(script.contains(marker), "boot smoke is missing `{marker}`");
+    }
+}
+
 /// The bus credential only exists if every worker actually sends it.
 ///
 /// Before the migration all 62 workers called `register_worker(&ws_url,
@@ -318,9 +403,17 @@ fn no_denied_id_is_fired_by_a_registry_worker_trigger() {
         "found only {} trigger targets - the scan is not looking at the tree",
         targets.len()
     );
+    // Wave 2 deliberately denies the credential-less `agent.inbox` queue
+    // deputy. WP-D removes that unused binding and pins authenticated deputies;
+    // until integration, name the one cross-package transition explicitly
+    // rather than weakening the deny.
+    const INTENTIONALLY_DISABLED_TARGETS: &[&str] = &["agent::chat"];
     let denied: Vec<String> = targets
         .iter()
-        .filter(|(id, _)| UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&id.as_str()))
+        .filter(|(id, _)| {
+            UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&id.as_str())
+                && !INTENTIONALLY_DISABLED_TARGETS.contains(&id.as_str())
+        })
         .map(|(id, path)| format!("  {id}  ({path})"))
         .collect();
     assert!(
@@ -354,6 +447,10 @@ fn every_shipped_registry_id_stays_registrable_without_a_credential() {
         ids.len() >= 100,
         "the capture holds only {} ids - an emptied fixture must not pass",
         ids.len()
+    );
+    assert!(
+        ids.iter().all(|id| !id.starts_with("configuration::")),
+        "the live capture proves configuration registers in-process; do not reopen its prefix"
     );
 
     let refused: Vec<&str> = ids

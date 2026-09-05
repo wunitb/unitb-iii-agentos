@@ -417,33 +417,31 @@ fn split_ws_authority(url: &str) -> Option<(&str, Option<u16>)> {
 mod tests {
     use super::*;
 
-    /// The overlay this repository ships, byte for byte.
-    fn shipped_overlay() -> String {
+    /// The default engine configuration this repository ships, byte for byte.
+    fn shipped_config() -> String {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
             .expect("crates/bus-auth is two levels below the repository root")
-            .join("bus-rbac.overlay.yaml");
-        std::fs::read_to_string(path).expect("read bus-rbac.overlay.yaml")
+            .join("config.yaml");
+        std::fs::read_to_string(path).expect("read config.yaml")
     }
 
     #[test]
-    fn the_shipped_overlay_arms_every_hook_this_daemon_serves() {
-        assert_eq!(inspect(&shipped_overlay()), GateStatus::Armed);
+    fn the_shipped_config_arms_every_hook_this_daemon_serves() {
+        assert_eq!(inspect(&shipped_config()), GateStatus::Armed);
     }
 
     #[test]
-    fn the_shipped_config_is_deliberately_unarmed() {
+    fn the_opt_in_overlay_is_retired() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
             .expect("repository root")
-            .join("config.yaml");
-        let config = std::fs::read_to_string(path).expect("read config.yaml");
-        assert_eq!(
-            inspect(&config),
-            GateStatus::NotArmed,
-            "config.yaml must stay unarmed: armed with no daemon listening, nothing boots"
+            .join("bus-rbac.overlay.yaml");
+        assert!(
+            !path.exists(),
+            "default-on RBAC must not leave a misleading opt-in overlay"
         );
     }
 
@@ -457,7 +455,7 @@ mod tests {
     /// The defect this module exists for: the engine accepts this file happily.
     #[test]
     fn a_typo_inside_rbac_is_reported_because_the_engine_never_will() {
-        let typo = shipped_overlay().replace("auth_function_id:", "auth_function_idd:");
+        let typo = shipped_config().replace("auth_function_id:", "auth_function_idd:");
         let reported = problems(&typo);
         assert!(
             reported
@@ -475,7 +473,7 @@ mod tests {
 
     #[test]
     fn an_id_the_daemon_does_not_serve_is_reported() {
-        let wrong = shipped_overlay().replace("agentos::bus_on_trigger_type", "agentos::typo");
+        let wrong = shipped_config().replace("agentos::bus_on_trigger_type", "agentos::typo");
         let reported = problems(&wrong);
         assert!(
             reported.iter().any(|problem| {
@@ -487,7 +485,7 @@ mod tests {
 
     #[test]
     fn an_unarmed_hook_is_reported_rather_than_left_silent() {
-        let dropped = shipped_overlay().replace(
+        let dropped = shipped_config().replace(
             "        on_trigger_type_registration_function_id: agentos::bus_on_trigger_type\n",
             "",
         );
@@ -501,7 +499,7 @@ mod tests {
 
     #[test]
     fn a_bridge_that_cannot_reach_the_daemon_is_reported() {
-        let no_forward = shipped_overlay().replace(
+        let no_forward = shipped_config().replace(
             "        - local_function: agentos::bus_on_trigger_type\n          remote_function: agentos::bus_on_trigger_type\n          timeout_ms: 5000\n",
             "",
         );
@@ -512,7 +510,7 @@ mod tests {
             "the forward list and the rbac block have to agree"
         );
 
-        let self_gating = shipped_overlay().replace("ws://127.0.0.1:49129", "ws://127.0.0.1:49134");
+        let self_gating = shipped_config().replace("ws://127.0.0.1:49129", "ws://127.0.0.1:49134");
         assert!(
             problems(&self_gating)
                 .iter()
@@ -520,8 +518,7 @@ mod tests {
             "a bridge pointed at the gated listener is a deadlock"
         );
 
-        let no_bridge =
-            shipped_overlay().replace("  - name: iii-bridge", "  - name: iii-unrelated");
+        let no_bridge = shipped_config().replace("  - name: iii-bridge", "  - name: iii-unrelated");
         assert!(
             problems(&no_bridge)
                 .iter()
@@ -537,7 +534,7 @@ mod tests {
     /// exact configuration it exists to refuse.
     #[test]
     fn the_self_gating_check_follows_the_configured_port() {
-        let moved = shipped_overlay()
+        let moved = shipped_config()
             .replace(
                 "      host: 127.0.0.1\n",
                 "      host: 127.0.0.1\n      port: 39534\n",
@@ -551,14 +548,14 @@ mod tests {
         );
 
         // The same file with the bridge left where it belongs is still fine.
-        let moved_ok = shipped_overlay().replace(
+        let moved_ok = shipped_config().replace(
             "      host: 127.0.0.1\n",
             "      host: 127.0.0.1\n      port: 39534\n",
         );
         assert_eq!(inspect(&moved_ok), GateStatus::Armed);
 
         // And 49134 stops being special once the engine is elsewhere.
-        let elsewhere = shipped_overlay()
+        let elsewhere = shipped_config()
             .replace(
                 "      host: 127.0.0.1\n",
                 "      host: 127.0.0.1\n      port: 39534\n",
@@ -762,7 +759,7 @@ mod tests {
     #[test]
     fn a_missing_expose_functions_is_reported() {
         let narrowed =
-            shipped_overlay().replace("        expose_functions:\n          - match(\"*\")\n", "");
+            shipped_config().replace("        expose_functions:\n          - match(\"*\")\n", "");
         assert!(
             problems(&narrowed)
                 .iter()

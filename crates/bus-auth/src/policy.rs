@@ -31,14 +31,14 @@
 //! * **untrusted** — no credential. Admitted, because the registry workers must
 //!   be, but (a) it may not invoke any id in [`UNTRUSTED_FORBIDDEN_FUNCTIONS`],
 //!   and (b) it may only register functions/triggers inside
-//!   [`UNTRUSTED_REGISTRATION_NAMESPACES`].
+//!   [`UNTRUSTED_REGISTRATION_PREFIXES`].
 //!
 //! What that buys: a credential-less local process can no longer read the vault,
 //! mint a cron/HTTP trigger, register an MCP server, or re-register (hijack) an
 //! id such as `vault::get` that a real worker owns. What it does NOT buy: that
 //! process may still do anything a registry worker may do — call `state::*`,
-//! `queue::*`, `configuration::*` and register ids inside those namespaces. Say
-//! so out loud; do not call the bus "authenticated".
+//! `queue::*`, and configuration reads, and register ids inside the captured
+//! registry namespaces. Say so out loud; do not call the bus "authenticated".
 
 use serde_json::{Map, Value, json};
 use subtle::ConstantTimeEq;
@@ -78,7 +78,7 @@ pub const TRIGGER_REGISTRATION_HOOK_ID: &str = "agentos::bus_on_trigger";
 pub const TRIGGER_TYPE_REGISTRATION_HOOK_ID: &str = "agentos::bus_on_trigger_type";
 
 /// Every engine-side id this daemon serves, and the `rbac` key that must name
-/// it. The armed `config.yaml`/overlay is checked against this table, because
+/// it. The default-armed `config.yaml` is checked against this table, because
 /// the nested `rbac` struct is NOT `deny_unknown_fields`: a misspelled key or a
 /// misspelled id is accepted silently and the gate is disarmed with no error
 /// anywhere (verified on 0.22.1 and 0.23.0).
@@ -148,10 +148,11 @@ pub const TIER_UNTRUSTED: &str = "untrusted";
 /// * The registry-fired trigger targets: `cron::cleanup_stale_sessions`,
 ///   `cron::aggregate_daily_costs`, `cron::reset_rate_limits`, `workflow::run`,
 ///   `memory::consolidate`, `memory::evict`, `feedback::auto_review`,
-///   `lifecycle::check_all`, `pulse::tick`, `hand::run::<id>` (cron) and
-///   `agent::chat` (queue). The factory halves — `cron::create|patch|delete`,
-///   `workflow::create` — ARE denied, which is what closes the composition
-///   route without stopping the schedule. `memory::consolidate` and
+///   `lifecycle::check_all`, `pulse::tick`, and `hand::run::<id>` (cron).
+///   `agent::chat` is denied: its credential-less queue trigger was retired and
+///   packaged deputies authenticate. The factory halves —
+///   `cron::create|patch|delete`, `workflow::create` — ARE denied, which closes
+///   the composition route without stopping the schedule. `memory::consolidate` and
 ///   `memory::evict` are destructive and still reachable; that is the price of
 ///   an unauthenticatable cron worker and it is recorded as a residual risk.
 ///
@@ -164,6 +165,9 @@ pub const TIER_UNTRUSTED: &str = "untrusted";
 /// `step.function_id` verbatim from its OWN trusted session, so an untrusted
 /// `workflow::create` + an allowed `workflow::run` reaches every id on this list.
 pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
+    // configuration — mutation is not required by the credential-less registry
+    // workers. Reads and the in-process registration path stay available. (B)
+    "configuration::set",
     // vault — the credential store itself. (C)
     "vault::backup",
     "vault::delete",
@@ -197,6 +201,10 @@ pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
     "mcp::serve",
     "mcp::serve_handler",
     "mcp::unserve",
+    // The manifest catalog is bounded, but adding/removing a live integration
+    // still starts or stops a process and mutates persisted integration state. (A)(B)
+    "integration::add",
+    "integration::remove",
     // hooks — arbitrary function ids fired on lifecycle events. (D)
     "hook::fire",
     "hook::list",
@@ -252,6 +260,7 @@ pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
     // writer of the contract I1 capability document; denying only
     // `security::set_capabilities` would leave the door next to it open. An
     // approval a caller can grant itself is not a gate.
+    "agent::chat",
     "agent::create",
     "agent::delete",
     "approval::decide",
@@ -342,7 +351,6 @@ pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
 /// — the measured alternative is a stack with no routing, no sessions, no
 /// directory and no context assembly.
 pub const UNTRUSTED_REGISTRATION_PREFIXES: &[&str] = &[
-    "configuration",
     "context",
     "cron",
     "directory",
@@ -680,12 +688,64 @@ mod tests {
             "feedback::auto_review",
             "lifecycle::check_all",
             "pulse::tick",
-            // Fired by the untrusted queue worker (workers/agent-core).
-            "agent::chat",
         ] {
             assert!(
                 !UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&id),
                 "{id} is fired by an engine-spawned worker that cannot authenticate"
+            );
+        }
+    }
+
+    #[test]
+    fn wave_two_mutations_are_forbidden_to_untrusted_sessions() {
+        let untrusted = auth_result(&headers(json!({})), Some("secret"));
+        let forbidden = untrusted["forbidden_functions"].as_array().unwrap();
+
+        for id in [
+            "configuration::set",
+            "agent::chat",
+            "integration::add",
+            "integration::remove",
+        ] {
+            assert!(
+                UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&id),
+                "{id} must be an exact untrusted invocation deny"
+            );
+            assert!(
+                forbidden.contains(&json!(id)),
+                "{id} must be delivered to the engine as forbidden"
+            );
+        }
+
+        for registry_required in [
+            "configuration::register",
+            "configuration::get",
+            "state::set",
+            "queue::send",
+            "workflow::run",
+        ] {
+            assert!(
+                !UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&registry_required),
+                "{registry_required} is required by an engine registry worker"
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_registration_is_in_process_not_an_untrusted_prefix() {
+        assert!(
+            !UNTRUSTED_REGISTRATION_PREFIXES.contains(&"configuration"),
+            "the live registry capture contains no configuration::* socket registrations"
+        );
+        let untrusted = json!({ TIER_CONTEXT_KEY: TIER_UNTRUSTED });
+        for id in [
+            "configuration::register",
+            "configuration::get",
+            "configuration::set",
+        ] {
+            assert!(
+                !function_registration_allowed(id, &untrusted),
+                "{id} is registered in-process and must not be claimable over a socket"
             );
         }
     }
@@ -817,24 +877,26 @@ mod tests {
         // here. Each one below maps to a clause of the "what earns an entry"
         // rule in the constant's docs; a new family cannot be added silently.
         const JUSTIFIED_FAMILIES: &[&str] = &[
-            "agent",        // (A) code_execute, (B) create/delete write the I1 document
-            "approval",     // (B) an approval a caller grants itself is not a gate
-            "control",      // (D) rehydrate replays the trigger factory
-            "coder",        // (A) the second surface of the shell binary
-            "council",      // (B) override rewrites a decision
-            "hand",         // (A) trigger runs an automation on demand
-            "lifecycle",    // (B)(C) per-agent state keyed on a bus-tier-trusted principal
-            "memory",       // (C) no tenancy on any of these ids
-            "orchestrator", // (A) executes a plan and writes host files
-            "policy",       // (B) set_rules rewrites the rule set
-            "realm",        // (B) import overwrites a realm document
-            "security",     // (B) capabilities, audit chain, signing oracle
-            "skillkit",     // (A) install/run spawn npx
-            "taint",        // (B) declassify removes a label
-            "task",         // (A) spawn_workers starts work
-            "trigger",      // (D) the mint factory
-            "worker",       // (A) add + start fetch and run a registry binary
-            "workflow",     // (D) create dispatches step ids from a trusted session
+            "agent",         // (A) code_execute, (B) create/delete write the I1 document
+            "approval",      // (B) an approval a caller grants itself is not a gate
+            "control",       // (D) rehydrate replays the trigger factory
+            "coder",         // (A) the second surface of the shell binary
+            "configuration", // (B) set mutates engine-wide worker configuration
+            "council",       // (B) override rewrites a decision
+            "hand",          // (A) trigger runs an automation on demand
+            "integration",   // (A)(B) add/remove process-backed catalog entries
+            "lifecycle",     // (B)(C) per-agent state keyed on a bus-tier-trusted principal
+            "memory",        // (C) no tenancy on any of these ids
+            "orchestrator",  // (A) executes a plan and writes host files
+            "policy",        // (B) set_rules rewrites the rule set
+            "realm",         // (B) import overwrites a realm document
+            "security",      // (B) capabilities, audit chain, signing oracle
+            "skillkit",      // (A) install/run spawn npx
+            "taint",         // (B) declassify removes a label
+            "task",          // (A) spawn_workers starts work
+            "trigger",       // (D) the mint factory
+            "worker",        // (A) add + start fetch and run a registry binary
+            "workflow",      // (D) create dispatches step ids from a trusted session
         ];
         const JUSTIFIED_IDS: &[&str] = &[
             // The engine's builtin bridge registers dotted ids, which have no

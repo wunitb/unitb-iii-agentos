@@ -11,6 +11,10 @@ on:
 # GITHUB_TOKEN, so it needs no scope here.
 permissions: {}
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -361,9 +365,13 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: rust
     env:
       AGENTOS_API_KEY: ci-smoke-key
+      AUDIT_HMAC_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      ANTHROPIC_API_KEY: ci-fake-key
+      AGENTOS_ANTHROPIC_BASE_URL: http://127.0.0.1:39091
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -410,6 +418,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p data
+          export IIIWORKER_DISABLE_BUILTIN_DAEMONS=1
+          ./target/release/agentos-bus-authd --config=config.yaml > bus-auth.log 2>&1 &
+          BUS_AUTH_PID=$!
+          echo "BUS_AUTH_PID=$BUS_AUTH_PID" >> "$GITHUB_ENV"
+          for _ in {1..60}; do
+            timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/49129" 2>/dev/null && break
+            kill -0 "$BUS_AUTH_PID" 2>/dev/null || { cat bus-auth.log; exit 1; }
+            sleep 0.25
+          done
+          timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/49129" 2>/dev/null \
+            || { echo "::error::bus-auth daemon never opened before iii"; cat bus-auth.log; exit 1; }
           iii --config config.yaml > engine.log 2>&1 &
           ENGINE_PID=$!
           echo "ENGINE_PID=$ENGINE_PID" >> "$GITHUB_ENV"
@@ -475,7 +494,7 @@ jobs:
           III_URL: ws://localhost:49134
         run: >-
           bunx vitest --run --config vitest.e2e.config.ts e2e/full-stack.test.ts
-          --testNamePattern="realm::create|mission::create|security::scan_injection|wasm::list_modules"
+          --testNamePattern="fake provider|realm::create|mission::create|security::scan_injection|wasm::list_modules"
 
       - name: "assert wasm:: + sandbox:: coexist (no namespace clash)"
         run: |
@@ -505,12 +524,14 @@ jobs:
         run: |
           pkill -f 'agentos-' || true
           if [ -n "${ENGINE_PID:-}" ]; then kill "$ENGINE_PID" || true; fi
+          if [ -n "${BUS_AUTH_PID:-}" ]; then kill "$BUS_AUTH_PID" || true; fi
 
   e2e-full:
     name: e2e full (main branch, credentials required)
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: e2e-smoke
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'wunitb/unitb-iii-agentos' && vars.AGENTOS_FULL_E2E_ENABLED == 'true' }}
     steps:
@@ -549,10 +570,22 @@ jobs:
       - name: start engine + workers
         env:
           AGENTOS_API_KEY: ${{ secrets.AGENTOS_API_KEY }}
+          AUDIT_HMAC_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p data
+          export IIIWORKER_DISABLE_BUILTIN_DAEMONS=1
+          ./target/release/agentos-bus-authd --config=config.yaml > bus-auth.log 2>&1 &
+          BUS_AUTH_PID=$!
+          echo "BUS_AUTH_PID=$BUS_AUTH_PID" >> "$GITHUB_ENV"
+          for _ in {1..60}; do
+            timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/49129" 2>/dev/null && break
+            kill -0 "$BUS_AUTH_PID" 2>/dev/null || { cat bus-auth.log; exit 1; }
+            sleep 0.25
+          done
+          timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/49129" 2>/dev/null \
+            || { echo "::error::bus-auth daemon never opened before iii"; cat bus-auth.log; exit 1; }
           iii --config config.yaml > engine.log 2>&1 &
           ENGINE_PID=$!
           echo "ENGINE_PID=$ENGINE_PID" >> "$GITHUB_ENV"
@@ -603,3 +636,4 @@ jobs:
         run: |
           pkill -f 'agentos-' || true
           if [ -n "${ENGINE_PID:-}" ]; then kill "$ENGINE_PID" || true; fi
+          if [ -n "${BUS_AUTH_PID:-}" ]; then kill "$BUS_AUTH_PID" || true; fi

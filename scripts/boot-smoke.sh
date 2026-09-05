@@ -1,6 +1,7 @@
 #!/bin/sh
 # Boot the release through the same entry point a user runs, then inspect the
-# live iii registry. No function is invoked, so this gate needs no provider key.
+# live iii boundary with read-only or deliberately invalid payloads. No provider
+# call is made, so this gate needs no provider key.
 set -eu
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -16,13 +17,45 @@ memory::recall
 context::build_prompt
 cron::create
 '
+UNTRUSTED_DENIED_FUNCTION_IDS='
+agentos::bus_auth
+mcp::list_connections
+bridge::list
+configuration::set
+agent::chat
+integration::add
+integration::remove
+'
+WORKER_MUTATION_FUNCTION_IDS='
+worker::add
+worker::clear
+worker::remove
+worker::start
+worker::stop
+worker::update
+'
 
 fail() {
   printf 'boot smoke: %s\n' "$*" >&2
   exit 1
 }
 
-for command in cp iii mktemp pgrep python3 timeout; do
+assert_untrusted_denied() {
+  function_id=$1
+  output="$scratch/denied-$function_id.log"
+  if iii trigger "$function_id" --json '{}' --timeout-ms 5000 > "$output" 2>&1; then
+    cat "$output" >&2
+    fail "untrusted call unexpectedly reached $function_id"
+  fi
+  if ! grep -F "$function_id" "$output" >/dev/null 2>&1 \
+    || ! grep -F 'not allowed' "$output" >/dev/null 2>&1; then
+    cat "$output" >&2
+    fail "$function_id failed for a reason other than the RBAC deny"
+  fi
+  printf 'boot smoke: ok: untrusted %s denied\n' "$function_id"
+}
+
+for command in cp grep iii mktemp pgrep python3 timeout; do
   command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
 [ -x "$REPO_ROOT/target/release/agentos" ]   || fail "release binary not found: $REPO_ROOT/target/release/agentos"
@@ -34,6 +67,7 @@ engine_home="$scratch/engine-home"
 registry_file="$scratch/functions.json"
 expected_workers_file="$scratch/expected-workers.txt"
 required_functions_file="$scratch/required-functions.txt"
+worker_mutations_file="$scratch/worker-mutations.txt"
 mkdir -p "$runtime/target/release" "$agentos_home" "$engine_home"
 
 port_is_open() {
@@ -188,10 +222,29 @@ LC_ALL=C sort -u -o "$expected_workers_file" "$expected_workers_file"
 export HOME="$engine_home"
 export AGENTOS_HOME="$agentos_home"
 export III_URL="ws://127.0.0.1:$ENGINE_PORT"
+export IIIWORKER_DISABLE_BUILTIN_DAEMONS=1
+# Exercise first-run key generation. The generated key stays in the isolated
+# runtime .env; this parent shell remains credential-less for the probes below.
+unset AGENTOS_API_KEY
 unset AGENTOS_CONFIG
 
 cd "$runtime"
-if ! timeout "$BOOT_TIMEOUT_SECONDS"   "$runtime/target/release/agentos" up --no-tui --timeout "$STAGE_TIMEOUT_SECONDS"; then
+set +e
+timeout --signal=TERM --kill-after=10s "$BOOT_TIMEOUT_SECONDS" \
+  "$runtime/target/release/agentos" up --no-tui --timeout "$STAGE_TIMEOUT_SECONDS"
+boot_status=$?
+set -e
+if [ "$boot_status" -eq 124 ] || [ "$boot_status" -eq 137 ]; then
+  printf 'boot smoke: boot deadlocked beyond the explicit %ss bound; scratch logs follow\n' \
+    "$BOOT_TIMEOUT_SECONDS" >&2
+  for log in "$agentos_home"/logs/*.log; do
+    [ -f "$log" ] || continue
+    printf '%s\n' "=== $log ===" >&2
+    tail -100 "$log" >&2 || true
+  done
+  exit 1
+fi
+if [ "$boot_status" -ne 0 ]; then
   printf 'boot smoke: agentos up failed; scratch logs follow\n' >&2
   for log in "$agentos_home"/logs/*.log; do
     [ -f "$log" ] || continue
@@ -202,8 +255,13 @@ if ! timeout "$BOOT_TIMEOUT_SECONDS"   "$runtime/target/release/agentos" up --no
 fi
 
 if ! iii trigger engine::functions::list --json '{}' --timeout-ms 5000 > "$registry_file"; then
-  fail "engine::functions::list failed after agentos up"
+  fail "allowed untrusted engine::functions::list failed after agentos up"
 fi
+printf 'boot smoke: ok: allowed untrusted engine::functions::list works\n'
+
+for function_id in $UNTRUSTED_DENIED_FUNCTION_IDS; do
+  assert_untrusted_denied "$function_id"
+done
 
 # Registration sites and why they are product-critical:
 # - workers/llm-router/src/main.rs:1652,1666 route and complete every chat turn.
@@ -212,7 +270,9 @@ fi
 # - workers/context-manager/src/main.rs:522 builds the model prompt.
 # - workers/cron/src/main.rs:628 creates scheduled AgentOS actions.
 printf '%s\n' "$REQUIRED_FUNCTION_IDS" > "$required_functions_file"
-python3 - "$registry_file" "$expected_workers_file" "$required_functions_file" <<'PY'
+printf '%s\n' "$WORKER_MUTATION_FUNCTION_IDS" > "$worker_mutations_file"
+python3 - "$registry_file" "$expected_workers_file" "$required_functions_file" \
+  "$worker_mutations_file" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -220,6 +280,7 @@ from pathlib import Path
 registry_path = Path(sys.argv[1])
 expected_path = Path(sys.argv[2])
 required_ids = Path(sys.argv[3]).read_text().split()
+worker_mutation_ids = Path(sys.argv[4]).read_text().split()
 text = registry_path.read_text()
 try:
     registry = json.loads(text)
@@ -243,6 +304,13 @@ missing_ids = [function_id for function_id in required_ids if function_id not in
 if missing_ids:
     raise SystemExit("boot smoke: missing function id(s): " + ", ".join(missing_ids))
 
+present_mutations = [function_id for function_id in worker_mutation_ids if function_id in registered_ids]
+if present_mutations:
+    raise SystemExit(
+        "boot smoke: builtin worker mutation function(s) unexpectedly registered: "
+        + ", ".join(present_mutations)
+    )
+
 expected_workers = set(expected_path.read_text().splitlines())
 connected_workers = {
     item.get("worker_name")
@@ -265,6 +333,7 @@ if len(connected_workers) != len(expected_workers) or connected_workers != expec
 
 print(
     f"boot smoke: ok: {len(required_ids)} required functions and "
-    f"{len(expected_workers)} AgentOS workers are registered"
+    f"{len(expected_workers)} AgentOS workers are registered; "
+    f"{len(worker_mutation_ids)} worker mutation functions are absent"
 )
 PY
