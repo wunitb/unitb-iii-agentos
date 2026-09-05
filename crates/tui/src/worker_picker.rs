@@ -629,10 +629,15 @@ mod tests {
 
     fn pattern_bindings(pattern: &syn::Pat, bindings: &mut Vec<(String, bool)>) {
         match pattern {
-            syn::Pat::Ident(identifier) => bindings.push((
-                identifier.ident.to_string(),
-                identifier.mutability.is_some(),
-            )),
+            syn::Pat::Ident(identifier) => {
+                bindings.push((
+                    identifier.ident.to_string(),
+                    identifier.mutability.is_some(),
+                ));
+                if let Some((_, subpattern)) = &identifier.subpat {
+                    pattern_bindings(subpattern, bindings);
+                }
+            }
             syn::Pat::Type(typed) => pattern_bindings(&typed.pat, bindings),
             syn::Pat::Tuple(tuple) => {
                 for element in &tuple.elems {
@@ -653,6 +658,11 @@ mod tests {
             syn::Pat::TupleStruct(value) => {
                 for element in &value.elems {
                     pattern_bindings(element, bindings);
+                }
+            }
+            syn::Pat::Or(value) => {
+                for case in &value.cases {
+                    pattern_bindings(case, bindings);
                 }
             }
             _ => {}
@@ -1286,6 +1296,25 @@ mod tests {
             ids.is_empty(),
             "factory tuple was assigned to the wrong pattern: {ids:?}"
         );
+    }
+
+    #[test]
+    fn extractor_tombstones_or_and_at_pattern_bindings() {
+        let source = r#"
+            fn install(first: Result<Id, Id>, second: Option<Id>) {
+                let id = "fake::outer";
+                match first {
+                    Ok(id) | Err(id) => iii.register_function(id, handler),
+                }
+                match second {
+                    whole @ Some(id) => iii.register_function(id, handler),
+                    None => {}
+                }
+            }
+        "#;
+
+        let ids = registered_function_ids_in_source(source).expect("parse fixture");
+        assert!(ids.is_empty(), "or/@ pattern reused an outer ID: {ids:?}");
     }
 
     #[test]
