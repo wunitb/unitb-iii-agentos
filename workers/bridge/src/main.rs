@@ -1,3 +1,7 @@
+use agentos_http_adapter::{
+    TriggerBus,
+    state::{set_op, update_errors, update_payload},
+};
 use dashmap::DashMap;
 use iii_sdk::errors::Error;
 use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
@@ -247,7 +251,10 @@ fn runs_scope() -> &'static str {
     "bridge:runs"
 }
 
-async fn register_runtime(iii: &IIIClient, req: RegisterRuntimeRequest) -> Result<Value, Error> {
+async fn register_runtime(
+    iii: &dyn TriggerBus,
+    req: RegisterRuntimeRequest,
+) -> Result<Value, Error> {
     let id = format!("rt-{}", uuid::Uuid::new_v4());
 
     let config = RuntimeConfig {
@@ -284,7 +291,7 @@ async fn register_runtime(iii: &IIIClient, req: RegisterRuntimeRequest) -> Resul
 }
 
 async fn invoke_runtime(
-    iii: &IIIClient,
+    iii: Arc<dyn TriggerBus>,
     req: InvokeRuntimeRequest,
     active_runs: &Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
 ) -> Result<Value, Error> {
@@ -338,7 +345,7 @@ async fn invoke_runtime(
     let iii_bg = iii.clone();
     let run_id_bg = run_id.clone();
     let handle = tokio::spawn(async move {
-        let result = execute_runtime(&iii_bg, &config, &req.context, timeout).await;
+        let result = execute_runtime(&config, &req.context, timeout).await;
 
         let (status, output, error, exit_code) = match result {
             Ok(out) => (RunStatus::Completed, Some(out), None, Some(0)),
@@ -401,8 +408,61 @@ async fn invoke_runtime(
     }))
 }
 
+async fn execute_http_runtime(
+    config: &RuntimeConfig,
+    context: &Value,
+    timeout_secs: u64,
+) -> Result<String, Error> {
+    let url = config
+        .url
+        .as_deref()
+        .ok_or_else(|| Error::Handler("missing url".into()))?;
+    validate_http_runtime_url(url)?;
+    let timeout_secs = validate_requested_timeout(Some(timeout_secs))?;
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(value) = config.headers.as_ref() {
+        let object = value
+            .as_object()
+            .ok_or_else(|| Error::Handler("headers must be an object of string values".into()))?;
+        for (name, value) in object {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|error| Error::Handler(format!("invalid HTTP header name: {error}")))?;
+            let value = value
+                .as_str()
+                .ok_or_else(|| Error::Handler("HTTP header values must be strings".into()))?;
+            let value = reqwest::header::HeaderValue::from_str(value)
+                .map_err(|error| Error::Handler(format!("invalid HTTP header value: {error}")))?;
+            headers.append(name, value);
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| Error::Handler(format!("HTTP client setup failed: {error}")))?;
+    let response = client
+        .post(url)
+        .headers(headers)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .json(context)
+        .send()
+        .await
+        .map_err(|error| Error::Handler(format!("HTTP runtime request failed: {error}")))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| Error::Handler(format!("HTTP runtime response failed: {error}")))?;
+    if !status.is_success() {
+        return Err(Error::Handler(format!(
+            "HTTP runtime returned {status}: {body}"
+        )));
+    }
+    Ok(body)
+}
+
 async fn execute_runtime(
-    iii: &IIIClient,
     config: &RuntimeConfig,
     context: &Value,
     timeout_secs: u64,
@@ -412,29 +472,7 @@ async fn execute_runtime(
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
     match config.kind {
-        RuntimeKind::Http => {
-            let url = config
-                .url
-                .as_deref()
-                .ok_or_else(|| Error::Handler("missing url".into()))?;
-
-            let result = iii
-                .trigger(TriggerRequest {
-                    function_id: "http::post".to_string(),
-                    payload: json!({
-                        "url": url,
-                        "body": context,
-                        "headers": config.headers,
-                        "timeoutMs": timeout_secs * 1000,
-                    }),
-                    action: None,
-                    timeout_ms: None,
-                })
-                .await
-                .map_err(|e| Error::Handler(format!("http invoke failed: {e}")))?;
-
-            Ok(result.to_string())
-        }
+        RuntimeKind::Http => execute_http_runtime(config, context, timeout_secs).await,
 
         RuntimeKind::Process
         | RuntimeKind::ClaudeCode
@@ -500,30 +538,36 @@ async fn execute_runtime(
 
 async fn cancel_run(
     active_runs: &Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
-    iii: &IIIClient,
+    iii: &dyn TriggerBus,
     req: CancelRequest,
 ) -> Result<Value, Error> {
     if let Some((_, handle)) = active_runs.remove(&req.run_id) {
         handle.abort();
 
-        iii.trigger(TriggerRequest {
-            function_id: "state::update".to_string(),
-            payload: json!({
-                "scope": runs_scope(),
-                "key": &req.run_id,
-                "path": "status",
-                "value": "cancelled",
-            }),
-            action: None,
-            timeout_ms: None,
-        })
-        .await
-        .map_err(|e| {
-            Error::Handler(format!(
-                "failed to mark run {} as cancelled: {e}",
+        let response = iii
+            .trigger(TriggerRequest {
+                function_id: "state::update".to_string(),
+                payload: update_payload(
+                    runs_scope(),
+                    &req.run_id,
+                    vec![set_op("status", json!("cancelled"))],
+                ),
+                action: None,
+                timeout_ms: None,
+            })
+            .await
+            .map_err(|e| {
+                Error::Handler(format!(
+                    "failed to mark run {} as cancelled: {e}",
+                    req.run_id
+                ))
+            })?;
+        if let Some(errors) = update_errors(&response) {
+            return Err(Error::Handler(format!(
+                "failed to mark run {} as cancelled: {errors}",
                 req.run_id
-            ))
-        })?;
+            )));
+        }
 
         Ok(json!({ "cancelled": true, "runId": req.run_id }))
     } else {
@@ -581,17 +625,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("Register an external agent runtime"),
     );
 
-    let iii_clone = iii.clone();
+    let invoke_bus: Arc<dyn TriggerBus> = Arc::new(iii.clone());
     let runs_clone = active_runs.clone();
     iii.register_function(
         "bridge::invoke",
         RegisterFunction::new_async(move |input: Value| {
-            let iii = iii_clone.clone();
+            let bus = invoke_bus.clone();
             let runs = runs_clone.clone();
             async move {
                 let req: InvokeRuntimeRequest =
                     serde_json::from_value(input).map_err(|e| Error::Handler(e.to_string()))?;
-                invoke_runtime(&iii, req, &runs).await
+                invoke_runtime(bus, req, &runs).await
             }
         })
         .description("Invoke an agent through its runtime bridge"),
@@ -684,7 +728,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod containment_tests {
     use super::*;
+    use agentos_http_adapter::fake::FakeBus;
     use std::collections::BTreeMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn runtime(kind: RuntimeKind) -> RuntimeConfig {
         RuntimeConfig {
@@ -852,6 +898,204 @@ mod containment_tests {
         let mut unsafe_http = runtime(RuntimeKind::Http);
         unsafe_http.url = Some("http://example.com/invoke?token=x".into());
         assert!(validate_persisted_runtime(&unsafe_http, false).is_err());
+    }
+
+    async fn local_http_once(response: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (format!("http://{address}/invoke"), task)
+    }
+
+    #[tokio::test]
+    async fn http_runtime_posts_context_and_headers_to_literal_loopback() {
+        let (url, request) = local_http_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+        )
+        .await;
+        let mut config = runtime(RuntimeKind::Http);
+        config.url = Some(url);
+        config.headers = Some(json!({ "x-agentos-test": "literal-header" }));
+
+        let result = execute_http_runtime(&config, &json!({ "literal": "data" }), 2)
+            .await
+            .unwrap();
+        let request = request.await.unwrap();
+        assert_eq!(result, "{\"ok\":true}");
+        assert!(
+            request.starts_with("POST /invoke HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-agentos-test: literal-header"),
+            "{request}"
+        );
+        assert!(request.ends_with("{\"literal\":\"data\"}"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn http_runtime_does_not_follow_redirects_and_reports_status() {
+        let (url, _request) = local_http_once(
+            "HTTP/1.1 302 Found\r\nLocation: /must-not-follow\r\nContent-Length: 8\r\nConnection: close\r\n\r\nredirect",
+        )
+        .await;
+        let mut config = runtime(RuntimeKind::Http);
+        config.url = Some(url);
+        let error = execute_http_runtime(&config, &json!({}), 2)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("302"), "{error}");
+        assert!(error.contains("redirect"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cancel_dispatches_real_state_ops_and_propagates_per_op_errors() {
+        let bus = FakeBus::new();
+        bus.on_value("state::update", json!({ "errors": [] }));
+        let runs = Arc::new(DashMap::new());
+        runs.insert("run-ok".into(), tokio::spawn(std::future::pending()));
+        cancel_run(
+            &runs,
+            &bus,
+            CancelRequest {
+                run_id: "run-ok".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let calls = bus.calls_to("state::update");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].payload,
+            json!({
+                "scope": "bridge:runs",
+                "key": "run-ok",
+                "ops": [{ "type": "set", "path": "status", "value": "cancelled" }],
+            })
+        );
+
+        bus.on_value(
+            "state::update",
+            json!({ "errors": [{ "code": "set.path.invalid" }] }),
+        );
+        runs.insert("run-bad".into(), tokio::spawn(std::future::pending()));
+        let error = cancel_run(
+            &runs,
+            &bus,
+            CancelRequest {
+                run_id: "run-bad".into(),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("set.path.invalid"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn registration_validates_before_persisting_runtime_state() {
+        let bus = FakeBus::new();
+        let mut poisoned = runtime(RuntimeKind::Http);
+        poisoned.url = Some("http://example.com/invoke".into());
+        let error = register_runtime(
+            &bus,
+            RegisterRuntimeRequest {
+                kind: poisoned.kind,
+                name: poisoned.name,
+                command: poisoned.command,
+                args: poisoned.args,
+                url: poisoned.url,
+                headers: poisoned.headers,
+                env_vars: poisoned.env_vars,
+                work_dir: poisoned.work_dir,
+                timeout_secs: poisoned.timeout_secs,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("loopback IP literal"), "{error}");
+        assert_eq!(bus.call_count("state::set"), 0);
+    }
+
+    #[tokio::test]
+    async fn execution_revalidates_again_before_the_spawn_boundary() {
+        let mut poisoned = runtime(RuntimeKind::ClaudeCode);
+        poisoned.command = Some("/definitely/not-present/sh".into());
+        poisoned.args = Some(vec!["-c".into(), "must-not-run".into()]);
+        let error = execute_runtime(&poisoned, &json!({}), 2)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("persisted runtime failed validation"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_revalidates_the_loaded_runtime_before_any_state_write() {
+        let fake = Arc::new(FakeBus::new());
+        let mut poisoned = runtime(RuntimeKind::ClaudeCode);
+        poisoned.command = Some("/bin/sh".into());
+        poisoned.args = Some(vec!["-c".into(), "touch /tmp/must-not-run".into()]);
+        fake.on_value("state::get", serde_json::to_value(poisoned).unwrap());
+        let bus: Arc<dyn TriggerBus> = fake.clone();
+        let runs = Arc::new(DashMap::new());
+
+        let error = invoke_runtime(
+            bus,
+            InvokeRuntimeRequest {
+                runtime_id: "rt-test".into(),
+                agent_id: "agent-test".into(),
+                context: json!({}),
+                timeout_secs: Some(2),
+            },
+            &runs,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("persisted runtime failed validation"),
+            "{error}"
+        );
+        assert_eq!(fake.call_count("state::get"), 1);
+        assert_eq!(fake.call_count("state::set"), 0);
+        assert!(runs.is_empty());
     }
 
     #[test]

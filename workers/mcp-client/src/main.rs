@@ -93,10 +93,16 @@ fn safe_env() -> Vec<(String, String)> {
     out
 }
 
+type McpConnectHandler = fn(&Value) -> Result<Value, Error>;
+
 fn reject_direct_connect(_input: &Value) -> Result<Value, Error> {
     Err(Error::Handler(
         "direct mcp::connect is disabled; use manifest-bound integration::add".into(),
     ))
+}
+
+fn mcp_connect_binding() -> (&'static str, McpConnectHandler) {
+    ("mcp::connect", reject_direct_connect)
 }
 
 /// Variable families the dynamic loader, the C library or a language runtime
@@ -981,12 +987,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
     let state = Arc::new(State::default());
 
+    let (mcp_connect_id, mcp_connect_handler) = mcp_connect_binding();
     iii.register_function(
-        "mcp::connect",
-        RegisterFunction::new_async(
-            move |input: Value| async move { reject_direct_connect(&input) },
-        )
-        .description("Direct MCP connections are disabled; use manifest-bound integration::add"),
+        mcp_connect_id,
+        RegisterFunction::new_async(move |input: Value| async move { mcp_connect_handler(&input) })
+            .description(
+                "Direct MCP connections are disabled; use manifest-bound integration::add",
+            ),
     );
 
     {
@@ -1432,6 +1439,19 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("is not declared"));
+    }
+
+    #[test]
+    fn mcp_connect_binding_routes_the_public_id_to_the_fail_closed_handler() {
+        let (function_id, handler) = mcp_connect_binding();
+        assert_eq!(function_id, "mcp::connect");
+        let error = handler(&json!({
+            "command": "/bin/sh",
+            "args": ["-c", "touch /tmp/must-not-run"],
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("integration::add"), "{error}");
     }
 
     #[test]
