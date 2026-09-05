@@ -30,9 +30,11 @@ done
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/agentos-boot-smoke.XXXXXX")
 runtime="$scratch/runtime"
 agentos_home="$scratch/home"
+engine_home="$scratch/engine-home"
 registry_file="$scratch/functions.json"
 expected_workers_file="$scratch/expected-workers.txt"
-mkdir -p "$runtime/target/release" "$agentos_home"
+required_functions_file="$scratch/required-functions.txt"
+mkdir -p "$runtime/target/release" "$agentos_home" "$engine_home"
 
 port_is_open() {
   python3 - "$ENGINE_PORT" <<'PY'
@@ -49,18 +51,25 @@ cleanup() {
   status=$?
   trap - 0 1 2 15
 
-  # Every process launched by this gate has the scratch runtime or config path
-  # in its argv. Limit teardown to that path; never use a repo-wide pkill.
-  pids=$(pgrep -f "$scratch" 2>/dev/null || true)
-  if [ -n "$pids" ]; then
-    kill $pids 2>/dev/null || true
+  # Local binaries run from the scratch runtime. Engine-managed registry
+  # workers run from the scratch HOME (`$scratch/engine-home/.iii/workers`).
+  # Both therefore carry this unique path in argv; limit teardown to it and
+  # never use a repo-wide pkill.
+  signal_owned() {
+    signal=$1
+    pgrep -f "$scratch" 2>/dev/null | while IFS= read -r pid; do
+      [ -n "$pid" ] || continue
+      kill "$signal" "$pid" 2>/dev/null || true
+    done
+  }
+  if pgrep -f "$scratch" >/dev/null 2>&1; then
+    signal_owned -TERM
     attempts=0
     while [ "$attempts" -lt 5 ] && pgrep -f "$scratch" >/dev/null 2>&1; do
       sleep 1
       attempts=$((attempts + 1))
     done
-    pids=$(pgrep -f "$scratch" 2>/dev/null || true)
-    [ -z "$pids" ] || kill -9 $pids 2>/dev/null || true
+    pgrep -f "$scratch" >/dev/null 2>&1 && signal_owned -KILL
   fi
 
   if port_is_open; then
@@ -109,6 +118,11 @@ done
 LC_ALL=C sort -u -o "$expected_workers_file" "$expected_workers_file"
 [ -s "$expected_workers_file" ] || fail "scratch runtime contains no release worker binaries"
 
+# iii resolves its managed-worker cache from HOME. Isolating HOME is not just
+# filesystem hygiene: registry workers detach and are reparented to PID 1, so
+# their executable path must remain under `$scratch` for the exit trap to own
+# and reap them without matching another user's iii process.
+export HOME="$engine_home"
 export AGENTOS_HOME="$agentos_home"
 export III_URL="ws://127.0.0.1:$ENGINE_PORT"
 unset AGENTOS_CONFIG
@@ -134,14 +148,15 @@ fi
 # - workers/memory/src/main.rs:59 provides retrieval used while building a turn.
 # - workers/context-manager/src/main.rs:522 builds the model prompt.
 # - workers/cron/src/main.rs:628 creates scheduled AgentOS actions.
-python3 - "$registry_file" "$expected_workers_file" $REQUIRED_FUNCTION_IDS <<'PY'
+printf '%s\n' "$REQUIRED_FUNCTION_IDS" > "$required_functions_file"
+python3 - "$registry_file" "$expected_workers_file" "$required_functions_file" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 registry_path = Path(sys.argv[1])
 expected_path = Path(sys.argv[2])
-required_ids = sys.argv[3:]
+required_ids = Path(sys.argv[3]).read_text().split()
 text = registry_path.read_text()
 try:
     registry = json.loads(text)

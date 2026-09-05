@@ -132,7 +132,9 @@ describe("boot smoke contract", () => {
     expect(declaration).not.toBeNull();
     const asserted = declaration?.[1].trim().split(/\s+/).sort();
     expect(asserted).toEqual(requiredFunctionIds);
-    expect(source).toContain('python3 - "$registry_file" "$expected_workers_file" $REQUIRED_FUNCTION_IDS');
+    expect(source).toContain(
+      'python3 - "$registry_file" "$expected_workers_file" "$required_functions_file"',
+    );
   });
 
   it("names a missing function and cleans up the scratch runtime and its process", async () => {
@@ -148,6 +150,7 @@ describe("boot smoke contract", () => {
     const source = await readFile(new URL("./boot-smoke.sh", import.meta.url), "utf8");
     expect(source).toMatch(/trap cleanup (?:0|EXIT)/);
     expect(source).toMatch(/if port_is_open; then[\s\S]*status=1/);
+    expect(source).toContain('export HOME="$engine_home"');
     expect(source).toContain('rm -rf "$scratch"');
   });
 
