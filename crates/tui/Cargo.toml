@@ -21,3 +21,6 @@ reqwest = { workspace = true, features = ["json", "stream"] }
 futures-util.workspace = true
 
 urlencoding = "2"
+
+[dev-dependencies]
+syn = { version = "2", features = ["full", "visit"] }

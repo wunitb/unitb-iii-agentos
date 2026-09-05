@@ -1141,6 +1141,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "syn 2.0.117",
  "tokio",
  "tracing",
  "urlencoding",

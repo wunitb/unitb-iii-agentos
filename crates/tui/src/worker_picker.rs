@@ -389,6 +389,8 @@ pub fn install_command(card: &WorkerCard) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use syn::parse::Parser;
+    use syn::visit::{self, Visit};
 
     #[test]
     fn install_cmd_for_uninstalled() {
@@ -447,42 +449,303 @@ mod tests {
         }
     }
 
-    /// Everything from the first `#[cfg(test)]` on is fixture code. No worker in
-    /// this tree registers a function after that marker, so cutting there keeps
-    /// the id set to what production actually registers.
-    fn production_source(source: &str) -> &str {
-        match source.find("#[cfg(test)]") {
-            Some(index) => &source[..index],
-            None => source,
+    fn cfg_possibilities_without_test(meta: &syn::Meta) -> (bool, bool) {
+        match meta {
+            syn::Meta::Path(path) if path.is_ident("test") => (false, true),
+            syn::Meta::Path(_) | syn::Meta::NameValue(_) => (true, true),
+            syn::Meta::List(list) => {
+                let Ok(children) =
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+                        .parse2(list.tokens.clone())
+                else {
+                    return (true, true);
+                };
+                let possibilities: Vec<_> = children
+                    .iter()
+                    .map(cfg_possibilities_without_test)
+                    .collect();
+                if list.path.is_ident("all") {
+                    (
+                        possibilities.iter().all(|(can_be_true, _)| *can_be_true),
+                        possibilities.iter().any(|(_, can_be_false)| *can_be_false),
+                    )
+                } else if list.path.is_ident("any") {
+                    (
+                        possibilities.iter().any(|(can_be_true, _)| *can_be_true),
+                        possibilities.iter().all(|(_, can_be_false)| *can_be_false),
+                    )
+                } else if list.path.is_ident("not") && possibilities.len() == 1 {
+                    (possibilities[0].1, possibilities[0].0)
+                } else {
+                    (true, true)
+                }
+            }
         }
     }
 
-    /// `const NAME: &str = "value";` / `static NAME: &str = "value";`
-    fn string_constants(source: &str) -> std::collections::HashMap<String, String> {
-        let mut constants = std::collections::HashMap::new();
-        for line in source.lines() {
-            let line = line.trim();
-            let Some(rest) = line
-                .strip_prefix("const ")
-                .or_else(|| line.strip_prefix("static "))
-            else {
-                continue;
+    /// A cfg item is test-only only when its predicate cannot be true with
+    /// `test = false`. Unknown feature/platform predicates are treated as
+    /// potentially production so the catalogue guard fails open only on syntax
+    /// it understands, not on a guessed build configuration.
+    fn is_test_only(attributes: &[syn::Attribute]) -> bool {
+        attributes.iter().any(|attribute| {
+            let syn::Meta::List(list) = &attribute.meta else {
+                return false;
             };
-            let Some((name, value)) = rest.split_once(':') else {
-                continue;
-            };
-            if !value.contains("str") {
-                continue;
+            if !list.path.is_ident("cfg") {
+                return false;
             }
-            let Some(literal) = value
-                .split_once('"')
-                .and_then(|(_, tail)| tail.split_once('"').map(|(literal, _)| literal.to_string()))
+            let Ok(predicates) =
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+                    .parse2(list.tokens.clone())
             else {
-                continue;
+                return false;
             };
-            constants.insert(name.trim().to_string(), literal);
+            predicates
+                .iter()
+                .any(|predicate| !cfg_possibilities_without_test(predicate).0)
+        })
+    }
+
+    fn literal_id(expression: &syn::Expr) -> Option<String> {
+        match expression {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(value),
+                ..
+            }) => Some(value.value()),
+            syn::Expr::Group(group) => literal_id(&group.expr),
+            syn::Expr::Paren(paren) => literal_id(&paren.expr),
+            syn::Expr::Reference(reference) => literal_id(&reference.expr),
+            _ => None,
         }
-        constants
+    }
+
+    fn returned_factory_id(block: &syn::Block) -> Option<String> {
+        let syn::Stmt::Expr(expression, _) = block.stmts.last()? else {
+            return None;
+        };
+        let expression = match expression {
+            syn::Expr::Return(returned) => returned.expr.as_deref()?,
+            expression => expression,
+        };
+        let syn::Expr::Tuple(tuple) = expression else {
+            return None;
+        };
+        literal_id(tuple.elems.first()?)
+    }
+
+    #[derive(Default)]
+    struct Definitions {
+        constants: std::collections::HashMap<String, String>,
+        factories: std::collections::HashMap<String, String>,
+    }
+
+    impl<'ast> Visit<'ast> for Definitions {
+        fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+            if is_test_only(&function.attrs) {
+                return;
+            }
+            if function.sig.inputs.is_empty()
+                && let Some(id) = returned_factory_id(&function.block)
+            {
+                self.factories.insert(function.sig.ident.to_string(), id);
+            }
+            visit::visit_item_fn(self, function);
+        }
+
+        fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+            if !is_test_only(&module.attrs) {
+                visit::visit_item_mod(self, module);
+            }
+        }
+
+        fn visit_item_impl(&mut self, implementation: &'ast syn::ItemImpl) {
+            if !is_test_only(&implementation.attrs) {
+                visit::visit_item_impl(self, implementation);
+            }
+        }
+
+        fn visit_item_const(&mut self, constant: &'ast syn::ItemConst) {
+            if !is_test_only(&constant.attrs)
+                && let Some(id) = literal_id(&constant.expr)
+            {
+                self.constants.insert(constant.ident.to_string(), id);
+            }
+        }
+
+        fn visit_item_static(&mut self, value: &'ast syn::ItemStatic) {
+            if !is_test_only(&value.attrs)
+                && let Some(id) = literal_id(&value.expr)
+            {
+                self.constants.insert(value.ident.to_string(), id);
+            }
+        }
+    }
+
+    struct Registrations<'a> {
+        definitions: &'a Definitions,
+        scopes: Vec<std::collections::HashMap<String, String>>,
+        ids: std::collections::BTreeSet<String>,
+    }
+
+    impl Registrations<'_> {
+        fn resolve_expression(&self, expression: &syn::Expr) -> Option<String> {
+            if let Some(id) = literal_id(expression) {
+                return Some(id);
+            }
+            match expression {
+                syn::Expr::Path(path) => {
+                    let identifier = path.path.get_ident()?.to_string();
+                    self.scopes
+                        .iter()
+                        .rev()
+                        .find_map(|scope| scope.get(&identifier).cloned())
+                        .or_else(|| self.definitions.constants.get(&identifier).cloned())
+                }
+                syn::Expr::Call(call) => {
+                    let syn::Expr::Path(function) = call.func.as_ref() else {
+                        return None;
+                    };
+                    let identifier = function.path.get_ident()?.to_string();
+                    self.definitions.factories.get(&identifier).cloned()
+                }
+                syn::Expr::Group(group) => self.resolve_expression(&group.expr),
+                syn::Expr::Paren(paren) => self.resolve_expression(&paren.expr),
+                syn::Expr::Reference(reference) => self.resolve_expression(&reference.expr),
+                _ => None,
+            }
+        }
+
+        fn remember_local(&mut self, local: &syn::Local) {
+            let Some(initializer) = &local.init else {
+                return;
+            };
+            let binding = match &local.pat {
+                syn::Pat::Ident(identifier) => Some(&identifier.ident),
+                syn::Pat::Tuple(tuple) => match tuple.elems.first() {
+                    Some(syn::Pat::Ident(identifier)) => Some(&identifier.ident),
+                    _ => None,
+                },
+                syn::Pat::Type(typed) => match typed.pat.as_ref() {
+                    syn::Pat::Ident(identifier) => Some(&identifier.ident),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let (Some(binding), Some(id), Some(scope)) = (
+                binding,
+                self.resolve_expression(&initializer.expr),
+                self.scopes.last_mut(),
+            ) {
+                scope.insert(binding.to_string(), id);
+            }
+        }
+
+        fn capture_registration(
+            &mut self,
+            arguments: &syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>,
+        ) {
+            if let Some(id) = arguments
+                .first()
+                .and_then(|argument| self.resolve_expression(argument))
+            {
+                self.ids.insert(id);
+            }
+        }
+    }
+
+    impl<'ast> Visit<'ast> for Registrations<'_> {
+        fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+            if !is_test_only(&function.attrs) {
+                visit::visit_item_fn(self, function);
+            }
+        }
+
+        fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+            if !is_test_only(&module.attrs) {
+                visit::visit_item_mod(self, module);
+            }
+        }
+
+        fn visit_item_impl(&mut self, implementation: &'ast syn::ItemImpl) {
+            if !is_test_only(&implementation.attrs) {
+                visit::visit_item_impl(self, implementation);
+            }
+        }
+
+        fn visit_block(&mut self, block: &'ast syn::Block) {
+            self.scopes.push(std::collections::HashMap::new());
+            for statement in &block.stmts {
+                self.visit_stmt(statement);
+            }
+            self.scopes.pop();
+        }
+
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if let Some(initializer) = &local.init {
+                self.visit_expr(&initializer.expr);
+                if let Some((_, diverge)) = &initializer.diverge {
+                    self.visit_expr(diverge);
+                }
+            }
+            self.remember_local(local);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "register_function" {
+                self.capture_registration(&call.args);
+            }
+            visit::visit_expr_method_call(self, call);
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(function) = call.func.as_ref()
+                && function
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "register_function")
+            {
+                self.capture_registration(&call.args);
+            }
+            visit::visit_expr_call(self, call);
+        }
+    }
+
+    fn registered_function_ids_in_source(
+        source: &str,
+    ) -> Result<std::collections::BTreeSet<String>, syn::Error> {
+        let file = syn::parse_file(source)?;
+        let mut definitions = Definitions::default();
+        definitions.visit_file(&file);
+        let mut registrations = Registrations {
+            definitions: &definitions,
+            scopes: Vec::new(),
+            ids: std::collections::BTreeSet::new(),
+        };
+        registrations.visit_file(&file);
+        Ok(registrations.ids)
+    }
+
+    /// Python workers use direct string ids. This parser is intentionally kept
+    /// separate from the Rust AST extractor rather than pretending Python is
+    /// Rust or applying Rust cfg rules to it.
+    fn python_registered_function_ids(source: &str) -> std::collections::BTreeSet<String> {
+        let mut ids = std::collections::BTreeSet::new();
+        for (index, _) in source.match_indices("register_function(") {
+            let argument = source[index + "register_function(".len()..]
+                .split(',')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if let Some(literal) = argument
+                .strip_prefix(['\'', '"'])
+                .and_then(|rest| rest.split(['\'', '"']).next())
+            {
+                ids.insert(literal.to_string());
+            }
+        }
+        ids
     }
 
     fn registered_function_ids() -> std::collections::BTreeSet<String> {
@@ -498,25 +761,87 @@ mod tests {
         for path in sources {
             let text =
                 std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-            let text = production_source(&text);
-            let constants = string_constants(text);
-            for (index, _) in text.match_indices("register_function(") {
-                let argument = text[index + "register_function(".len()..]
-                    .split(',')
-                    .next()
-                    .unwrap_or("")
-                    .trim();
-                if let Some(literal) = argument
-                    .strip_prefix('"')
-                    .and_then(|rest| rest.split('"').next())
-                {
-                    ids.insert(literal.to_string());
-                } else if let Some(resolved) = constants.get(argument) {
-                    ids.insert(resolved.clone());
-                }
+            match path.extension().and_then(|extension| extension.to_str()) {
+                Some("rs") => ids.extend(
+                    registered_function_ids_in_source(&text)
+                        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display())),
+                ),
+                Some("py") => ids.extend(python_registered_function_ids(&text)),
+                _ => {}
             }
         }
         ids
+    }
+
+    #[test]
+    fn extractor_keeps_production_registrations_after_standalone_test_item() {
+        let source = r#"
+            #[cfg(test)]
+            async fn install_test_job() {
+                iii.register_function("fake::helper", fake_handler);
+            }
+
+            fn main() {
+                iii.register_function("pulse::register", production_handler);
+                iii.register_function("pulse::tick", production_handler);
+                iii.register_function("pulse::status", production_handler);
+            }
+        "#;
+
+        let ids = registered_function_ids_in_source(source).expect("parse fixture");
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from([
+                "pulse::register".to_string(),
+                "pulse::status".to_string(),
+                "pulse::tick".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn extractor_omits_registrations_inside_test_only_module() {
+        let source = r#"
+            fn install(iii: &Iii) {
+                iii.register_function("real::function", production_handler);
+            }
+
+            #[cfg(test)]
+            mod tests {
+                fn fake(iii: &Iii) {
+                    iii.register_function("fake::test-only", fake_handler);
+                }
+            }
+        "#;
+
+        let ids = registered_function_ids_in_source(source).expect("parse fixture");
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from(["real::function".to_string()])
+        );
+    }
+
+    #[test]
+    fn extractor_resolves_literal_id_from_pure_binding_factory() {
+        let source = r#"
+            type Handler = fn();
+            fn reject_direct_connect() {}
+
+            fn mcp_connect_binding() -> (&'static str, Handler) {
+                ("mcp::connect", reject_direct_connect)
+            }
+
+            fn main() {
+                let (mcp_connect_id, mcp_connect_handler) = mcp_connect_binding();
+                iii.register_function(mcp_connect_id, mcp_connect_handler);
+            }
+        "#;
+
+        let ids = registered_function_ids_in_source(source).expect("parse fixture");
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from(["mcp::connect".to_string()])
+        );
     }
 
     #[test]
