@@ -1,7 +1,15 @@
 use agentos_http_adapter::{CHAT_TIMEOUT_MS, TriggerBus, principal};
 use iii_sdk::errors::Error;
-use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
+use iii_sdk::{
+    IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker, trigger::Trigger,
+};
 use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::Mutex;
 
 mod types;
 
@@ -31,6 +39,119 @@ async fn authorize_named_agent(
 
 fn expected_bearer() -> Option<String> {
     agentos_bus_auth::policy::expected_api_key()
+}
+
+/// A credential-less engine trigger is not proof of scheduler origin. The
+/// table below is the authority for scheduled work in this process. Handles
+/// and the boot token are deliberately treated as public replay material.
+///
+/// One minute is the narrowest dependency-free bound that preserves the normal
+/// five-field cron cadence. Six-field sub-minute schedules are therefore
+/// coalesced. A leaked current handle cannot choose its target and cannot
+/// start overlapping or more-than-once-per-minute runs. It can shift a run to
+/// any time after this rate limit opens and can raise the cadence of a slower
+/// cron schedule up to that hard cap; this is bounded replay, not provenance.
+const MIN_TICK_INTERVAL: Duration = Duration::from_secs(60);
+
+type ScheduledJobs = Arc<Mutex<HashMap<String, ScheduledJob>>>;
+
+struct ScheduledJob {
+    config: PulseConfig,
+    boot_token: String,
+    in_flight: bool,
+    last_started: Option<Instant>,
+    trigger: Option<Trigger>,
+}
+
+fn tick_metadata(job_handle: &str, boot_token: &str) -> Value {
+    json!({ "jobHandle": job_handle, "bootToken": boot_token })
+}
+
+fn metadata_handle_and_token(metadata: Option<&Value>) -> Result<(&str, &str), Error> {
+    let object = metadata
+        .and_then(Value::as_object)
+        .ok_or_else(|| Error::Handler("pulse::tick requires an opaque job handle".into()))?;
+    if object.len() != 2 {
+        return Err(Error::Handler(
+            "pulse::tick metadata must contain only jobHandle and bootToken".into(),
+        ));
+    }
+    let handle = object
+        .get("jobHandle")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Handler("pulse::tick requires an opaque job handle".into()))?;
+    let token = object
+        .get("bootToken")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Handler("pulse::tick requires a process boot token".into()))?;
+    Ok((handle, token))
+}
+
+async fn claim_scheduled_job(
+    jobs: &ScheduledJobs,
+    handle: &str,
+    token: &str,
+    now: Instant,
+) -> Result<Option<PulseConfig>, Error> {
+    let mut jobs = jobs.lock().await;
+    let job = jobs.get_mut(handle).ok_or_else(|| {
+        Error::Handler("pulse::tick job handle is unknown in this process".into())
+    })?;
+    if job.boot_token != token {
+        return Err(Error::Handler(
+            "pulse::tick process boot token is stale".into(),
+        ));
+    }
+    if !job.config.enabled {
+        return Ok(None);
+    }
+    if job.in_flight {
+        return Err(Error::Handler(
+            "pulse::tick job is already in flight".into(),
+        ));
+    }
+    if job
+        .last_started
+        .is_some_and(|last| now.saturating_duration_since(last) < MIN_TICK_INTERVAL)
+    {
+        return Err(Error::Handler(
+            "pulse::tick replay arrived before the minimum interval".into(),
+        ));
+    }
+    job.in_flight = true;
+    job.last_started = Some(now);
+    Ok(Some(job.config.clone()))
+}
+
+async fn finish_scheduled_job(jobs: &ScheduledJobs, handle: &str) {
+    if let Some(job) = jobs.lock().await.get_mut(handle) {
+        job.in_flight = false;
+    }
+}
+
+#[cfg(test)]
+async fn install_test_job(jobs: &ScheduledJobs, handle: &str, token: &str, config: PulseConfig) {
+    jobs.lock().await.insert(
+        handle.to_string(),
+        ScheduledJob {
+            config,
+            boot_token: token.to_string(),
+            in_flight: false,
+            last_started: None,
+            trigger: None,
+        },
+    );
+}
+
+#[cfg(test)]
+async fn mark_test_job_in_flight(jobs: &ScheduledJobs, handle: &str) {
+    jobs.lock()
+        .await
+        .get_mut(handle)
+        .expect("test job")
+        .in_flight = true;
 }
 
 async fn build_context(
@@ -114,7 +235,12 @@ async fn build_context(
     }
 }
 
-async fn register_pulse(iii: &IIIClient, req: RegisterPulseRequest) -> Result<Value, Error> {
+async fn register_pulse(
+    iii: &IIIClient,
+    req: RegisterPulseRequest,
+    jobs: &ScheduledJobs,
+    boot_token: &str,
+) -> Result<Value, Error> {
     let config = PulseConfig {
         agent_id: req.agent_id.clone(),
         realm_id: req.realm_id.clone(),
@@ -126,18 +252,6 @@ async fn register_pulse(iii: &IIIClient, req: RegisterPulseRequest) -> Result<Va
     };
 
     let value = serde_json::to_value(&config).map_err(|e| Error::Handler(e.to_string()))?;
-
-    agentos_http_adapter::register_cron_trigger_with_metadata(
-        iii,
-        "pulse::tick",
-        &req.cron,
-        Some(json!({
-            "agentId": &req.agent_id,
-            "realmId": &req.realm_id,
-        })),
-    )
-    .map_err(|e| Error::Handler(format!("failed to register cron trigger: {e}")))?;
-
     iii.trigger(TriggerRequest {
         function_id: "state::set".to_string(),
         payload: json!({
@@ -150,6 +264,41 @@ async fn register_pulse(iii: &IIIClient, req: RegisterPulseRequest) -> Result<Va
     })
     .await
     .map_err(|e| Error::Handler(e.to_string()))?;
+
+    let handle = uuid::Uuid::new_v4().to_string();
+    let trigger = agentos_http_adapter::register_cron_trigger_with_metadata(
+        iii,
+        "pulse::tick",
+        &req.cron,
+        Some(tick_metadata(&handle, boot_token)),
+    )
+    .map_err(|e| Error::Handler(format!("failed to register cron trigger: {e}")))?;
+
+    let mut table = jobs.lock().await;
+    let stale = table
+        .iter()
+        .filter_map(|(key, job)| {
+            (job.config.agent_id == config.agent_id && job.config.realm_id == config.realm_id)
+                .then_some(key.clone())
+        })
+        .collect::<Vec<_>>();
+    for key in stale {
+        if let Some(old) = table.remove(&key)
+            && let Some(trigger) = old.trigger
+        {
+            trigger.unregister();
+        }
+    }
+    table.insert(
+        handle,
+        ScheduledJob {
+            config: config.clone(),
+            boot_token: boot_token.to_string(),
+            in_flight: false,
+            last_started: None,
+            trigger: Some(trigger),
+        },
+    );
 
     Ok(serde_json::to_value(&config).unwrap())
 }
@@ -231,15 +380,13 @@ async fn invoke_pulse(iii: &dyn TriggerBus, req: InvokeRequest) -> Result<Value,
     Ok(serde_json::to_value(&finished_run).unwrap())
 }
 
-async fn tick(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
-    let agent_id = input["agentId"]
-        .as_str()
-        .ok_or_else(|| Error::Handler("missing agentId in tick".into()))?;
-    let realm_id = input["realmId"]
-        .as_str()
-        .ok_or_else(|| Error::Handler("missing realmId in tick".into()))?;
+async fn tick(iii: &dyn TriggerBus, config: PulseConfig) -> Result<Value, Error> {
+    let agent_id = &config.agent_id;
+    let realm_id = &config.realm_id;
 
-    let config_val = iii
+    // Stored state can only disable an in-memory authorized job. It is never
+    // allowed to name the target or enable work the table did not authorize.
+    let stored = iii
         .trigger(TriggerRequest {
             function_id: "state::get".to_string(),
             payload: json!({
@@ -249,14 +396,10 @@ async fn tick(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
             action: None,
             timeout_ms: None,
         })
-        .await
-        .map_err(|e| Error::Handler(e.to_string()))?;
-
-    let config: PulseConfig =
-        serde_json::from_value(config_val).map_err(|e| Error::Handler(e.to_string()))?;
-
-    if !config.enabled {
-        return Ok(json!({ "skipped": true, "reason": "disabled" }));
+        .await;
+    if !matches!(stored, Ok(ref value) if value.get("enabled").and_then(Value::as_bool) == Some(true))
+    {
+        return Ok(json!({ "skipped": true, "reason": "disabled_in_state" }));
     }
 
     let budget_check = iii
@@ -269,37 +412,50 @@ async fn tick(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
             action: None,
             timeout_ms: None,
         })
-        .await
-        .unwrap_or(json!({ "allowed": true }));
+        .await;
 
-    if budget_check["allowed"] == false {
-        return Ok(json!({ "skipped": true, "reason": "budget_exceeded" }));
+    if !matches!(budget_check, Ok(ref value) if value.get("allowed").and_then(Value::as_bool) == Some(true))
+    {
+        return Ok(json!({ "skipped": true, "reason": "budget_unavailable" }));
     }
 
     invoke_pulse(
         iii,
         InvokeRequest {
-            agent_id: agent_id.to_string(),
-            realm_id: realm_id.to_string(),
+            agent_id: agent_id.clone(),
+            realm_id: realm_id.clone(),
             context_mode: Some(config.context_mode),
         },
     )
     .await
 }
 
+/// Execute only a job installed by an authenticated register call in THIS
+/// worker process. iii 0.22.1 forwards caller-supplied invocation metadata
+/// unchanged, so metadata and `_caller_worker_id` are not scheduler identity.
+///
+/// The handle/token may be visible. The in-flight flag and one-minute start
+/// interval bound replay, but a holder can shift timing and can raise a slower
+/// schedule to the one-per-minute cap. This is not cron-origin proof, not
+/// durable across worker restart, and
+/// not at-most-once across crashes. The engine triggers and this table are
+/// process-local; the operator must re-register schedules after restart.
 async fn tick_from_trigger(
     iii: &dyn TriggerBus,
     input: Value,
     metadata: Option<Value>,
+    jobs: &ScheduledJobs,
+    now: Instant,
 ) -> Result<Value, Error> {
-    let metadata = metadata.ok_or_else(|| {
-        Error::Handler("pulse::tick accepts only a registered cron trigger".to_string())
-    })?;
     principal::refuse_agent_principal(&input, expected_bearer().as_deref(), "pulse::tick")?;
-    // The registered metadata fixes agentId/realmId. The config row must still
-    // exist and be enabled, but unauthenticated state mutation remains a known
-    // residual until the bus policy protects the state mutation functions.
-    tick(iii, metadata).await
+    let (handle, token) = metadata_handle_and_token(metadata.as_ref())?;
+    let Some(config) = claim_scheduled_job(jobs, handle, token, now).await? else {
+        return Ok(json!({ "skipped": true, "reason": "disabled" }));
+    };
+
+    let result = tick(iii, config).await;
+    finish_scheduled_job(jobs, handle).await;
+    result
 }
 
 async fn get_pulse_status(
@@ -352,25 +508,23 @@ async fn toggle_pulse(
     realm_id: &str,
     agent_id: &str,
     enabled: bool,
+    jobs: &ScheduledJobs,
 ) -> Result<Value, Error> {
-    let config_val = iii
-        .trigger(TriggerRequest {
-            function_id: "state::get".to_string(),
-            payload: json!({
-                "scope": config_scope(realm_id),
-                "key": agent_id,
-            }),
-            action: None,
-            timeout_ms: None,
-        })
-        .await
-        .map_err(|e| Error::Handler(e.to_string()))?;
-
-    let mut config: PulseConfig =
-        serde_json::from_value(config_val).map_err(|e| Error::Handler(e.to_string()))?;
-
+    // The process-local table is authoritative. Persist only a view of the
+    // authenticated job; never pull target/config fields back out of mutable
+    // state and bless them into the table.
+    let mut jobs = jobs.lock().await;
+    let job = jobs
+        .values_mut()
+        .find(|job| job.config.agent_id == agent_id && job.config.realm_id == realm_id)
+        .ok_or_else(|| {
+            Error::Handler(
+                "pulse schedule is not active in this process; register it again after restart"
+                    .into(),
+            )
+        })?;
+    let mut config = job.config.clone();
     config.enabled = enabled;
-
     let value = serde_json::to_value(&config).map_err(|e| Error::Handler(e.to_string()))?;
 
     iii.trigger(TriggerRequest {
@@ -386,6 +540,7 @@ async fn toggle_pulse(
     .await
     .map_err(|e| Error::Handler(e.to_string()))?;
 
+    job.config = config;
     Ok(json!({ "enabled": enabled, "agentId": agent_id }))
 }
 
@@ -395,12 +550,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
     let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
+    let scheduled_jobs = ScheduledJobs::default();
+    let boot_token = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
+    tracing::warn!(
+        "pulse schedules are process-local and must be re-registered after worker restart"
+    );
 
     let iii_clone = iii.clone();
+    let jobs_for_register = Arc::clone(&scheduled_jobs);
+    let token_for_register = Arc::clone(&boot_token);
     iii.register_function(
         "pulse::register",
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_clone.clone();
+            let jobs = Arc::clone(&jobs_for_register);
+            let boot_token = Arc::clone(&token_for_register);
             async move {
                 let mut req: RegisterPulseRequest = serde_json::from_value(payload_body(&input))
                     .map_err(|e| Error::Handler(e.to_string()))?;
@@ -411,7 +575,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     expected_bearer().as_deref(),
                 )
                 .await?;
-                register_pulse(&iii, req).await
+                register_pulse(&iii, req, &jobs, &boot_token).await
             }
         })
         .description("Register scheduled pulse for an agent"),
@@ -439,11 +603,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let iii_clone = iii.clone();
+    let jobs_for_tick = Arc::clone(&scheduled_jobs);
     iii.register_function(
         "pulse::tick",
         RegisterFunction::new_async(move |input: Value, metadata: Option<Value>| {
             let iii = iii_clone.clone();
-            async move { tick_from_trigger(&iii, input, metadata).await }
+            let jobs = Arc::clone(&jobs_for_tick);
+            async move { tick_from_trigger(&iii, input, metadata, &jobs, Instant::now()).await }
         })
         .description("Internal: cron-triggered pulse execution"),
     );
@@ -471,10 +637,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let iii_clone = iii.clone();
+    let jobs_for_toggle = Arc::clone(&scheduled_jobs);
     iii.register_function(
         "pulse::toggle",
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_clone.clone();
+            let jobs = Arc::clone(&jobs_for_toggle);
             async move {
                 let body = payload_body(&input);
                 let realm_id = body["realmId"]
@@ -487,7 +655,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let agent_id =
                     authorize_named_agent(&iii, &input, named, expected_bearer().as_deref())
                         .await?;
-                toggle_pulse(&iii, realm_id, &agent_id, enabled).await
+                toggle_pulse(&iii, realm_id, &agent_id, enabled, &jobs).await
             }
         })
         .description("Enable or disable agent pulse"),
@@ -530,47 +698,324 @@ mod tests {
     use agentos_http_adapter::{fake::FakeBus, principal};
 
     #[tokio::test]
-    async fn tick_accepts_only_bare_registered_metadata_and_keeps_the_cron_seam() {
-        let direct = FakeBus::new();
-        assert!(
-            tick_from_trigger(&direct, json!({ "agentId": "victim" }), None)
-                .await
-                .is_err()
-        );
-        assert!(direct.calls().is_empty());
-
-        let labelled = FakeBus::new();
-        assert!(
-            tick_from_trigger(
-                &labelled,
-                json!({ "principal": principal::as_agent("caller") }),
-                Some(json!({ "agentId": "caller", "realmId": "realm" })),
-            )
-            .await
-            .is_err()
-        );
-        assert!(labelled.calls().is_empty());
-
-        let cron = FakeBus::new();
-        cron.on("state::get", |_| {
+    async fn caller_controlled_tick_metadata_is_not_cron_authority() {
+        let forged = FakeBus::new();
+        forged.on("state::get", |_| {
             Ok(json!({
-                "agentId": "scheduled",
-                "realmId": "realm",
+                "agentId": "victim",
+                "realmId": "forged-realm",
                 "cron": "0 * * * *",
                 "enabled": false,
                 "contextMode": "thin",
             }))
         });
-        let result = tick_from_trigger(
-            &cron,
+
+        let jobs = ScheduledJobs::default();
+        let error = tick_from_trigger(
+            &forged,
             json!({}),
-            Some(json!({ "agentId": "scheduled", "realmId": "realm" })),
+            Some(json!({ "agentId": "victim", "realmId": "forged-realm" })),
+            &jobs,
+            Instant::now(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("job handle"), "got: {error}");
+        assert!(
+            forged.calls().is_empty(),
+            "caller metadata reached side effects: {:?}",
+            forged.calls()
+        );
+    }
+
+    fn scheduled_config(agent: &str) -> PulseConfig {
+        PulseConfig {
+            agent_id: agent.to_string(),
+            realm_id: "realm".to_string(),
+            cron: "* * * * *".to_string(),
+            enabled: true,
+            context_mode: ContextMode::Thin,
+            timeout_secs: None,
+            max_retries: None,
+        }
+    }
+
+    async fn scheduled_jobs(handle: &str, token: &str, agent: &str) -> ScheduledJobs {
+        let jobs = ScheduledJobs::default();
+        install_test_job(&jobs, handle, token, scheduled_config(agent)).await;
+        jobs
+    }
+
+    fn scheduled_metadata(handle: &str, token: &str) -> Value {
+        json!({ "jobHandle": handle, "bootToken": token })
+    }
+
+    #[tokio::test]
+    async fn unknown_missing_and_stale_tick_handles_stop_before_the_bus() {
+        let empty = ScheduledJobs::default();
+        for metadata in [
+            None,
+            Some(json!({ "jobHandle": "unknown" })),
+            Some(scheduled_metadata("unknown", "boot")),
+        ] {
+            let bus = FakeBus::new();
+            assert!(
+                tick_from_trigger(&bus, json!({}), metadata, &empty, std::time::Instant::now())
+                    .await
+                    .is_err()
+            );
+            assert!(bus.calls().is_empty());
+        }
+
+        let jobs = scheduled_jobs("known", "current", "scheduled").await;
+        let stale = FakeBus::new();
+        assert!(
+            tick_from_trigger(
+                &stale,
+                json!({}),
+                Some(scheduled_metadata("known", "old")),
+                &jobs,
+                std::time::Instant::now(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(stale.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn target_fields_beside_a_valid_handle_are_rejected_not_ignored() {
+        let jobs = scheduled_jobs("known", "boot", "scheduled").await;
+        let bus = FakeBus::new();
+        let metadata = json!({
+            "jobHandle": "known",
+            "bootToken": "boot",
+            "agentId": "victim",
+            "realmId": "forged",
+        });
+
+        assert!(
+            tick_from_trigger(
+                &bus,
+                json!({ "agentId": "victim", "realmId": "forged" }),
+                Some(metadata),
+                &jobs,
+                std::time::Instant::now(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(bus.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_inside_the_minimum_interval_stops_before_the_bus() {
+        let jobs = scheduled_jobs("known", "boot", "scheduled").await;
+        let bus = FakeBus::new();
+        bus.on_value("state::get", json!({ "enabled": false }));
+        let now = std::time::Instant::now();
+
+        let first = tick_from_trigger(
+            &bus,
+            json!({}),
+            Some(scheduled_metadata("known", "boot")),
+            &jobs,
+            now,
         )
         .await
         .unwrap();
-        assert_eq!(result, json!({ "skipped": true, "reason": "disabled" }));
-        assert_eq!(cron.call_count("state::get"), 1);
-        assert_eq!(cron.call_count("agent::chat"), 0);
+        assert_eq!(
+            first,
+            json!({ "skipped": true, "reason": "disabled_in_state" })
+        );
+        assert_eq!(bus.call_count("state::get"), 1);
+
+        assert!(
+            tick_from_trigger(
+                &bus,
+                json!({}),
+                Some(scheduled_metadata("known", "boot")),
+                &jobs,
+                now + MIN_TICK_INTERVAL / 2,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(bus.call_count("state::get"), 1, "replay reached state");
+        assert_eq!(bus.call_count("agent::chat"), 0);
+    }
+
+    #[tokio::test]
+    async fn registered_schedule_derives_its_target_only_from_the_job_table() {
+        let jobs = scheduled_jobs("known", "boot", "scheduled").await;
+        let bus = FakeBus::new();
+        bus.on_value("state::get", json!({ "enabled": true }));
+        bus.on_value("ledger::check", json!({ "allowed": true }));
+        bus.on_value("state::set", json!({ "stored": true }));
+        bus.on_value("agent::chat", json!({ "content": "ok" }));
+
+        let result = tick_from_trigger(
+            &bus,
+            json!({ "agentId": "victim", "realmId": "forged" }),
+            Some(scheduled_metadata("known", "boot")),
+            &jobs,
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["agentId"], "scheduled");
+        assert_eq!(bus.call_count("agent::chat"), 1);
+        assert_eq!(
+            bus.calls_to("agent::chat")[0].payload["agentId"],
+            "scheduled"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_budget_is_a_denial_not_an_allow() {
+        let jobs = scheduled_jobs("known", "boot", "scheduled").await;
+        let bus = FakeBus::new();
+        bus.on_value("state::get", json!({ "enabled": true }));
+        bus.on_value("ledger::check", json!({}));
+
+        let result = tick_from_trigger(
+            &bus,
+            json!({}),
+            Some(scheduled_metadata("known", "boot")),
+            &jobs,
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({ "skipped": true, "reason": "budget_unavailable" })
+        );
+        assert_eq!(bus.call_count("agent::chat"), 0);
+    }
+
+    struct PausingBus {
+        calls: std::sync::atomic::AtomicUsize,
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Default for PausingBus {
+        fn default() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                entered: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    impl TriggerBus for PausingBus {
+        fn trigger(&self, request: TriggerRequest) -> agentos_http_adapter::BusFuture<'_> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if request.function_id != "state::get" {
+                    return Err(Error::Handler(format!(
+                        "unexpected call: {}",
+                        request.function_id
+                    )));
+                }
+                self.entered.add_permits(1);
+                self.release
+                    .acquire()
+                    .await
+                    .expect("release semaphore closed")
+                    .forget();
+                Ok(json!({ "enabled": false }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_uses_the_real_tick_claim_and_never_reaches_the_bus() {
+        let jobs = scheduled_jobs("known", "boot", "scheduled").await;
+        let bus = Arc::new(PausingBus::default());
+        let now = Instant::now();
+        let first = tokio::spawn({
+            let jobs = Arc::clone(&jobs);
+            let bus = Arc::clone(&bus);
+            async move {
+                tick_from_trigger(
+                    bus.as_ref(),
+                    json!({}),
+                    Some(scheduled_metadata("known", "boot")),
+                    &jobs,
+                    now,
+                )
+                .await
+            }
+        });
+
+        bus.entered
+            .acquire()
+            .await
+            .expect("entered semaphore closed")
+            .forget();
+        let duplicate = tick_from_trigger(
+            bus.as_ref(),
+            json!({}),
+            Some(scheduled_metadata("known", "boot")),
+            &jobs,
+            now + MIN_TICK_INTERVAL,
+        )
+        .await;
+        assert!(duplicate.is_err());
+        assert_eq!(
+            bus.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the concurrent duplicate reached the bus"
+        );
+
+        bus.release.add_permits(1);
+        assert_eq!(
+            first.await.expect("first task panicked").unwrap(),
+            json!({ "skipped": true, "reason": "disabled_in_state" })
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_duplicate_stops_before_the_bus() {
+        let jobs = scheduled_jobs("known", "boot", "scheduled").await;
+        mark_test_job_in_flight(&jobs, "known").await;
+        let bus = FakeBus::new();
+
+        assert!(
+            tick_from_trigger(
+                &bus,
+                json!({}),
+                Some(scheduled_metadata("known", "boot")),
+                &jobs,
+                std::time::Instant::now(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(bus.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn toggle_after_restart_reports_inactive_before_reading_state() {
+        let bus = FakeBus::new();
+        let jobs = ScheduledJobs::default();
+
+        let error = toggle_pulse(&bus, "realm", "scheduled", false, &jobs)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("register it again after restart"),
+            "got: {error}"
+        );
+        assert!(bus.calls().is_empty());
     }
 
     #[tokio::test]
