@@ -864,11 +864,11 @@ fn message_tool_call_id(message: &Value) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
-fn remove_assistant_tool_calls(message: &mut Value) {
-    if let Some(object) = message.as_object_mut() {
-        object.remove("tool_calls");
-        object.remove("toolCalls");
-    }
+fn provider_message_content(message: &Value) -> Option<Value> {
+    message
+        .get("content")
+        .filter(|content| content.is_string() || content.is_array())
+        .cloned()
 }
 
 fn anthropic_messages(messages: &[Value], aliases: &ToolAliases) -> Vec<Value> {
@@ -879,9 +879,9 @@ fn anthropic_messages(messages: &[Value], aliases: &ToolAliases) -> Vec<Value> {
             Some("assistant") => {
                 let calls = message_function_calls(message);
                 if calls.is_empty() {
-                    let mut native = message.clone();
-                    remove_assistant_tool_calls(&mut native);
-                    provider_messages.push(native);
+                    if let Some(content) = provider_message_content(message) {
+                        provider_messages.push(json!({ "role": "assistant", "content": content }));
+                    }
                     continue;
                 }
 
@@ -905,10 +905,13 @@ fn anthropic_messages(messages: &[Value], aliases: &ToolAliases) -> Vec<Value> {
                 let Some(call_id) = message_tool_call_id(message) else {
                     continue;
                 };
+                let Some(content) = provider_message_content(message) else {
+                    continue;
+                };
                 let block = json!({
                     "type": "tool_result",
                     "tool_use_id": call_id,
-                    "content": message.get("content").cloned().unwrap_or(Value::Null),
+                    "content": content,
                 });
 
                 let appended = provider_messages.last_mut().is_some_and(|previous| {
@@ -932,49 +935,91 @@ fn anthropic_messages(messages: &[Value], aliases: &ToolAliases) -> Vec<Value> {
                     provider_messages.push(json!({ "role": "user", "content": [block] }));
                 }
             }
-            _ => provider_messages.push(message.clone()),
+            Some("user") => {
+                if let Some(content) = provider_message_content(message) {
+                    provider_messages.push(json!({ "role": "user", "content": content }));
+                }
+            }
+            // Anthropic accepts its system prompt only in the request's
+            // top-level `system` field. Dropping every other role here keeps a
+            // caller-supplied `system` envelope off the wire instead of
+            // silently giving it user-message semantics.
+            _ => {}
         }
     }
 
     provider_messages
 }
 
+fn openai_message_with_content(message: &Value, role: &str) -> Option<Value> {
+    let content = provider_message_content(message)?;
+    let mut native = json!({ "role": role, "content": content });
+    if let Some(name) = message.get("name").and_then(Value::as_str) {
+        native["name"] = json!(name);
+    }
+    Some(native)
+}
+
 fn openai_messages(messages: &[Value], aliases: &ToolAliases) -> Vec<Value> {
     messages
         .iter()
-        .map(|message| {
-            let mut native = message.clone();
-            let calls = message_function_calls(message);
-            if message.get("role").and_then(Value::as_str) == Some("assistant") {
-                remove_assistant_tool_calls(&mut native);
-                let calls: Vec<Value> = calls
-                    .into_iter()
-                    .filter_map(|call| {
-                        Some(json!({
-                            "id": call.call_id,
-                            "type": "function",
-                            "function": {
-                                "name": aliases.provider_name(&call.id)?,
-                                "arguments": serde_json::to_string(&call.arguments)
-                                    .unwrap_or_else(|_| "null".to_string()),
-                            },
-                        }))
-                    })
-                    .collect();
-                if !calls.is_empty() {
-                    native["tool_calls"] = Value::Array(calls);
+        .filter_map(
+            |message| match message.get("role").and_then(Value::as_str) {
+                Some("assistant") => {
+                    let calls = message_function_calls(message);
+                    let mut native = if calls.is_empty() {
+                        openai_message_with_content(message, "assistant")?
+                    } else {
+                        let content = message
+                            .get("content")
+                            .filter(|content| {
+                                content.is_null() || content.is_string() || content.is_array()
+                            })
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let mut native = json!({ "role": "assistant", "content": content });
+                        if let Some(name) = message.get("name").and_then(Value::as_str) {
+                            native["name"] = json!(name);
+                        }
+                        native
+                    };
+                    let calls: Vec<Value> = calls
+                        .into_iter()
+                        .filter_map(|call| {
+                            Some(json!({
+                                "id": call.call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": aliases.provider_name(&call.id)?,
+                                    "arguments": serde_json::to_string(&call.arguments)
+                                        .unwrap_or_else(|_| "null".to_string()),
+                                },
+                            }))
+                        })
+                        .collect();
+                    if !calls.is_empty() {
+                        native["tool_calls"] = Value::Array(calls);
+                    }
+                    Some(native)
                 }
-            }
-            if message.get("role").and_then(Value::as_str) == Some("tool")
-                && let Some(call_id) = message_tool_call_id(message)
-            {
-                native["tool_call_id"] = json!(call_id);
-                if let Some(object) = native.as_object_mut() {
-                    object.remove("toolCallId");
+                Some("tool") => {
+                    let call_id = message_tool_call_id(message)?;
+                    let content = provider_message_content(message)?;
+                    Some(json!({
+                        "role": "tool",
+                        "content": content,
+                        "tool_call_id": call_id,
+                    }))
                 }
-            }
-            native
-        })
+                Some(role @ ("developer" | "system" | "user")) => {
+                    openai_message_with_content(message, role)
+                }
+                // Build every provider envelope from its allowlisted fields. This
+                // is the last boundary before the HTTP request, so storage
+                // metadata and unknown caller roles must not survive by cloning.
+                _ => None,
+            },
+        )
         .collect()
 }
 
@@ -2304,6 +2349,51 @@ mod tests {
                     ],
                 },
             ])
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_strip_unknown_keys_and_reject_roles_outside_its_schema() {
+        let messages = vec![
+            json!({
+                "role": "user",
+                "content": "hello",
+                "score": 0.91,
+                "timestamp": 10,
+                "id": "memory-1",
+                "junk": true,
+            }),
+            json!({
+                "role": "system",
+                "content": "not valid in Anthropic messages",
+                "score": 0.82,
+            }),
+        ];
+
+        let body = anthropic_request_body("model", None, &messages, &[], 128);
+
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "user", "content": "hello" }])
+        );
+    }
+
+    #[test]
+    fn openai_messages_strip_keys_outside_the_provider_schema() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": "hello",
+            "score": 0.91,
+            "timestamp": 10,
+            "id": "memory-1",
+            "junk": true,
+        })];
+
+        let body = openai_request_body("model", None, &messages, &[], 128);
+
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "user", "content": "hello" }])
         );
     }
 

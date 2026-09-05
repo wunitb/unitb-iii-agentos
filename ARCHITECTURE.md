@@ -183,7 +183,7 @@ Development is coordinated outside this repository. Work is split into packages 
 
 ## CI
 
-`.github/workflows/ci.yml` defines eleven jobs. Nine run on every event;
+`.github/workflows/ci.yml` defines twelve jobs. Ten run on every event;
 `dependency-review` runs on pull requests only and `e2e-full` only on a `main`
 push with `AGENTOS_FULL_E2E_ENABLED`. The workflow starts from
 `permissions: {}` and each job re-grants only `contents: read`. No step carries
@@ -191,13 +191,14 @@ push with `AGENTOS_FULL_E2E_ENABLED`. The workflow starts from
 
 | job | gate |
 |---|---|
-| `rust` | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` (dev profile, 1,998 test attributes; 3 live-engine checks ignored by default) + `cargo build --workspace --release` + `cargo audit` + `cargo deny check` (advisories, bans, licences, sources — policy in `deny.toml`) |
+| `rust` | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` (dev profile, 2,002 test attributes; 3 live-engine checks ignored by default) + `cargo build --workspace --release` + `cargo audit` + `cargo deny check` (advisories, bans, licences, sources — policy in `deny.toml`) |
+| `boot-smoke` | downloads the release binaries built by `rust`, boots a scratch runtime through `agentos up --no-tui`, and requires every local worker identity plus the six functions that make the AgentOS layer usable; no provider credential or model call |
 | `node-unit` | `bun run typecheck`, `bun run test:unit` (tests of the software), `bun run test:governance` (build-evidence and documentation contracts), `bun run counts:check` (every published number recomputed from the tree) |
 | `dependency-review` | `actions/dependency-review-action` with `fail-on-severity: moderate`, pull requests only |
 | `portable-bundle` | stages the release payload from the `rust` artifacts and asserts the extracted bundle needs no checkout-relative path |
 | `python` | `pytest workers/embedding/test_main.py` |
 | `website` | `npm ci` + `npm run build` in `website/` |
-| `scripts` | `shellcheck --severity=warning` over the six shipped shell scripts |
+| `scripts` | `shellcheck --severity=warning` over the seven shipped shell scripts |
 | `worker-yaml` | every `workers/<name>/iii.worker.yaml` parses, matches its folder, declares `runtime.kind` of `rust` or `python`, and carries a `scripts.start` string |
 | `namespace-clash` | grep ensures no agentos worker registers `sandbox::*` |
 | `e2e-smoke` | typechecks and tests the Node examples and startup configuration, then starts engine + workers, asserts ports listen, the required functions register, and no namespace clash |

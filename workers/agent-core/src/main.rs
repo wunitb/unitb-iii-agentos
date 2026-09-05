@@ -496,6 +496,48 @@ fn memory_recall_payload(agent_id: &str, message: &str) -> Value {
     })
 }
 
+/// Turn relevance-ranked recall rows into provider-safe conversational context.
+///
+/// `memory::recall` returns `role` and `content` plus storage metadata at
+/// `workers/memory/src/main.rs:854-860`; compaction records use the `system`
+/// role at lines 1252 and 1268. All valid rows are therefore rendered as one
+/// user message instead of being trusted as chat envelopes. This retains a
+/// system summary's information without granting recalled text system-prompt
+/// authority, and it leaves storage-only keys outside the provider request.
+/// Iteration keeps recall's score order, so the model sees the most relevant
+/// row first, the less relevant rows after it, and the current turn last.
+fn messages_with_recalled_memories(memories: &Value, current_turn: &str) -> Vec<Value> {
+    let recalled: Vec<(&str, &str)> = memories
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|memory| {
+            Some((
+                memory.get("role")?.as_str()?,
+                memory.get("content")?.as_str()?,
+            ))
+        })
+        .collect();
+
+    let mut messages = Vec::with_capacity(usize::from(!recalled.is_empty()) + 1);
+    if !recalled.is_empty() {
+        let entries = recalled
+            .iter()
+            .enumerate()
+            .map(|(index, (role, content))| format!("{}. [{role}]\n{content}", index + 1))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        messages.push(json!({
+            "role": "user",
+            "content": format!(
+                "Relevant recalled memories, ranked from most to least relevant:\n\n{entries}"
+            ),
+        }));
+    }
+    messages.push(json!({ "role": "user", "content": current_turn }));
+    messages
+}
+
 /// `memory::store` for one turn of the agent this turn runs as.
 fn memory_store_payload(
     agent_id: &str,
@@ -638,11 +680,7 @@ async fn agent_chat(iii: &Bus, req: ChatRequest) -> Result<Value, Error> {
         )));
     }
 
-    let mut messages = vec![];
-    if let Some(mems) = memories.as_array() {
-        messages.extend(mems.iter().cloned());
-    }
-    messages.push(json!({ "role": "user", "content": &req.message }));
+    let mut messages = messages_with_recalled_memories(&memories, &req.message);
 
     let mut response: Value = iii
         .trigger(TriggerRequest {
@@ -1273,6 +1311,64 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn recalled_rows_become_provider_safe_context_before_the_current_turn() {
+        let fake = turn_bus(vec![json!({ "content": "answer" })]);
+        fake.on_value(
+            "memory::recall",
+            json!([
+                {
+                    "role": "assistant",
+                    "content": "Highest-ranked answer",
+                    "score": 0.97,
+                    "timestamp": 30,
+                    "id": "memory-3",
+                },
+                {
+                    "role": "system",
+                    "content": "Compaction summary",
+                    "score": 0.84,
+                    "timestamp": 20,
+                    "id": "memory-2",
+                },
+                {
+                    "role": "user",
+                    "content": "Lower-ranked question",
+                    "score": 0.72,
+                    "timestamp": 10,
+                    "id": "memory-1",
+                },
+            ]),
+        );
+        let bus: Bus = Arc::clone(&fake) as Bus;
+
+        chat(&bus, json!({ "agentId": "a-1", "message": "Current turn" }))
+            .await
+            .expect("turn with recalled memory");
+
+        let completions = payloads(&fake, "agentos::llm::complete");
+        assert_eq!(completions.len(), 1);
+        assert_eq!(
+            completions[0]["messages"],
+            json!([
+                {
+                    "role": "user",
+                    "content": "Relevant recalled memories, ranked from most to least relevant:
+
+1. [assistant]
+Highest-ranked answer
+
+2. [system]
+Compaction summary
+
+3. [user]
+Lower-ranked question",
+                },
+                { "role": "user", "content": "Current turn" },
+            ])
+        );
     }
 
     #[tokio::test]

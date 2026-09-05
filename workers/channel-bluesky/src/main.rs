@@ -1,3 +1,8 @@
+// This polling worker deliberately has no inbound HTTP adapter. Keep its chat
+// budget equal to the canonical edge budget; the tracked-tree governance test
+// locks both values so this local boundary cannot drift.
+const CHAT_TIMEOUT_MS: u64 = 300_000;
+
 use iii_sdk::errors::Error;
 use iii_sdk::protocol::TriggerAction;
 use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
@@ -235,7 +240,7 @@ async fn webhook_handler(
                 "sessionId": format!("bluesky:{did}"),
             }),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
