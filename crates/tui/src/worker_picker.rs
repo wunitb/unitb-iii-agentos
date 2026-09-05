@@ -489,6 +489,14 @@ mod tests {
     /// it understands, not on a guessed build configuration.
     fn is_test_only(attributes: &[syn::Attribute]) -> bool {
         attributes.iter().any(|attribute| {
+            if attribute
+                .path()
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "test")
+            {
+                return true;
+            }
             let syn::Meta::List(list) = &attribute.meta else {
                 return false;
             };
@@ -521,7 +529,10 @@ mod tests {
     }
 
     fn returned_factory_id(block: &syn::Block) -> Option<String> {
-        let syn::Stmt::Expr(expression, _) = block.stmts.last()? else {
+        if block.stmts.len() != 1 {
+            return None;
+        }
+        let syn::Stmt::Expr(expression, _) = block.stmts.first()? else {
             return None;
         };
         let expression = match expression {
@@ -531,13 +542,31 @@ mod tests {
         let syn::Expr::Tuple(tuple) = expression else {
             return None;
         };
+        if tuple.elems.len() != 2 || !matches!(tuple.elems.get(1), Some(syn::Expr::Path(_))) {
+            return None;
+        }
         literal_id(tuple.elems.first()?)
+    }
+
+    fn record_unique_definition(
+        definitions: &mut std::collections::HashMap<String, Option<String>>,
+        name: String,
+        candidate: Option<String>,
+    ) {
+        match definitions.entry(name) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+        }
     }
 
     #[derive(Default)]
     struct Definitions {
-        constants: std::collections::HashMap<String, String>,
-        factories: std::collections::HashMap<String, String>,
+        constants: std::collections::HashMap<String, Option<String>>,
+        factories: std::collections::HashMap<String, Option<String>>,
     }
 
     impl<'ast> Visit<'ast> for Definitions {
@@ -545,11 +574,17 @@ mod tests {
             if is_test_only(&function.attrs) {
                 return;
             }
-            if function.sig.inputs.is_empty()
-                && let Some(id) = returned_factory_id(&function.block)
-            {
-                self.factories.insert(function.sig.ident.to_string(), id);
-            }
+            let candidate = function
+                .sig
+                .inputs
+                .is_empty()
+                .then(|| returned_factory_id(&function.block))
+                .flatten();
+            record_unique_definition(
+                &mut self.factories,
+                function.sig.ident.to_string(),
+                candidate,
+            );
             visit::visit_item_fn(self, function);
         }
 
@@ -566,29 +601,77 @@ mod tests {
         }
 
         fn visit_item_const(&mut self, constant: &'ast syn::ItemConst) {
-            if !is_test_only(&constant.attrs)
-                && let Some(id) = literal_id(&constant.expr)
-            {
-                self.constants.insert(constant.ident.to_string(), id);
+            if !is_test_only(&constant.attrs) {
+                record_unique_definition(
+                    &mut self.constants,
+                    constant.ident.to_string(),
+                    literal_id(&constant.expr),
+                );
             }
         }
 
         fn visit_item_static(&mut self, value: &'ast syn::ItemStatic) {
-            if !is_test_only(&value.attrs)
-                && let Some(id) = literal_id(&value.expr)
-            {
-                self.constants.insert(value.ident.to_string(), id);
+            if !is_test_only(&value.attrs) {
+                record_unique_definition(
+                    &mut self.constants,
+                    value.ident.to_string(),
+                    literal_id(&value.expr),
+                );
             }
         }
     }
 
     struct Registrations<'a> {
         definitions: &'a Definitions,
-        scopes: Vec<std::collections::HashMap<String, String>>,
+        scopes: Vec<std::collections::HashMap<String, Option<String>>>,
         ids: std::collections::BTreeSet<String>,
     }
 
+    fn pattern_bindings(pattern: &syn::Pat, bindings: &mut Vec<(String, bool)>) {
+        match pattern {
+            syn::Pat::Ident(identifier) => bindings.push((
+                identifier.ident.to_string(),
+                identifier.mutability.is_some(),
+            )),
+            syn::Pat::Type(typed) => pattern_bindings(&typed.pat, bindings),
+            syn::Pat::Tuple(tuple) => {
+                for element in &tuple.elems {
+                    pattern_bindings(element, bindings);
+                }
+            }
+            syn::Pat::Reference(reference) => pattern_bindings(&reference.pat, bindings),
+            syn::Pat::Slice(slice) => {
+                for element in &slice.elems {
+                    pattern_bindings(element, bindings);
+                }
+            }
+            syn::Pat::Struct(value) => {
+                for field in &value.fields {
+                    pattern_bindings(&field.pat, bindings);
+                }
+            }
+            syn::Pat::TupleStruct(value) => {
+                for element in &value.elems {
+                    pattern_bindings(element, bindings);
+                }
+            }
+            _ => {}
+        }
+    }
+
     impl Registrations<'_> {
+        /// `Some(None)` means the nearest lexical binding is known to exist but
+        /// its value is unknown. Callers must stop there rather than falling
+        /// through to an outer local, constant, or factory with the same name.
+        fn lexical_value(&self, identifier: &str) -> Option<Option<String>> {
+            for scope in self.scopes.iter().rev() {
+                if let Some(value) = scope.get(identifier) {
+                    return Some(value.clone());
+                }
+            }
+            None
+        }
+
         fn resolve_expression(&self, expression: &syn::Expr) -> Option<String> {
             if let Some(id) = literal_id(expression) {
                 return Some(id);
@@ -596,18 +679,29 @@ mod tests {
             match expression {
                 syn::Expr::Path(path) => {
                     let identifier = path.path.get_ident()?.to_string();
-                    self.scopes
-                        .iter()
-                        .rev()
-                        .find_map(|scope| scope.get(&identifier).cloned())
-                        .or_else(|| self.definitions.constants.get(&identifier).cloned())
+                    match self.lexical_value(&identifier) {
+                        Some(value) => value,
+                        None => self
+                            .definitions
+                            .constants
+                            .get(&identifier)
+                            .cloned()
+                            .flatten(),
+                    }
                 }
                 syn::Expr::Call(call) => {
                     let syn::Expr::Path(function) = call.func.as_ref() else {
                         return None;
                     };
                     let identifier = function.path.get_ident()?.to_string();
-                    self.definitions.factories.get(&identifier).cloned()
+                    if self.lexical_value(&identifier).is_some() {
+                        return None;
+                    }
+                    self.definitions
+                        .factories
+                        .get(&identifier)
+                        .cloned()
+                        .flatten()
                 }
                 syn::Expr::Group(group) => self.resolve_expression(&group.expr),
                 syn::Expr::Paren(paren) => self.resolve_expression(&paren.expr),
@@ -617,27 +711,23 @@ mod tests {
         }
 
         fn remember_local(&mut self, local: &syn::Local) {
-            let Some(initializer) = &local.init else {
+            let resolved = local
+                .init
+                .as_ref()
+                .and_then(|initializer| self.resolve_expression(&initializer.expr));
+            let mut bindings = Vec::new();
+            pattern_bindings(&local.pat, &mut bindings);
+            let Some(scope) = self.scopes.last_mut() else {
                 return;
             };
-            let binding = match &local.pat {
-                syn::Pat::Ident(identifier) => Some(&identifier.ident),
-                syn::Pat::Tuple(tuple) => match tuple.elems.first() {
-                    Some(syn::Pat::Ident(identifier)) => Some(&identifier.ident),
-                    _ => None,
-                },
-                syn::Pat::Type(typed) => match typed.pat.as_ref() {
-                    syn::Pat::Ident(identifier) => Some(&identifier.ident),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let (Some(binding), Some(id), Some(scope)) = (
-                binding,
-                self.resolve_expression(&initializer.expr),
-                self.scopes.last_mut(),
-            ) {
-                scope.insert(binding.to_string(), id);
+            for (name, _) in &bindings {
+                scope.insert(name.clone(), None);
+            }
+            if let Some((name, mutable)) = bindings.first()
+                && !mutable
+                && let Some(id) = resolved
+            {
+                scope.insert(name.clone(), Some(id));
             }
         }
 
@@ -654,10 +744,39 @@ mod tests {
         }
     }
 
+    impl Registrations<'_> {
+        fn visit_function_body<'ast>(
+            &mut self,
+            inputs: &'ast syn::punctuated::Punctuated<syn::FnArg, syn::Token![,]>,
+            block: &'ast syn::Block,
+        ) {
+            let outer_scopes = std::mem::take(&mut self.scopes);
+            let mut parameters = std::collections::HashMap::new();
+            for input in inputs {
+                if let syn::FnArg::Typed(argument) = input {
+                    let mut bindings = Vec::new();
+                    pattern_bindings(&argument.pat, &mut bindings);
+                    for (name, _) in bindings {
+                        parameters.insert(name, None);
+                    }
+                }
+            }
+            self.scopes.push(parameters);
+            self.visit_block(block);
+            self.scopes = outer_scopes;
+        }
+    }
+
     impl<'ast> Visit<'ast> for Registrations<'_> {
         fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
             if !is_test_only(&function.attrs) {
-                visit::visit_item_fn(self, function);
+                self.visit_function_body(&function.sig.inputs, &function.block);
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
+            if !is_test_only(&function.attrs) {
+                self.visit_function_body(&function.sig.inputs, &function.block);
             }
         }
 
@@ -682,6 +801,9 @@ mod tests {
         }
 
         fn visit_local(&mut self, local: &'ast syn::Local) {
+            if is_test_only(&local.attrs) {
+                return;
+            }
             if let Some(initializer) = &local.init {
                 self.visit_expr(&initializer.expr);
                 if let Some((_, diverge)) = &initializer.diverge {
@@ -691,7 +813,33 @@ mod tests {
             self.remember_local(local);
         }
 
+        fn visit_expr_block(&mut self, block: &'ast syn::ExprBlock) {
+            if !is_test_only(&block.attrs) {
+                visit::visit_expr_block(self, block);
+            }
+        }
+
+        fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+            if is_test_only(&closure.attrs) {
+                return;
+            }
+            let mut parameters = std::collections::HashMap::new();
+            for input in &closure.inputs {
+                let mut bindings = Vec::new();
+                pattern_bindings(input, &mut bindings);
+                for (name, _) in bindings {
+                    parameters.insert(name, None);
+                }
+            }
+            self.scopes.push(parameters);
+            self.visit_expr(&closure.body);
+            self.scopes.pop();
+        }
+
         fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if is_test_only(&call.attrs) {
+                return;
+            }
             if call.method == "register_function" {
                 self.capture_registration(&call.args);
             }
@@ -699,6 +847,9 @@ mod tests {
         }
 
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if is_test_only(&call.attrs) {
+                return;
+            }
             if let syn::Expr::Path(function) = call.func.as_ref()
                 && function
                     .path
@@ -842,6 +993,137 @@ mod tests {
             ids,
             std::collections::BTreeSet::from(["mcp::connect".to_string()])
         );
+    }
+
+    #[test]
+    fn extractor_stops_at_unknown_shadow_and_refuses_mutable_inference() {
+        let source = r#"
+            const ID: &str = "fake::constant";
+
+            fn same_scope(runtime_id: fn() -> &'static str) {
+                let id = "fake::same-scope";
+                let id = runtime_id();
+                iii.register_function(id, handler);
+            }
+
+            fn inner_scope(runtime_id: fn() -> &'static str) {
+                let id = ID;
+                {
+                    let id = runtime_id();
+                    iii.register_function(id, handler);
+                }
+            }
+
+            fn mutable(runtime_id: fn() -> &'static str) {
+                let mut id = "fake::mutable";
+                id = runtime_id();
+                iii.register_function(id, handler);
+            }
+        "#;
+
+        let ids = registered_function_ids_in_source(source).expect("parse fixture");
+        assert!(ids.is_empty(), "unknown bindings leaked old ids: {ids:?}");
+    }
+
+    #[test]
+    fn extractor_omits_test_attributes_and_cfg_test_expressions() {
+        let source = r#"
+            #[test]
+            fn unit_fixture() {
+                iii.register_function("fake::test", handler);
+            }
+
+            #[tokio::test]
+            async fn async_fixture() {
+                iii.register_function("fake::tokio-test", handler);
+            }
+
+            fn production() {
+                #[cfg(test)]
+                let _fake = iii.register_function("fake::local", handler);
+                #[cfg(test)]
+                {
+                    iii.register_function("fake::block", handler);
+                }
+                iii.register_function("real::production", handler);
+            }
+        "#;
+
+        let ids = registered_function_ids_in_source(source).expect("parse fixture");
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from(["real::production".to_string()])
+        );
+    }
+
+    #[test]
+    fn extractor_rejects_factory_with_another_return_path() {
+        let source = r#"
+            fn binding() -> (&'static str, Handler) {
+                if changed() {
+                    return ("other::id", other_handler);
+                }
+                ("fake::advertised", advertised_handler)
+            }
+
+            fn install() {
+                let (id, handler) = binding();
+                iii.register_function(id, handler);
+            }
+        "#;
+
+        let ids = registered_function_ids_in_source(source).expect("parse fixture");
+        assert!(
+            ids.is_empty(),
+            "dynamic factory was inferred as pure: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn extractor_does_not_resolve_shadowed_factory_names() {
+        let source = r#"
+            fn binding() -> (&'static str, Handler) {
+                ("fake::global", global_handler)
+            }
+
+            fn from_parameter(binding: Factory) {
+                let (id, handler) = binding();
+                iii.register_function(id, handler);
+            }
+
+            fn from_local(runtime_factory: Factory) {
+                let binding = runtime_factory;
+                let (id, handler) = binding();
+                iii.register_function(id, handler);
+            }
+        "#;
+
+        let ids = registered_function_ids_in_source(source).expect("parse fixture");
+        assert!(ids.is_empty(), "shadowed factory leaked global id: {ids:?}");
+    }
+
+    #[test]
+    fn extractor_rejects_ambiguous_same_name_factories() {
+        let source = r#"
+            mod one {
+                fn binding() -> (&'static str, Handler) {
+                    ("fake::one", one_handler)
+                }
+            }
+            mod two {
+                fn binding() -> (&'static str, Handler) {
+                    ("fake::two", two_handler)
+                }
+            }
+
+            fn install() {
+                let (id, handler) = binding();
+                iii.register_function(id, handler);
+            }
+        "#;
+
+        let ids = registered_function_ids_in_source(source).expect("parse fixture");
+        assert!(ids.is_empty(), "ambiguous factory was guessed: {ids:?}");
     }
 
     #[test]
