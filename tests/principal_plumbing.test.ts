@@ -6,10 +6,11 @@ import { collectHttpRoutes, collectRegistrations, withoutComments, withoutTestMo
 /**
  * Contract T1 (tenancy): a `memory::*` or `vault::*` handler resolves WHO a
  * call is from — a `principal` set by a trusted worker, or the operator bearer
- * in `headers` — and never from the payload's `agentId`. A call that carries
- * neither fails closed. So every worker that dispatches one of those ids has
- * to label the call, and this scanner is what stops the next caller from
- * forgetting: it finds each dispatch of a literal `memory::…` / `vault::…` id
+ * in `headers` — and never from the payload's `agentId`. `agent::chat` applies
+ * the same rule because it runs a whole turn. A call that carries neither
+ * fails closed. So every worker that dispatches one of those ids has to label
+ * the call, and this scanner is what stops the next caller from forgetting:
+ * it finds each literal `memory::…`, `vault::…`, or `agent::chat` dispatch
  * under `workers/` and resolves its payload expression — a `json!` literal, a
  * builder function in the same file, or an `attach_agent` call — to prove the
  * label is there.
@@ -132,10 +133,13 @@ export function payloadCarriesPrincipal(expression: string, fileText: string, se
   return body !== undefined && payloadCarriesPrincipal(body, fileText, seen);
 }
 
-const ID_LITERAL = /"(memory|vault)::[A-Za-z0-9_:]+"/g;
+const ID_LITERAL = /"(?:(?:memory|vault)::[A-Za-z0-9_:]+|agent::chat)"/g;
 /** The literal is the second argument of a call whose first argument is the bus. */
+const FIRST_ARGUMENT = /\bchat_trigger\s*\(\s*$/;
+const FIRST_STRING_FROM = /\bchat_trigger\s*\(\s*String::from\(\s*$/;
 const SECOND_ARGUMENT = /\(\s*&?[A-Za-z_][A-Za-z0-9_.]*\s*,\s*$/;
 const TRIGGER_FIELD = /function_id\s*:\s*$/;
+const TRIGGER_STRING_FROM = /function_id\s*:\s*String::from\(\s*$/;
 const REGISTRATION = /register_(function|cron_trigger|http_trigger)\s*\(\s*(&?[A-Za-z_][A-Za-z0-9_]*\s*,\s*)?$/;
 
 interface Dispatch {
@@ -147,35 +151,56 @@ interface Dispatch {
 }
 
 export function dispatchesIn(file: string, text: string): Dispatch[] {
-  const found: Dispatch[] = [];
-  for (const match of text.matchAll(ID_LITERAL)) {
-    const before = text.slice(Math.max(0, match.index - 120), match.index);
-    if (REGISTRATION.test(before)) continue;
-    const id = match[0].slice(1, -1);
+  const found: Array<Dispatch & { index: number }> = [];
+
+  const inspect = (id: string, index: number, tokenEnd: number): void => {
+    const before = text.slice(Math.max(0, index - 160), index);
+    if (REGISTRATION.test(before)) return;
     let payload: string | undefined;
 
-    if (TRIGGER_FIELD.test(before)) {
-      // `TriggerRequest { function_id: "memory::store".to_string(), payload: <expr>, ... }`
-      const window = text.slice(match.index, match.index + 900);
+    if (TRIGGER_FIELD.test(before) || TRIGGER_STRING_FROM.test(before)) {
+      const window = text.slice(tokenEnd, tokenEnd + 900);
       const field = /\bpayload\s*:/.exec(window);
-      if (field) payload = argumentAt(text, match.index + field.index + field[0].length);
-    } else if (SECOND_ARGUMENT.test(before)) {
-      // `helper(iii, "memory::store", <expr>)`
-      const after = text.slice(match.index + match[0].length);
-      const separator = /^(?:\.(?:to_string|into|to_owned)\(\))?\s*,\s*/.exec(after);
-      if (separator) payload = argumentAt(text, match.index + match[0].length + separator[0].length);
+      if (field) payload = argumentAt(text, tokenEnd + field.index + field[0].length);
+    } else if (FIRST_ARGUMENT.test(before) || FIRST_STRING_FROM.test(before) || SECOND_ARGUMENT.test(before)) {
+      const after = text.slice(tokenEnd);
+      const separator = FIRST_STRING_FROM.test(before)
+        ? /^\)\s*,\s*/.exec(after)
+        : /^(?:\.(?:to_string|into|to_owned)\(\))?\s*,\s*/.exec(after);
+      if (separator) payload = argumentAt(text, tokenEnd + separator[0].length);
     }
 
-    if (payload === undefined) continue;
+    if (payload === undefined) return;
     found.push({
       file,
-      line: lineOf(text, match.index),
+      line: lineOf(text, index),
       id,
       payload: payload.trim(),
       labelled: payloadCarriesPrincipal(payload, text),
+      index,
     });
+  };
+
+  for (const match of text.matchAll(ID_LITERAL)) {
+    inspect(match[0].slice(1, -1), match.index, match.index + match[0].length);
   }
-  return found;
+
+  const constants = [...text.matchAll(/\bconst\s+([A-Za-z_][A-Za-z0-9_]*)\s*:[^=;]+?=\s*"((?:(?:memory|vault)::[A-Za-z0-9_:]+|agent::chat))"\s*;/g)];
+  for (const definition of constants) {
+    const name = definition[1]!;
+    const id = definition[2]!;
+    const start = definition.index;
+    const end = start + definition[0].length;
+    const uses = new RegExp(`\\b${name}\\b`, "g");
+    for (const use of text.matchAll(uses)) {
+      if (use.index >= start && use.index < end) continue;
+      inspect(id, use.index, use.index + name.length);
+    }
+  }
+
+  return found
+    .sort((left, right) => left.index - right.index)
+    .map(({ index: _index, ...dispatch }) => dispatch);
 }
 
 const sources = workerRustSources().map((file) => ({
@@ -195,7 +220,7 @@ function offenders(): Map<string, Dispatch[]> {
   return byKey;
 }
 
-describe("contract T1: every memory::*/vault::* dispatch carries a principal", () => {
+describe("contract T1: every memory::*/vault::*/agent::chat dispatch carries a principal", () => {
   it("labels every dispatch outside the dated allowlist", () => {
     const allowed = new Set(KNOWN_UNLABELLED_DISPATCHES.map((entry) => entry.key));
     const unexpected = [...offenders()]
@@ -229,6 +254,7 @@ describe("contract T1: every memory::*/vault::* dispatch carries a principal", (
       "workers/agent-core/src/main.rs vault::get",
       "workers/swarm/src/main.rs memory::store",
       "workers/security-map/src/main.rs vault::get",
+      "workers/streaming/src/main.rs agent::chat",
     ]) {
       expect(labelled, `${expected} should be found and labelled`).toContain(expected);
     }
@@ -251,6 +277,42 @@ describe("contract T1: every memory::*/vault::* dispatch carries a principal", (
 
 describe("principal scanner", () => {
   const scan = (text: string) => dispatchesIn("probe.rs", withoutComments(withoutTestModules(text)));
+
+  it("finds agent chat through TriggerRequest literals, helpers, constants, and string conversions", () => {
+    const text = [
+      'const CHAT: &str = "agent::chat";',
+      'iii.trigger(TriggerRequest { function_id: "agent::chat".into(), payload: json!({ "principal": principal::as_agent(a) }), action: None, timeout_ms: None });',
+      'iii.trigger(TriggerRequest { function_id: String::from("agent::chat"), payload: json!({ "headers": h }), action: None, timeout_ms: None });',
+      'chat_trigger("agent::chat".to_owned(), agent_chat_payload(input, body, message));',
+      'chat_trigger(String::from("agent::chat"), json!({ "principal": principal::as_agent(a) }));',
+      'chat_trigger(CHAT, json!({ "agentId": "victim" }));',
+    ].join("\n");
+    const found = scan(text);
+    expect(found.map(({ id }) => id)).toEqual(["agent::chat", "agent::chat", "agent::chat", "agent::chat", "agent::chat"]);
+    expect(found.map(({ labelled }) => labelled)).toEqual([true, true, false, true, false]);
+  });
+
+  it("does not accept a principal mentioned only in a comment", () => {
+    const text = [
+      'iii.trigger(TriggerRequest { function_id: "agent::chat".to_string(), payload: json!({',
+      '  "agentId": a, // "principal": principal::as_agent(a)',
+      '}), action: None, timeout_ms: None });',
+    ].join("\n");
+    expect(scan(text).map(({ labelled }) => labelled)).toEqual([false]);
+  });
+
+  it("catches streaming header removal and an added bare chat helper call", () => {
+    const streaming = readFileSync(join(repositoryRoot, "workers/streaming/src/main.rs"), "utf8");
+    const withoutForwarding = streaming.replace('"headers": headers,', '"notHeaders": headers,');
+    const withBareSecondCall = streaming.replace(
+      'chat_trigger(\n        "agent::chat",\n        agent_chat_payload(input, body, message),\n    )',
+      'chat_trigger("agent::chat", json!({ "agentId": "victim" }));\n    chat_trigger(\n        "agent::chat",\n        agent_chat_payload(input, body, message),\n    )',
+    );
+    expect(dispatchesIn("streaming.rs", withoutComments(withoutTestModules(withoutForwarding)))
+      .filter(({ id }) => id === "agent::chat").map(({ labelled }) => labelled)).toEqual([false]);
+    expect(dispatchesIn("streaming.rs", withoutComments(withoutTestModules(withBareSecondCall)))
+      .filter(({ id }) => id === "agent::chat").map(({ labelled }) => labelled)).toEqual([false, true]);
+  });
 
   it("flags a TriggerRequest whose json! payload has no principal", () => {
     const text = 'iii.trigger(TriggerRequest { function_id: "memory::recall".to_string(), payload: json!({ "agentId": id, "query": q }), action: None, timeout_ms: None })';

@@ -1,4 +1,4 @@
-use agentos_http_adapter::CHAT_TIMEOUT_MS;
+use agentos_http_adapter::{CHAT_TIMEOUT_MS, TriggerBus, principal};
 use iii_sdk::errors::Error;
 use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
@@ -23,7 +23,7 @@ fn http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-async fn state_get(iii: &IIIClient, scope: &str, key: &str) -> Result<Option<Value>, Error> {
+async fn state_get(iii: &dyn TriggerBus, scope: &str, key: &str) -> Result<Option<Value>, Error> {
     let v = iii
         .trigger(TriggerRequest {
             function_id: "state::get".to_string(),
@@ -36,7 +36,12 @@ async fn state_get(iii: &IIIClient, scope: &str, key: &str) -> Result<Option<Val
     Ok(if v.is_null() { None } else { Some(v) })
 }
 
-async fn state_set(iii: &IIIClient, scope: &str, key: &str, value: Value) -> Result<(), Error> {
+async fn state_set(
+    iii: &dyn TriggerBus,
+    scope: &str,
+    key: &str,
+    value: Value,
+) -> Result<(), Error> {
     iii.trigger(TriggerRequest {
         function_id: "state::set".to_string(),
         payload: json!({ "scope": scope, "key": key, "value": value }),
@@ -48,7 +53,7 @@ async fn state_set(iii: &IIIClient, scope: &str, key: &str, value: Value) -> Res
     .map_err(|e| Error::Handler(e.to_string()))
 }
 
-async fn state_delete(iii: &IIIClient, scope: &str, key: &str) -> Result<(), Error> {
+async fn state_delete(iii: &dyn TriggerBus, scope: &str, key: &str) -> Result<(), Error> {
     iii.trigger(TriggerRequest {
         function_id: "state::delete".to_string(),
         payload: json!({ "scope": scope, "key": key }),
@@ -60,7 +65,7 @@ async fn state_delete(iii: &IIIClient, scope: &str, key: &str) -> Result<(), Err
     .map_err(|e| Error::Handler(e.to_string()))
 }
 
-async fn get_task_order(iii: &IIIClient) -> Result<Vec<String>, Error> {
+async fn get_task_order(iii: &dyn TriggerBus) -> Result<Vec<String>, Error> {
     Ok(state_get(iii, "a2a_tasks", "_order")
         .await?
         .and_then(|v| v.as_array().cloned())
@@ -99,7 +104,7 @@ fn update_rejection(result: &Value) -> Option<String> {
 
 /// Atomically append a task id to the `_order` index using `state::update`.
 /// Falls back to read-modify-write if the engine rejects the operation.
-async fn append_task_to_order(iii: &IIIClient, task_id: &str) -> Result<(), Error> {
+async fn append_task_to_order(iii: &dyn TriggerBus, task_id: &str) -> Result<(), Error> {
     let result = iii
         .trigger(TriggerRequest {
             function_id: "state::update".to_string(),
@@ -130,7 +135,7 @@ async fn append_task_to_order(iii: &IIIClient, task_id: &str) -> Result<(), Erro
     }
 }
 
-async fn evict_old_tasks(iii: &IIIClient) -> Result<(), Error> {
+async fn evict_old_tasks(iii: &dyn TriggerBus) -> Result<(), Error> {
     let mut order = get_task_order(iii).await?;
     while order.len() >= MAX_TASKS {
         let oldest = order.remove(0);
@@ -492,7 +497,23 @@ async fn cancel_task(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     Ok::<Value, Error>(value)
 }
 
-async fn handle_task(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn resolve_task_agent(
+    iii: &dyn TriggerBus,
+    input: &Value,
+    params: &Value,
+    expected_bearer: Option<&str>,
+) -> Result<String, Error> {
+    let caller = principal::resolve(input, expected_bearer)?;
+    let target = params
+        .get("agentId")
+        .and_then(Value::as_str)
+        .filter(|agent_id| !agent_id.is_empty())
+        .map(|agent_id| json!({ "agentId": agent_id }))
+        .unwrap_or_else(|| json!({}));
+    principal::acting_agent(iii, &caller, &target, "default").await
+}
+
+async fn handle_task(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let body = input.get("body").cloned().unwrap_or(input.clone());
     let jsonrpc = body.get("jsonrpc").and_then(|v| v.as_str()).unwrap_or("");
     let rpc_id = body.get("id").cloned().unwrap_or(Value::Null);
@@ -509,6 +530,13 @@ async fn handle_task(iii: &IIIClient, input: Value) -> Result<Value, Error> {
 
     match method {
         "tasks/send" => {
+            let agent_id = resolve_task_agent(
+                iii,
+                &input,
+                &params,
+                agentos_bus_auth::policy::expected_api_key().as_deref(),
+            )
+            .await?;
             let task_id = params
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -561,8 +589,8 @@ async fn handle_task(iii: &IIIClient, input: Value) -> Result<Value, Error> {
                 .trigger(TriggerRequest {
                     function_id: "agent::chat".to_string(),
                     payload: json!({
-                        "agentId": "default",
-                        "principal": { "agentId": "default" },
+                        "agentId": &agent_id,
+                        "principal": { "agentId": &agent_id },
                         "message": user_text,
                         "sessionId": session_id,
                     }),
@@ -864,6 +892,110 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_bare_tasks_send_is_refused_without_creating_task_state() {
+        use agentos_http_adapter::fake::FakeBus;
+        let bus = FakeBus::new();
+        let input = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tasks/send",
+            "params": { "agentId": "victim" },
+        });
+        assert!(handle_task(&bus, input).await.is_err());
+        assert!(bus.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn incoming_task_agent_is_bound_before_task_state_changes() {
+        use agentos_http_adapter::{fake::FakeBus, principal};
+        for input in [json!({}), json!({ "principal": {} })] {
+            let bus = FakeBus::new();
+            assert!(
+                resolve_task_agent(&bus, &input, &json!({ "agentId": "victim" }), Some("key"))
+                    .await
+                    .is_err()
+            );
+            assert!(bus.calls().is_empty());
+        }
+
+        let self_bus = FakeBus::new();
+        assert_eq!(
+            resolve_task_agent(
+                &self_bus,
+                &json!({ "principal": principal::as_agent("caller") }),
+                &json!({}),
+                None
+            )
+            .await
+            .unwrap(),
+            "caller"
+        );
+        assert!(self_bus.calls().is_empty());
+
+        let denied = FakeBus::new();
+        assert!(
+            resolve_task_agent(
+                &denied,
+                &json!({ "principal": principal::as_agent("caller") }),
+                &json!({ "agentId": "victim" }),
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(denied.call_count("security::check_capability"), 1);
+        assert_eq!(denied.call_count("state::set"), 0);
+        assert_eq!(denied.call_count("agent::chat"), 0);
+
+        let granted = FakeBus::new();
+        granted.on("security::check_capability", |input| Ok(json!({
+            "allowed": input["agentId"] == "caller" && input["resource"] == "grant::act_as::victim"
+        })));
+        assert_eq!(
+            resolve_task_agent(
+                &granted,
+                &json!({ "principal": principal::as_agent("caller") }),
+                &json!({ "agentId": "victim" }),
+                None
+            )
+            .await
+            .unwrap(),
+            "victim"
+        );
+
+        let operator = FakeBus::new();
+        assert_eq!(
+            resolve_task_agent(
+                &operator,
+                &json!({ "headers": { "Authorization": "Bearer key" } }),
+                &json!({ "agentId": "victim" }),
+                Some("key")
+            )
+            .await
+            .unwrap(),
+            "victim"
+        );
+
+        let forged = principal::attach_agent(
+            "a2a::handle_task",
+            json!({ "principal": principal::as_agent("victim"), "headers": { "Authorization": "Bearer key" } }),
+            "caller",
+        );
+        let forged_bus = FakeBus::new();
+        assert!(
+            resolve_task_agent(
+                &forged_bus,
+                &forged,
+                &json!({ "agentId": "victim" }),
+                Some("key")
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(forged_bus.call_count("security::check_capability"), 1);
+    }
 
     // --- state::update protocol (verified against iii 0.22.1) ---
 

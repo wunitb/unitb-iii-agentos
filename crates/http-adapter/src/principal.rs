@@ -58,18 +58,28 @@ pub const PRINCIPAL_KEY: &str = "principal";
 /// an agent.
 ///
 /// `memory`, `vault`, `lifecycle` and `wasm` keep per-agent data or act on it.
-/// `agent` and `workflow` are DEPUTIES: `agent::chat` runs a whole turn as the
-/// agent it names and `workflow::run` dispatches steps as the agents the
-/// definition names, so a model tool call into either that went out unlabelled
-/// would let the model pick whose turn, memory and capabilities it runs with.
-/// Labelled, both bind what they run to the caller's principal and demand the
+/// `agent`, `workflow`, `pulse`, `swarm`, and `a2a` are DEPUTIES: they can run
+/// a turn or persist work that later runs turns for named agents. A model tool
+/// call into any of them must therefore be relabelled with the current agent;
+/// otherwise model arguments could forge a principal or operator header and
+/// choose whose memory and capabilities the deputy uses. Their target-bearing
+/// handler paths bind named agents to that relabelled caller and demand the
 /// exact `grant::act_as::<target>` for anyone else.
 ///
 /// Deliberately a list rather than "everything": some upstream and in-tree
 /// request structs are `deny_unknown_fields` (`hand::*`), so an unconditional
 /// extra field would turn every such tool call into a deserialisation error.
-pub const PRINCIPAL_FAMILIES: [&str; 6] =
-    ["memory", "vault", "lifecycle", "wasm", "agent", "workflow"];
+pub const PRINCIPAL_FAMILIES: [&str; 9] = [
+    "memory",
+    "vault",
+    "lifecycle",
+    "wasm",
+    "agent",
+    "workflow",
+    "pulse",
+    "swarm",
+    "a2a",
+];
 
 /// Who a call is from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,8 +300,9 @@ pub fn as_agent(agent_id: &str) -> Value {
 }
 
 /// Label `payload` as made on behalf of `agent_id` when `function_id` resolves
-/// a principal, OVERWRITING any `principal` already there — the deputy decides
-/// who it acts for, never the model or the caller that supplied the arguments.
+/// a principal, OVERWRITING any `principal` and removing any `headers` already
+/// there. The deputy decides who it acts for; model arguments cannot preserve
+/// a forged agent label or operator bearer.
 ///
 /// Calls into other families are returned unchanged (see
 /// [`PRINCIPAL_FAMILIES`]). A non-object payload cannot carry a label and is
@@ -301,6 +312,7 @@ pub fn attach_agent(function_id: &str, mut payload: Value, agent_id: &str) -> Va
         return payload;
     }
     if let Some(object) = payload.as_object_mut() {
+        object.remove("headers");
         object.insert(PRINCIPAL_KEY.to_string(), as_agent(agent_id));
     }
     payload
@@ -540,9 +552,17 @@ mod tests {
 
     #[test]
     fn attach_agent_labels_only_the_families_that_resolve_one_and_overwrites() {
-        let model_supplied = json!({ "agentId": "a-2", "principal": { "agentId": "a-2" } });
+        let model_supplied = json!({
+            "agentId": "a-2",
+            "principal": { "agentId": "a-2" },
+            "headers": { "Authorization": "Bearer model-supplied" },
+        });
         let labelled = attach_agent("memory::recall", model_supplied.clone(), "a-1");
         assert_eq!(labelled["principal"], as_agent("a-1"));
+        assert!(
+            labelled.get("headers").is_none(),
+            "a model cannot preserve forged operator headers"
+        );
         assert_eq!(
             labelled["agentId"], "a-2",
             "what the call is ABOUT is left for the handler to judge"
@@ -556,6 +576,18 @@ mod tests {
             "agent::chat",
             "workflow::run",
             "workflow::create",
+            "pulse::register",
+            "pulse::invoke",
+            "pulse::tick",
+            "pulse::status",
+            "pulse::toggle",
+            "swarm::create",
+            "swarm::broadcast",
+            "swarm::collect",
+            "swarm::consensus",
+            "swarm::dissolve",
+            "a2a::handle_task",
+            "a2a::send_task",
         ] {
             assert!(resolves_principal(function_id), "{function_id}");
             assert_eq!(

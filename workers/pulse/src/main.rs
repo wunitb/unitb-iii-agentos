@@ -1,4 +1,4 @@
-use agentos_http_adapter::CHAT_TIMEOUT_MS;
+use agentos_http_adapter::{CHAT_TIMEOUT_MS, TriggerBus, principal};
 use iii_sdk::errors::Error;
 use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
@@ -15,8 +15,26 @@ fn runs_scope(realm_id: &str) -> String {
     format!("realm:{realm_id}:pulse:runs")
 }
 
+fn payload_body(input: &Value) -> Value {
+    input.get("body").cloned().unwrap_or_else(|| input.clone())
+}
+
+async fn authorize_named_agent(
+    iii: &dyn TriggerBus,
+    input: &Value,
+    named: &str,
+    expected_bearer: Option<&str>,
+) -> Result<String, Error> {
+    let caller = principal::resolve(input, expected_bearer)?;
+    principal::acting_agent(iii, &caller, &json!({ "agentId": named }), named).await
+}
+
+fn expected_bearer() -> Option<String> {
+    agentos_bus_auth::policy::expected_api_key()
+}
+
 async fn build_context(
-    iii: &IIIClient,
+    iii: &dyn TriggerBus,
     agent_id: &str,
     realm_id: &str,
     mode: &ContextMode,
@@ -136,7 +154,7 @@ async fn register_pulse(iii: &IIIClient, req: RegisterPulseRequest) -> Result<Va
     Ok(serde_json::to_value(&config).unwrap())
 }
 
-async fn invoke_pulse(iii: &IIIClient, req: InvokeRequest) -> Result<Value, Error> {
+async fn invoke_pulse(iii: &dyn TriggerBus, req: InvokeRequest) -> Result<Value, Error> {
     let realm_id = &req.realm_id;
     let mode = req.context_mode.unwrap_or(ContextMode::Thin);
     let context = build_context(iii, &req.agent_id, realm_id, &mode).await;
@@ -213,7 +231,7 @@ async fn invoke_pulse(iii: &IIIClient, req: InvokeRequest) -> Result<Value, Erro
     Ok(serde_json::to_value(&finished_run).unwrap())
 }
 
-async fn tick(iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn tick(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let agent_id = input["agentId"]
         .as_str()
         .ok_or_else(|| Error::Handler("missing agentId in tick".into()))?;
@@ -269,7 +287,26 @@ async fn tick(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     .await
 }
 
-async fn get_pulse_status(iii: &IIIClient, realm_id: &str, agent_id: &str) -> Result<Value, Error> {
+async fn tick_from_trigger(
+    iii: &dyn TriggerBus,
+    input: Value,
+    metadata: Option<Value>,
+) -> Result<Value, Error> {
+    let metadata = metadata.ok_or_else(|| {
+        Error::Handler("pulse::tick accepts only a registered cron trigger".to_string())
+    })?;
+    principal::refuse_agent_principal(&input, expected_bearer().as_deref(), "pulse::tick")?;
+    // The registered metadata fixes agentId/realmId. The config row must still
+    // exist and be enabled, but unauthenticated state mutation remains a known
+    // residual until the bus policy protects the state mutation functions.
+    tick(iii, metadata).await
+}
+
+async fn get_pulse_status(
+    iii: &dyn TriggerBus,
+    realm_id: &str,
+    agent_id: &str,
+) -> Result<Value, Error> {
     let config = iii
         .trigger(TriggerRequest {
             function_id: "state::get".to_string(),
@@ -311,7 +348,7 @@ async fn get_pulse_status(iii: &IIIClient, realm_id: &str, agent_id: &str) -> Re
 }
 
 async fn toggle_pulse(
-    iii: &IIIClient,
+    iii: &dyn TriggerBus,
     realm_id: &str,
     agent_id: &str,
     enabled: bool,
@@ -365,8 +402,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_clone.clone();
             async move {
-                let req: RegisterPulseRequest =
-                    serde_json::from_value(input).map_err(|e| Error::Handler(e.to_string()))?;
+                let mut req: RegisterPulseRequest = serde_json::from_value(payload_body(&input))
+                    .map_err(|e| Error::Handler(e.to_string()))?;
+                req.agent_id = authorize_named_agent(
+                    &iii,
+                    &input,
+                    &req.agent_id,
+                    expected_bearer().as_deref(),
+                )
+                .await?;
                 register_pulse(&iii, req).await
             }
         })
@@ -379,8 +423,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_clone.clone();
             async move {
-                let req: InvokeRequest =
-                    serde_json::from_value(input).map_err(|e| Error::Handler(e.to_string()))?;
+                let mut req: InvokeRequest = serde_json::from_value(payload_body(&input))
+                    .map_err(|e| Error::Handler(e.to_string()))?;
+                req.agent_id = authorize_named_agent(
+                    &iii,
+                    &input,
+                    &req.agent_id,
+                    expected_bearer().as_deref(),
+                )
+                .await?;
                 invoke_pulse(&iii, req).await
             }
         })
@@ -392,7 +443,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "pulse::tick",
         RegisterFunction::new_async(move |input: Value, metadata: Option<Value>| {
             let iii = iii_clone.clone();
-            async move { tick(&iii, metadata.unwrap_or(input)).await }
+            async move { tick_from_trigger(&iii, input, metadata).await }
         })
         .description("Internal: cron-triggered pulse execution"),
     );
@@ -403,13 +454,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_clone.clone();
             async move {
-                let realm_id = input["realmId"]
+                let body = payload_body(&input);
+                let realm_id = body["realmId"]
                     .as_str()
                     .ok_or_else(|| Error::Handler("missing realmId".into()))?;
-                let agent_id = input["agentId"]
+                let named = body["agentId"]
                     .as_str()
                     .ok_or_else(|| Error::Handler("missing agentId".into()))?;
-                get_pulse_status(&iii, realm_id, agent_id).await
+                let agent_id =
+                    authorize_named_agent(&iii, &input, named, expected_bearer().as_deref())
+                        .await?;
+                get_pulse_status(&iii, realm_id, &agent_id).await
             }
         })
         .description("Get pulse config and recent runs"),
@@ -421,14 +476,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_clone.clone();
             async move {
-                let realm_id = input["realmId"]
+                let body = payload_body(&input);
+                let realm_id = body["realmId"]
                     .as_str()
                     .ok_or_else(|| Error::Handler("missing realmId".into()))?;
-                let agent_id = input["agentId"]
+                let named = body["agentId"]
                     .as_str()
                     .ok_or_else(|| Error::Handler("missing agentId".into()))?;
-                let enabled = input["enabled"].as_bool().unwrap_or(true);
-                toggle_pulse(&iii, realm_id, agent_id, enabled).await
+                let enabled = body["enabled"].as_bool().unwrap_or(true);
+                let agent_id =
+                    authorize_named_agent(&iii, &input, named, expected_bearer().as_deref())
+                        .await?;
+                toggle_pulse(&iii, realm_id, &agent_id, enabled).await
             }
         })
         .description("Enable or disable agent pulse"),
@@ -463,4 +522,154 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     iii.shutdown_async().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentos_http_adapter::{fake::FakeBus, principal};
+
+    #[tokio::test]
+    async fn tick_accepts_only_bare_registered_metadata_and_keeps_the_cron_seam() {
+        let direct = FakeBus::new();
+        assert!(
+            tick_from_trigger(&direct, json!({ "agentId": "victim" }), None)
+                .await
+                .is_err()
+        );
+        assert!(direct.calls().is_empty());
+
+        let labelled = FakeBus::new();
+        assert!(
+            tick_from_trigger(
+                &labelled,
+                json!({ "principal": principal::as_agent("caller") }),
+                Some(json!({ "agentId": "caller", "realmId": "realm" })),
+            )
+            .await
+            .is_err()
+        );
+        assert!(labelled.calls().is_empty());
+
+        let cron = FakeBus::new();
+        cron.on("state::get", |_| {
+            Ok(json!({
+                "agentId": "scheduled",
+                "realmId": "realm",
+                "cron": "0 * * * *",
+                "enabled": false,
+                "contextMode": "thin",
+            }))
+        });
+        let result = tick_from_trigger(
+            &cron,
+            json!({}),
+            Some(json!({ "agentId": "scheduled", "realmId": "realm" })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, json!({ "skipped": true, "reason": "disabled" }));
+        assert_eq!(cron.call_count("state::get"), 1);
+        assert_eq!(cron.call_count("agent::chat"), 0);
+    }
+
+    #[tokio::test]
+    async fn external_pulse_targets_are_bound_to_the_caller_before_side_effects() {
+        let missing = FakeBus::new();
+        assert!(
+            authorize_named_agent(
+                &missing,
+                &json!({ "agentId": "victim" }),
+                "victim",
+                Some("key")
+            )
+            .await
+            .is_err()
+        );
+        assert!(missing.calls().is_empty());
+
+        let malformed = FakeBus::new();
+        assert!(
+            authorize_named_agent(
+                &malformed,
+                &json!({ "principal": {}, "agentId": "victim" }),
+                "victim",
+                Some("key")
+            )
+            .await
+            .is_err()
+        );
+        assert!(malformed.calls().is_empty());
+
+        let same = FakeBus::new();
+        assert_eq!(
+            authorize_named_agent(
+                &same,
+                &json!({ "principal": principal::as_agent("caller") }),
+                "caller",
+                None
+            )
+            .await
+            .unwrap(),
+            "caller"
+        );
+        assert!(same.calls().is_empty());
+
+        let denied = FakeBus::new();
+        assert!(
+            authorize_named_agent(
+                &denied,
+                &json!({ "principal": principal::as_agent("caller") }),
+                "victim",
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(denied.call_count("security::check_capability"), 1);
+        assert_eq!(denied.call_count("state::set"), 0);
+        assert_eq!(denied.call_count("agent::chat"), 0);
+
+        let granted = FakeBus::new();
+        granted.on("security::check_capability", |input| Ok(json!({
+            "allowed": input["agentId"] == "caller" && input["resource"] == "grant::act_as::victim"
+        })));
+        assert_eq!(
+            authorize_named_agent(
+                &granted,
+                &json!({ "principal": principal::as_agent("caller") }),
+                "victim",
+                None
+            )
+            .await
+            .unwrap(),
+            "victim"
+        );
+
+        let operator = FakeBus::new();
+        assert_eq!(
+            authorize_named_agent(
+                &operator,
+                &json!({ "headers": { "Authorization": "Bearer key" } }),
+                "victim",
+                Some("key")
+            )
+            .await
+            .unwrap(),
+            "victim"
+        );
+
+        let forged = principal::attach_agent(
+            "pulse::invoke",
+            json!({ "agentId": "victim", "principal": principal::as_agent("victim"), "headers": { "Authorization": "Bearer key" } }),
+            "caller",
+        );
+        let forged_bus = FakeBus::new();
+        assert!(
+            authorize_named_agent(&forged_bus, &forged, "victim", Some("key"))
+                .await
+                .is_err()
+        );
+        assert_eq!(forged_bus.call_count("security::check_capability"), 1);
+    }
 }
