@@ -184,9 +184,13 @@ These are **declarative config**, not workers:
 
 None ship as registered functions; they configure workers that do.
 
-`pulse` schedules are authorized, in-memory registrations. A worker restart loses
-them until the caller registers them again. Invocation is capped at one per minute;
-this is not durable scheduling or an arbitrary cron-frequency guarantee.
+`pulse` accepts 5- or 6-field UTC cron expressions; 5 fields are normalized to
+6 with second `0`. It admits only the newest configured due slot within a
+five-second late-delivery window, at most once per slot and without overlapping
+runs. Older due slots are not caught up. A known handle can shift a run within
+that window; it does not prove scheduler origin. Registrations are authorized
+and held in memory. A worker restart requires the caller to register them again.
+This is not durable or crash-exactly-once scheduling.
 
 The `workflow` worker auto-loads every `.yaml`/`.yml` definition from `AGENTOS_WORKFLOWS_DIR` or the bundled `workflows/` directory. Loading rejects invalid IDs, duplicate or missing dependencies, undeclared agent references, unbounded timeout/retry/loop controls, and incompatible consecutive fanout policies. Execution resolves the dependency graph, checks the selected agent's capability before every function call, and supports `sequential`, concurrently joined `parallel`, grouped `fanout`, and bounded `loop` modes with `fail`, `skip`, or retry behavior.
 

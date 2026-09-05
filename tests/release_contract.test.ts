@@ -238,6 +238,14 @@ describe("public setup documentation", () => {
     expect(readme).toContain("runtime proof");
   });
 
+  test("documents configured UTC pulse slots instead of a one-minute throttle", () => {
+    const architecture = read("ARCHITECTURE.md");
+    expect(architecture).toContain("5- or 6-field UTC");
+    expect(architecture).toContain("five-second late-delivery window");
+    expect(architecture).toContain("Older due slots are not caught up");
+    expect(architecture).not.toContain("capped at one per minute");
+  });
+
   test("root security, release, and contribution entry points exist", () => {
     for (const path of ["SECURITY.md", "RELEASING.md", "CONTRIBUTING.md"]) {
       expect(Bun.file(join(root, path)).size, `${path} is empty or absent`).toBeGreaterThan(0);

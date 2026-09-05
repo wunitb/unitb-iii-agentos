@@ -1778,12 +1778,6 @@ mod config_tree_guards {
     }
 
     /// The opt-in bus RBAC overlay, which is NOT part of the default stack.
-    fn rbac_overlay() -> String {
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bus-rbac.overlay.yaml");
-        std::fs::read_to_string(path)
-            .expect("bus-rbac.overlay.yaml is readable from the worker crate")
-    }
 
     #[test]
     fn the_bus_is_pinned_to_loopback() {
@@ -1802,32 +1796,29 @@ mod config_tree_guards {
     }
 
     #[test]
-    fn the_default_stack_does_not_arm_a_gate_it_cannot_serve() {
-        // Bus RBAC fails closed: armed with no `agentos-bus-authd` listening, the
-        // engine refuses every worker connection after the bridge timeout. The
-        // documented `iii --config config.yaml` path starts no daemon, so an armed
-        // default breaks a clean clone - measured, in CI run 33628742702.
+    fn the_default_stack_arms_the_gate_served_by_the_owned_launcher() {
+        // `agentos up` / `agentos start` and dev-up start the off-bus daemon
+        // before the engine. Bare `iii --config` is not the supported launcher.
         let source = without_comments(&config_yaml());
+        assert!(source.contains("rbac:"), "default bus RBAC is not armed");
         assert!(
-            !source.contains("rbac:"),
-            "config.yaml arms bus RBAC; it belongs in bus-rbac.overlay.yaml \
-             so that `iii --config config.yaml` still boots without the daemon"
+            source.contains("- name: iii-bridge\n"),
+            "default RBAC has no off-bus hook bridge"
         );
         assert!(
-            !source.contains("- name: iii-bridge\n"),
-            "the iii-bridge entry only exists to serve the RBAC hooks; it belongs \
-             with the overlay"
+            !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../bus-rbac.overlay.yaml")
+                .exists(),
+            "default-on RBAC must not drift back to an optional overlay"
         );
     }
 
-    /// The guard above reads configuration, not prose: `config.yaml` warns the
-    /// operator about the nested `rbac:` mapping in a comment, and that must not
-    /// read as an armed gate — nor may a real one hide behind a comment.
+    /// The guard reads active configuration, not commented-out examples.
     #[test]
     fn the_armed_gate_guard_reads_configuration_and_not_comments() {
         assert!(
             config_yaml().contains("rbac:"),
-            "config.yaml is expected to MENTION rbac: in its warning comment"
+            "config.yaml must contain the default rbac block"
         );
         assert!(
             !without_comments("workers:\n  # rbac: not armed, just described\n").contains("rbac:")
@@ -1840,19 +1831,18 @@ mod config_tree_guards {
     }
 
     #[test]
-    fn the_overlay_arms_every_hook_and_serves_them_from_off_the_bus() {
-        let overlay = rbac_overlay();
-        let manager = worker_entry(&overlay, "iii-worker-manager");
-        let bridge = worker_entry(&overlay, "iii-bridge");
+    fn the_default_arms_every_hook_and_serves_them_from_off_the_bus() {
+        let source = config_yaml();
+        let manager = worker_entry(&source, "iii-worker-manager");
+        let bridge = worker_entry(&source, "iii-bridge");
 
         assert!(
             manager.contains("rbac:"),
-            "the overlay must carry the rbac block; it is the only thing that arms the gate"
+            "the default manager must carry the rbac block"
         );
         assert!(
             manager.contains("host: 127.0.0.1"),
-            "the overlay replaces the whole iii-worker-manager entry, so it must keep the \
-             loopback pin"
+            "the default iii-worker-manager must keep the loopback pin"
         );
         assert!(
             bridge.contains("url: ws://127.0.0.1:"),
@@ -1864,12 +1854,12 @@ mod config_tree_guards {
         );
 
         // Every hook the daemon serves, from its own table: adding a hook there
-        // and forgetting the overlay is exactly how the trigger-TYPE surface
+        // and forgetting the default config is how the trigger-TYPE surface
         // stayed ungated.
         for (key, id) in ARMED_HOOKS {
             assert!(
                 manager.contains(&format!("{key}: {id}")),
-                "the overlay does not set `{key}: {id}`; that hook is unarmed and the \
+                "the default config does not set `{key}: {id}`; that hook is unarmed and the \
                  engine will not say so - the nested rbac struct ignores what it does \
                  not know"
             );

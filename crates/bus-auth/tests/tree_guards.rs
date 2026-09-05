@@ -479,16 +479,11 @@ fn no_denied_id_is_fired_by_a_registry_worker_trigger() {
         "found only {} trigger targets - the scan is not looking at the tree",
         targets.len()
     );
-    // INTEGRATION-SEAM(WP-D): delete this exemption after WP-D removes the
-    // credential-less `agent.inbox` queue deputy. Until then, name the one
-    // cross-package transition explicitly rather than weakening the deny.
-    const INTENTIONALLY_DISABLED_TARGETS: &[&str] = &["agent::chat"];
+    // Every denied target is checked, including agent::chat. The old
+    // credential-less agent.inbox deputy has been removed from agent-core.
     let denied: Vec<String> = targets
         .iter()
-        .filter(|(id, _)| {
-            UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&id.as_str())
-                && !INTENTIONALLY_DISABLED_TARGETS.contains(&id.as_str())
-        })
+        .filter(|(id, _)| UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&id.as_str()))
         .map(|(id, path)| format!("  {id}  ({path})"))
         .collect();
     assert!(
