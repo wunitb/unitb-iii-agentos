@@ -1,7 +1,7 @@
 {
   "name": "agentos",
   "description": "Agent Operating System — self-evolving agents, multi-agent orchestration, 25-screen TUI, 11 LLM providers. Built on iii-engine.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "UnitB",
     "url": "https://github.com/wunitb"

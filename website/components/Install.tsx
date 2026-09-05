@@ -7,20 +7,20 @@ const STEPS = [
     cmd: "git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos",
   },
   {
+    label: "Create private config; add one model credential",
+    cmd: "install -m 600 .env.example .env && ${EDITOR:-vi} .env",
+  },
+  {
     label: "Install pinned iii v0.22.1",
     cmd: "bash scripts/install-iii.sh",
   },
   {
-    label: "Build 62 Rust workers, CLI, and TUI",
+    label: "Build AgentOS",
     cmd: "cargo build --workspace --release",
   },
   {
-    label: "Boot the engine",
-    cmd: "iii --config config.yaml &",
-  },
-  {
-    label: "Start workers (background)",
-    cmd: "for w in target/release/agentos-*; do \"./$w\" & done",
+    label: "Start through the guarded launcher",
+    cmd: "./target/release/agentos up",
   },
 ];
 

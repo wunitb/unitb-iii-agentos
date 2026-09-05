@@ -57,9 +57,9 @@ CI's `validate iii.worker.yaml` job enforces this on every PR.
 
 ## Engine boot
 
-`config.yaml` uses the `.iii-version` stable pin, currently iii v0.22.1, and its configuration-worker layout. It declares sixteen engine workers — the file-backed `configuration` store, the `iii-worker-manager` bus itself (declared explicitly so its bind host is pinned to loopback; when the entry is absent the engine appends it with the default host 0.0.0.0), plus `iii-http`, `iii-pubsub`, `state`, `llm-router`, `context-manager`, `cron`, `iii-directory`, `iii-observability`, `iii-stream`, `provider-anthropic`, `provider-openai`, `provider-openai-codex`, `queue`, and `session-manager`. These are upstream registry binaries resolved through `iii.lock`; the engine's `llm-router` and `context-manager` are *not* the AgentOS workers of the same folder name. The state, queue, and cron workers use the canonical 0.22.1 names; declaring their deprecated `iii-*` aliases alongside canonical workers makes the engine reject the config. Their committed values live in matching files under `config/`; `config.yaml` keeps only worker entries and migration breadcrumbs. AgentOS workers spawn alongside as separate processes — each connects to the engine WebSocket via `register_worker` and stays resident.
+`config.yaml` uses the `.iii-version` stable pin, currently iii v0.22.1, and its configuration-worker layout. It declares seventeen engine workers — the file-backed `configuration` store, the loopback `iii-worker-manager` bus, `iii-bridge`, plus `iii-http`, `iii-pubsub`, `state`, `llm-router`, `context-manager`, `cron`, `iii-directory`, `iii-observability`, `iii-stream`, `provider-anthropic`, `provider-openai`, `provider-openai-codex`, `queue`, and `session-manager`. These are upstream registry binaries resolved through `iii.lock`; `iii-bridge` forwards the four RBAC hooks to the loopback `agentos-bus-authd`. The engine's `llm-router` and `context-manager` are *not* the AgentOS workers of the same folder name. The state, queue, and cron workers use the canonical 0.22.1 names; declaring their deprecated `iii-*` aliases alongside canonical workers makes the engine reject the config. Their committed values live in matching files under `config/`. AgentOS workers spawn alongside as separate processes and connect through `register_worker`.
 
-Bus RBAC is **not armed by default**. It fails closed, so an armed configuration with no `agentos-bus-authd` listening refuses every worker connection and the stack does not come up — which is what the documented `iii --config config.yaml` path would do on a clean clone. The `rbac:` block and the `iii-bridge` entry that serves its hooks live in `bus-rbac.overlay.yaml` with instructions; `agentos up` starts the daemon and `agentos doctor` reports whether the gate is armed and whether the daemon answers.
+Bus RBAC is armed by default and fails closed when `agentos-bus-authd` cannot answer. `agentos up` and `scripts/dev-up.sh` start authd before an engine they own, force builtin mutation daemons off, and refuse an already-listening engine whose live RBAC gate cannot be verified. The gate assigns an untrusted tier to callers without the shared bearer and broader tiers to trusted workers/operator calls. It denies exact sensitive calls and registration families, but intentionally leaves generic registry and state compatibility; it is not a hostile same-host sandbox.
 
 The `shell`, `console` and `harness` registry workers are configured under `config/` but deliberately **not** booted by default: `shell` exposes host command execution on the unauthenticated bus, and console v1.9.16 has no host key — it listens on `0.0.0.0` and proxies `/ws` to the bus — so both are opt-in.
 
@@ -91,6 +91,20 @@ tokio::spawn(async move {
 ```
 
 This is the only inter-worker contract. There is no shared in-process state.
+
+## Process and environment boundary
+
+Rust workers start from a cleared environment, a safe process baseline, their exact
+identity, and the keys listed for that worker in `workers/env.allowlist`. Non-empty
+dotenv values override shell exports. `AGENTOS_API_KEY` is a shared operator key,
+not a distinct worker identity or an OS boundary.
+
+Direct `mcp::connect` no longer accepts a caller-selected process. Trusted
+`integration::add` calls resolve a checked-in manifest, which can still run `npx`;
+that makes package-registry resolution and transitive install behavior part of the
+trusted supply chain. The process bridge is default-off. Its opt-in named-binary
+check does not bind an inode or sandbox arguments, and timeout/cancellation cannot
+guarantee teardown of descendants.
 
 ## Sandbox primitives — two surfaces
 
@@ -179,7 +193,11 @@ Development is coordinated outside this repository. Work is split into packages 
 - iii-sdk (Rust): **=0.22.1** in workspace `Cargo.toml`
 - iii-sdk (Node): **0.22.1** in root `package.json` (e2e tests only)
 - iii-sdk (Python): **=0.22.1** in `workers/embedding/pyproject.toml`
-- agentos workspace: **0.1.0**, inherited by every Rust crate from `[workspace.package]`
+- agentos workspace: **0.2.0**, inherited by every Rust crate from `[workspace.package]`
+
+iii `v0.23` is the latest stable upstream line. This release defers it until
+RBAC hooks, SDK wire contracts, locked registry assets, supported-platform binaries,
+boot behavior, and the full matrix pass together. The current pin is deliberate.
 
 ## CI
 

@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-a2a"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-a2a-cards"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-approval"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-approval-tiers"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-browser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-bus-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-http-adapter",
  "anyhow",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-channel-bluesky"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "anyhow",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-channel-discord"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-channel-email"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "anyhow",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-channel-linkedin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-channel-mastodon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "anyhow",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-channel-matrix"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-channel-reddit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "anyhow",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-channel-signal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "anyhow",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-channel-slack"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-channel-teams"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-channel-telegram"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-channel-twitch"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-channel-webex"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-channel-whatsapp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "anyhow",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-code-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "anyhow",
@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-context-cache"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-context-manager"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-context-monitor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-coordination"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -530,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-council"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -567,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-cron"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-directive"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-eval"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-evolve"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-feedback"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-hand-runner"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-hashline"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-hierarchy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-hooks"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-http-adapter"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "iii-sdk",
  "serde_json",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-ledger"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-llm-router"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-loop-guard"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "anyhow",
@@ -780,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-lsp-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-mcp-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-memory"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-mission"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-orchestrator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -868,7 +868,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-pulse"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-rate-limiter"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -901,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-realm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-security"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-security-headers"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-security-map"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-security-zeroize"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "anyhow",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-session-lifecycle"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-session-replay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-skill-security"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-skillkit-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -1063,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-streaming"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-swarm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-task-decomposer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-telemetry"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -1132,7 +1132,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossterm 0.28.1",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-vault"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "agentos-bus-auth",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-wasm-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-workflow"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
