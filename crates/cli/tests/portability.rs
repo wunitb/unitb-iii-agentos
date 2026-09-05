@@ -30,6 +30,20 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).expect("make executable");
 }
 
+fn write_env_policy(runtime: &Path) {
+    fs::create_dir_all(runtime.join("integrations")).expect("create integrations directory");
+    fs::write(
+        runtime.join(".env.example"),
+        "III_URL=\nAGENTOS_API_KEY=\nAGENTOS_DISABLED_WORKERS=\n",
+    )
+    .expect("write dotenv template");
+    fs::write(
+        runtime.join("workers/env.allowlist"),
+        "echo=III_URL,AGENTOS_API_KEY\n",
+    )
+    .expect("write worker env policy");
+}
+
 fn wait_for_file(path: &Path) {
     for _ in 0..100 {
         if path.is_file() {
@@ -91,6 +105,7 @@ fn run_start_with_relative_config(config_override: &str) {
         "iii: v1\nname: echo\nruntime: rust\nscripts:\n  start: echo\n",
     )
     .expect("write worker manifest");
+    write_env_policy(&runtime);
 
     let engine_pid = caller.join("engine.pid");
     let engine_cwd = caller.join("engine.cwd");
@@ -177,6 +192,7 @@ fn start_uses_relative_home_for_installed_runtime() {
         "iii: v1\nname: echo\nruntime: rust\nscripts:\n  start: echo\n",
     )
     .expect("write worker manifest");
+    write_env_policy(&runtime);
 
     let engine_cwd = caller.join("engine.cwd");
     let engine_pid = caller.join("engine.pid");
@@ -253,6 +269,7 @@ fn start_fails_closed_when_engine_exits_before_workers() {
         "iii: v1\nname: echo\nruntime: rust\nscripts:\n  start: echo\n",
     )
     .expect("write worker manifest");
+    write_env_policy(&runtime);
     write_executable(&bin.join("iii"), "#!/bin/sh\nexit 0\n");
 
     let old_path = std::env::var_os("PATH").unwrap_or_default();
@@ -285,6 +302,7 @@ fn start_fails_closed_when_worker_launch_fails() {
         "iii: v1\nname: echo\nruntime: rust\nscripts:\n  start: echo\n",
     )
     .expect("write worker manifest");
+    write_env_policy(&runtime);
     let engine_pid = root.join("engine.pid");
     write_executable(
         &bin.join("iii"),

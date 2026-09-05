@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -344,6 +344,9 @@ pub(crate) struct WorkerSpec {
     pub(crate) name: String,
     pub(crate) runtime: WorkerRuntime,
     pub(crate) binary: Option<PathBuf>,
+    /// Exact dotenv/shell keys this worker may receive. The process baseline is
+    /// added separately and is intentionally non-secret.
+    pub(crate) env: Vec<String>,
 }
 
 pub(crate) struct RunningWorker {
@@ -664,6 +667,240 @@ fn parse_inline_runtime(value: &str) -> Result<WorkerRuntime> {
     parse_runtime_kind(kind.ok_or_else(|| anyhow::anyhow!("Missing direct runtime.kind"))?)
 }
 
+const WORKER_ENV_POLICY: &str = "workers/env.allowlist";
+const DOTENV_TEMPLATE: &str = ".env.example";
+const UNIVERSAL_WORKER_ENV: [&str; 2] = ["III_URL", "AGENTOS_API_KEY"];
+const DISABLED_WORKERS_VARIABLE: &str = "AGENTOS_DISABLED_WORKERS";
+
+fn valid_worker_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+}
+
+fn valid_env_name(name: &str) -> bool {
+    let Some(first) = name.bytes().next() else {
+        return false;
+    };
+    (first.is_ascii_uppercase() || first == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn dotenv_template_names(source: &str) -> BTreeSet<String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (name, _) = line.split_once('=')?;
+            valid_env_name(name).then(|| name.to_string())
+        })
+        .collect()
+}
+
+fn integration_env_names(runtime_dir: &Path) -> Result<BTreeSet<String>> {
+    let directory = runtime_dir.join("integrations");
+    let entries = std::fs::read_dir(&directory).with_context(|| {
+        format!(
+            "Worker env policy requires integration manifests in {}",
+            directory.display()
+        )
+    })?;
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("Cannot read {}", directory.display()))?
+            .path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)
+            .with_context(|| format!("Cannot read integration manifest {}", path.display()))?;
+        let document = source
+            .parse::<toml::Value>()
+            .with_context(|| format!("Invalid integration manifest {}", path.display()))?;
+        let Some(environment) = document
+            .get("integration")
+            .and_then(|integration| integration.get("env"))
+            .and_then(toml::Value::as_table)
+        else {
+            continue;
+        };
+        for name in environment.keys() {
+            if !valid_env_name(name) {
+                anyhow::bail!(
+                    "Invalid env key {name:?} in integration manifest {}",
+                    path.display()
+                );
+            }
+            names.insert(name.clone());
+        }
+    }
+    Ok(names)
+}
+
+/// Parses the shared Rust/Bash policy format: one `worker=KEY,KEY` line per
+/// shipped Rust worker. Exact set equality makes an unknown new worker fail
+/// closed until its least-privilege declaration is reviewed.
+fn parse_worker_env_policy(
+    source: &str,
+    rust_workers: &BTreeSet<String>,
+    allowed_env: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut policy = BTreeMap::new();
+    for (index, raw) in source.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line != raw {
+            anyhow::bail!(
+                "Malformed worker env policy at line {}: surrounding whitespace is forbidden",
+                index + 1
+            );
+        }
+        let Some((worker, raw_keys)) = line.split_once('=') else {
+            anyhow::bail!("Malformed worker env policy at line {}", index + 1);
+        };
+        if !valid_worker_name(worker) || raw_keys.is_empty() || raw_keys.contains('=') {
+            anyhow::bail!("Malformed worker env policy at line {}", index + 1);
+        }
+        if !rust_workers.contains(worker) {
+            anyhow::bail!(
+                "Unknown worker {worker:?} in worker env policy at line {}",
+                index + 1
+            );
+        }
+        if policy.contains_key(worker) {
+            anyhow::bail!(
+                "Duplicate worker {worker:?} in worker env policy at line {}",
+                index + 1
+            );
+        }
+        let mut seen = BTreeSet::new();
+        let keys = raw_keys
+            .split(',')
+            .map(|key| {
+                if !valid_env_name(key) {
+                    anyhow::bail!(
+                        "Invalid env key {key:?} for worker {worker:?} at line {}",
+                        index + 1
+                    );
+                }
+                if !allowed_env.contains(key) {
+                    anyhow::bail!(
+                        "Unknown env key {key:?} for worker {worker:?} at line {}",
+                        index + 1
+                    );
+                }
+                if !seen.insert(key) {
+                    anyhow::bail!(
+                        "Duplicate env key {key:?} for worker {worker:?} at line {}",
+                        index + 1
+                    );
+                }
+                Ok(key.to_string())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if keys.first().map(String::as_str) != Some(UNIVERSAL_WORKER_ENV[0])
+            || keys.get(1).map(String::as_str) != Some(UNIVERSAL_WORKER_ENV[1])
+        {
+            anyhow::bail!(
+                "Worker {worker:?} must declare III_URL,AGENTOS_API_KEY first and exactly once"
+            );
+        }
+        policy.insert(worker.to_string(), keys);
+    }
+    let missing = rust_workers
+        .iter()
+        .filter(|worker| !policy.contains_key(*worker))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Worker env policy has no declaration for: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(policy)
+}
+
+fn parse_disabled_workers(
+    raw: Option<&str>,
+    available: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(BTreeSet::new());
+    };
+    let mut disabled = BTreeSet::new();
+    for name in raw.split(',') {
+        if name.is_empty() || name.trim() != name || !valid_worker_name(name) {
+            anyhow::bail!(
+                "Invalid {DISABLED_WORKERS_VARIABLE} entry {name:?}; use comma-separated shipped Rust worker names"
+            );
+        }
+        if !available.contains(name) {
+            anyhow::bail!("Unknown {DISABLED_WORKERS_VARIABLE} worker {name:?}");
+        }
+        if !disabled.insert(name.to_string()) {
+            anyhow::bail!("Duplicate {DISABLED_WORKERS_VARIABLE} worker {name:?}");
+        }
+    }
+    Ok(disabled)
+}
+
+const PROCESS_BASELINE_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "AGENTOS_HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LANGUAGE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NIX_SSL_CERT_FILE",
+    "RUST_BACKTRACE",
+    "RUST_LOG",
+];
+
+fn is_process_baseline(name: &str) -> bool {
+    PROCESS_BASELINE_ENV.contains(&name) || name.starts_with("LC_")
+}
+
+fn scoped_worker_environment(
+    declared: &[String],
+    dotenv: &BTreeMap<String, String>,
+    parent: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut scoped = parent
+        .iter()
+        .filter(|(name, _)| is_process_baseline(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for name in declared {
+        if let Some(value) = dotenv.get(name).filter(|value| !value.is_empty()) {
+            scoped.insert(name.clone(), value.clone());
+        } else if let Some(value) = parent.get(name) {
+            scoped.insert(name.clone(), value.clone());
+        }
+    }
+    scoped
+}
+
 fn parse_worker_runtime(manifest: &str) -> Result<WorkerRuntime> {
     let lines = manifest.lines().collect::<Vec<_>>();
     for (line_number, line) in lines.iter().enumerate() {
@@ -826,6 +1063,7 @@ pub(crate) fn collect_worker_specs(runtime_dir: &Path) -> Result<Vec<WorkerSpec>
             name: worker_name,
             runtime,
             binary,
+            env: Vec::new(),
         });
     }
 
@@ -834,11 +1072,59 @@ pub(crate) fn collect_worker_specs(runtime_dir: &Path) -> Result<Vec<WorkerSpec>
     }
 
     workers.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let rust_workers = workers
+        .iter()
+        .filter(|worker| worker.runtime == WorkerRuntime::Rust)
+        .map(|worker| worker.name.clone())
+        .collect::<BTreeSet<_>>();
+    let template_path = runtime_dir.join(DOTENV_TEMPLATE);
+    let template = std::fs::read_to_string(&template_path)
+        .with_context(|| format!("Worker env policy requires {}", template_path.display()))?;
+    let policy_path = runtime_dir.join(WORKER_ENV_POLICY);
+    let policy_source = std::fs::read_to_string(&policy_path).with_context(|| {
+        format!(
+            "Worker env policy is missing or unreadable: {}",
+            policy_path.display()
+        )
+    })?;
+    let mut allowed_env = dotenv_template_names(&template);
+    allowed_env.extend(integration_env_names(runtime_dir)?);
+    let mut policy = parse_worker_env_policy(&policy_source, &rust_workers, &allowed_env)
+        .with_context(|| format!("Invalid worker env policy {}", policy_path.display()))?;
+    for worker in &mut workers {
+        if worker.runtime == WorkerRuntime::Rust {
+            worker.env = policy
+                .remove(&worker.name)
+                .expect("complete policy checked above");
+        }
+    }
     Ok(workers)
 }
 
-fn discover_workers(runtime_dir: &Path) -> Result<Vec<WorkerSpec>> {
-    let workers = collect_worker_specs(runtime_dir)?;
+fn filter_disabled_workers(workers: Vec<WorkerSpec>, raw: Option<&str>) -> Result<Vec<WorkerSpec>> {
+    let available = workers
+        .iter()
+        .filter(|worker| worker.runtime == WorkerRuntime::Rust)
+        .map(|worker| worker.name.clone())
+        .collect::<BTreeSet<_>>();
+    let disabled = parse_disabled_workers(raw, &available)?;
+    Ok(workers
+        .into_iter()
+        .filter(|worker| !disabled.contains(&worker.name))
+        .collect())
+}
+
+fn discover_workers(
+    runtime_dir: &Path,
+    launch_env: &BTreeMap<String, String>,
+) -> Result<Vec<WorkerSpec>> {
+    let inherited_disabled = std::env::var(DISABLED_WORKERS_VARIABLE).ok();
+    let disabled = launch_env
+        .get(DISABLED_WORKERS_VARIABLE)
+        .map(String::as_str)
+        .or(inherited_disabled.as_deref());
+    let workers = filter_disabled_workers(collect_worker_specs(runtime_dir)?, disabled)?;
     let missing = missing_worker_binaries(&workers);
     if !missing.is_empty() {
         anyhow::bail!(
@@ -948,10 +1234,13 @@ pub(crate) fn launch_workers(
         let Some(binary) = worker.binary.as_ref() else {
             continue;
         };
+        let parent_env = std::env::vars().collect::<BTreeMap<_, _>>();
+        let scoped_env = scoped_worker_environment(&worker.env, launch.env, &parent_env);
         let mut command = Command::new(binary);
         command
             .current_dir(launch.runtime_dir)
-            .envs(launch.env)
+            .env_clear()
+            .envs(scoped_env)
             // iii-sdk 0.22.1 otherwise falls back to hostname:pid, which is
             // not stable enough for readiness or duplicate suppression. The
             // value is namespaced so it cannot collide with an engine worker
@@ -1031,6 +1320,9 @@ pub(crate) fn spawn_engine(
         .arg(config_path)
         .current_dir(runtime_dir)
         .envs(env)
+        // AgentOS owns this engine lifecycle. The built-in daemon would expose
+        // worker::* mutation functions outside the packaged-worker boundary.
+        .env("IIIWORKER_DISABLE_BUILTIN_DAEMONS", "1")
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err));
     if detached {
@@ -1108,7 +1400,6 @@ async fn main() -> Result<()> {
                     config_yaml.display()
                 );
             }
-            let worker_specs = discover_workers(&runtime_dir)?;
             let iii_path = find_iii_binary(&agentos_home)?;
             let engine_log = engine_log_path(&agentos_home);
             let worker_log = worker_log_path(&agentos_home);
@@ -1116,10 +1407,13 @@ async fn main() -> Result<()> {
             // the active `.env` has none, then hand that `.env` to the engine,
             // the workers, and the TUI.
             let key_outcome = bootstrap::ensure_api_key(&runtime_dir)?;
+            let audit_outcome = bootstrap::ensure_audit_key(&runtime_dir)?;
             let launch_env = bootstrap::load_dotenv(&runtime_dir)?;
+            let worker_specs = discover_workers(&runtime_dir, &launch_env)?;
 
             println!("\n{}", "AgentOS".bold().cyan());
             println!("{} {}", "✓".green(), key_outcome.describe());
+            println!("{} {}", "✓".green(), audit_outcome.describe());
             println!("{}", "─".repeat(40).dimmed());
 
             // Same order as `up`: the bus RBAC gate must answer before the
@@ -1806,6 +2100,8 @@ async fn main() -> Result<()> {
             if paths.config_path.is_file() {
                 let outcome = bootstrap::ensure_api_key(&paths.runtime_dir)?;
                 println!("{} {}", "✓".green(), outcome.describe());
+                let audit = bootstrap::ensure_audit_key(&paths.runtime_dir)?;
+                println!("{} {}", "✓".green(), audit.describe());
             }
             let launch_env = bootstrap::load_dotenv(&paths.runtime_dir)?;
             let mut effects = bootstrap::SystemEffects::new(&paths, launch_env);
@@ -2668,6 +2964,8 @@ async fn main() -> Result<()> {
             let paths = runtime_paths()?;
             let key_outcome = bootstrap::ensure_api_key(&paths.runtime_dir)?;
             println!("  {} {}", "✓".green(), key_outcome.describe());
+            let audit_outcome = bootstrap::ensure_audit_key(&paths.runtime_dir)?;
+            println!("  {} {}", "✓".green(), audit_outcome.describe());
 
             // The provider credential is a different thing entirely: workers
             // read it from the environment, so it goes into the active `.env`.
@@ -3693,7 +3991,7 @@ mod tests {
             .permissions();
         permissions.set_mode(0o0);
         std::fs::set_permissions(&workers_dir, permissions).expect("make workers unreadable");
-        assert!(discover_workers(&root).is_err());
+        assert!(discover_workers(&root, &BTreeMap::new()).is_err());
         let mut permissions = std::fs::metadata(&workers_dir)
             .expect("read workers directory metadata")
             .permissions();
@@ -3711,11 +4009,164 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agentos_engine_spawn_forces_builtin_daemons_disabled() {
+        let root = std::env::temp_dir().join(format!(
+            "agentos-engine-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create root");
+        let engine = root.join("iii");
+        let capture = root.join("captured");
+        std::fs::write(
+            &engine,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$IIIWORKER_DISABLE_BUILTIN_DAEMONS\" > '{}'\n",
+                capture.display()
+            ),
+        )
+        .expect("write fake engine");
+        let mut permissions = std::fs::metadata(&engine).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&engine, permissions).unwrap();
+        let log = root.join("engine.log");
+        let mut child = spawn_engine(
+            &engine,
+            Path::new("config.yaml"),
+            &root,
+            &log,
+            &BTreeMap::from([(
+                "IIIWORKER_DISABLE_BUILTIN_DAEMONS".to_string(),
+                "0".to_string(),
+            )]),
+            false,
+        )
+        .expect("spawn fake engine");
+        assert!(child.wait().unwrap().success());
+        assert_eq!(std::fs::read_to_string(capture).unwrap(), "1");
+        std::fs::remove_dir_all(root).expect("clean up");
+    }
+
+    #[test]
+    fn worker_env_policy_is_strict_and_complete() {
+        let workers = ["alpha", "beta"].into_iter().map(str::to_string).collect();
+        let allowed = ["III_URL", "AGENTOS_API_KEY", "ONLY_ALPHA"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let parsed = parse_worker_env_policy(
+            "alpha=III_URL,AGENTOS_API_KEY,ONLY_ALPHA\nbeta=III_URL,AGENTOS_API_KEY\n",
+            &workers,
+            &allowed,
+        )
+        .expect("strict policy");
+        assert_eq!(parsed["alpha"][2], "ONLY_ALPHA");
+
+        for source in [
+            "alpha=III_URL,AGENTOS_API_KEY\nalpha=III_URL,AGENTOS_API_KEY\nbeta=III_URL,AGENTOS_API_KEY\n",
+            "alpha=III_URL,AGENTOS_API_KEY,ONLY_ALPHA,ONLY_ALPHA\nbeta=III_URL,AGENTOS_API_KEY\n",
+            "alpha=III_URL,AGENTOS_API_KEY,UNKNOWN\nbeta=III_URL,AGENTOS_API_KEY\n",
+            "alpha=III_URL,AGENTOS_API_KEY\nunknown=III_URL,AGENTOS_API_KEY\nbeta=III_URL,AGENTOS_API_KEY\n",
+            "alpha=III_URL,AGENTOS_API_KEY\n",
+            "alpha=AGENTOS_API_KEY,III_URL\nbeta=III_URL,AGENTOS_API_KEY\n",
+        ] {
+            assert!(
+                parse_worker_env_policy(source, &workers, &allowed).is_err(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_worker_environment_clears_parent_secrets_and_dotenv_wins() {
+        let parent = BTreeMap::from([
+            ("PATH".to_string(), "/bin".to_string()),
+            ("HOME".to_string(), "/home/test".to_string()),
+            ("USER".to_string(), "tester".to_string()),
+            ("LOGNAME".to_string(), "tester".to_string()),
+            ("SHELL".to_string(), "/bin/sh".to_string()),
+            ("TERM".to_string(), "xterm".to_string()),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("RUST_BACKTRACE".to_string(), "1".to_string()),
+            ("PARENT_CANARY".to_string(), "must-not-leak".to_string()),
+            ("ONLY_ALPHA".to_string(), "from-shell".to_string()),
+            ("OTHER_SECRET".to_string(), "must-not-cross".to_string()),
+        ]);
+        let dotenv = BTreeMap::from([
+            ("ONLY_ALPHA".to_string(), "from-dotenv".to_string()),
+            ("OTHER_SECRET".to_string(), "other-dotenv".to_string()),
+        ]);
+        let env = scoped_worker_environment(&["ONLY_ALPHA".to_string()], &dotenv, &parent);
+        assert_eq!(
+            env.get("ONLY_ALPHA").map(String::as_str),
+            Some("from-dotenv")
+        );
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/test"));
+        assert_eq!(env.get("LANG").map(String::as_str), Some("C.UTF-8"));
+        assert_eq!(env.get("RUST_BACKTRACE").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "HOME",
+                "LANG",
+                "LOGNAME",
+                "ONLY_ALPHA",
+                "PATH",
+                "RUST_BACKTRACE",
+                "SHELL",
+                "TERM",
+                "USER",
+            ]
+        );
+        assert!(!env.contains_key("PARENT_CANARY"));
+        assert!(!env.contains_key("OTHER_SECRET"));
+    }
+
+    #[test]
+    fn disabled_workers_are_strict_and_default_to_none() {
+        let available = ["alpha", "beta"].into_iter().map(str::to_string).collect();
+        assert!(parse_disabled_workers(None, &available).unwrap().is_empty());
+        assert_eq!(
+            parse_disabled_workers(Some("beta"), &available).unwrap(),
+            ["beta".to_string()].into_iter().collect()
+        );
+        assert!(parse_disabled_workers(Some("unknown"), &available).is_err());
+        assert!(parse_disabled_workers(Some("alpha,alpha"), &available).is_err());
+        assert!(parse_disabled_workers(Some("alpha,,beta"), &available).is_err());
+
+        let workers = ["alpha", "beta"]
+            .into_iter()
+            .map(|name| WorkerSpec {
+                name: name.to_string(),
+                runtime: WorkerRuntime::Rust,
+                binary: Some(PathBuf::from(format!("agentos-{name}"))),
+                env: UNIVERSAL_WORKER_ENV
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect(),
+            })
+            .collect();
+        let enabled = filter_disabled_workers(workers, Some("beta")).unwrap();
+        assert_eq!(
+            enabled
+                .iter()
+                .map(|worker| worker.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha"]
+        );
+    }
+
     #[test]
     fn test_repository_worker_manifests_parse_fail_closed() {
         let workers_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workers");
         let mut count = 0;
-        for entry in std::fs::read_dir(workers_dir).expect("read repository workers") {
+        for entry in std::fs::read_dir(&workers_dir).expect("read repository workers") {
             let entry = entry.expect("read worker entry");
             if !entry.path().is_dir() {
                 continue;
@@ -3733,5 +4184,17 @@ mod tests {
             count += 1;
         }
         assert!(count > 0);
+
+        let runtime = workers_dir.parent().expect("repository root");
+        let specs = collect_worker_specs(runtime).expect("collect governed repository workers");
+        let mcp = specs
+            .iter()
+            .find(|worker| worker.name == "mcp-client")
+            .unwrap();
+        assert!(
+            mcp.env
+                .contains(&"GITHUB_PERSONAL_ACCESS_TOKEN".to_string())
+        );
+        assert!(mcp.env.contains(&"AWS_SECRET_ACCESS_KEY".to_string()));
     }
 }

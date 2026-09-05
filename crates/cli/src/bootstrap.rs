@@ -48,10 +48,10 @@ pub(crate) const WORKSPACE_BUILD_HINT: &str = "run `cargo build --workspace --re
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 const WORKER_IDENTITIES_UNREPORTED: &str = "the engine did not report connected worker identities";
 
-/// Reads `<runtime>/.env` for `agentos up` without mutating this process. Keys
-/// already exported by the invoking shell are deliberately omitted so child
-/// process inheritance keeps the explicit value. The returned values are
-/// applied to the engine, workers, and TUI at spawn time.
+/// Reads `<runtime>/.env` for `agentos up` without mutating this process. The
+/// returned map keeps every non-empty assignment. Spawn code applies dotenv
+/// values after inherited values, so the active runtime file has deterministic
+/// precedence without ever sourcing shell syntax.
 pub(crate) fn load_dotenv(runtime_dir: &Path) -> Result<BTreeMap<String, String>> {
     let path = runtime_dir.join(".env");
     if !path.is_file() {
@@ -64,15 +64,15 @@ pub(crate) fn load_dotenv(runtime_dir: &Path) -> Result<BTreeMap<String, String>
 
 fn parse_dotenv(source: &str, path: &Path) -> Result<BTreeMap<String, String>> {
     let mut values = parse_dotenv_all(source, path)?;
-    // Explicit shell exports win: dropping them here keeps the exported value
-    // on the child process instead of overwriting it with the file value.
-    values.retain(|key, _| std::env::var_os(key).is_none());
+    // A blank template assignment is not an override. Omitting it lets the
+    // exported shell value survive for engine/daemon children and matches the
+    // scoped-worker fallback rule.
+    values.retain(|_, value| !value.trim().is_empty());
     Ok(values)
 }
 
 /// Every assignment in a dotenv file, ignoring what the current process
-/// exports. `agentos doctor` needs the file's own view to say where a
-/// credential comes from; `up` filters this down in [`parse_dotenv`].
+/// exports. Spawn-time scoping decides which declared values a child receives.
 fn parse_dotenv_all(source: &str, path: &Path) -> Result<BTreeMap<String, String>> {
     let mut values = BTreeMap::new();
     for (index, raw_line) in source.lines().enumerate() {
@@ -159,6 +159,7 @@ fn parse_dotenv_value(value: &str, path: &Path, line: usize) -> Result<String> {
 /// to register without this variable, so a clean machine loses almost every
 /// worker when it is unset.
 pub(crate) const API_KEY_VARIABLE: &str = "AGENTOS_API_KEY";
+pub(crate) const AUDIT_KEY_VARIABLE: &str = "AUDIT_HMAC_KEY";
 /// 32 bytes, rendered as 64 lowercase hex characters.
 const API_KEY_BYTES: usize = 32;
 
@@ -188,8 +189,8 @@ const PROVIDER_VARIABLES: [(&str, &str); 10] = [
 const CODEX_PROVIDER: &str = "codex";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
 
-/// Where a credential value comes from. The shell export wins at spawn time
-/// (see [`parse_dotenv`]), so the two are never confused in a report.
+/// Where a credential value comes from. A non-empty dotenv assignment wins at
+/// spawn time; a blank or absent assignment falls back to the shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CredentialSource {
     Environment,
@@ -295,13 +296,15 @@ impl Credentials {
         F: Fn(&str) -> Option<String>,
     {
         let lookup = |name: &str| -> Option<(String, CredentialSource)> {
-            if let Some(value) = environment(name).filter(|value| !value.trim().is_empty()) {
-                return Some((value, CredentialSource::Environment));
-            }
             dotenv
                 .get(name)
                 .filter(|value| !value.trim().is_empty())
                 .map(|value| (value.clone(), CredentialSource::Dotenv))
+                .or_else(|| {
+                    environment(name)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(|value| (value, CredentialSource::Environment))
+                })
         };
 
         let api_key = lookup(API_KEY_VARIABLE).map(|(_, source)| source);
@@ -460,6 +463,65 @@ where
     Ok(ApiKeyOutcome::Generated(path))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuditKeyOutcome {
+    Inherited,
+    AlreadyPresent(PathBuf),
+    Generated(PathBuf),
+}
+
+impl AuditKeyOutcome {
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Inherited => format!(
+                "{AUDIT_KEY_VARIABLE} inherited from the process environment; .env left unchanged"
+            ),
+            Self::AlreadyPresent(path) => {
+                format!("{AUDIT_KEY_VARIABLE} already set in {}", path.display())
+            }
+            Self::Generated(path) => format!(
+                "generated a new 32-byte {AUDIT_KEY_VARIABLE} in {} (mode 0600)",
+                path.display()
+            ),
+        }
+    }
+}
+
+pub(crate) fn ensure_audit_key(runtime_dir: &Path) -> Result<AuditKeyOutcome> {
+    ensure_audit_key_with(
+        runtime_dir,
+        || std::env::var(AUDIT_KEY_VARIABLE).ok(),
+        || random_secret(AUDIT_KEY_VARIABLE),
+    )
+}
+
+fn ensure_audit_key_with<E, G>(
+    runtime_dir: &Path,
+    environment: E,
+    generate: G,
+) -> Result<AuditKeyOutcome>
+where
+    E: Fn() -> Option<String>,
+    G: Fn() -> Result<String>,
+{
+    if environment().is_some_and(|value| !value.trim().is_empty()) {
+        return Ok(AuditKeyOutcome::Inherited);
+    }
+    let path = dotenv_path(runtime_dir);
+    let source = if path.is_file() {
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("Cannot read dotenv file {}", path.display()))?
+    } else {
+        String::new()
+    };
+    if read_dotenv_value(&source, &path, AUDIT_KEY_VARIABLE)?.is_some() {
+        return Ok(AuditKeyOutcome::AlreadyPresent(path));
+    }
+    let updated = dotenv_with_assignment(&source, AUDIT_KEY_VARIABLE, &generate()?);
+    write_dotenv_secret(&path, &updated)?;
+    Ok(AuditKeyOutcome::Generated(path))
+}
+
 /// The `.env` text carrying `key`, or `None` when a non-empty value is already
 /// assigned. An empty assignment is filled in place so the operator's own
 /// layout and comments survive.
@@ -537,14 +599,18 @@ pub(crate) fn provider_variable(provider: &str) -> Option<&'static str> {
 
 /// 32 bytes from the kernel CSPRNG as lowercase hex.
 fn random_api_key() -> Result<String> {
+    random_secret(API_KEY_VARIABLE)
+}
+
+fn random_secret(variable: &str) -> Result<String> {
     #[cfg(unix)]
     {
         use std::io::Read as _;
         let mut bytes = [0u8; API_KEY_BYTES];
         std::fs::File::open("/dev/urandom")
-            .context("Cannot open /dev/urandom to generate AGENTOS_API_KEY")?
+            .with_context(|| format!("Cannot open /dev/urandom to generate {variable}"))?
             .read_exact(&mut bytes)
-            .context("Cannot read 32 random bytes for AGENTOS_API_KEY")?;
+            .with_context(|| format!("Cannot read 32 random bytes for {variable}"))?;
         let mut key = String::with_capacity(API_KEY_BYTES * 2);
         for byte in bytes {
             use std::fmt::Write as _;
@@ -555,7 +621,7 @@ fn random_api_key() -> Result<String> {
     #[cfg(not(unix))]
     {
         anyhow::bail!(
-            "cannot generate {API_KEY_VARIABLE} on this platform: set it manually in the active .env"
+            "cannot generate {variable} on this platform: set it manually in the active .env"
         )
     }
 }
@@ -639,6 +705,9 @@ pub(crate) trait Diagnostics {
     fn engine_version(&self, binary: &Path) -> Option<String>;
     /// Whether the engine accepts connections on its worker port.
     fn engine_healthy(&self) -> bool;
+    /// Whether a pre-existing engine is proven to enforce the active armed
+    /// config. TCP-open alone is never such proof.
+    fn live_rbac_verified(&self) -> bool;
     /// Stable names of connected non-engine workers, `None` when the engine
     /// cannot answer `engine::functions::list`.
     fn connected_worker_ids(&self) -> Option<BTreeSet<String>>;
@@ -1029,10 +1098,15 @@ pub(crate) fn start_bus_auth_for_foreground(
     launch_env: &BTreeMap<String, String>,
 ) -> Result<Option<std::process::Child>> {
     let addr = parse_bus_auth_addr(
-        std::env::var(BUS_AUTH_ADDR_VARIABLE)
-            .ok()
+        launch_env
+            .get(BUS_AUTH_ADDR_VARIABLE)
             .filter(|value| !value.trim().is_empty())
-            .or_else(|| launch_env.get(BUS_AUTH_ADDR_VARIABLE).cloned())
+            .cloned()
+            .or_else(|| {
+                std::env::var(BUS_AUTH_ADDR_VARIABLE)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
             .as_deref(),
     )?;
     let config = std::fs::read_to_string(config_path).unwrap_or_default();
@@ -1337,6 +1411,15 @@ fn up_stages(
     let endpoint = engine_endpoint();
     let reused_engine = effects.engine_healthy();
     if reused_engine {
+        let armed = effects
+            .engine_config()
+            .as_deref()
+            .is_some_and(|config| config.contains(BUS_RBAC_MARKER));
+        if armed && !effects.live_rbac_verified() {
+            anyhow::bail!(
+                "an engine is already listening on {endpoint}, but AgentOS cannot verify live bus RBAC against the active armed config. Refusing to reuse or kill an unknown process; restart the existing stack, then run `agentos up` so AgentOS starts the gated engine itself"
+            );
+        }
         stage_ok(out, "Bus", &format!("already healthy on {endpoint}"))?;
     } else {
         stage_run(out, &format!("Starting iii-engine on {endpoint}..."))?;
@@ -1742,17 +1825,17 @@ impl SystemEffects {
         }
     }
 
-    /// Values this invocation would hand to a child process: the active `.env`
-    /// first, then whatever this process already exports.
+    /// Values this invocation would hand to a child process: a non-empty active
+    /// `.env` assignment overrides the process environment.
     fn launch_value(&self, name: &str) -> Option<String> {
-        std::env::var(name)
-            .ok()
+        self.launch_env
+            .get(name)
             .filter(|value| !value.trim().is_empty())
+            .cloned()
             .or_else(|| {
-                self.launch_env
-                    .get(name)
+                std::env::var(name)
+                    .ok()
                     .filter(|value| !value.trim().is_empty())
-                    .cloned()
             })
     }
 }
@@ -1830,6 +1913,12 @@ impl Diagnostics for SystemEffects {
         TcpStream::connect_timeout(&engine_endpoint(), HEALTH_PROBE_TIMEOUT).is_ok()
     }
 
+    fn live_rbac_verified(&self) -> bool {
+        // iii 0.22.1 exposes no authoritative config fingerprint or RBAC status.
+        // Refuse armed reuse rather than infer policy from an open TCP port.
+        false
+    }
+
     fn connected_worker_ids(&self) -> Option<BTreeSet<String>> {
         let binary = self.engine_binary().ok()?;
         let output = std::process::Command::new(binary)
@@ -1889,7 +1978,12 @@ impl Diagnostics for SystemEffects {
     }
 
     fn worker_specs(&self) -> Result<Vec<WorkerSpec>> {
-        crate::collect_worker_specs(&self.runtime_dir)
+        let workers = crate::collect_worker_specs(&self.runtime_dir)?;
+        crate::filter_disabled_workers(
+            workers,
+            self.launch_value(crate::DISABLED_WORKERS_VARIABLE)
+                .as_deref(),
+        )
     }
 
     fn tui_binary(&self) -> Option<PathBuf> {
@@ -2026,6 +2120,7 @@ mod tests {
             name: name.to_string(),
             runtime,
             binary: built.then(|| PathBuf::from(format!("/release/agentos-{name}"))),
+            env: vec!["III_URL".to_string(), "AGENTOS_API_KEY".to_string()],
         }
     }
 
@@ -2088,6 +2183,8 @@ mod tests {
         bus_auth_exits: bool,
         /// Contents of the active `config.yaml`.
         engine_config: Option<String>,
+        /// Test seam for authoritative live-gate proof.
+        live_rbac_verified: bool,
         /// Keys in state scope `agents`; `None` when the engine cannot answer.
         agent_keys: Option<Vec<String>>,
         /// Keys in state scope `capabilities`.
@@ -2127,6 +2224,7 @@ mod tests {
                 bus_auth_probes: Cell::new(0),
                 bus_auth_exits: false,
                 engine_config: Some(armed_config("ws://127.0.0.1:49129")),
+                live_rbac_verified: true,
                 agent_keys: Some(vec!["default".to_string()]),
                 capability_keys: Some(vec!["default".to_string()]),
                 identity_probes: Cell::new(0),
@@ -2185,6 +2283,10 @@ mod tests {
                 .map(|threshold| probe >= threshold)
                 .unwrap_or(false);
             started && !stopped
+        }
+
+        fn live_rbac_verified(&self) -> bool {
+            self.live_rbac_verified
         }
 
         fn connected_worker_ids(&self) -> Option<BTreeSet<String>> {
@@ -3256,7 +3358,7 @@ mod tests {
     }
 
     #[test]
-    fn dotenv_parser_handles_quotes_comments_and_shell_precedence() {
+    fn dotenv_parser_keeps_all_assignments_for_spawn_time_scoping() {
         let values = parse_dotenv(
             "# comment\nPLAIN=value\nexport QUOTED=\"line\\nnext\"\nSINGLE='literal value'\nINLINE=yes # note\nPATH=must-not-override-shell\n",
             Path::new("/runtime/.env"),
@@ -3269,7 +3371,11 @@ mod tests {
             Some("literal value")
         );
         assert_eq!(values.get("INLINE").map(String::as_str), Some("yes"));
-        assert!(!values.contains_key("PATH"), "shell PATH must win");
+        assert_eq!(
+            values.get("PATH").map(String::as_str),
+            Some("must-not-override-shell"),
+            "the worker policy decides whether a dotenv value is declared"
+        );
     }
 
     #[test]
@@ -3296,9 +3402,9 @@ mod tests {
             values.get("AGENTOS_TEST_DUPLICATE").map(String::as_str),
             Some("first")
         );
-        assert_eq!(
-            values.get("AGENTOS_TEST_EMPTY").map(String::as_str),
-            Some("")
+        assert!(
+            !values.contains_key("AGENTOS_TEST_EMPTY"),
+            "blank dotenv assignments must fall back to the shell at spawn time"
         );
         assert!(
             load_dotenv(Path::new("/agentos-test-path-that-does-not-exist"))
@@ -3426,6 +3532,22 @@ mod tests {
             !dotenv_path(&runtime).exists(),
             "an exported key must not cause a second, inert value in .env"
         );
+        std::fs::remove_dir_all(&runtime).expect("clean up");
+    }
+
+    #[test]
+    fn audit_hmac_key_is_generated_distinctly_with_mode_0600() {
+        let runtime = temporary_runtime("audit-generate");
+        let outcome =
+            ensure_audit_key_with(&runtime, || None, fixed_key).expect("generate audit key");
+        let path = dotenv_path(&runtime);
+        assert_eq!(outcome, AuditKeyOutcome::Generated(path.clone()));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read dotenv"),
+            format!("{AUDIT_KEY_VARIABLE}={}\n", "f".repeat(64))
+        );
+        #[cfg(unix)]
+        assert_eq!(mode_of(&path), 0o600);
         std::fs::remove_dir_all(&runtime).expect("clean up");
     }
 
@@ -3598,27 +3720,37 @@ mod tests {
     }
 
     #[test]
-    fn credentials_prefer_the_process_environment_over_the_file() {
+    fn credentials_report_nonempty_dotenv_precedence_with_shell_fallback() {
         let mut values = BTreeMap::new();
         values.insert(API_KEY_VARIABLE.to_string(), "from-file".to_string());
         values.insert("ANTHROPIC_API_KEY".to_string(), "  ".to_string());
+        values.insert("OPENAI_API_KEY".to_string(), "from-file".to_string());
         let credentials = Credentials::resolve(Path::new("/runtime/.env"), &values, |name| {
-            (name == "ANTHROPIC_API_KEY").then(|| "from-shell".to_string())
+            ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+                .contains(&name)
+                .then(|| "from-shell".to_string())
         });
         assert_eq!(credentials.api_key, Some(CredentialSource::Dotenv));
         assert_eq!(
             credentials.providers,
-            vec![ProviderCredential {
-                provider: "anthropic",
-                variable: "ANTHROPIC_API_KEY",
-                source: CredentialSource::Environment,
-            }],
-            "a blank file value must not mask the exported credential"
+            vec![
+                ProviderCredential {
+                    provider: "anthropic",
+                    variable: "ANTHROPIC_API_KEY",
+                    source: CredentialSource::Environment,
+                },
+                ProviderCredential {
+                    provider: "openai",
+                    variable: "OPENAI_API_KEY",
+                    source: CredentialSource::Dotenv,
+                },
+            ],
+            "non-empty dotenv wins, while a blank assignment falls back to the shell"
         );
     }
 
     #[test]
-    fn dotenv_parsing_separates_the_file_view_from_the_process_view() {
+    fn dotenv_spawn_view_keeps_file_values_so_declared_dotenv_overrides_shell() {
         let path = Path::new("/runtime/.env");
         let source = "AGENTOS_API_KEY=from-file\nANTHROPIC_API_KEY=cloud\n";
         let all = parse_dotenv_all(source, path).expect("parse every assignment");
@@ -3634,9 +3766,10 @@ mod tests {
         )
         .expect("parse spawn view");
         unsafe { std::env::remove_var("AGENTOS_TEST_DOTENV_VIEW") };
-        assert!(
-            !exported.contains_key("AGENTOS_TEST_DOTENV_VIEW"),
-            "an exported key must keep its exported value at spawn time"
+        assert_eq!(
+            exported.get("AGENTOS_TEST_DOTENV_VIEW").map(String::as_str),
+            Some("from-file"),
+            "declared dotenv values must remain available to override the shell"
         );
         assert_eq!(
             exported.get("ANTHROPIC_API_KEY").map(String::as_str),
@@ -3940,6 +4073,22 @@ mod tests {
         );
         assert!(output.contains("Bus auth"), "{output}");
         assert!(output.contains("listening on 127.0.0.1:49129"), "{output}");
+    }
+
+    #[test]
+    fn up_refuses_to_reuse_an_unverified_engine_for_an_armed_config() {
+        let config = existing_config();
+        let mut fake = Fake {
+            live_rbac_verified: false,
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome
+            .expect_err("TCP-open alone cannot authorize armed engine reuse")
+            .to_string();
+        assert!(error.contains("cannot verify live bus RBAC"), "{error}");
+        assert!(error.contains("restart"), "{error}");
+        assert!(!fake.events().contains(&"start_engine".to_string()));
     }
 
     #[test]

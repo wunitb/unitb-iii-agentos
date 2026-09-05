@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Boot the agentos dev stack: every release worker binary connects to the
-# local iii engine on ws://localhost:49134. Run this in a second terminal
-# after `iii --config config.yaml` is up.
+# Boot the AgentOS dev stack in one enforced order: bus-auth (when armed),
+# iii-engine, then scoped release workers. Do not start iii by hand first.
 #
 # Usage:
 #   bash scripts/dev-up.sh           # spawn all release workers in background
@@ -181,51 +180,196 @@ if [[ -z "${CODEX_PROXY_API_KEY:-}" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
     echo "warning: no model provider credential is configured"
 fi
 
-: > "$PIDFILE"
 spawned=0
 
-# Bus RBAC gate. iii 0.22.1 calls the RBAC auth function for EVERY bus
-# connection, so this daemon has to answer before a worker connects; it is not a
-# worker itself and must not be started by the loop below. Started here as a
-# best effort: in this flow the engine is already running, and its iii-bridge
-# retries, so a late daemon costs the connections made in that window.
-BUS_AUTH_BIN="$RELEASE_DIR/agentos-bus-authd"
-BUS_AUTH_ADDR="${AGENTOS_BUS_AUTH_ADDR:-127.0.0.1:49129}"
-bus_auth_listening() {
-    local host="${BUS_AUTH_ADDR%:*}" port="${BUS_AUTH_ADDR##*:}"
-    (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null
+CONFIG="$ROOT/config.yaml"
+POLICY="$ROOT/workers/env.allowlist"
+[[ -f "$CONFIG" ]] || { echo "error: missing engine config: $CONFIG" >&2; exit 1; }
+[[ -f "$POLICY" ]] || { echo "error: missing worker env policy: $POLICY" >&2; exit 1; }
+
+# Parse and validate the same strict policy as the Rust launcher. The format is
+# deliberately only `worker=KEY,KEY`: no shell evaluation, quoting, or spaces.
+rust_workers=$'\n'
+for manifest in "$ROOT"/workers/*/iii.worker.yaml; do
+    [[ -f "$manifest" ]] || continue
+    if grep -Eq '^[[:space:]]*kind:[[:space:]]*python[[:space:]]*$|^runtime:[[:space:]]*python[[:space:]]*$' "$manifest"; then
+        continue
+    fi
+    worker="$(basename "$(dirname "$manifest")")"
+    [[ "$worker" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || {
+        echo "error: invalid discovered Rust worker name '$worker'" >&2
+        exit 1
+    }
+    rust_workers="${rust_workers}${worker}"$'\n'
+done
+
+policy_workers=$'\n'
+policy_line=0
+while IFS= read -r declaration || [[ -n "$declaration" ]]; do
+    policy_line=$((policy_line + 1))
+    [[ -z "$declaration" || "$declaration" == \#* ]] && continue
+    if [[ ! "$declaration" =~ ^([a-z0-9]+(-[a-z0-9]+)*)=([A-Z][A-Z0-9_]*(,[A-Z][A-Z0-9_]*)*)$ ]]; then
+        echo "error: malformed worker env policy on line $policy_line" >&2
+        exit 1
+    fi
+    worker="${declaration%%=*}"
+    keys="${declaration#*=}"
+    case "$rust_workers" in
+        *$'\n'"$worker"$'\n'*) ;;
+        *) echo "error: unknown worker '$worker' in env policy on line $policy_line" >&2; exit 1 ;;
+    esac
+    case "$policy_workers" in
+        *$'\n'"$worker"$'\n'*) echo "error: duplicate worker '$worker' in env policy on line $policy_line" >&2; exit 1 ;;
+    esac
+    [[ "$keys" == III_URL,AGENTOS_API_KEY || "$keys" == III_URL,AGENTOS_API_KEY,* ]] || {
+        echo "error: worker '$worker' must declare III_URL,AGENTOS_API_KEY first" >&2
+        exit 1
+    }
+    seen_keys=$'\n'
+    IFS=',' read -r -a key_list <<< "$keys"
+    for key in "${key_list[@]}"; do
+        case "$allowed_names" in
+            *$'\n'"$key"$'\n'*) ;;
+            *) echo "error: unknown env key '$key' for worker '$worker' on policy line $policy_line" >&2; exit 1 ;;
+        esac
+        case "$seen_keys" in
+            *$'\n'"$key"$'\n'*) echo "error: duplicate env key '$key' for worker '$worker' on policy line $policy_line" >&2; exit 1 ;;
+        esac
+        seen_keys="${seen_keys}${key}"$'\n'
+    done
+    policy_workers="${policy_workers}${worker}"$'\n'
+done < "$POLICY"
+
+while IFS= read -r worker; do
+    [[ -n "$worker" ]] || continue
+    case "$policy_workers" in
+        *$'\n'"$worker"$'\n'*) ;;
+        *) echo "error: worker env policy has no declaration for '$worker'" >&2; exit 1 ;;
+    esac
+done <<< "$rust_workers"
+
+disabled_workers=$'\n'
+if [[ -n "${AGENTOS_DISABLED_WORKERS:-}" ]]; then
+    if [[ ! "$AGENTOS_DISABLED_WORKERS" =~ ^[a-z0-9]+(-[a-z0-9]+)*(,[a-z0-9]+(-[a-z0-9]+)*)*$ ]]; then
+        echo "error: invalid AGENTOS_DISABLED_WORKERS value '$AGENTOS_DISABLED_WORKERS'" >&2
+        exit 1
+    fi
+    IFS=',' read -r -a disabled_list <<< "$AGENTOS_DISABLED_WORKERS"
+    for worker in "${disabled_list[@]}"; do
+        [[ "$worker" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || {
+            echo "error: invalid AGENTOS_DISABLED_WORKERS entry '$worker'" >&2; exit 1;
+        }
+        case "$rust_workers" in
+            *$'\n'"$worker"$'\n'*) ;;
+            *) echo "error: unknown AGENTOS_DISABLED_WORKERS worker '$worker'" >&2; exit 1 ;;
+        esac
+        case "$disabled_workers" in
+            *$'\n'"$worker"$'\n'*) echo "error: duplicate AGENTOS_DISABLED_WORKERS worker '$worker'" >&2; exit 1 ;;
+        esac
+        disabled_workers="${disabled_workers}${worker}"$'\n'
+    done
+fi
+
+engine_authority="${III_URL#*://}"
+engine_authority="${engine_authority%%/*}"
+ENGINE_HOST="${engine_authority%:*}"
+ENGINE_PORT="${engine_authority##*:}"
+if [[ -z "$ENGINE_HOST" || ! "$ENGINE_PORT" =~ ^[0-9]+$ ]]; then
+    echo "error: III_URL must name a host:port WebSocket endpoint: $III_URL" >&2
+    exit 1
+fi
+engine_listening() {
+    (exec 3<>"/dev/tcp/$ENGINE_HOST/$ENGINE_PORT") 2>/dev/null
 }
-if bus_auth_listening; then
-    echo "▸ bus-auth daemon already listening on $BUS_AUTH_ADDR"
-elif [[ -x "$BUS_AUTH_BIN" ]]; then
-    "$BUS_AUTH_BIN" "--listen=$BUS_AUTH_ADDR" >> "$ROOT/.agentos-bus-authd.log" 2>&1 &
+config_armed=0
+grep -q 'auth_function_id' "$CONFIG" && config_armed=1
+
+# A listener that predates this invocation has no trustworthy config identity.
+# Never kill it, but never claim an armed config protects it either.
+if engine_listening; then
+    if [[ $config_armed -eq 1 ]]; then
+        echo "error: an engine already listens on $ENGINE_HOST:$ENGINE_PORT, but live bus RBAC cannot be verified" >&2
+        echo "       stop that stack yourself, then rerun scripts/dev-up.sh so bus-auth starts before the engine" >&2
+        exit 1
+    fi
+    : > "$PIDFILE"
+    echo "▸ reusing unarmed engine on $ENGINE_HOST:$ENGINE_PORT"
+else
+    : > "$PIDFILE"
+    BUS_AUTH_BIN="$RELEASE_DIR/agentos-bus-authd"
+    BUS_AUTH_ADDR="${AGENTOS_BUS_AUTH_ADDR:-127.0.0.1:49129}"
+    bus_auth_listening() {
+        local host="${BUS_AUTH_ADDR%:*}" port="${BUS_AUTH_ADDR##*:}"
+        (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null
+    }
+    if [[ $config_armed -eq 1 ]]; then
+        if bus_auth_listening; then
+            echo "▸ bus-auth daemon already listening on $BUS_AUTH_ADDR"
+        elif [[ -x "$BUS_AUTH_BIN" ]]; then
+            "$BUS_AUTH_BIN" "--listen=$BUS_AUTH_ADDR" >> "$ROOT/.agentos-bus-authd.log" 2>&1 &
+            echo $! >> "$PIDFILE"
+            spawned=$((spawned + 1))
+            for _ in {1..20}; do
+                bus_auth_listening && break
+                sleep 0.2
+            done
+            if ! bus_auth_listening; then
+                echo "error: agentos-bus-authd did not listen on $BUS_AUTH_ADDR; see $ROOT/.agentos-bus-authd.log" >&2
+                stop_workers >/dev/null
+                exit 1
+            fi
+            echo "▸ bus-auth daemon listening on $BUS_AUTH_ADDR"
+        else
+            echo "error: $CONFIG arms bus RBAC but $BUS_AUTH_BIN is not built" >&2
+            echo "       run: cargo build --workspace --release" >&2
+            exit 1
+        fi
+    fi
+
+    command -v iii >/dev/null 2>&1 || { echo "error: iii is not on PATH" >&2; stop_workers >/dev/null; exit 1; }
+    IIIWORKER_DISABLE_BUILTIN_DAEMONS=1 iii --config "$CONFIG" >> "$ROOT/.agentos-engine.log" 2>&1 &
     echo $! >> "$PIDFILE"
     spawned=$((spawned + 1))
     for _ in {1..20}; do
-        bus_auth_listening && break
+        engine_listening && break
         sleep 0.2
     done
-    if bus_auth_listening; then
-        echo "▸ bus-auth daemon listening on $BUS_AUTH_ADDR"
-    else
-        echo "warning: agentos-bus-authd did not listen on $BUS_AUTH_ADDR; see $ROOT/.agentos-bus-authd.log" >&2
-        echo "         it refuses to start without AGENTOS_API_KEY; with bus RBAC armed the engine refuses every worker" >&2
+    if ! engine_listening; then
+        echo "error: iii-engine did not listen on $ENGINE_HOST:$ENGINE_PORT; see $ROOT/.agentos-engine.log" >&2
+        stop_workers >/dev/null
+        exit 1
     fi
-elif grep -q 'auth_function_id' "$ROOT/config.yaml" 2>/dev/null; then
-    echo "warning: $ROOT/config.yaml arms bus RBAC but $BUS_AUTH_BIN is not built" >&2
-    echo "         the engine will refuse every worker connection; run: cargo build --workspace --release" >&2
+    echo "▸ iii-engine listening on $ENGINE_HOST:$ENGINE_PORT"
 fi
 
-for bin in "$RELEASE_DIR"/agentos-*; do
-    name="$(basename "$bin")"
-    case "$name" in
-        agentos-tui|agentos-cli|agentos-bus-authd|*.d|*.dSYM) continue ;;
-    esac
+# Each worker receives only a small process baseline plus its declared policy
+# values. `env -i` makes parent-shell canaries and other workers' credentials
+# absent by construction. A non-empty dotenv assignment already overwrote the
+# shell above; an empty assignment preserved the shell value.
+while IFS= read -r worker; do
+    [[ -n "$worker" ]] || continue
+    case "$disabled_workers" in *$'\n'"$worker"$'\n'*) continue ;; esac
+    bin="$RELEASE_DIR/agentos-$worker"
     [[ -x "$bin" ]] || continue
-    "$bin" >> "$ROOT/.agentos-${name#agentos-}.log" 2>&1 &
+    declaration="$(grep -E "^${worker}=" "$POLICY")"
+    keys="${declaration#*=}"
+    worker_env=(env -i)
+    for key in PATH HOME USER LOGNAME SHELL TERM AGENTOS_HOME TMPDIR TMP TEMP LANG LANGUAGE SSL_CERT_FILE SSL_CERT_DIR NIX_SSL_CERT_FILE RUST_BACKTRACE RUST_LOG; do
+        if [[ ${!key+x} ]]; then worker_env+=("$key=${!key}"); fi
+    done
+    while IFS= read -r key; do
+        [[ "$key" == LC_* ]] || continue
+        worker_env+=("$key=${!key}")
+    done < <(compgen -e)
+    IFS=',' read -r -a key_list <<< "$keys"
+    for key in "${key_list[@]}"; do
+        if [[ ${!key+x} ]]; then worker_env+=("$key=${!key}"); fi
+    done
+    worker_env+=("III_WORKER_NAME=agentos-$worker")
+    "${worker_env[@]}" "$bin" >> "$ROOT/.agentos-${worker}.log" 2>&1 &
     echo $! >> "$PIDFILE"
     spawned=$((spawned + 1))
-done
+done <<< "$rust_workers"
 
 # memworkr runs from an immutable version explicitly installed by
 # scripts/memworkr-sync.sh. Never execute a development checkout directly.
