@@ -448,7 +448,8 @@ async fn webhook_handler(
         .trigger(TriggerRequest {
             function_id: "agent::chat".to_string(),
             payload: json!({
-                "agentId": agent_id,
+                "agentId": &agent_id,
+                "principal": { "agentId": &agent_id },
                 "message": text,
                 "sessionId": format!("twitch:{channel_id}"),
             }),
@@ -793,6 +794,10 @@ mod tests {
         .unwrap();
         assert_eq!(valid["status_code"], 200);
         assert_eq!(bus.call_count("agent::chat"), 1);
+        assert_eq!(
+            bus.calls_to("agent::chat")[0].payload["principal"],
+            json!({ "agentId": "default" })
+        );
 
         let tampered = DELIVERY.replace("hello", "forged");
         let mut forged = fresh_request(Some(DELIVERY), "notification");

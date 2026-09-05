@@ -1,12 +1,8 @@
 use agentos_http_adapter::TriggerBus;
 use agentos_http_adapter::bus::CHAT_TIMEOUT_MS;
-use agentos_http_adapter::principal::{self, PrincipalError};
+use agentos_http_adapter::principal;
 use iii_sdk::errors::Error;
-use iii_sdk::{
-    IIIClient, RegisterFunction,
-    protocol::{RegisterTriggerInput, TriggerRequest},
-    register_worker,
-};
+use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Instant;
@@ -367,13 +363,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
-    iii.register_trigger(RegisterTriggerInput {
-        trigger_type: "queue".to_string(),
-        function_id: "agent::chat".to_string(),
-        config: json!({ "topic": "agent.inbox" }),
-        metadata: None,
-    })?;
-
     tracing::info!("agent-core worker started");
     tokio::signal::ctrl_c().await?;
     iii.shutdown_async().await;
@@ -579,16 +568,13 @@ fn tool_dispatch_payload(call: &FunctionCall, agent_id: &str) -> Value {
 ///   what a model tool call `agent::chat {agentId: ...}` becomes — runs as `a`,
 ///   or as the named agent only with the exact `grant::act_as::<named>`;
 /// * the operator (bearer, the HTTP edge) runs as whoever it names;
-/// * a bare payload — the untrusted queue worker firing `agent.inbox`, and the
-///   channel/a2a/hand/pulse workers that hand a message over from their own
-///   trusted sessions — runs as the named agent. That is the pre-T1 contract
-///   for callers that have no principal to give and is kept ON PURPOSE; the
-///   bus tier is its trust basis.
+/// * a bare payload has no authenticated caller and is refused. Trusted
+///   deputies must label the resolved agent, while HTTP edges forward the
+///   operator bearer.
 async fn chat_agent(bus: &dyn TriggerBus, input: &Value, named: &str) -> Result<String, Error> {
     let expected = agentos_bus_auth::policy::expected_api_key();
     match principal::resolve(input, expected.as_deref()) {
         Ok(principal) => principal::acting_agent(bus, &principal, input, named).await,
-        Err(PrincipalError::Missing) => Ok(named.to_string()),
         Err(error) => Err(error.into()),
     }
 }
@@ -1344,9 +1330,16 @@ mod tests {
         );
         let bus: Bus = Arc::clone(&fake) as Bus;
 
-        chat(&bus, json!({ "agentId": "a-1", "message": "Current turn" }))
-            .await
-            .expect("turn with recalled memory");
+        chat(
+            &bus,
+            json!({
+                "agentId": "a-1",
+                "message": "Current turn",
+                "principal": principal::as_agent("a-1"),
+            }),
+        )
+        .await
+        .expect("turn with recalled memory");
 
         let completions = payloads(&fake, "agentos::llm::complete");
         assert_eq!(completions.len(), 1);
@@ -1385,9 +1378,16 @@ Lower-ranked question",
         fake.on_value("agent::chat", json!({ "content": "nested turn" }));
         let bus: Bus = Arc::clone(&fake) as Bus;
 
-        chat(&bus, json!({ "agentId": "a-1", "message": "hi" }))
-            .await
-            .expect("a-1's own turn");
+        chat(
+            &bus,
+            json!({
+                "agentId": "a-1",
+                "message": "hi",
+                "principal": principal::as_agent("a-1"),
+            }),
+        )
+        .await
+        .expect("a-1's own turn");
 
         // 1. Handed to the real handler, the model's call must not read
         //    victim's memory: it is refused for want of the exact grant.
@@ -1477,22 +1477,19 @@ Lower-ranked question",
     }
 
     #[tokio::test]
-    async fn a_bare_message_still_runs_as_the_named_agent() {
-        // The untrusted queue worker (`agent.inbox`) and the channel workers
-        // hand over bare payloads; that carve-out is deliberate.
-        let fake = turn_bus(vec![json!({ "content": "queued" })]);
+    async fn a_bare_message_is_refused_before_the_named_agents_memory_is_read() {
+        let fake = turn_bus(vec![json!({ "content": "must not run" })]);
         let bus: Bus = Arc::clone(&fake) as Bus;
 
-        chat(
-            &bus,
-            json!({ "agentId": "a-9", "message": "from a channel" }),
-        )
-        .await
-        .expect("bare payload");
-        assert_eq!(recalls_as(&fake, "a-9"), 1);
+        let error = chat(&bus, json!({ "agentId": "a-9", "message": "unlabelled" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("principal required"), "{error}");
+        assert_eq!(recalls_as(&fake, "a-9"), 0);
         assert!(grants_asked(&fake).is_empty());
 
-        // But a bearer that does not match is a refusal, not a bare call.
+        // A bearer that does not match is also a refusal, not a bare call.
         let error = chat(
             &bus,
             json!({
@@ -1505,7 +1502,7 @@ Lower-ranked question",
         .unwrap_err()
         .to_string();
         assert!(error.contains("Unauthorized"), "{error}");
-        assert_eq!(recalls_as(&fake, "a-9"), 1);
+        assert_eq!(recalls_as(&fake, "a-9"), 0);
     }
 
     #[test]

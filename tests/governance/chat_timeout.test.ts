@@ -57,16 +57,51 @@ function firstLine(block: string): string {
   return block.split("\n").slice(0, 8).join(" ").replaceAll(/\s+/g, " ").slice(0, 180);
 }
 
+function isLiteralAgentChat(block: string): boolean {
+  return /function_id:\s*(?:"agent::chat"(?:\.(?:to_string|to_owned|into)\(\))?|String::from\(\s*"agent::chat"\s*\))/.test(block);
+}
+
 describe("chat calls keep the full bounded turn budget", () => {
   const rustFiles = trackedRustFiles();
   const chatCalls: Array<{ path: string; block: string }> = [];
   for (const path of rustFiles) {
-    for (const block of triggerRequests(read(path))) {
-      if (/function_id:\s*"agent::chat"\.to_string\(\)/.test(block)) {
+    const productionSource = read(path).split(/\n#\[cfg\(test\)\]/, 1)[0];
+    for (const block of triggerRequests(productionSource)) {
+      if (isLiteralAgentChat(block)) {
         chatCalls.push({ path, block });
       }
     }
   }
+
+  it("recognizes literal agent chat ids independent of Rust string conversion style", () => {
+    for (const functionId of [
+      '"agent::chat".to_string()',
+      '"agent::chat".to_owned()',
+      '"agent::chat".into()',
+      'String::from("agent::chat")',
+    ]) {
+      expect(isLiteralAgentChat(`TriggerRequest { function_id: ${functionId}, payload: json!({}) }`)).toBeTrue();
+    }
+    expect(isLiteralAgentChat('TriggerRequest { function_id: function_id.clone(), payload: json!({}) }')).toBeFalse();
+  });
+
+  it("does not register the credential-less agent inbox queue", () => {
+    expect(read("workers/agent-core/src/main.rs")).not.toContain('"topic": "agent.inbox"');
+  });
+
+  it("labels every production literal agent chat deputy with a principal or operator headers", () => {
+    const offenders = chatCalls
+      .filter(({ block }) =>
+        !/["']principal["']\s*:/.test(block) &&
+        !/["']headers["']\s*:/.test(block)
+      )
+      .map(({ path, block }) => `${path}: ${firstLine(block)}`);
+
+    expect(
+      offenders,
+      "a trusted agent::chat deputy can impersonate its payload agentId; attach the resolved agent principal or forward authenticated operator headers",
+    ).toEqual([]);
+  });
 
   it("leaves no literal agent chat trigger on the SDK default", () => {
     // Hand runner and swarm derive a smaller deadline from an explicit outer

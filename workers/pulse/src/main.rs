@@ -174,10 +174,11 @@ async fn invoke_pulse(iii: &IIIClient, req: InvokeRequest) -> Result<Value, Erro
         .trigger(TriggerRequest {
             function_id: "agent::chat".to_string(),
             payload: json!({
-            "agentId": req.agent_id,
-            "message": "You have been invoked via pulse. Review your current context and take appropriate action.",
-            "context": context,
-        }),
+                "agentId": &req.agent_id,
+                "principal": { "agentId": &req.agent_id },
+                "message": "You have been invoked via pulse. Review your current context and take appropriate action.",
+                "context": context,
+            }),
             action: None,
             timeout_ms: Some(CHAT_TIMEOUT_MS),
         })

@@ -562,6 +562,7 @@ async fn handle_task(iii: &IIIClient, input: Value) -> Result<Value, Error> {
                     function_id: "agent::chat".to_string(),
                     payload: json!({
                         "agentId": "default",
+                        "principal": { "agentId": "default" },
                         "message": user_text,
                         "sessionId": session_id,
                     }),
