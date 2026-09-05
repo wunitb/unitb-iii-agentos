@@ -1322,8 +1322,9 @@ pub(crate) struct UpOptions {
 pub(crate) enum UpOutcome {
     /// `--no-tui`: engine and workers are ready and keep running.
     Ready,
-    /// The TUI ran in the foreground and exited with this code.
-    Tui(i32),
+    /// Startup is ready for ownership handoff; run this TUI only after the
+    /// owned-process record is durable and the lifecycle lock is released.
+    Tui(PathBuf),
 }
 
 /// Brings the stack up in order: config, engine binary, TUI binary, engine
@@ -1513,13 +1514,10 @@ fn up_stages(
     // report success against a dead bus.
     ensure_engine_alive(effects)?;
 
-    // 8. TUI in the foreground.
+    // 8. Hand the prepared TUI path back to the entry point. It must persist
+    // ownership and release the lifecycle transaction before waiting here.
     match tui_binary {
-        Some(path) => {
-            stage_run(out, "Starting agentos-tui...")?;
-            let code = effects.run_tui(&path)?;
-            Ok(UpOutcome::Tui(code))
-        }
+        Some(path) => Ok(UpOutcome::Tui(path)),
         None => {
             writeln!(out, "{}", "─".repeat(46).dimmed())?;
             writeln!(out, "  Engine   {}  ws://{endpoint}", "●".green())?;
@@ -2126,9 +2124,12 @@ impl Bootstrap for SystemEffects {
 
     fn run_tui(&mut self, binary: &Path) -> Result<i32> {
         // Inherited stdio: the TUI owns the terminal until the user quits.
+        let parent = crate::unicode_environment(std::env::vars_os());
+        let environment = crate::scoped_tui_environment(&self.launch_env, &parent);
         let status = std::process::Command::new(binary)
             .current_dir(&self.runtime_dir)
-            .envs(&self.launch_env)
+            .env_clear()
+            .envs(environment)
             .status()
             .with_context(|| format!("Failed to start {}", binary.display()))?;
         Ok(status.code().unwrap_or(1))
@@ -2741,7 +2742,7 @@ mod tests {
     }
 
     #[test]
-    fn up_launches_the_tui_last_and_returns_its_exit_code() {
+    fn up_prepares_the_tui_for_post_persistence_launch() {
         let config = existing_config();
         let mut fake = Fake {
             connected: RefCell::new(Some(BTreeSet::new())),
@@ -2749,12 +2750,12 @@ mod tests {
             ..Fake::default()
         };
         let (outcome, output) = up(&mut fake, &options(true), &config);
-        assert_eq!(outcome.expect("up succeeds"), UpOutcome::Tui(7));
         assert_eq!(
-            fake.events(),
-            vec!["start_workers".to_string(), "run_tui".to_string()]
+            outcome.expect("up succeeds"),
+            UpOutcome::Tui(PathBuf::from("/usr/local/bin/agentos-tui"))
         );
-        assert!(output.contains("Starting agentos-tui"), "{output}");
+        assert_eq!(fake.events(), vec!["start_workers".to_string()]);
+        assert!(!output.contains("Starting agentos-tui"), "{output}");
     }
 
     #[test]

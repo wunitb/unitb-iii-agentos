@@ -2185,7 +2185,9 @@ async fn main() -> Result<()> {
             let outcome = outcome?;
             effects.persist_started()?;
             drop(lifecycle_lock);
-            if let bootstrap::UpOutcome::Tui(code) = outcome {
+            if let bootstrap::UpOutcome::Tui(tui_path) = outcome {
+                println!("{} Starting agentos-tui...", "→".blue());
+                let code = bootstrap::Bootstrap::run_tui(&mut effects, &tui_path)?;
                 std::process::exit(code);
             }
         }

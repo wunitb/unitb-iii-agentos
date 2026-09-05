@@ -5,8 +5,9 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::Write as _;
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard};
@@ -152,10 +153,25 @@ impl Fixture {
     /// `cargo test --workspace` builds in `target/debug`.
     fn cli(&self) -> PathBuf {
         let cli = self.bin.join("agentos");
-        fs::copy(env!("CARGO_BIN_EXE_agentos"), &cli).expect("copy agentos binary");
-        let mut permissions = fs::metadata(&cli).expect("read cli metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&cli, permissions).expect("make cli executable");
+        let pending = self.bin.join(format!(
+            ".agentos.{}.{}.pending",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock before epoch")
+                .as_nanos()
+        ));
+        let bytes = fs::read(env!("CARGO_BIN_EXE_agentos")).expect("read agentos binary");
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&pending)
+            .expect("create pending CLI copy");
+        output.write_all(&bytes).expect("copy agentos binary");
+        output.sync_all().expect("sync copied CLI");
+        drop(output);
+        fs::rename(&pending, &cli).expect("publish closed CLI inode");
         cli
     }
 
@@ -169,6 +185,32 @@ impl Fixture {
                 "#!/bin/sh\necho started > '{}'\nprintf '%s|%s|%s\\n' \"$DOTENV_ONLY\" \"$EXPLICIT_WINS\" \"$AGENTOS_API_KEY\" > '{}'\nexit {exit_code}\n",
                 self.tui_marker.display(),
                 self.tui_env.display()
+            ),
+        );
+        cli
+    }
+
+    fn with_persistent_tui(&self, release: &Path) -> PathBuf {
+        let cli = self.cli();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(self.runtime.join(".env"))
+            .unwrap()
+            .write_all(
+                b"ANTHROPIC_API_KEY=provider-must-not-cross\nAUDIT_HMAC_KEY=audit-must-not-cross\n",
+            )
+            .unwrap();
+        write_executable(
+            &self.bin.join("agentos-tui"),
+            &format!(
+                "#!/bin/sh\n[ \"${{AGENTOS_API_KEY-}}\" = 'fresh-clone-key' ] && selected=true || selected=false\n[ -n \"${{ANTHROPIC_API_KEY+x}}\" ] && provider=true || provider=false\n[ -n \"${{AUDIT_HMAC_KEY+x}}\" ] && audit=true || audit=false\nprintf 'selected:%s|provider:%s|audit:%s\\n' \"$selected\" \"$provider\" \"$audit\" > '{}'
+echo started > '{}'
+while [ ! -f '{}' ]; do sleep 0.05; done
+exit 7
+",
+                self.tui_env.display(),
+                self.tui_marker.display(),
+                release.display()
             ),
         );
         cli
@@ -429,13 +471,97 @@ fn up_runs_the_tui_in_the_foreground_and_propagates_its_exit_code() {
     assert!(wait_for_file(&fixture.worker_pid), "worker never started");
     assert_eq!(
         fs::read_to_string(&fixture.tui_env).expect("read TUI environment"),
-        "from-dotenv|from-dotenv|fresh-clone-key\n"
+        "||fresh-clone-key\n"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Starting agentos-tui"), "{stdout}");
 
     drop(engine);
     fixture.cleanup();
+}
+
+#[test]
+fn up_hands_off_ownership_before_waiting_for_the_tui() {
+    let _guard = engine_port_lock();
+    let fixture = Fixture::new("tui-ownership-handoff");
+    let Ok(engine) = TcpListener::bind(("127.0.0.1", ENGINE_PORT)) else {
+        eprintln!("skipped: port {ENGINE_PORT} is already in use by another engine");
+        fixture.cleanup();
+        return;
+    };
+    let release = fixture.root.join("release-tui");
+    let cli = fixture.with_persistent_tui(&release);
+    let mut up = Command::new(&cli)
+        .arg("up")
+        .env("PATH", fixture.path_with_engine())
+        .env("HOME", &fixture.home)
+        .env("AGENTOS_HOME", &fixture.home)
+        .env("AGENTOS_CONFIG", fixture.runtime.join("config.yaml"))
+        .env_remove("AGENTOS_API_KEY")
+        .current_dir(&fixture.root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(
+        wait_for_file(&fixture.tui_marker),
+        "persistent TUI never started"
+    );
+    let record = fixture.home.join("run/owned-processes.json");
+    let handed_off = record.is_file();
+
+    let mut stop_succeeded = false;
+    let mut stop_detail = String::new();
+    let mut up_stayed_open = false;
+    if handed_off {
+        let stop = Command::new(&cli)
+            .args(["stop", "--grace-seconds", "1"])
+            .env("PATH", fixture.path_with_engine())
+            .env("HOME", &fixture.home)
+            .env("AGENTOS_HOME", &fixture.home)
+            .env("AGENTOS_CONFIG", fixture.runtime.join("config.yaml"))
+            .current_dir(&fixture.root)
+            .output()
+            .unwrap();
+        stop_succeeded = stop.status.success() && !record.exists();
+        stop_detail = format!(
+            "status={} record_exists={} stdout={} stderr={}",
+            stop.status,
+            record.exists(),
+            String::from_utf8_lossy(&stop.stdout),
+            String::from_utf8_lossy(&stop.stderr)
+        );
+        up_stayed_open = up.try_wait().unwrap().is_none();
+    }
+    fs::write(&release, "release\n").unwrap();
+    let output = up.wait_with_output().unwrap();
+    let record_recreated = record.exists();
+    let tui_environment = fs::read_to_string(&fixture.tui_env).unwrap_or_default();
+
+    drop(engine);
+    fixture.cleanup();
+
+    assert!(
+        handed_off,
+        "ownership was not persisted before the TUI wait"
+    );
+    assert!(
+        stop_succeeded,
+        "a second CLI could not stop the handed-off stack: {stop_detail}"
+    );
+    assert!(
+        up_stayed_open,
+        "stopping the stack also ended the foreground TUI"
+    );
+    assert_eq!(output.status.code(), Some(7));
+    assert!(
+        !record_recreated,
+        "TUI exit recreated a stopped lifecycle record"
+    );
+    assert_eq!(
+        tui_environment,
+        "selected:true|provider:false|audit:false\n"
+    );
 }
 
 #[test]
@@ -612,7 +738,7 @@ fn up_hands_the_generated_api_key_to_the_launched_processes() {
         .expect("AGENTOS_API_KEY assignment");
     assert_eq!(
         fs::read_to_string(&fixture.tui_env).expect("read TUI environment"),
-        format!("from-dotenv|from-dotenv|{key}\n")
+        format!("||{key}\n")
     );
 
     drop(engine);
