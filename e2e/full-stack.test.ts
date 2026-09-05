@@ -1,8 +1,21 @@
+import { spawnSync } from "node:child_process";
+import { once } from "node:events";
+import { readFileSync } from "node:fs";
+import { createServer, type IncomingHttpHeaders } from "node:http";
+import { createRequire } from "node:module";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { IIIClient } from "iii-sdk";
 
 const shouldRunE2E = process.env.AGENTOS_E2E === "1";
 const suite = shouldRunE2E ? describe : describe.skip;
+const fakeProviderEnabled = process.env.AGENTOS_E2E_FAKE_PROVIDER === "1";
+const fakeProviderIt = fakeProviderEnabled ? it : it.skip;
+const fakeAnthropicBaseUrl = "http://127.0.0.1:39091";
+const fakeAnthropicApiKey = "agentos-e2e-fake-anthropic-key";
+const fakeLanePreflightTitle =
+  "local fake Anthropic provider lane preflight is fully armed or absent";
 
 const wsUrl = process.env.III_URL || "ws://localhost:49134";
 const realmName = `e2e-${Date.now()}`;
@@ -12,6 +25,235 @@ let sdk: IIIClient;
 let realmId = "";
 let missionId = "";
 let proposalId = "";
+
+function liveAnthropicEvidenceEnabled(
+  apiKey = process.env.ANTHROPIC_API_KEY || "",
+  fakeMode = fakeProviderEnabled,
+) {
+  return apiKey.length > 0 && apiKey !== fakeAnthropicApiKey && !fakeMode;
+}
+
+function operatorPayloadHeaders(apiKey = process.env.AGENTOS_API_KEY || "") {
+  return apiKey ? { authorization: `Bearer ${apiKey}` } : undefined;
+}
+
+function sdkRegistrationOptions(apiKey = process.env.AGENTOS_API_KEY || "") {
+  return {
+    workerName: "e2e-test-client",
+    ...(apiKey
+      ? { headers: { Authorization: `Bearer ${apiKey}` } }
+      : {}),
+  };
+}
+
+type FakeLaneEnvKey =
+  | "AGENTOS_E2E"
+  | "AGENTOS_E2E_FAKE_PROVIDER"
+  | "ANTHROPIC_API_KEY"
+  | "AGENTOS_ANTHROPIC_BASE_URL";
+
+function runFakeLanePreflightMutation(missing: FakeLaneEnvKey) {
+  const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+  const require = createRequire(import.meta.url);
+  const installedPackage = require.resolve("vitest/package.json");
+  const vitestCli = resolve(dirname(installedPackage), "vitest.mjs");
+  const configuredVersion = JSON.parse(
+    readFileSync(resolve(projectRoot, "package.json"), "utf8"),
+  ).devDependencies.vitest;
+  const installedVersion = JSON.parse(
+    readFileSync(installedPackage, "utf8"),
+  ).version;
+  const lockfile = readFileSync(resolve(projectRoot, "bun.lock"), "utf8");
+  const lockPinsInstalledVersion = lockfile.includes(
+    `"vitest": ["vitest@${installedVersion}"`,
+  );
+  const manifestAcceptsInstalledVersion = [
+    installedVersion,
+    `^${installedVersion}`,
+    `~${installedVersion}`,
+  ].includes(configuredVersion);
+  if (!manifestAcceptsInstalledVersion || !lockPinsInstalledVersion) {
+    throw new Error("installed Vitest does not match the project lock");
+  }
+
+  const env: NodeJS.ProcessEnv = {
+    CI: "1",
+    NO_COLOR: "1",
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    TMPDIR: process.env.TMPDIR,
+    AGENTOS_E2E: "1",
+    AGENTOS_E2E_FAKE_PROVIDER: "1",
+    ANTHROPIC_API_KEY: fakeAnthropicApiKey,
+    AGENTOS_ANTHROPIC_BASE_URL: fakeAnthropicBaseUrl,
+  };
+  delete env[missing];
+
+  const result = spawnSync(
+    process.execPath,
+    [
+      vitestCli,
+      "--run",
+      "--reporter=json",
+      "--config",
+      resolve(projectRoot, "vitest.e2e.config.ts"),
+      "--testNamePattern",
+      fakeLanePreflightTitle,
+    ],
+    { cwd: projectRoot, env, encoding: "utf8", timeout: 20_000 },
+  );
+  let reportedStatus = "";
+  try {
+    const report = JSON.parse(result.stdout || "{}");
+    reportedStatus = report.testResults
+      ?.flatMap((testResult: any) => testResult.assertionResults || [])
+      .find((assertion: any) => assertion.title === fakeLanePreflightTitle)
+      ?.status || "";
+  } catch {}
+  return {
+    status: result.status,
+    reportedStatus,
+    errorCode:
+      result.error && "code" in result.error ? String(result.error.code) : "",
+  };
+}
+
+function errorCode(error: unknown): string {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return "";
+  }
+  return String(error.code);
+}
+
+type RecordedAnthropicRequest = {
+  method: string;
+  url: string;
+  headers: IncomingHttpHeaders;
+  remoteAddress: string;
+  body: Record<string, any>;
+};
+
+async function startFakeAnthropicProvider() {
+  const requests: RecordedAnthropicRequest[] = [];
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    requests.push({
+      method: request.method || "",
+      url: request.url || "",
+      headers: request.headers,
+      remoteAddress: request.socket.remoteAddress || "",
+      body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+    });
+
+    const body = JSON.stringify({
+      id: "msg-agentos-e2e-fake",
+      type: "message",
+      role: "assistant",
+      content: [
+        { type: "text", text: "deterministic fake-provider answer" },
+      ],
+      model: "claude-haiku-4-5-20251001",
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 7, output_tokens: 4 },
+    });
+    response.writeHead(200, {
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(body),
+      connection: "close",
+    });
+    response.end(body);
+  });
+  server.listen(39091, "127.0.0.1");
+  await once(server, "listening");
+
+  return {
+    requests,
+    async close() {
+      if (!server.listening) return;
+      server.closeAllConnections?.();
+      if (!server.listening) return;
+      await new Promise<void>((done, reject) => {
+        const finish = (error?: Error) => {
+          if (!error || errorCode(error) === "ERR_SERVER_NOT_RUNNING") {
+            done();
+          } else {
+            reject(error);
+          }
+        };
+        try {
+          server.close(finish);
+        } catch (error) {
+          if (errorCode(error) === "ERR_SERVER_NOT_RUNNING") done();
+          else reject(error);
+        }
+      });
+    },
+  };
+}
+
+describe("full-stack E2E client configuration", () => {
+  it(fakeLanePreflightTitle, () => {
+    const markerPresent =
+      fakeProviderEnabled ||
+      process.env.ANTHROPIC_API_KEY === fakeAnthropicApiKey ||
+      process.env.AGENTOS_ANTHROPIC_BASE_URL === fakeAnthropicBaseUrl;
+    if (!markerPresent) return;
+
+    expect(process.env.AGENTOS_E2E === "1").toBe(true);
+    expect(process.env.AGENTOS_E2E_FAKE_PROVIDER === "1").toBe(true);
+    expect(process.env.ANTHROPIC_API_KEY === fakeAnthropicApiKey).toBe(true);
+    expect(
+      process.env.AGENTOS_ANTHROPIC_BASE_URL === fakeAnthropicBaseUrl,
+    ).toBe(true);
+  });
+
+  it("local fake Anthropic provider preflight mutations fail loudly", () => {
+    for (const missing of [
+      "AGENTOS_E2E",
+      "AGENTOS_E2E_FAKE_PROVIDER",
+      "ANTHROPIC_API_KEY",
+      "AGENTOS_ANTHROPIC_BASE_URL",
+    ] as const) {
+      const result = runFakeLanePreflightMutation(missing);
+      expect(result.errorCode, `spawn for missing ${missing}`).toBe("");
+      expect(result.status, `missing ${missing}`).not.toBe(0);
+      expect(result.reportedStatus, `missing ${missing}`).toBe("failed");
+    }
+  });
+
+  it("local fake Anthropic provider cleanup is idempotent and releases its port", async () => {
+    const first = await startFakeAnthropicProvider();
+    await first.close();
+    await first.close();
+
+    const rebound = await startFakeAnthropicProvider();
+    await rebound.close();
+  });
+
+  it("local fake Anthropic provider client configuration applies bus credentials safely", () => {
+    expect(sdkRegistrationOptions("literal-bus-test-key")).toEqual({
+      workerName: "e2e-test-client",
+      headers: { Authorization: "Bearer literal-bus-test-key" },
+    });
+    expect(sdkRegistrationOptions("")).toEqual({
+      workerName: "e2e-test-client",
+    });
+    expect(operatorPayloadHeaders("literal-bus-test-key")).toEqual({
+      authorization: "Bearer literal-bus-test-key",
+    });
+  });
+
+  it("local fake Anthropic provider key never counts as live evidence", () => {
+    expect(liveAnthropicEvidenceEnabled(fakeAnthropicApiKey, true)).toBe(false);
+    expect(liveAnthropicEvidenceEnabled(fakeAnthropicApiKey, false)).toBe(false);
+    expect(liveAnthropicEvidenceEnabled("real-key-from-CI", false)).toBe(true);
+    expect(liveAnthropicEvidenceEnabled("", false)).toBe(false);
+  });
+});
 
 async function call<T = unknown>(
   fn: string,
@@ -29,7 +271,7 @@ async function call<T = unknown>(
 suite("AgentOS full-stack E2E", () => {
   beforeAll(async () => {
     const { registerWorker } = await import("iii-sdk");
-    sdk = registerWorker(wsUrl, { workerName: "e2e-test-client" });
+    sdk = registerWorker(wsUrl, sdkRegistrationOptions());
   });
 
   afterAll(async () => {
@@ -263,8 +505,8 @@ suite("AgentOS full-stack E2E", () => {
   });
 
   it("agentos::llm::complete — real Anthropic call", async () => {
-    if (!process.env.ANTHROPIC_API_KEY) {
-      console.warn("ANTHROPIC_API_KEY not set; skipping live call assertion");
+    if (!liveAnthropicEvidenceEnabled()) {
+      console.warn("live Anthropic evidence disabled; skipping live call assertion");
       return;
     }
     const r = await call<{
@@ -291,15 +533,67 @@ suite("AgentOS full-stack E2E", () => {
     expect(r.usage.output).toBeGreaterThan(0);
   }, 90_000);
 
+  fakeProviderIt("agent::chat — local fake Anthropic provider", async () => {
+    expect(process.env.AGENTOS_ANTHROPIC_BASE_URL).toBe(fakeAnthropicBaseUrl);
+    expect(process.env.ANTHROPIC_API_KEY === fakeAnthropicApiKey).toBe(true);
+
+    const fake = await startFakeAnthropicProvider();
+    const runId = Date.now();
+    const agentId = `agent-e2e-fake-provider-${runId}`;
+    let primaryFailure: unknown;
+    try {
+      const response = await call<{ content: string; durationMs: number }>(
+        "agent::chat",
+        {
+          agentId,
+          headers: operatorPayloadHeaders(),
+          sessionId: `fake-provider-${runId}`,
+          provider: "anthropic",
+          model: "claude-haiku-4-5-20251001",
+          message: "Reply with the deterministic fake-provider answer.",
+        },
+        30_000,
+      );
+      expect(response.content).toBe("deterministic fake-provider answer");
+
+      expect(fake.requests).toHaveLength(1);
+      const request = fake.requests[0];
+      expect(request.method).toBe("POST");
+      expect(request.url).toBe("/v1/messages");
+      expect(request.headers.host).toBe("127.0.0.1:39091");
+      expect(request.remoteAddress).toBe("127.0.0.1");
+      expect(request.headers["x-api-key"] === fakeAnthropicApiKey).toBe(true);
+      expect(request.headers["anthropic-version"]).toBe("2023-06-01");
+      expect(request.body.model).toBe("claude-haiku-4-5-20251001");
+      expect(request.body.messages.at(-1)).toEqual({
+        role: "user",
+        content: "Reply with the deterministic fake-provider answer.",
+      });
+    } catch (error) {
+      primaryFailure = error;
+      throw error;
+    } finally {
+      try {
+        await fake.close();
+      } catch (cleanupError) {
+        if (primaryFailure === undefined) throw cleanupError;
+        console.error(
+          `fake provider cleanup also failed (code=${errorCode(cleanupError) || "unknown"})`,
+        );
+      }
+    }
+  }, 40_000);
+
   it("agent::chat — full ReAct loop, math", async () => {
-    if (!process.env.ANTHROPIC_API_KEY) {
-      console.warn("ANTHROPIC_API_KEY not set; skipping live call assertion");
+    if (!liveAnthropicEvidenceEnabled()) {
+      console.warn("live Anthropic evidence disabled; skipping live call assertion");
       return;
     }
     const r = await call<{ content: string; durationMs: number }>(
       "agent::chat",
       {
         agentId: "agent-e2e",
+        headers: operatorPayloadHeaders(),
         message: "What is 17 times 23? Reply with just the number.",
       },
       115_000,
@@ -309,7 +603,7 @@ suite("AgentOS full-stack E2E", () => {
   }, 120_000);
 
   it("agentos::llm::usage — tracks tokens across calls", async () => {
-    if (!process.env.ANTHROPIC_API_KEY) {
+    if (!liveAnthropicEvidenceEnabled()) {
       return;
     }
     const r = await call<{
