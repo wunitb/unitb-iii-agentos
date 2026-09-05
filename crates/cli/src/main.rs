@@ -1467,7 +1467,7 @@ async fn main() -> Result<()> {
                 ..
             } = runtime_paths()?;
             let first_run = !agentos_home.exists();
-            let lifecycle_lock = lifecycle::try_lock(&agentos_home)?;
+            let lifecycle_lock = lifecycle::try_lock_foreground(&agentos_home)?;
             initialize_agentos_home(&agentos_home)?;
             if first_run {
                 println!("{} First run detected. Initializing...", "→".blue());

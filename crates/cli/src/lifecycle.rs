@@ -124,6 +124,54 @@ pub(crate) fn try_lock(_agentos_home: &Path) -> Result<LifecycleLock> {
     unreachable!()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForegroundLockPolicy {
+    Exclusive,
+    NoPlatformLock,
+}
+
+const fn foreground_lock_policy(is_linux: bool) -> ForegroundLockPolicy {
+    if is_linux {
+        ForegroundLockPolicy::Exclusive
+    } else {
+        ForegroundLockPolicy::NoPlatformLock
+    }
+}
+
+/// Serialize foreground startup on Linux without routing supported non-Linux
+/// foreground mode through the detached-lifecycle refusal.
+pub(crate) fn try_lock_foreground(agentos_home: &Path) -> Result<Option<LifecycleLock>> {
+    match foreground_lock_policy(cfg!(target_os = "linux")) {
+        ForegroundLockPolicy::Exclusive => {
+            #[cfg(target_os = "linux")]
+            return try_lock(agentos_home).map(Some);
+            #[cfg(not(target_os = "linux"))]
+            unreachable!("non-Linux cannot select the exclusive Linux lock policy");
+        }
+        ForegroundLockPolicy::NoPlatformLock => {
+            let _ = agentos_home;
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod platform_policy_tests {
+    use super::*;
+
+    #[test]
+    fn foreground_start_never_routes_non_linux_through_detached_refusal() {
+        assert_eq!(
+            foreground_lock_policy(false),
+            ForegroundLockPolicy::NoPlatformLock
+        );
+        assert_eq!(
+            foreground_lock_policy(true),
+            ForegroundLockPolicy::Exclusive
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct OwnedCandidate {
     role: String,
