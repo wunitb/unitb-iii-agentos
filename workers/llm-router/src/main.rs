@@ -3447,17 +3447,54 @@ mod tests {
     // 4xx body reaches the caller, and a hung provider ends in a timeout
     // instead of running (and billing) forever.
 
-    use std::net::SocketAddr;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        net::SocketAddr,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::Mutex,
+    };
+
+    #[derive(Clone, Debug)]
+    struct RecordedProviderRequest {
+        peer: SocketAddr,
+        method: String,
+        path: String,
+        headers: BTreeMap<String, String>,
+        body: Value,
+    }
+
+    #[derive(Clone, Copy)]
+    struct FakeProviderResponse {
+        status: &'static str,
+        body: &'static str,
+        delay: Duration,
+    }
+
+    impl FakeProviderResponse {
+        fn ok(body: &'static str) -> Self {
+            Self {
+                status: "200 OK",
+                body,
+                delay: Duration::ZERO,
+            }
+        }
+    }
 
     struct FakeProvider {
         addr: SocketAddr,
+        requests: Arc<Mutex<Vec<RecordedProviderRequest>>>,
         handle: tokio::task::JoinHandle<()>,
     }
 
     impl FakeProvider {
         fn base_url(&self) -> String {
             format!("http://{}", self.addr)
+        }
+
+        async fn requests(&self) -> Vec<RecordedProviderRequest> {
+            self.requests.lock().await.clone()
         }
     }
 
@@ -3467,31 +3504,122 @@ mod tests {
         }
     }
 
+    async fn read_provider_request(
+        stream: &mut tokio::net::TcpStream,
+        peer: SocketAddr,
+    ) -> RecordedProviderRequest {
+        const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+        let mut raw = Vec::new();
+        let (header_end, content_length) = loop {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).await.expect("read fake request");
+            assert!(read > 0, "provider request ended before its headers");
+            raw.extend_from_slice(&chunk[..read]);
+            assert!(
+                raw.len() <= MAX_REQUEST_BYTES,
+                "fake provider request too large"
+            );
+
+            let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = std::str::from_utf8(&raw[..header_end]).expect("ASCII request headers");
+            let content_length = head
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .expect("provider request content-length");
+            break (header_end, content_length);
+        };
+
+        let body_start = header_end + 4;
+        while raw.len() < body_start + content_length {
+            let mut chunk = [0_u8; 4096];
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .expect("read fake request body");
+            assert!(read > 0, "provider request ended before its body");
+            raw.extend_from_slice(&chunk[..read]);
+            assert!(
+                raw.len() <= MAX_REQUEST_BYTES,
+                "fake provider request too large"
+            );
+        }
+
+        let head = std::str::from_utf8(&raw[..header_end]).expect("ASCII request headers");
+        let mut lines = head.split("\r\n");
+        let mut request_line = lines
+            .next()
+            .expect("provider request line")
+            .split_whitespace();
+        let method = request_line.next().expect("request method").to_string();
+        let path = request_line.next().expect("request path").to_string();
+        let headers = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+            .collect();
+        let body = serde_json::from_slice(&raw[body_start..body_start + content_length])
+            .expect("JSON provider request body");
+
+        RecordedProviderRequest {
+            peer,
+            method,
+            path,
+            headers,
+            body,
+        }
+    }
+
+    async fn spawn_fake_provider_sequence(responses: Vec<FakeProviderResponse>) -> FakeProvider {
+        assert!(!responses.is_empty(), "fake provider needs a response");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake provider");
+        let addr = listener.local_addr().expect("fake provider address");
+        assert!(addr.ip().is_loopback(), "fake provider escaped loopback");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let handle = tokio::spawn(async move {
+            let mut responses = VecDeque::from(responses);
+            while let Some(scripted) = responses.pop_front() {
+                let (mut stream, peer) = listener.accept().await.expect("accept fake request");
+                assert!(peer.ip().is_loopback(), "non-loopback fake-provider client");
+                let request = read_provider_request(&mut stream, peer).await;
+                recorded.lock().await.push(request);
+                tokio::time::sleep(scripted.delay).await;
+                let response = format!(
+                    "HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    scripted.status,
+                    scripted.body.len(),
+                    scripted.body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write fake response");
+                stream.flush().await.expect("flush fake response");
+            }
+        });
+        FakeProvider {
+            addr,
+            requests,
+            handle,
+        }
+    }
+
     async fn spawn_fake_provider(
         status: &'static str,
         body: &'static str,
         delay: Duration,
     ) -> FakeProvider {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind fake provider");
-        let addr = listener.local_addr().expect("fake provider address");
-        let handle = tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut scratch = vec![0_u8; 16 * 1024];
-                    let _ = stream.read(&mut scratch).await;
-                    tokio::time::sleep(delay).await;
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.flush().await;
-                });
-            }
-        });
-        FakeProvider { addr, handle }
+        spawn_fake_provider_sequence(vec![FakeProviderResponse {
+            status,
+            body,
+            delay,
+        }])
+        .await
     }
 
     fn provider_request<'a>(
@@ -3514,6 +3642,91 @@ mod tests {
     }
 
     const SLOW_PROVIDER_DELAY: Duration = Duration::from_secs(45);
+
+    #[tokio::test]
+    async fn two_turn_anthropic_history_round_trips_through_one_loopback_fake() {
+        let server = spawn_fake_provider_sequence(vec![
+            FakeProviderResponse::ok(
+                r#"{"id":"msg-turn-one","type":"message","role":"assistant","content":[{"type":"text","text":"turn-one reply"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":4}}"#,
+            ),
+            FakeProviderResponse::ok(
+                r#"{"id":"msg-turn-two","type":"message","role":"assistant","content":[{"type":"text","text":"turn-two reply"}],"stop_reason":"end_turn","usage":{"input_tokens":8,"output_tokens":5}}"#,
+            ),
+        ])
+        .await;
+        assert!(server.addr.ip().is_loopback());
+
+        let client = provider_client(reqwest::Client::builder()).expect("client");
+        let base_url = server.base_url();
+        let mut messages = vec![json!({ "role": "user", "content": "turn-one user" })];
+
+        let first = call_anthropic(
+            &client,
+            &provider_request("anthropic", &base_url, &messages, provider_timeout(None)),
+        )
+        .await
+        .expect("turn one response");
+        assert_eq!(extract_anthropic_text(&first), "turn-one reply");
+        assert_eq!(first["type"], "message");
+        assert_eq!(first["role"], "assistant");
+        assert_eq!(first["stop_reason"], "end_turn");
+        assert_eq!(
+            first["usage"],
+            json!({ "input_tokens": 3, "output_tokens": 4 })
+        );
+
+        messages.push(json!({ "role": "assistant", "content": "turn-one reply" }));
+        messages.push(json!({ "role": "user", "content": "turn-two user" }));
+        let second = call_anthropic(
+            &client,
+            &provider_request("anthropic", &base_url, &messages, provider_timeout(None)),
+        )
+        .await
+        .expect("turn two response");
+        assert_eq!(extract_anthropic_text(&second), "turn-two reply");
+        assert_eq!(second["id"], "msg-turn-two");
+        assert_eq!(second["type"], "message");
+        assert_eq!(second["role"], "assistant");
+        assert_eq!(second["stop_reason"], "end_turn");
+        assert_eq!(
+            second["usage"],
+            json!({ "input_tokens": 8, "output_tokens": 5 })
+        );
+
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert!(request.peer.ip().is_loopback());
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.path, "/v1/messages");
+            assert_eq!(
+                request.headers.get("x-api-key").map(String::as_str),
+                Some("test-key")
+            );
+            assert_eq!(
+                request.headers.get("anthropic-version").map(String::as_str),
+                Some("2023-06-01")
+            );
+            assert_eq!(
+                request.headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+            assert_eq!(request.body["model"], "test-model");
+            assert_eq!(request.body["max_tokens"], 64);
+        }
+        assert_eq!(
+            requests[0].body["messages"],
+            json!([{ "role": "user", "content": "turn-one user" }])
+        );
+        assert_eq!(
+            requests[1].body["messages"],
+            json!([
+                { "role": "user", "content": "turn-one user" },
+                { "role": "assistant", "content": "turn-one reply" },
+                { "role": "user", "content": "turn-two user" }
+            ])
+        );
+    }
 
     #[tokio::test]
     async fn a_provider_answer_slower_than_the_legacy_30s_ceiling_still_completes() {
