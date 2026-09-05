@@ -474,9 +474,14 @@ download_and_install() {
   if [ ! -d "$tmp_dir/runtime" ] || [ -L "$tmp_dir/runtime" ]; then
     err "Could not find regular runtime directory in $asset"
   fi
-  if [ ! -s "$tmp_dir/runtime/.iii-version" ] || [ -L "$tmp_dir/runtime/.iii-version" ]; then
+  if [ ! -f "$tmp_dir/runtime/.iii-version" ] || [ -L "$tmp_dir/runtime/.iii-version" ] || [ ! -s "$tmp_dir/runtime/.iii-version" ]; then
     err "Release runtime must contain a non-empty regular .iii-version"
   fi
+  for relative_path in .env.example iii.lock workers/env.allowlist; do
+    if [ ! -f "$tmp_dir/runtime/$relative_path" ] || [ -L "$tmp_dir/runtime/$relative_path" ]; then
+      err "Release runtime input $relative_path must be a regular file"
+    fi
+  done
   for relative_path in "${RELEASE_GOVERNED_PATHS[@]}"; do
     if [ -e "$tmp_dir/runtime/$relative_path" ] && { [ ! -f "$tmp_dir/runtime/$relative_path" ] || [ -L "$tmp_dir/runtime/$relative_path" ]; }; then
       err "Release governance input $relative_path must be a regular file"

@@ -264,6 +264,9 @@ EOF
   # to continue without it, so the release fixture must ship it like the real
   # bundle does (.iii-version at the repository root).
   printf '%s\n' "$III_PINNED_VERSION" > "$stage/runtime/.iii-version"
+  printf 'AGENTOS_API_KEY=\nAUDIT_HMAC_KEY=\n' > "$stage/runtime/.env.example"
+  printf 'version = 1\n' > "$stage/runtime/iii.lock"
+  printf 'echo=III_URL,AGENTOS_API_KEY\n' > "$stage/runtime/workers/env.allowlist"
 
   for extra in "$@"; do
     mkdir -p "$stage/runtime/$(dirname "$extra")"
@@ -548,6 +551,57 @@ OPERATOR
   assert_file_contains "$config.bak" "host: 0.0.0.0" bus_host
 }
 
+test_upgrade_refuses_missing_required_runtime_inputs_before_mutation() {
+  make_release v1.0.0
+  run_installer v1.0.0 || return
+
+  local runtime_before binaries_before required stage status log label
+  runtime_before="$(tree_manifest "$AGENTOS_HOME/runtime")"
+  binaries_before="$(tree_manifest "$BIN_DIR")"
+  for required in .env.example iii.lock workers/env.allowlist; do
+    make_release v2.0.0
+    stage="$SANDBOX/stage-v2.0.0"
+    rm "$stage/runtime/$required"
+    tar -czf "$AGENTOS_TEST_FIXTURE_DIR/release.tar.gz" -C "$stage" bin runtime
+    label="missing_${required//\//_}"
+    log="$SANDBOX/$label.log"
+    AGENTOS_VERSION=v2.0.0 bash "$INSTALLER" > "$log" 2>&1
+    status=$?
+    if [ "$status" -eq 0 ]; then
+      fail "$label: installer accepted a release without $required"
+    fi
+    assert_equal "$(tree_manifest "$AGENTOS_HOME/runtime")" "$runtime_before" "${label}_runtime"
+    assert_equal "$(tree_manifest "$BIN_DIR")" "$binaries_before" "${label}_binaries"
+    assert_absent "$AGENTOS_HOME/runtime.new" "$label"
+    assert_absent "$AGENTOS_HOME/runtime.old" "$label"
+  done
+}
+
+test_upgrade_refuses_directory_iii_version_before_mutation() {
+  make_release v1.0.0
+  run_installer v1.0.0 || return
+
+  local runtime_before binaries_before stage status log
+  runtime_before="$(tree_manifest "$AGENTOS_HOME/runtime")"
+  binaries_before="$(tree_manifest "$BIN_DIR")"
+  make_release v2.0.0
+  stage="$SANDBOX/stage-v2.0.0"
+  rm "$stage/runtime/.iii-version"
+  mkdir "$stage/runtime/.iii-version"
+  printf 'not-a-file\n' > "$stage/runtime/.iii-version/payload"
+  tar -czf "$AGENTOS_TEST_FIXTURE_DIR/release.tar.gz" -C "$stage" bin runtime
+  log="$SANDBOX/directory-iii-version.log"
+  AGENTOS_VERSION=v2.0.0 bash "$INSTALLER" > "$log" 2>&1
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    fail "directory_iii_version: installer accepted a directory as .iii-version"
+  fi
+  assert_equal "$(tree_manifest "$AGENTOS_HOME/runtime")" "$runtime_before" directory_iii_version_runtime
+  assert_equal "$(tree_manifest "$BIN_DIR")" "$binaries_before" directory_iii_version_binaries
+  assert_absent "$AGENTOS_HOME/runtime.new" directory_iii_version
+  assert_absent "$AGENTOS_HOME/runtime.old" directory_iii_version
+}
+
 test_upgrade_refuses_missing_authd_before_mutation() {
   make_release v1.0.0
   run_installer v1.0.0 || return
@@ -743,6 +797,8 @@ ALL_TESTS=(
   test_upgrade_applies_release_security_defaults
   test_upgrade_removes_unsafe_worker_entries_from_adopted_config
   test_upgrade_migrates_unarmed_config_to_secure_topology
+  test_upgrade_refuses_missing_required_runtime_inputs_before_mutation
+  test_upgrade_refuses_directory_iii_version_before_mutation
   test_upgrade_refuses_missing_authd_before_mutation
   test_upgrade_refuses_conflicting_security_topology_before_swap
   test_upgrade_pins_the_bus_worker_to_loopback
