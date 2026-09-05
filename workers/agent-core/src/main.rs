@@ -1245,7 +1245,6 @@ async fn create_agent_authorized(
         )));
     }
 
-    drop(_guard);
     let _ = iii
         .trigger(TriggerRequest {
             function_id: "publish".to_string(),
@@ -1285,7 +1284,6 @@ async fn delete_agent_authorized(
     })
     .await
     .map_err(|error| Error::Handler(error.to_string()))?;
-    drop(_guard);
     let _ = iii
         .trigger(TriggerRequest {
             function_id: "publish".to_string(),
@@ -1544,10 +1542,77 @@ mod tests {
 
     // --- the agent::chat deputy binds a turn to its principal (review F2) ---
 
+    use agentos_http_adapter::bus::BusFuture;
     use agentos_http_adapter::fake::FakeBus;
     use agentos_http_adapter::policy;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    struct LifecycleRaceBus {
+        calls: Mutex<Vec<String>>,
+        created_publish_started: tokio::sync::Semaphore,
+        release_created_publish: tokio::sync::Semaphore,
+        delete_state_started: tokio::sync::Semaphore,
+    }
+
+    impl LifecycleRaceBus {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                created_publish_started: tokio::sync::Semaphore::new(0),
+                release_created_publish: tokio::sync::Semaphore::new(0),
+                delete_state_started: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }
+    }
+
+    impl TriggerBus for LifecycleRaceBus {
+        fn trigger(&self, request: TriggerRequest) -> BusFuture<'_> {
+            Box::pin(async move {
+                let lifecycle_event = request
+                    .payload
+                    .get("data")
+                    .and_then(|data| data.get("type"))
+                    .and_then(Value::as_str);
+                let label = match (request.function_id.as_str(), lifecycle_event) {
+                    ("publish", Some(event)) => format!("publish:{event}"),
+                    (function_id, _) => function_id.to_string(),
+                };
+                self.calls
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(label);
+
+                match request.function_id.as_str() {
+                    "state::get" => Ok(Value::Null),
+                    "state::set" => Ok(json!({ "stored": true })),
+                    "state::delete" => {
+                        self.delete_state_started.add_permits(1);
+                        Ok(json!({ "deleted": true }))
+                    }
+                    "security::set_capabilities" => Ok(json!({ "updated": true })),
+                    "publish" if lifecycle_event == Some("created") => {
+                        self.created_publish_started.add_permits(1);
+                        self.release_created_publish
+                            .acquire()
+                            .await
+                            .map_err(|error| Error::Handler(error.to_string()))?
+                            .forget();
+                        Ok(json!({ "published": true }))
+                    }
+                    "publish" => Ok(json!({ "published": true })),
+                    other => Err(Error::Handler(format!("unexpected test call: {other}"))),
+                }
+            })
+        }
+    }
 
     static AUTH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1832,6 +1897,92 @@ Lower-ranked question",
                     .is_err()
                 );
                 assert!(denied_delete.calls().is_empty());
+            })
+        });
+    }
+
+    #[test]
+    fn lifecycle_guard_keeps_publication_in_mutation_order() {
+        with_api_key(Some("operator-key"), || {
+            block_on(async {
+                let bus = LifecycleRaceBus::new();
+                let guard = Arc::new(tokio::sync::Mutex::new(()));
+                let create_bus = Arc::clone(&bus);
+                let create_guard = Arc::clone(&guard);
+                let create = tokio::spawn(async move {
+                    create_agent_authorized(
+                        create_bus.as_ref(),
+                        json!({
+                            "headers": { "authorization": "Bearer operator-key" },
+                            "body": { "id": "same", "name": "same", "capabilities": { "functions": [] } }
+                        }),
+                        &create_guard,
+                    )
+                    .await
+                });
+
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    bus.created_publish_started.acquire(),
+                )
+                .await
+                .expect("create must reach its bounded publish")
+                .expect("start semaphore open")
+                .forget();
+
+                let delete_bus = Arc::clone(&bus);
+                let delete_guard = Arc::clone(&guard);
+                let delete = tokio::spawn(async move {
+                    delete_agent_authorized(
+                        delete_bus.as_ref(),
+                        json!({
+                            "headers": { "authorization": "Bearer operator-key" },
+                            "agentId": "same"
+                        }),
+                        &delete_guard,
+                    )
+                    .await
+                });
+
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        bus.delete_state_started.acquire(),
+                    )
+                    .await
+                    .is_err(),
+                    "delete passed its state-write step while create publication was blocked"
+                );
+
+                bus.release_created_publish.add_permits(1);
+                tokio::time::timeout(std::time::Duration::from_secs(1), create)
+                    .await
+                    .expect("create task bounded")
+                    .expect("create task joined")
+                    .expect("create succeeded");
+                tokio::time::timeout(std::time::Duration::from_secs(1), delete)
+                    .await
+                    .expect("delete task bounded")
+                    .expect("delete task joined")
+                    .expect("delete succeeded");
+
+                let calls = bus.calls();
+                let created = calls
+                    .iter()
+                    .position(|call| call == "publish:created")
+                    .unwrap();
+                let state_delete = calls
+                    .iter()
+                    .position(|call| call == "state::delete")
+                    .unwrap();
+                let deleted = calls
+                    .iter()
+                    .position(|call| call == "publish:deleted")
+                    .unwrap();
+                assert!(
+                    created < state_delete && state_delete < deleted,
+                    "{calls:?}"
+                );
             })
         });
     }
