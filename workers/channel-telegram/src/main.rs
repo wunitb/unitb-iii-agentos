@@ -139,6 +139,22 @@ async fn startup_secret(iii: &dyn TriggerBus, key: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+fn transport_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else {
+        "transport"
+    }
+}
+
 async fn send_message(
     iii: &dyn TriggerBus,
     api: &TelegramApi,
@@ -165,13 +181,20 @@ async fn send_message(
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .map_err(|e| Error::Handler(e.to_string()))?;
+            .map_err(|error| {
+                // reqwest Display includes the request URL. Telegram embeds the
+                // bot token in that URL, so expose only a bounded error kind.
+                Error::Handler(format!(
+                    "Telegram send failed (transport:{})",
+                    transport_error_kind(&error)
+                ))
+            })?;
         if !res.status().is_success() {
-            let status = res.status();
-            let body = res.text().await.unwrap_or_default();
+            // Provider response bodies are untrusted and may reflect the token
+            // or submitted text. Status is actionable without echoing the body.
             return Err(Error::Handler(format!(
-                "Telegram send failed ({status}): {}",
-                body.chars().take(300).collect::<String>()
+                "Telegram send failed (HTTP {})",
+                res.status()
             )));
         }
     }
@@ -438,7 +461,11 @@ mod tests {
         }
     }
 
-    async fn spawn_fake_provider(delay: Duration) -> FakeProvider {
+    async fn spawn_fake_provider(
+        status: &'static str,
+        response_body: &'static str,
+        delay: Duration,
+    ) -> FakeProvider {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fake provider");
@@ -456,10 +483,9 @@ mod tests {
                     .unwrap_or_else(|error| error.into_inner())
                     .push(String::from_utf8_lossy(&bytes[..count]).to_string());
                 tokio::time::sleep(delay).await;
-                let body = "{}";
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.flush().await;
@@ -612,7 +638,7 @@ mod tests {
 
     #[tokio::test]
     async fn slow_chat_is_acknowledged_before_the_turn_finishes() {
-        let provider = spawn_fake_provider(Duration::from_millis(200)).await;
+        let provider = spawn_fake_provider("200 OK", "{}", Duration::from_millis(200)).await;
         let bus = bus_with_secret(SECRET);
         bus.on("vault::get", |payload| {
             Ok(json!({
@@ -743,7 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn positive_reply_posts_once_to_fake_provider() {
-        let provider = spawn_fake_provider(Duration::ZERO).await;
+        let provider = spawn_fake_provider("200 OK", "{}", Duration::ZERO).await;
         let bus = bus_with_secret(SECRET);
         bus.on("vault::get", |payload| {
             Ok(json!({
@@ -835,5 +861,65 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), admission.shutdown())
             .await
             .expect("owned task shutdown timed out");
+    }
+
+    #[tokio::test]
+    async fn telegram_transport_error_never_exposes_bot_token_or_url_path() {
+        const FAKE_BOT_TOKEN: &str = "literal-fake-bot-token-for-red-test";
+        // TCP port 0 is reserved and cannot have a listening peer.
+        let base_url = "http://127.0.0.1:0".to_string();
+        let bus = bus_with_secret(SECRET);
+        bus.on_value("vault::get", json!({ "value": FAKE_BOT_TOKEN }));
+        let api = TelegramApi {
+            client: reqwest::Client::new(),
+            base_url,
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            send_message(bus.as_ref(), &api, 42, "safe text"),
+        )
+        .await
+        .expect("refused loopback request timed out")
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !error.contains(FAKE_BOT_TOKEN),
+            "transport error exposed configured bot token"
+        );
+        assert!(
+            !error.contains("sendMessage"),
+            "transport error exposed credential-bearing URL path"
+        );
+        assert!(
+            error.contains("transport:connect"),
+            "transport error lost bounded failure kind"
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_http_error_never_echoes_provider_body() {
+        const REFLECTED_SECRET: &str = "reflected-secret-marker";
+        const REFLECTED_CHAT: &str = "reflected-chat-marker";
+        let body = r#"{"error":"reflected-secret-marker reflected-chat-marker"}"#;
+        let provider = spawn_fake_provider("502 Bad Gateway", body, Duration::ZERO).await;
+        let bus = bus_with_secret(SECRET);
+        bus.on_value("vault::get", json!({ "value": "fake-token" }));
+        let api = TelegramApi {
+            client: reqwest::Client::new(),
+            base_url: provider.base_url.clone(),
+        };
+        let error = send_message(bus.as_ref(), &api, 42, REFLECTED_CHAT)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains(REFLECTED_SECRET),
+            "HTTP error echoed provider-controlled secret marker"
+        );
+        assert!(
+            !error.contains(REFLECTED_CHAT),
+            "HTTP error echoed submitted chat marker"
+        );
+        assert!(error.contains("502"), "HTTP error lost actionable status");
     }
 }

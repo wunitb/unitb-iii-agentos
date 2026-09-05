@@ -253,6 +253,22 @@ fn verify_slack_signature_at(
 /// POST to `chat.postMessage`. Splits text > 4000 chars into multiple messages.
 /// Returns Slack's response from the LAST chunk.
 /// Slack docs: https://api.slack.com/methods/chat.postMessage
+fn transport_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else {
+        "transport"
+    }
+}
+
 async fn slack_post_message(
     api: &SlackApi,
     bot_token: &str,
@@ -277,20 +293,32 @@ async fn slack_post_message(
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::Handler(format!("Slack API error: {e}")))?;
+            .map_err(|error| {
+                // Keep request URLs and any provider-controlled source text out
+                // of logs; the bounded kind is sufficient for operations.
+                Error::Handler(format!(
+                    "Slack chat.postMessage failed (transport:{})",
+                    transport_error_kind(&error)
+                ))
+            })?;
         let status = resp.status();
-        last = resp
-            .json::<Value>()
-            .await
-            .map_err(|e| Error::Handler(format!("Slack response decode: {e}")))?;
-        if !status.is_success() || last.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let error = last
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown_error");
+        if !status.is_success() {
             return Err(Error::Handler(format!(
-                "Slack chat.postMessage failed ({status}): {error}"
+                "Slack chat.postMessage failed (HTTP {status})"
             )));
+        }
+        last = resp.json::<Value>().await.map_err(|error| {
+            Error::Handler(format!(
+                "Slack chat.postMessage failed (response:{})",
+                transport_error_kind(&error)
+            ))
+        })?;
+        if last.get("ok").and_then(Value::as_bool) != Some(true) {
+            // Slack's `error` string is provider-controlled and can reflect
+            // sensitive input. Do not carry it into the loggable error.
+            return Err(Error::Handler(
+                "Slack chat.postMessage rejected (HTTP 200)".into(),
+            ));
         }
     }
     Ok(last)
@@ -697,7 +725,11 @@ mod tests {
         }
     }
 
-    async fn spawn_fake_provider(response_body: &'static str, delay: Duration) -> FakeProvider {
+    async fn spawn_fake_provider(
+        status: &'static str,
+        response_body: &'static str,
+        delay: Duration,
+    ) -> FakeProvider {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fake provider");
@@ -716,7 +748,7 @@ mod tests {
                     .push(String::from_utf8_lossy(&bytes[..count]).to_string());
                 tokio::time::sleep(delay).await;
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
                     response_body.len()
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
@@ -1049,7 +1081,8 @@ mod tests {
 
     #[tokio::test]
     async fn slow_chat_is_acknowledged_before_the_turn_finishes() {
-        let provider = spawn_fake_provider(r#"{"ok":true}"#, Duration::from_millis(200)).await;
+        let provider =
+            spawn_fake_provider("200 OK", r#"{"ok":true}"#, Duration::from_millis(200)).await;
         let bus = bus_with_secret(SECRET);
         bus.on("vault::get", |payload| {
             Ok(json!({
@@ -1229,7 +1262,7 @@ mod tests {
 
     #[tokio::test]
     async fn positive_reply_posts_once_to_fake_provider() {
-        let provider = spawn_fake_provider(r#"{"ok":true}"#, Duration::ZERO).await;
+        let provider = spawn_fake_provider("200 OK", r#"{"ok":true}"#, Duration::ZERO).await;
         let bus = bus_with_secret(SECRET);
         bus.on("vault::get", |payload| {
             Ok(json!({
@@ -1337,5 +1370,51 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), admission.shutdown())
             .await
             .expect("owned task shutdown timed out");
+    }
+
+    #[tokio::test]
+    async fn slack_transport_error_omits_request_url() {
+        // TCP port 0 is reserved and cannot have a listening peer.
+        let base_url = "http://127.0.0.1:0".to_string();
+        let api = SlackApi {
+            client: reqwest::Client::new(),
+            base_url: base_url.clone(),
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            slack_post_message(&api, "fake-token", "C1", "safe text", None),
+        )
+        .await
+        .expect("refused loopback request timed out")
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !error.contains(&base_url),
+            "transport error exposed request URL"
+        );
+        assert!(
+            error.contains("transport:connect"),
+            "transport error lost bounded failure kind"
+        );
+    }
+
+    #[tokio::test]
+    async fn slack_http_error_never_echoes_provider_error() {
+        const REFLECTED_SECRET: &str = "reflected-secret-marker";
+        let body = r#"{"ok":false,"error":"reflected-secret-marker"}"#;
+        let provider = spawn_fake_provider("502 Bad Gateway", body, Duration::ZERO).await;
+        let api = SlackApi {
+            client: reqwest::Client::new(),
+            base_url: provider.base_url.clone(),
+        };
+        let error = slack_post_message(&api, "fake-token", "C1", "safe text", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains(REFLECTED_SECRET),
+            "HTTP error echoed provider-controlled marker"
+        );
+        assert!(error.contains("502"), "HTTP error lost actionable status");
     }
 }
