@@ -11,6 +11,10 @@ on:
 # GITHUB_TOKEN, so it needs no scope here.
 permissions: {}
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -25,6 +29,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -116,6 +121,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -162,6 +168,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
@@ -174,6 +181,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       TARGET_OS: linux
       TARGET_ARCH: x86_64
@@ -189,17 +197,24 @@ jobs:
       - name: stage and inspect isolated bundle
         run: |
           set -euo pipefail
-          version="0.1.0"
+          # Derive the release identity from Cargo.toml [workspace.package]; WP-F's
+          # release bump must flow into this bundle without a second version edit.
+          version="$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p&&/^version *=/{gsub(/^version *= *"|"$/,"",$0);print;exit}' Cargo.toml)"
+          [[ -n "$version" ]] || { echo "::error::workspace package version missing"; exit 1; }
           asset="agentos-${version}-${TARGET_ARCH}-${TARGET_OS}"
           stage="$RUNNER_TEMP/$asset"
           archive="$RUNNER_TEMP/$asset.tar.gz"
           checksum="$archive.sha256"
-          mkdir -p "$stage/bin" "$stage/runtime/target/release" "$HOME" "$AGENTOS_HOME" "$BIN_DIR"
+          mkdir -p "$stage/bin" "$stage/runtime/target/release" "$stage/runtime/workers" "$HOME" "$AGENTOS_HOME" "$BIN_DIR"
           install -m 0755 target/release/agentos "$stage/bin/agentos"
           install -m 0755 target/release/agentos-tui "$stage/bin/agentos-tui"
+          # `agentos` resolves the daemon beside its own installed executable.
+          install -m 0755 target/release/agentos-bus-authd "$stage/bin/agentos-bus-authd"
+          cp .env.example "$stage/runtime/.env.example"
           cp .iii-version "$stage/runtime/.iii-version"
           cp config.yaml "$stage/runtime/config.yaml"
           cp iii.lock "$stage/runtime/iii.lock"
+          cp workers/env.allowlist "$stage/runtime/workers/env.allowlist"
           cp -R config agents hands identity integrations plugin workflows "$stage/runtime/"
           while IFS= read -r manifest; do
             destination="$stage/runtime/$(dirname "$manifest")"
@@ -223,9 +238,12 @@ jobs:
           for required in \
             ./bin/agentos \
             ./bin/agentos-tui \
+            ./bin/agentos-bus-authd \
+            ./runtime/.env.example \
             ./runtime/.iii-version \
             ./runtime/config.yaml \
             ./runtime/iii.lock \
+            ./runtime/workers/env.allowlist \
             ./runtime/workers/agent-core/iii.worker.yaml \
             ./runtime/target/release/agentos-agent-core \
             ./runtime/workers/embedding/main.py \
@@ -241,6 +259,14 @@ jobs:
             || { echo "::error::packaged agentos is not executable"; stat "$extract/bin/agentos"; exit 1; }
           [[ -x "$extract/bin/agentos-tui" ]] \
             || { echo "::error::packaged agentos-tui is not executable"; stat "$extract/bin/agentos-tui"; exit 1; }
+          [[ -x "$extract/bin/agentos-bus-authd" ]] \
+            || { echo "::error::packaged agentos-bus-authd is not executable"; stat "$extract/bin/agentos-bus-authd"; exit 1; }
+          cmp -s .env.example "$extract/runtime/.env.example" \
+            || { echo "::error::packaged .env.example mismatch"; exit 1; }
+          cmp -s iii.lock "$extract/runtime/iii.lock" \
+            || { echo "::error::packaged iii.lock mismatch"; exit 1; }
+          cmp -s workers/env.allowlist "$extract/runtime/workers/env.allowlist" \
+            || { echo "::error::packaged env.allowlist mismatch"; exit 1; }
           [[ "$(cat "$extract/runtime/.iii-version")" == "$(cat .iii-version)" ]] \
             || { echo "::error::packaged iii version mismatch"; exit 1; }
           [[ -f "$extract/runtime/config.yaml" ]] \
@@ -254,6 +280,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
@@ -267,6 +294,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: website
@@ -285,6 +313,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: shellcheck --severity=warning scripts/install.sh scripts/dev-up.sh scripts/desktop-up.sh scripts/memworkr-sync.sh website/public/install.sh scripts/install-iii.sh scripts/boot-smoke.sh
@@ -294,6 +323,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -345,6 +375,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: "assert no sandbox:: registration"
@@ -361,9 +392,14 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: rust
     env:
       AGENTOS_API_KEY: ci-smoke-key
+      AUDIT_HMAC_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      AGENTOS_E2E_FAKE_PROVIDER: "1"
+      ANTHROPIC_API_KEY: agentos-e2e-fake-anthropic-key
+      AGENTOS_ANTHROPIC_BASE_URL: http://127.0.0.1:39091
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -410,6 +446,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p data
+          export IIIWORKER_DISABLE_BUILTIN_DAEMONS=1
+          ./target/release/agentos-bus-authd --config=config.yaml > bus-auth.log 2>&1 &
+          BUS_AUTH_PID=$!
+          echo "BUS_AUTH_PID=$BUS_AUTH_PID" >> "$GITHUB_ENV"
+          for _ in {1..60}; do
+            timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/49129" 2>/dev/null && break
+            kill -0 "$BUS_AUTH_PID" 2>/dev/null || { cat bus-auth.log; exit 1; }
+            sleep 0.25
+          done
+          timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/49129" 2>/dev/null \
+            || { echo "::error::bus-auth daemon never opened before iii"; cat bus-auth.log; exit 1; }
           iii --config config.yaml > engine.log 2>&1 &
           ENGINE_PID=$!
           echo "ENGINE_PID=$ENGINE_PID" >> "$GITHUB_ENV"
@@ -475,7 +522,7 @@ jobs:
           III_URL: ws://localhost:49134
         run: >-
           bunx vitest --run --config vitest.e2e.config.ts e2e/full-stack.test.ts
-          --testNamePattern="realm::create|mission::create|security::scan_injection|wasm::list_modules"
+          --testNamePattern="local fake Anthropic provider|realm::create|mission::create|security::scan_injection|wasm::list_modules"
 
       - name: "assert wasm:: + sandbox:: coexist (no namespace clash)"
         run: |
@@ -505,12 +552,14 @@ jobs:
         run: |
           pkill -f 'agentos-' || true
           if [ -n "${ENGINE_PID:-}" ]; then kill "$ENGINE_PID" || true; fi
+          if [ -n "${BUS_AUTH_PID:-}" ]; then kill "$BUS_AUTH_PID" || true; fi
 
   e2e-full:
     name: e2e full (main branch, credentials required)
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: e2e-smoke
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'wunitb/unitb-iii-agentos' && vars.AGENTOS_FULL_E2E_ENABLED == 'true' }}
     steps:
@@ -549,10 +598,22 @@ jobs:
       - name: start engine + workers
         env:
           AGENTOS_API_KEY: ${{ secrets.AGENTOS_API_KEY }}
+          AUDIT_HMAC_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p data
+          export IIIWORKER_DISABLE_BUILTIN_DAEMONS=1
+          ./target/release/agentos-bus-authd --config=config.yaml > bus-auth.log 2>&1 &
+          BUS_AUTH_PID=$!
+          echo "BUS_AUTH_PID=$BUS_AUTH_PID" >> "$GITHUB_ENV"
+          for _ in {1..60}; do
+            timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/49129" 2>/dev/null && break
+            kill -0 "$BUS_AUTH_PID" 2>/dev/null || { cat bus-auth.log; exit 1; }
+            sleep 0.25
+          done
+          timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/49129" 2>/dev/null \
+            || { echo "::error::bus-auth daemon never opened before iii"; cat bus-auth.log; exit 1; }
           iii --config config.yaml > engine.log 2>&1 &
           ENGINE_PID=$!
           echo "ENGINE_PID=$ENGINE_PID" >> "$GITHUB_ENV"
@@ -603,3 +664,4 @@ jobs:
         run: |
           pkill -f 'agentos-' || true
           if [ -n "${ENGINE_PID:-}" ]; then kill "$ENGINE_PID" || true; fi
+          if [ -n "${BUS_AUTH_PID:-}" ]; then kill "$BUS_AUTH_PID" || true; fi

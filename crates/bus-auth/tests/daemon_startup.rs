@@ -62,16 +62,16 @@ fn a_named_config_that_cannot_be_read_stops_the_daemon() {
     );
 }
 
-/// The overlay this repository ships, with one hook id typo'd — the exact edit
-/// the engine accepts in silence.
+/// The default config this repository ships, with one hook id typo'd — the exact
+/// edit the engine accepts in silence.
 #[test]
 fn an_armed_config_the_daemon_cannot_honour_stops_it() {
-    let overlay = std::fs::read_to_string(repository_root().join("bus-rbac.overlay.yaml"))
-        .expect("read bus-rbac.overlay.yaml");
+    let config =
+        std::fs::read_to_string(repository_root().join("config.yaml")).expect("read config.yaml");
     let broken = std::env::temp_dir().join("agentos-bus-auth-startup-typo.yaml");
     std::fs::write(
         &broken,
-        overlay.replace(
+        config.replace(
             "auth_function_id: agentos::bus_auth",
             "auth_function_idd: agentos::bus_auth",
         ),

@@ -10,9 +10,9 @@
 # Regenerate (iii 0.22.1, ~40 s):
 #   1. cargo +1.90 build -p agentos-bus-auth
 #   2. AGENTOS_API_KEY=<key> RUST_LOG=debug agentos-bus-authd --listen=127.0.0.1:49129
-#   3. boot `iii` with this repo's config.yaml plus the rbac + iii-bridge block
-#      from /tmp/agentos-remediation/requests/bus-rbac.md (do NOT set
-#      IIIWORKER_DISABLE_BUILTIN_DAEMONS: `worker::*` comes from iii-worker-ops)
+#   3. boot `iii` with this repo's default-armed config.yaml after the daemon is
+#      listening (do NOT set IIIWORKER_DISABLE_BUILTIN_DAEMONS when regenerating
+#      this historical superset: `worker::*` comes from iii-worker-ops)
 #   4. grep the daemon log:
 #        sed -n 's/.*allowed function registration function_id=\([^ ]*\).*/\1/p' \
 #          authd.log | sort -u

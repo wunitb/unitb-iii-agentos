@@ -3,8 +3,8 @@
 # The `configuration` worker is the source of truth for every other worker's
 # settings: each `- name: X` entry below reads its value from ./config/X.yaml.
 # Inline `config:` blocks on those entries are no longer read — change a value
-# with `iii config set X` (or the `configuration::set` function) at runtime, or
-# by editing ./config/X.yaml.
+# by editing ./config/X.yaml. Runtime `configuration::set` is restricted to an
+# authenticated bus client; the bare `iii config set X` CLI is untrusted.
 
 workers:
   # The engine's own WebSocket bus (the socket every worker connects to). It is
@@ -23,13 +23,38 @@ workers:
   - name: iii-worker-manager
     config:
       host: 127.0.0.1
-      # Bus RBAC is NOT armed here. It is fail-closed by design, so an armed
-      # config with no `agentos-bus-authd` listening refuses every worker
-      # connection and the stack does not come up — which is what the documented
-      # `iii --config config.yaml` path would do on a clean clone. The opt-in
-      # overlay and its instructions live in `bus-rbac.overlay.yaml` (repo root, so the
-      # configuration worker does not try to parse it as a worker config);
-      # `agentos up` starts the daemon and `agentos doctor` reports the state.
+      # `rbac.auth_function_id` fails closed. Every supported boot path must
+      # start `agentos-bus-authd` on 127.0.0.1:49129 before starting iii.
+      # The four hooks below gate connections, function registrations, trigger
+      # registrations, and trigger-type claims respectively.
+      rbac:
+        auth_function_id: agentos::bus_auth
+        on_function_registration_function_id: agentos::bus_on_register
+        on_trigger_registration_function_id: agentos::bus_on_trigger
+        on_trigger_type_registration_function_id: agentos::bus_on_trigger_type
+        # `forbidden_functions` returned by bus-authd narrows the untrusted tier
+        # by exact id; the engine requires this global wildcard first.
+        expose_functions:
+          - match("*")
+  # Bootstrap bridge for the four RBAC hooks. The bridge registers its forward
+  # handlers before the engine bus listener starts, so the gate can authenticate
+  # the first registry-worker connection. Never point this at the engine bus.
+  - name: iii-bridge
+    config:
+      url: ws://127.0.0.1:49129
+      forward:
+        - local_function: agentos::bus_auth
+          remote_function: agentos::bus_auth
+          timeout_ms: 5000
+        - local_function: agentos::bus_on_register
+          remote_function: agentos::bus_on_register
+          timeout_ms: 5000
+        - local_function: agentos::bus_on_trigger
+          remote_function: agentos::bus_on_trigger
+          timeout_ms: 5000
+        - local_function: agentos::bus_on_trigger_type
+          remote_function: agentos::bus_on_trigger_type
+          timeout_ms: 5000
   - name: iii-http
   - name: iii-pubsub
   - name: state
