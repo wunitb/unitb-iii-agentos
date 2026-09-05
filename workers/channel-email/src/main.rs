@@ -1,3 +1,4 @@
+use agentos_http_adapter::CHAT_TIMEOUT_MS;
 use iii_sdk::errors::Error;
 use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use lettre::message::Message;
@@ -147,7 +148,7 @@ async fn handle_webhook(iii: &IIIClient, req: Value) -> Result<Value, Error> {
                 "sessionId": format!("email:{from}"),
             }),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
         .map_err(|e| Error::Handler(format!("agent::chat failed: {e}")))?;

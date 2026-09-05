@@ -175,6 +175,7 @@ name = "agentos-channel-bluesky"
 version = "0.1.0"
 dependencies = [
  "agentos-bus-auth",
+ "agentos-http-adapter",
  "anyhow",
  "chrono",
  "iii-sdk",
@@ -209,6 +210,7 @@ name = "agentos-channel-email"
 version = "0.1.0"
 dependencies = [
  "agentos-bus-auth",
+ "agentos-http-adapter",
  "anyhow",
  "hex",
  "iii-sdk",
@@ -245,6 +247,7 @@ name = "agentos-channel-mastodon"
 version = "0.1.0"
 dependencies = [
  "agentos-bus-auth",
+ "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
  "reqwest",
@@ -278,6 +281,7 @@ name = "agentos-channel-reddit"
 version = "0.1.0"
 dependencies = [
  "agentos-bus-auth",
+ "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
  "reqwest",
@@ -293,6 +297,7 @@ name = "agentos-channel-signal"
 version = "0.1.0"
 dependencies = [
  "agentos-bus-auth",
+ "agentos-http-adapter",
  "anyhow",
  "iii-sdk",
  "reqwest",

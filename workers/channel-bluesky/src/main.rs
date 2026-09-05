@@ -1,3 +1,4 @@
+use agentos_http_adapter::CHAT_TIMEOUT_MS;
 use iii_sdk::errors::Error;
 use iii_sdk::protocol::TriggerAction;
 use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
@@ -235,7 +236,7 @@ async fn webhook_handler(
                 "sessionId": format!("bluesky:{did}"),
             }),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
