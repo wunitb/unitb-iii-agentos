@@ -659,6 +659,48 @@ mod tests {
         }
     }
 
+    fn unknown_pattern_scope(
+        pattern: &syn::Pat,
+    ) -> std::collections::HashMap<String, Option<String>> {
+        let mut bindings = Vec::new();
+        pattern_bindings(pattern, &mut bindings);
+        bindings.into_iter().map(|(name, _)| (name, None)).collect()
+    }
+
+    fn condition_pattern_bindings(expression: &syn::Expr, bindings: &mut Vec<(String, bool)>) {
+        match expression {
+            syn::Expr::Let(value) => pattern_bindings(&value.pat, bindings),
+            syn::Expr::Binary(binary) => {
+                condition_pattern_bindings(&binary.left, bindings);
+                condition_pattern_bindings(&binary.right, bindings);
+            }
+            syn::Expr::Group(group) => condition_pattern_bindings(&group.expr, bindings),
+            syn::Expr::Paren(paren) => condition_pattern_bindings(&paren.expr, bindings),
+            _ => {}
+        }
+    }
+
+    fn immutable_identifier(pattern: &syn::Pat) -> Option<String> {
+        match pattern {
+            syn::Pat::Ident(identifier) if identifier.mutability.is_none() => {
+                Some(identifier.ident.to_string())
+            }
+            syn::Pat::Type(typed) => immutable_identifier(&typed.pat),
+            _ => None,
+        }
+    }
+
+    fn tuple_element_zero_identifier(pattern: &syn::Pat) -> Option<String> {
+        let pattern = match pattern {
+            syn::Pat::Type(typed) => typed.pat.as_ref(),
+            pattern => pattern,
+        };
+        let syn::Pat::Tuple(tuple) = pattern else {
+            return None;
+        };
+        immutable_identifier(tuple.elems.first()?)
+    }
+
     impl Registrations<'_> {
         /// `Some(None)` means the nearest lexical binding is known to exist but
         /// its value is unknown. Callers must stop there rather than falling
@@ -689,20 +731,6 @@ mod tests {
                             .flatten(),
                     }
                 }
-                syn::Expr::Call(call) => {
-                    let syn::Expr::Path(function) = call.func.as_ref() else {
-                        return None;
-                    };
-                    let identifier = function.path.get_ident()?.to_string();
-                    if self.lexical_value(&identifier).is_some() {
-                        return None;
-                    }
-                    self.definitions
-                        .factories
-                        .get(&identifier)
-                        .cloned()
-                        .flatten()
-                }
                 syn::Expr::Group(group) => self.resolve_expression(&group.expr),
                 syn::Expr::Paren(paren) => self.resolve_expression(&paren.expr),
                 syn::Expr::Reference(reference) => self.resolve_expression(&reference.expr),
@@ -710,11 +738,36 @@ mod tests {
             }
         }
 
+        fn resolve_factory_call(&self, expression: &syn::Expr) -> Option<String> {
+            let call = match expression {
+                syn::Expr::Call(call) => call,
+                syn::Expr::Group(group) => return self.resolve_factory_call(&group.expr),
+                syn::Expr::Paren(paren) => return self.resolve_factory_call(&paren.expr),
+                _ => return None,
+            };
+            let syn::Expr::Path(function) = call.func.as_ref() else {
+                return None;
+            };
+            let identifier = function.path.get_ident()?.to_string();
+            if self.lexical_value(&identifier).is_some() {
+                return None;
+            }
+            self.definitions
+                .factories
+                .get(&identifier)
+                .cloned()
+                .flatten()
+        }
+
         fn remember_local(&mut self, local: &syn::Local) {
-            let resolved = local
-                .init
-                .as_ref()
-                .and_then(|initializer| self.resolve_expression(&initializer.expr));
+            let resolved = local.init.as_ref().and_then(|initializer| {
+                if let Some(name) = tuple_element_zero_identifier(&local.pat) {
+                    self.resolve_factory_call(&initializer.expr)
+                        .map(|id| (name, id))
+                } else {
+                    immutable_identifier(&local.pat).zip(self.resolve_expression(&initializer.expr))
+                }
+            });
             let mut bindings = Vec::new();
             pattern_bindings(&local.pat, &mut bindings);
             let Some(scope) = self.scopes.last_mut() else {
@@ -723,11 +776,8 @@ mod tests {
             for (name, _) in &bindings {
                 scope.insert(name.clone(), None);
             }
-            if let Some((name, mutable)) = bindings.first()
-                && !mutable
-                && let Some(id) = resolved
-            {
-                scope.insert(name.clone(), Some(id));
+            if let Some((name, id)) = resolved {
+                scope.insert(name, Some(id));
             }
         }
 
@@ -834,6 +884,64 @@ mod tests {
             self.scopes.push(parameters);
             self.visit_expr(&closure.body);
             self.scopes.pop();
+        }
+
+        fn visit_expr_for_loop(&mut self, loop_expression: &'ast syn::ExprForLoop) {
+            if is_test_only(&loop_expression.attrs) {
+                return;
+            }
+            self.visit_expr(&loop_expression.expr);
+            self.scopes
+                .push(unknown_pattern_scope(&loop_expression.pat));
+            self.visit_block(&loop_expression.body);
+            self.scopes.pop();
+        }
+
+        fn visit_expr_if(&mut self, if_expression: &'ast syn::ExprIf) {
+            if is_test_only(&if_expression.attrs) {
+                return;
+            }
+            self.visit_expr(&if_expression.cond);
+            let mut bindings = Vec::new();
+            condition_pattern_bindings(&if_expression.cond, &mut bindings);
+            self.scopes
+                .push(bindings.into_iter().map(|(name, _)| (name, None)).collect());
+            self.visit_block(&if_expression.then_branch);
+            self.scopes.pop();
+            if let Some((_, else_expression)) = &if_expression.else_branch {
+                self.visit_expr(else_expression);
+            }
+        }
+
+        fn visit_expr_while(&mut self, while_expression: &'ast syn::ExprWhile) {
+            if is_test_only(&while_expression.attrs) {
+                return;
+            }
+            self.visit_expr(&while_expression.cond);
+            let mut bindings = Vec::new();
+            condition_pattern_bindings(&while_expression.cond, &mut bindings);
+            self.scopes
+                .push(bindings.into_iter().map(|(name, _)| (name, None)).collect());
+            self.visit_block(&while_expression.body);
+            self.scopes.pop();
+        }
+
+        fn visit_expr_match(&mut self, match_expression: &'ast syn::ExprMatch) {
+            if is_test_only(&match_expression.attrs) {
+                return;
+            }
+            self.visit_expr(&match_expression.expr);
+            for arm in &match_expression.arms {
+                if is_test_only(&arm.attrs) {
+                    continue;
+                }
+                self.scopes.push(unknown_pattern_scope(&arm.pat));
+                if let Some((_, guard)) = &arm.guard {
+                    self.visit_expr(guard);
+                }
+                self.visit_expr(&arm.body);
+                self.scopes.pop();
+            }
         }
 
         fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
@@ -1124,6 +1232,60 @@ mod tests {
 
         let ids = registered_function_ids_in_source(source).expect("parse fixture");
         assert!(ids.is_empty(), "ambiguous factory was guessed: {ids:?}");
+    }
+
+    #[test]
+    fn extractor_tombstones_control_flow_pattern_bindings() {
+        let source = r#"
+            fn install(runtime_ids: RuntimeIds, runtime: Runtime) {
+                let id = "fake::outer";
+                for id in runtime_ids {
+                    iii.register_function(id, handler);
+                }
+                if let Some(id) = runtime.next_id() {
+                    iii.register_function(id, handler);
+                }
+                while let Some(id) = runtime.next_id() {
+                    iii.register_function(id, handler);
+                }
+                match runtime.result() {
+                    Ok(id) => iii.register_function(id, handler),
+                    Err(_) => {}
+                }
+            }
+        "#;
+
+        let ids = registered_function_ids_in_source(source).expect("parse fixture");
+        assert!(
+            ids.is_empty(),
+            "control-flow pattern reused an outer ID: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn extractor_maps_factory_id_only_to_tuple_element_zero_identifier() {
+        let source = r#"
+            const OTHER_ID: &str = "runtime::other";
+            fn binding() -> (&'static str, &'static str) {
+                ("fake::first", OTHER_ID)
+            }
+
+            fn destructured() {
+                let (_, id) = binding();
+                iii.register_function(id, handler);
+            }
+
+            fn scalar() {
+                let pair = binding();
+                iii.register_function(pair, handler);
+            }
+        "#;
+
+        let ids = registered_function_ids_in_source(source).expect("parse fixture");
+        assert!(
+            ids.is_empty(),
+            "factory tuple was assigned to the wrong pattern: {ids:?}"
+        );
     }
 
     #[test]
