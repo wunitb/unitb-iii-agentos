@@ -47,29 +47,92 @@ with socket.socket() as probe:
 PY
 }
 
+# Print every process owned by this run. Engine-managed workers are started
+# through a short-lived `iii-worker start` helper: before it execs the cached
+# worker its argv has no scratch path, but it already inherits the scratch HOME.
+# On Linux, inspect both argv and the exact inherited environment so that late,
+# reparented helpers cannot escape the path-only sweep. The pgrep fallback keeps
+# the developer helper usable on hosts without procfs; the required CI host is
+# Linux and takes the stronger branch.
+owned_pids() {
+  if [ -d /proc ]; then
+    python3 - "$scratch" "$engine_home" "$agentos_home" "$$" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+scratch, engine_home, agentos_home = (value.encode() for value in sys.argv[1:4])
+excluded = {int(sys.argv[4]), os.getpid(), os.getppid()}
+environment_needles = (
+    b"HOME=" + engine_home + b"\0",
+    b"AGENTOS_HOME=" + agentos_home + b"\0",
+)
+for entry in Path("/proc").iterdir():
+    if not entry.name.isdigit():
+        continue
+    pid = int(entry.name)
+    if pid in excluded:
+        continue
+    try:
+        command = (entry / "cmdline").read_bytes()
+        environment = (entry / "environ").read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        continue
+    if scratch in command or any(needle in environment for needle in environment_needles):
+        print(pid)
+PY
+  else
+    pgrep -f "$scratch" 2>/dev/null || true
+  fi
+}
+
 cleanup() {
   status=$?
   trap - 0 1 2 15
+  owned_file="$scratch/owned-pids"
 
-  # Local binaries run from the scratch runtime. Engine-managed registry
-  # workers run from the scratch HOME (`$scratch/engine-home/.iii/workers`).
-  # Both therefore carry this unique path in argv; limit teardown to it and
-  # never use a repo-wide pkill.
-  signal_owned() {
+  write_owned() {
+    owned_pids > "$owned_file"
+  }
+  signal_owned_file() {
     signal=$1
-    pgrep -f "$scratch" 2>/dev/null | while IFS= read -r pid; do
+    while IFS= read -r pid; do
       [ -n "$pid" ] || continue
       kill "$signal" "$pid" 2>/dev/null || true
-    done
+    done < "$owned_file"
   }
-  if pgrep -f "$scratch" >/dev/null 2>&1; then
-    signal_owned -TERM
-    attempts=0
-    while [ "$attempts" -lt 5 ] && pgrep -f "$scratch" >/dev/null 2>&1; do
-      sleep 1
-      attempts=$((attempts + 1))
-    done
-    pgrep -f "$scratch" >/dev/null 2>&1 && signal_owned -KILL
+
+  # Freeze one ownership snapshot before killing it. In particular this stops
+  # the engine and its `iii-worker start` helpers before either can create a new
+  # detached child between the TERM sweep and the final emptiness check.
+  write_owned
+  if [ -s "$owned_file" ]; then
+    signal_owned_file -STOP
+    signal_owned_file -KILL
+  fi
+
+  # An exec already committed by a helper can appear just after the first
+  # sweep. Require three consecutive empty one-second observations, rather than
+  # treating one empty instant as quiescence, and fail closed after 15 probes.
+  attempts=0
+  quiet_observations=0
+  while [ "$attempts" -lt 15 ] && [ "$quiet_observations" -lt 3 ]; do
+    sleep 1
+    write_owned
+    if [ -s "$owned_file" ]; then
+      signal_owned_file -STOP
+      signal_owned_file -KILL
+      quiet_observations=0
+    else
+      quiet_observations=$((quiet_observations + 1))
+    fi
+    attempts=$((attempts + 1))
+  done
+  write_owned
+  if [ -s "$owned_file" ] || [ "$quiet_observations" -lt 3 ]; then
+    printf 'boot smoke: teardown could not quiesce owned processes\n' >&2
+    cat "$owned_file" >&2
+    status=1
   fi
 
   if port_is_open; then

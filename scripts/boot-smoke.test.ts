@@ -74,7 +74,12 @@ async function missingFunctionFixture(): Promise<{
     agentos,
     "#!/bin/sh\n" +
       "test \"$1 $2\" = \"up --no-tui\" || exit 64\n" +
-      "\"$PWD/target/release/agentos-agent-core\" &\n" +
+      // Model the real iii-worker helper: it is reparented after this stub
+      // exits, its argv contains no scratch path yet, and only its inherited
+      // scratch HOME proves ownership before the delayed exec.
+      "/bin/sh -c 'sleep 1; mkdir -p \"$HOME/.iii/workers\"; " +
+      "cp /bin/sleep \"$HOME/.iii/workers/provider-late\"; " +
+      "exec \"$HOME/.iii/workers/provider-late\" 60' &\n" +
       "printf '%s\\n' $! > \"$SMOKE_CHILD_PID_FILE\"\n",
   );
   await chmod(agentos, 0o755);
@@ -142,7 +147,7 @@ describe("boot smoke contract", () => {
     );
   });
 
-  it("names a missing function and cleans up the scratch runtime and its process", async () => {
+  it("names a missing function and reaps a late helper whose argv has no scratch path", async () => {
     const { exitCode, stderr, tmpRoot, childPid, portProbe } = await missingFunctionFixture();
 
     expect(exitCode).not.toBe(0);
@@ -157,6 +162,8 @@ describe("boot smoke contract", () => {
     expect(source).toMatch(/trap cleanup (?:0|EXIT)/);
     expect(source).toMatch(/if port_is_open; then[\s\S]*status=1/);
     expect(source).toContain('export HOME="$engine_home"');
+    expect(source).toContain('Path("/proc")');
+    expect(source).toMatch(/quiet_observations=.*0[\s\S]*quiet_observations.*-lt 3/);
     expect(source).toContain('rm -rf "$scratch"');
   });
 
