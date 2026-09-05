@@ -30,6 +30,20 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).expect("make executable");
 }
 
+fn write_env_policy(runtime: &Path) {
+    fs::create_dir_all(runtime.join("integrations")).expect("create integrations directory");
+    fs::write(
+        runtime.join(".env.example"),
+        "III_URL=\nAGENTOS_API_KEY=\nAGENTOS_DISABLED_WORKERS=\n",
+    )
+    .expect("write dotenv template");
+    fs::write(
+        runtime.join("workers/env.allowlist"),
+        "echo=III_URL,AGENTOS_API_KEY\n",
+    )
+    .expect("write worker env policy");
+}
+
 fn wait_for_file(path: &Path) {
     for _ in 0..100 {
         if path.is_file() {
@@ -91,6 +105,7 @@ fn run_start_with_relative_config(config_override: &str) {
         "iii: v1\nname: echo\nruntime: rust\nscripts:\n  start: echo\n",
     )
     .expect("write worker manifest");
+    write_env_policy(&runtime);
 
     let engine_pid = caller.join("engine.pid");
     let engine_cwd = caller.join("engine.cwd");
@@ -177,6 +192,7 @@ fn start_uses_relative_home_for_installed_runtime() {
         "iii: v1\nname: echo\nruntime: rust\nscripts:\n  start: echo\n",
     )
     .expect("write worker manifest");
+    write_env_policy(&runtime);
 
     let engine_cwd = caller.join("engine.cwd");
     let engine_pid = caller.join("engine.pid");
@@ -253,6 +269,7 @@ fn start_fails_closed_when_engine_exits_before_workers() {
         "iii: v1\nname: echo\nruntime: rust\nscripts:\n  start: echo\n",
     )
     .expect("write worker manifest");
+    write_env_policy(&runtime);
     write_executable(&bin.join("iii"), "#!/bin/sh\nexit 0\n");
 
     let old_path = std::env::var_os("PATH").unwrap_or_default();
@@ -285,6 +302,7 @@ fn start_fails_closed_when_worker_launch_fails() {
         "iii: v1\nname: echo\nruntime: rust\nscripts:\n  start: echo\n",
     )
     .expect("write worker manifest");
+    write_env_policy(&runtime);
     let engine_pid = root.join("engine.pid");
     write_executable(
         &bin.join("iii"),
@@ -445,4 +463,118 @@ fn doctor_does_not_create_state_or_start_processes() {
     assert_eq!(state["hint"], "create it with `agentos init`");
 
     fs::remove_dir_all(root).expect("remove temporary doctor directory");
+}
+
+fn run_copied_cli_tui(
+    label: &str,
+    dotenv_key: &str,
+    shell_key: Option<&str>,
+    expected_key: &str,
+) -> std::process::Output {
+    let root = temporary_directory(label);
+    let runtime = root.join("runtime");
+    let bin = root.join("bin");
+    let home = root.join("home");
+    fs::create_dir_all(&runtime).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(runtime.join("config.yaml"), "workers: []\n").unwrap();
+    let file_secret = "dotenv-provider-secret-must-not-leak";
+    let audit_secret = "dotenv-audit-secret-must-not-leak";
+    fs::write(
+        runtime.join(".env"),
+        format!(
+            "AGENTOS_API_KEY={dotenv_key}\nANTHROPIC_API_KEY={file_secret}\nAUDIT_HMAC_KEY={audit_secret}\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(runtime.join(".env"), fs::Permissions::from_mode(0o600)).unwrap();
+
+    let copied_cli = bin.join("agentos");
+    fs::copy(env!("CARGO_BIN_EXE_agentos"), &copied_cli).unwrap();
+    let tui = bin.join("agentos-tui");
+    write_executable(
+        &tui,
+        &format!(
+            "#!/bin/sh\n[ \"${{AGENTOS_API_KEY-}}\" = '{expected_key}' ] && selected=true || selected=false\n[ -n \"${{ANTHROPIC_API_KEY+x}}\" ] || [ -n \"${{AUDIT_HMAC_KEY+x}}\" ] && unrelated=true || unrelated=false\n[ -n \"${{HOME-}}\" ] && [ -n \"${{PATH-}}\" ] && [ -n \"${{TERM-}}\" ] && baseline=true || baseline=false\nprintf 'selected:%s\\nunrelated:%s\\nbaseline:%s\\n' \"$selected\" \"$unrelated\" \"$baseline\"\n"
+        ),
+    );
+    let mut command = Command::new(&copied_cli);
+    command
+        .arg("tui")
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-test")
+        .env("AGENTOS_HOME", &root)
+        .env("AGENTOS_CONFIG", runtime.join("config.yaml"));
+    if let Some(key) = shell_key {
+        command.env("AGENTOS_API_KEY", key);
+    }
+    let output = command.output().unwrap();
+    fs::remove_dir_all(root).unwrap();
+    output
+}
+
+#[test]
+fn standalone_tui_receives_selected_dotenv_bearer_and_no_unrelated_secrets() {
+    let output = run_copied_cli_tui(
+        "tui-dotenv-bearer",
+        "dotenv-selected-key",
+        Some("shell-key-must-lose"),
+        "dotenv-selected-key",
+    );
+    assert!(output.status.success(), "copied CLI failed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("selected:true"),
+        "TUI did not receive selected bearer"
+    );
+    assert!(
+        stdout.contains("unrelated:false"),
+        "TUI received an unrelated secret"
+    );
+    assert!(
+        stdout.contains("baseline:true"),
+        "TUI lost its process baseline"
+    );
+    for secret in [
+        "dotenv-selected-key",
+        "shell-key-must-lose",
+        "dotenv-provider-secret-must-not-leak",
+        "dotenv-audit-secret-must-not-leak",
+    ] {
+        assert!(
+            !stdout.contains(secret),
+            "TUI output disclosed supplied secret material"
+        );
+    }
+}
+
+#[test]
+fn standalone_tui_uses_inherited_bearer_when_dotenv_is_blank() {
+    let output = run_copied_cli_tui(
+        "tui-shell-bearer",
+        "\"   \"",
+        Some("inherited-selected-key"),
+        "inherited-selected-key",
+    );
+    assert!(output.status.success(), "copied CLI failed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("selected:true"),
+        "TUI did not use inherited fallback bearer"
+    );
+    assert!(
+        stdout.contains("unrelated:false"),
+        "TUI received an unrelated dotenv secret"
+    );
+    assert!(
+        stdout.contains("baseline:true"),
+        "TUI lost its process baseline"
+    );
+    assert!(
+        !stdout.contains("inherited-selected-key"),
+        "TUI output disclosed supplied secret material"
+    );
 }
