@@ -731,12 +731,39 @@ pub(crate) fn worker_binary_dir(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("target/release")
 }
 
+/// The name an AgentOS worker announces to the engine, which is the identity
+/// the engine's function registry reports back as `worker_name`.
+///
+/// It is deliberately NOT the `workers/` directory name. `config.yaml` boots
+/// engine workers of its own, and three of them — `llm-router`,
+/// `context-manager` and `cron` — share a directory name with a worker in this
+/// repo. Announcing the bare directory name put two different processes on the
+/// bus under one identity, with three consequences, all observed live on
+/// 0.22.1:
+///
+/// * `up` treated the engine's worker as "this worker is already connected"
+///   and skipped launching ours. `agentos-llm-router` never started, so
+///   `agentos::llm::complete` and `agentos::llm::route` were absent and
+///   `agent::chat` answered `function_not_found` — the whole product, on a
+///   default `agentos up`.
+/// * Which of the two won was a race with engine worker startup, so the
+///   symptom moved between machines.
+/// * iii 0.23.0 rejects a duplicate worker name outright instead of tolerating
+///   it, turning the same collision into a reconnect loop.
+///
+/// The `agentos-` prefix is the name the release binary already carries
+/// (`missing_worker_binaries` below, and `worker_binary_dir`), so the bus
+/// identity, the binary name and the operator-facing name are now one string.
+pub(crate) fn bus_identity(worker_name: &str) -> String {
+    format!("agentos-{worker_name}")
+}
+
 /// Release binaries a Rust worker needs but does not have yet.
 pub(crate) fn missing_worker_binaries(workers: &[WorkerSpec]) -> Vec<String> {
     workers
         .iter()
         .filter(|worker| worker.runtime == WorkerRuntime::Rust && worker.binary.is_none())
-        .map(|worker| format!("agentos-{}", worker.name))
+        .map(|worker| bus_identity(&worker.name))
         .collect()
 }
 
@@ -926,8 +953,10 @@ pub(crate) fn launch_workers(
             .current_dir(launch.runtime_dir)
             .envs(launch.env)
             // iii-sdk 0.22.1 otherwise falls back to hostname:pid, which is
-            // not stable enough for readiness or duplicate suppression.
-            .env("III_WORKER_NAME", &worker.name)
+            // not stable enough for readiness or duplicate suppression. The
+            // value is namespaced so it cannot collide with an engine worker
+            // of the same directory name — see `bus_identity`.
+            .env("III_WORKER_NAME", bus_identity(&worker.name))
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log.try_clone()?));
         if launch.detached {
