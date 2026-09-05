@@ -40,7 +40,7 @@ pub const KEYMAP: &[KeyBind] = &[
     },
     KeyBind {
         keys: "Esc",
-        action: "Close overlay / clear input",
+        action: "Close overlay / clear input / stop waiting locally",
     },
     KeyBind {
         keys: "Ctrl+L",
