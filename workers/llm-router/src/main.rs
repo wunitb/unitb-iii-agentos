@@ -385,8 +385,6 @@ enum Driver {
     Anthropic,
     OpenAiCompat,
     Gemini,
-    #[allow(dead_code)]
-    Bedrock,
 }
 
 fn default_providers() -> Vec<(
@@ -1385,7 +1383,7 @@ fn function_calls(driver: Driver, result: &Value, aliases: &ToolAliases) -> Vec<
                 )
             })
             .collect(),
-        Driver::OpenAiCompat | Driver::Bedrock => result["choices"]
+        Driver::OpenAiCompat => result["choices"]
             .as_array()
             .and_then(|choices| choices.first())
             .and_then(|choice| choice["message"]["tool_calls"].as_array())
@@ -1426,6 +1424,60 @@ fn function_calls(driver: Driver, result: &Value, aliases: &ToolAliases) -> Vec<
                     })
             })
             .collect(),
+    }
+}
+
+struct NormalizedProviderResponse {
+    content: String,
+    tool_calls: Vec<FunctionCall>,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+fn normalize_provider_response(
+    driver: Driver,
+    result: &Value,
+    aliases: &ToolAliases,
+) -> NormalizedProviderResponse {
+    let input_tokens = result["usage"]["input_tokens"]
+        .as_u64()
+        .or(result["usage"]["prompt_tokens"].as_u64())
+        .or(result["usageMetadata"]["promptTokenCount"].as_u64())
+        .unwrap_or(0);
+    let output_tokens = result["usage"]["output_tokens"]
+        .as_u64()
+        .or(result["usage"]["completion_tokens"].as_u64())
+        .or(result["usageMetadata"]["candidatesTokenCount"].as_u64())
+        .unwrap_or(0);
+    let content = result["content"]
+        .as_array()
+        .and_then(|blocks| {
+            blocks
+                .iter()
+                .find(|block| block["type"].as_str() == Some("text"))
+        })
+        .and_then(|block| block["text"].as_str())
+        .or_else(|| {
+            result["choices"]
+                .as_array()
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice["message"]["content"].as_str())
+        })
+        .or_else(|| {
+            result["candidates"]
+                .as_array()
+                .and_then(|candidates| candidates.first())
+                .and_then(|candidate| candidate["content"]["parts"].as_array())
+                .and_then(|parts| parts.iter().find_map(|part| part["text"].as_str()))
+        })
+        .unwrap_or("")
+        .to_string();
+
+    NormalizedProviderResponse {
+        content,
+        tool_calls: function_calls(driver, result, aliases),
+        input_tokens,
+        output_tokens,
     }
 }
 
@@ -1487,63 +1539,32 @@ async fn complete_handler(
 
     let result = match driver {
         Driver::Anthropic => call_anthropic(client, &request).await?,
-        Driver::OpenAiCompat | Driver::Bedrock => call_openai_compat(client, &request).await?,
+        Driver::OpenAiCompat => call_openai_compat(client, &request).await?,
         Driver::Gemini => call_gemini(client, &request).await?,
     };
 
     let _elapsed_ms = start.elapsed().as_millis() as u64;
 
-    let input_tokens = result["usage"]["input_tokens"]
-        .as_u64()
-        .or(result["usage"]["prompt_tokens"].as_u64())
-        .or(result["usageMetadata"]["promptTokenCount"].as_u64())
-        .unwrap_or(0);
-    let output_tokens = result["usage"]["output_tokens"]
-        .as_u64()
-        .or(result["usage"]["completion_tokens"].as_u64())
-        .or(result["usageMetadata"]["candidatesTokenCount"].as_u64())
-        .unwrap_or(0);
-
+    let normalized = normalize_provider_response(driver, &result, &tool_aliases);
     let key = format!("{}:{}", route.provider, model);
     let mut usage = state.usage.entry(key).or_insert(Usage {
         input_tokens: 0,
         output_tokens: 0,
         requests: 0,
     });
-    usage.input_tokens += input_tokens;
-    usage.output_tokens += output_tokens;
+    usage.input_tokens += normalized.input_tokens;
+    usage.output_tokens += normalized.output_tokens;
     usage.requests += 1;
 
-    let content = result["content"]
-        .as_array()
-        .and_then(|blocks| blocks.iter().find(|b| b["type"].as_str() == Some("text")))
-        .and_then(|b| b["text"].as_str())
-        .or_else(|| {
-            result["choices"]
-                .as_array()
-                .and_then(|c| c.first())
-                .and_then(|c| c["message"]["content"].as_str())
-        })
-        .or_else(|| {
-            result["candidates"]
-                .as_array()
-                .and_then(|candidates| candidates.first())
-                .and_then(|candidate| candidate["content"]["parts"].as_array())
-                .and_then(|parts| parts.iter().find_map(|part| part["text"].as_str()))
-        })
-        .unwrap_or("");
-
-    let tool_calls = function_calls(driver, &result, &tool_aliases);
-
     Ok(json!({
-        "content": content,
+        "content": normalized.content,
         "model": model,
         "provider": route.provider,
-        "toolCalls": tool_calls,
+        "toolCalls": normalized.tool_calls,
         "usage": {
-            "input": input_tokens,
-            "output": output_tokens,
-            "total": input_tokens + output_tokens,
+            "input": normalized.input_tokens,
+            "output": normalized.output_tokens,
+            "total": normalized.input_tokens + normalized.output_tokens,
         }
     }))
 }
@@ -2677,12 +2698,7 @@ mod tests {
     #[test]
     fn function_call_normalization_handles_empty_missing_and_malformed_fields() {
         let aliases = aliases(&["state::get", "state::set", "queue::publish"]);
-        for driver in [
-            Driver::Anthropic,
-            Driver::OpenAiCompat,
-            Driver::Gemini,
-            Driver::Bedrock,
-        ] {
+        for driver in [Driver::Anthropic, Driver::OpenAiCompat, Driver::Gemini] {
             assert!(function_calls(driver, &json!({}), &aliases).is_empty());
         }
 
@@ -2722,7 +2738,6 @@ mod tests {
             function_calls(Driver::OpenAiCompat, &openai, &aliases),
             expected
         );
-        assert_eq!(function_calls(Driver::Bedrock, &openai, &aliases), expected);
 
         let gemini = json!({
             "candidates": [
@@ -3394,20 +3409,6 @@ mod tests {
         assert_eq!(parts[0], "just-a-key");
     }
 
-    fn extract_anthropic_text(result: &Value) -> &str {
-        result["content"]
-            .as_array()
-            .and_then(|blocks| blocks.iter().find(|b| b["type"].as_str() == Some("text")))
-            .and_then(|b| b["text"].as_str())
-            .or_else(|| {
-                result["choices"]
-                    .as_array()
-                    .and_then(|c| c.first())
-                    .and_then(|c| c["message"]["content"].as_str())
-            })
-            .unwrap_or("")
-    }
-
     #[test]
     fn test_content_extraction_tool_use_first_then_text() {
         let result = json!({
@@ -3416,20 +3417,29 @@ mod tests {
                 {"type": "text", "text": "Here is what I found."},
             ]
         });
-        assert_eq!(extract_anthropic_text(&result), "Here is what I found.");
+        assert_eq!(
+            normalize_provider_response(Driver::Anthropic, &result, &aliases(&[])).content,
+            "Here is what I found."
+        );
     }
 
     #[test]
     fn test_content_extraction_text_only() {
         let result = json!({"content": [{"type": "text", "text": "just text"}]});
-        assert_eq!(extract_anthropic_text(&result), "just text");
+        assert_eq!(
+            normalize_provider_response(Driver::Anthropic, &result, &aliases(&[])).content,
+            "just text"
+        );
     }
 
     #[test]
     fn test_content_extraction_only_tool_use_returns_empty() {
         let result =
             json!({"content": [{"type": "tool_use", "id": "t1", "name": "x", "input": {}}]});
-        assert_eq!(extract_anthropic_text(&result), "");
+        assert_eq!(
+            normalize_provider_response(Driver::Anthropic, &result, &aliases(&[])).content,
+            ""
+        );
     }
 
     #[test]
@@ -3437,7 +3447,10 @@ mod tests {
         let result = json!({
             "choices": [{"message": {"content": "openai-style content"}}]
         });
-        assert_eq!(extract_anthropic_text(&result), "openai-style content");
+        assert_eq!(
+            normalize_provider_response(Driver::OpenAiCompat, &result, &aliases(&[])).content,
+            "openai-style content"
+        );
     }
 
     // ----- provider transport contract -------------------------------------
@@ -3666,7 +3679,12 @@ mod tests {
         )
         .await
         .expect("turn one response");
-        assert_eq!(extract_anthropic_text(&first), "turn-one reply");
+        let first_normalized =
+            normalize_provider_response(Driver::Anthropic, &first, &aliases(&[]));
+        assert_eq!(first_normalized.content, "turn-one reply");
+        assert_eq!(first_normalized.input_tokens, 3);
+        assert_eq!(first_normalized.output_tokens, 4);
+        assert!(first_normalized.tool_calls.is_empty());
         assert_eq!(first["type"], "message");
         assert_eq!(first["role"], "assistant");
         assert_eq!(first["stop_reason"], "end_turn");
@@ -3683,7 +3701,12 @@ mod tests {
         )
         .await
         .expect("turn two response");
-        assert_eq!(extract_anthropic_text(&second), "turn-two reply");
+        let second_normalized =
+            normalize_provider_response(Driver::Anthropic, &second, &aliases(&[]));
+        assert_eq!(second_normalized.content, "turn-two reply");
+        assert_eq!(second_normalized.input_tokens, 8);
+        assert_eq!(second_normalized.output_tokens, 5);
+        assert!(second_normalized.tool_calls.is_empty());
         assert_eq!(second["id"], "msg-turn-two");
         assert_eq!(second["type"], "message");
         assert_eq!(second["role"], "assistant");
