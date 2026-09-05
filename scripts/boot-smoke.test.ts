@@ -32,6 +32,7 @@ async function missingFunctionFixture(): Promise<{
   stderr: string;
   tmpRoot: string;
   childPid: number;
+  portProbe: string;
 }> {
   const root = await mkdtemp(join(tmpdir(), "agentos-boot-smoke-test-"));
   fixtureRoots.push(root);
@@ -40,6 +41,7 @@ async function missingFunctionFixture(): Promise<{
   const stub = join(root, "stub");
   const tmpRoot = join(root, "tmp");
   const childPidFile = join(root, "child.pid");
+  const portProbeFile = join(root, "port-probe.seen");
   await Promise.all([
     mkdir(scripts, { recursive: true }),
     mkdir(release, { recursive: true }),
@@ -95,7 +97,8 @@ async function missingFunctionFixture(): Promise<{
   await writeFile(
     python,
     "#!/bin/sh\n" +
-      "if [ \"$#\" -eq 1 ] && [ \"$1\" = 49134 ]; then exit 1; fi\n" +
+      "if [ \"$#\" -eq 2 ] && [ \"$1\" = - ] && [ \"$2\" = 49134 ]; then " +
+      "printf 'seen\n' > \"$SMOKE_PORT_PROBE_FILE\"; exit 1; fi\n" +
       `exec ${JSON.stringify(realPython)} \"$@\"\n`,
   );
   await chmod(python, 0o755);
@@ -108,6 +111,7 @@ async function missingFunctionFixture(): Promise<{
         PATH: `${stub}:${process.env.PATH}`,
         TMPDIR: tmpRoot,
         SMOKE_CHILD_PID_FILE: childPidFile,
+        SMOKE_PORT_PROBE_FILE: portProbeFile,
       },
       timeout: 15_000,
     });
@@ -118,7 +122,8 @@ async function missingFunctionFixture(): Promise<{
     stderr = commandError.stderr ?? "";
   }
   const childPid = Number((await readFile(childPidFile, "utf8")).trim());
-  return { exitCode, stderr, tmpRoot, childPid };
+  const portProbe = (await readFile(portProbeFile, "utf8")).trim();
+  return { exitCode, stderr, tmpRoot, childPid, portProbe };
 }
 
 afterEach(async () => {
@@ -138,10 +143,11 @@ describe("boot smoke contract", () => {
   });
 
   it("names a missing function and cleans up the scratch runtime and its process", async () => {
-    const { exitCode, stderr, tmpRoot, childPid } = await missingFunctionFixture();
+    const { exitCode, stderr, tmpRoot, childPid, portProbe } = await missingFunctionFixture();
 
     expect(exitCode).not.toBe(0);
     expect(stderr).toContain("missing function id(s): agentos::llm::complete");
+    expect(portProbe).toBe("seen");
     expect(await readdir(tmpRoot)).toEqual([]);
     expect(await processExists(childPid)).toBe(false);
   });
