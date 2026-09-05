@@ -1197,11 +1197,15 @@ fn capability_item(probes: &dyn Diagnostics) -> ReadinessItem {
 
 /// Workers `up` launches and therefore expects to see on the bus: every Rust
 /// worker in the runtime. Python workers are started by their own tooling.
+///
+/// These are bus identities (`crate::bus_identity`), not directory names, so
+/// the set is comparable to what the engine's registry reports and cannot be
+/// satisfied by an engine worker that merely shares a directory name.
 fn required_worker_ids(workers: &[WorkerSpec]) -> BTreeSet<String> {
     workers
         .iter()
         .filter(|worker| worker.runtime == WorkerRuntime::Rust)
-        .map(|worker| worker.name.clone())
+        .map(|worker| crate::bus_identity(&worker.name))
         .collect()
 }
 
@@ -1394,7 +1398,11 @@ fn up_stages(
         }
         let workers_to_start = workers
             .iter()
-            .filter(|worker| missing.binary_search(&worker.name).is_ok())
+            .filter(|worker| {
+                missing
+                    .binary_search(&crate::bus_identity(&worker.name))
+                    .is_ok()
+            })
             .cloned()
             .collect::<Vec<_>>();
         let started = effects.start_workers(&workers_to_start)?;
@@ -2021,8 +2029,20 @@ mod tests {
         }
     }
 
+    /// Identities exactly as the engine's registry reports them. Use this for
+    /// workers this stack does not own: the engine's own `llm-router`, or an
+    /// unrelated process that happens to be on the bus.
     fn ids(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    /// The same, for AgentOS workers this stack launched. They announce
+    /// `crate::bus_identity`, so a fake that reports the bare directory name is
+    /// modelling a DIFFERENT worker — which is the whole point of the
+    /// namespacing and is asserted by
+    /// `up_starts_a_local_worker_whose_directory_name_an_engine_worker_also_uses`.
+    fn ours(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| crate::bus_identity(name)).collect()
     }
 
     fn paths(config_path: &Path, discovery: ConfigDiscovery) -> RuntimePaths {
@@ -2101,7 +2121,7 @@ mod tests {
                 engine_exits_after: None,
                 stop_checks: Cell::new(0),
                 engine_start_error: None,
-                connected: RefCell::new(Some(ids(&["core", "memory"]))),
+                connected: RefCell::new(Some(ours(&["core", "memory"]))),
                 bus_auth_binary: Some(PathBuf::from("/release/agentos-bus-authd")),
                 bus_auth_healthy_from: Some(0),
                 bus_auth_probes: Cell::new(0),
@@ -2111,7 +2131,7 @@ mod tests {
                 capability_keys: Some(vec!["default".to_string()]),
                 identity_probes: Cell::new(0),
                 connected_from_probe: None,
-                connected_after_start: Some(ids(&["core", "memory"])),
+                connected_after_start: Some(ours(&["core", "memory"])),
                 workers: Ok(vec![
                     spec("core", WorkerRuntime::Rust, true),
                     spec("memory", WorkerRuntime::Rust, true),
@@ -2634,7 +2654,7 @@ mod tests {
     fn up_keeps_workers_that_are_already_connected() {
         let config = existing_config();
         let mut fake = Fake {
-            connected: RefCell::new(Some(ids(&["core", "memory"]))),
+            connected: RefCell::new(Some(ours(&["core", "memory"]))),
             ..Fake::default()
         };
         let (outcome, output) = up(&mut fake, &options(false), &config);
@@ -2651,7 +2671,7 @@ mod tests {
         let config = existing_config();
         // One of the two Rust workers is on the bus: the stack is not up.
         let mut fake = Fake {
-            connected: RefCell::new(Some(ids(&["core"]))),
+            connected: RefCell::new(Some(ours(&["core"]))),
             ..Fake::default()
         };
         let (outcome, output) = up(&mut fake, &options(false), &config);
@@ -2664,6 +2684,43 @@ mod tests {
         assert_eq!(&*fake.started_worker_names.borrow(), &["memory"]);
     }
 
+    /// Regression for the defect that took the whole product down: `config.yaml`
+    /// boots engine workers named `llm-router`, `context-manager` and `cron`,
+    /// and this repo has a `workers/` directory for each of the three. While
+    /// local workers announced the bare directory name, the engine's worker
+    /// satisfied the required identity, `up` skipped launching ours, and
+    /// `agentos::llm::complete` — registered only by our `workers/llm-router` —
+    /// was never on the bus. `agent::chat` answered `function_not_found` on a
+    /// clean `agentos up`. Modelled here with the fake's own worker names: the
+    /// engine reports `core` and `memory`, which are NOT `agentos-core` and
+    /// `agentos-memory`, so both of ours must still start.
+    #[test]
+    fn up_starts_a_local_worker_whose_directory_name_an_engine_worker_also_uses() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(Some(ids(&["core", "memory"]))),
+            connected_after_start: Some(
+                ours(&["core", "memory"])
+                    .union(&ids(&["core", "memory"]))
+                    .cloned()
+                    .collect(),
+            ),
+            ..Fake::default()
+        };
+        let (outcome, output) = up(&mut fake, &options(false), &config);
+        assert_eq!(outcome.expect("up succeeds"), UpOutcome::Ready);
+        assert_eq!(fake.events(), vec!["start_workers".to_string()]);
+        assert_eq!(
+            &*fake.started_worker_names.borrow(),
+            &["core", "memory"],
+            "an engine worker sharing a directory name must not suppress ours"
+        );
+        assert!(
+            output.contains("Starting 2 missing workers (2 connected)"),
+            "{output}"
+        );
+    }
+
     #[test]
     fn up_does_not_accept_an_unrelated_worker_count_as_readiness() {
         let config = existing_config();
@@ -2671,7 +2728,12 @@ mod tests {
         // workers are connected, but neither required identity is present.
         let mut fake = Fake {
             connected: RefCell::new(Some(ids(&["foreign-a", "foreign-b"]))),
-            connected_after_start: Some(ids(&["core", "memory", "foreign-a", "foreign-b"])),
+            connected_after_start: Some(
+                ours(&["core", "memory"])
+                    .union(&ids(&["foreign-a", "foreign-b"]))
+                    .cloned()
+                    .collect(),
+            ),
             ..Fake::default()
         };
         let (outcome, output) = up(&mut fake, &options(false), &config);
@@ -2689,7 +2751,7 @@ mod tests {
         let config = existing_config();
         let mut fake = Fake {
             connected: RefCell::new(Some(BTreeSet::new())),
-            connected_after_start: Some(ids(&["core", "memory"])),
+            connected_after_start: Some(ours(&["core", "memory"])),
             ..Fake::default()
         };
         let (outcome, output) = up(&mut fake, &options(false), &config);
@@ -2703,7 +2765,7 @@ mod tests {
         let config = existing_config();
         let mut fake = Fake {
             connected: RefCell::new(Some(BTreeSet::new())),
-            connected_after_start: Some(ids(&["core"])),
+            connected_after_start: Some(ours(&["core"])),
             ..Fake::default()
         };
         let (outcome, _) = up(&mut fake, &options(true), &config);
@@ -2711,7 +2773,7 @@ mod tests {
             .expect_err("workers that never connect must fail")
             .to_string();
         assert!(
-            error.contains("1 worker identities are still missing within 3s: memory"),
+            error.contains("1 worker identities are still missing within 3s: agentos-memory"),
             "{error}"
         );
         assert!(error.contains("workers.log"), "{error}");
@@ -3046,20 +3108,22 @@ mod tests {
         let item = report.item("Connected").expect("connected item");
         assert!(!item.passed);
         assert!(
-            output.contains("0 connected; missing 2 of 2 required identities: core, memory"),
+            output.contains(
+                "0 connected; missing 2 of 2 required identities: agentos-core, agentos-memory"
+            ),
             "{output}"
         );
 
         // A partial stack is not ready either: one of two required workers.
         let partial = Fake {
-            connected: RefCell::new(Some(ids(&["core"]))),
+            connected: RefCell::new(Some(ours(&["core"]))),
             ..Fake::default()
         };
         let (report, output) = diagnose(&partial, ConfigDiscovery::Checkout, &config);
         let item = report.item("Connected").expect("connected item");
         assert!(!item.passed);
         assert!(
-            output.contains("1 connected; missing 1 of 2 required identities: memory"),
+            output.contains("1 connected; missing 1 of 2 required identities: agentos-memory"),
             "{output}"
         );
         assert_eq!(
@@ -3068,7 +3132,12 @@ mod tests {
         );
 
         let some = Fake {
-            connected: RefCell::new(Some(ids(&["core", "memory", "unrelated"]))),
+            connected: RefCell::new(Some(
+                ours(&["core", "memory"])
+                    .union(&ids(&["unrelated"]))
+                    .cloned()
+                    .collect(),
+            )),
             ..Fake::default()
         };
         let (report, _) = diagnose(&some, ConfigDiscovery::Checkout, &config);
@@ -3086,7 +3155,9 @@ mod tests {
         let connected = report.item("Connected").expect("connected item");
         assert!(!connected.passed);
         assert!(
-            output.contains("2 connected; missing 2 of 2 required identities: core, memory"),
+            output.contains(
+                "2 connected; missing 2 of 2 required identities: agentos-core, agentos-memory"
+            ),
             "{output}"
         );
 
@@ -3618,8 +3689,8 @@ mod tests {
         let fake = Fake {
             // The engine is up and one of the two required workers exited,
             // exactly what an unset AGENTOS_API_KEY produces.
-            connected: RefCell::new(Some(ids(&["core"]))),
-            connected_after_start: Some(ids(&["core"])),
+            connected: RefCell::new(Some(ours(&["core"]))),
+            connected_after_start: Some(ours(&["core"])),
             ..Fake::default()
         };
         let (report, output) =
@@ -3664,8 +3735,8 @@ mod tests {
     fn doctor_keeps_the_start_hint_when_the_api_key_is_present() {
         let config = existing_config();
         let fake = Fake {
-            connected: RefCell::new(Some(ids(&["core"]))),
-            connected_after_start: Some(ids(&["core"])),
+            connected: RefCell::new(Some(ours(&["core"]))),
+            connected_after_start: Some(ours(&["core"])),
             ..Fake::default()
         };
         let (report, _) = diagnose(&fake, ConfigDiscovery::Checkout, &config);

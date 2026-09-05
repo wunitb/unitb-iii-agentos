@@ -104,7 +104,7 @@ impl Fixture {
         write_executable(
             &bin.join("iii"),
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'iii 0.22.1'; exit 0; fi\nif [ \"$1\" = \"trigger\" ]; then if [ -f '{}' ]; then printf '%s\\n' '{{\"workers\":[{{\"name\":\"echo\",\"runtime\":\"rust\",\"status\":\"connected\"}}]}}'; else printf '%s\\n' '{{\"workers\":[]}}'; fi; exit 0; fi\necho started > '{}'\nexec sleep 60\n",
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'iii 0.22.1'; exit 0; fi\nif [ \"$1\" = \"trigger\" ]; then if [ -f '{}' ]; then printf '%s\\n' '{{\"workers\":[{{\"name\":\"agentos-echo\",\"runtime\":\"rust\",\"status\":\"connected\"}}]}}'; else printf '%s\\n' '{{\"workers\":[]}}'; fi; exit 0; fi\necho started > '{}'\nexec sleep 60\n",
                 worker_pid.display(),
                 engine_marker.display()
             ),
@@ -356,7 +356,7 @@ fn up_reuses_a_healthy_engine_and_starts_workers_without_the_tui() {
     assert!(wait_for_file(&fixture.worker_pid), "worker never started");
     assert_eq!(
         fs::read_to_string(&fixture.worker_env).expect("read worker environment"),
-        "from-dotenv|from-shell|echo\n"
+        "from-dotenv|from-shell|agentos-echo\n"
     );
     let first_pid = fs::read_to_string(&fixture.worker_pid).expect("read worker pid");
     assert!(
@@ -632,7 +632,7 @@ fn start_loads_the_active_dotenv_and_generates_the_api_key() {
     assert!(started, "start never launched the worker");
     assert_eq!(
         fs::read_to_string(&fixture.worker_env).expect("read worker environment"),
-        "from-dotenv|from-shell|echo\n",
+        "from-dotenv|from-shell|agentos-echo\n",
         "start must load the same dotenv as up"
     );
     let key = fixture
