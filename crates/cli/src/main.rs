@@ -57,8 +57,12 @@ enum Commands {
     /// active `.env` exactly like `up`; `up` is the one-command path and also
     /// launches the TUI.
     Start,
-    /// Stop an engine and workers started by `up`.
-    Stop,
+    /// Stop processes started by `up`. Sends SIGTERM, then escalates after a bounded grace.
+    Stop {
+        /// Seconds to wait for owned leaders to exit before SIGKILL (maximum 60).
+        #[arg(long, default_value_t = 5)]
+        grace_seconds: u64,
+    },
     Status {
         #[arg(long)]
         json: bool,
@@ -1581,10 +1585,13 @@ async fn main() -> Result<()> {
             println!("{} Stopped.", "✓".green());
         }
 
-        Commands::Stop => {
+        Commands::Stop { grace_seconds } => {
+            if grace_seconds > 60 {
+                anyhow::bail!("--grace-seconds must be between 0 and 60");
+            }
             let paths = runtime_paths()?;
             println!("{} Stopping AgentOS-owned processes...", "→".blue());
-            match lifecycle::stop_owned(&paths.agentos_home)? {
+            match lifecycle::stop_owned(&paths.agentos_home, Duration::from_secs(grace_seconds))? {
                 lifecycle::StopOutcome::NothingRecorded => {
                     println!(
                         "{} No owned process record; nothing was signalled.",
@@ -3144,9 +3151,12 @@ fn print_log_entry(entry: &Value) {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use std::io::Write as _;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn test_validate_id_valid_alphanumeric() {
@@ -3939,6 +3949,43 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove temporary workers directory");
     }
 
+    fn isolated_fixture_root(label: &str) -> PathBuf {
+        let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "agentos-{label}-{}-{sequence}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).expect("create unique fixture root");
+        root
+    }
+
+    #[cfg(unix)]
+    fn install_executable_fixture(path: &Path, source: &str) {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // The executable pathname never names an inode that is still open for
+        // writing. This prevents ETXTBSY when tests spawn fixtures in parallel.
+        let pending = path.with_extension(format!(
+            "pending-{}",
+            FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&pending)
+            .expect("create pending executable fixture");
+        file.write_all(source.as_bytes())
+            .expect("write executable fixture");
+        file.sync_all().expect("sync executable fixture");
+        drop(file);
+        std::fs::rename(&pending, path).expect("publish closed executable fixture");
+    }
+
     fn restore_test_env(name: &str, previous: Option<std::ffi::OsString>) {
         unsafe {
             match previous {
@@ -3951,25 +3998,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn agentos_engine_spawn_rebuilds_a_bounded_environment() {
-        let root = std::env::temp_dir().join(format!(
-            "agentos-engine-env-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).expect("create root");
+        let root = isolated_fixture_root("engine-env");
         let engine = root.join("iii");
         let capture = root.join("captured");
-        std::fs::write(
+        install_executable_fixture(
             &engine,
-            format!("#!/bin/sh\nenv | sort > '{}'\n", capture.display()),
-        )
-        .expect("write fake engine");
-        let mut permissions = std::fs::metadata(&engine).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&engine, permissions).unwrap();
+            &format!("#!/bin/sh\nenv | sort > '{}'\n", capture.display()),
+        );
         let log = root.join("engine.log");
         let mut child = spawn_engine(
             &engine,
@@ -4021,25 +4056,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bus_auth_spawn_receives_only_its_api_key_and_process_baseline() {
-        let root = std::env::temp_dir().join(format!(
-            "agentos-auth-env-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = isolated_fixture_root("auth-env");
         let daemon = root.join("agentos-bus-authd");
         let capture = root.join("captured");
-        std::fs::write(
+        install_executable_fixture(
             &daemon,
-            format!("#!/bin/sh\nenv | sort > '{}'\n", capture.display()),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&daemon).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&daemon, permissions).unwrap();
+            &format!("#!/bin/sh\nenv | sort > '{}'\n", capture.display()),
+        );
         let env = BTreeMap::from([
             ("AGENTOS_API_KEY".to_string(), "machine-key".to_string()),
             ("ANTHROPIC_API_KEY".to_string(), "must-not-leak".to_string()),
