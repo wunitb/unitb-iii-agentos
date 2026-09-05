@@ -93,16 +93,16 @@ fn safe_env() -> Vec<(String, String)> {
     out
 }
 
-fn validate_command(cmd: &str) -> Result<(), Error> {
-    if cmd.is_empty()
-        || cmd.contains(';')
-        || cmd.contains('|')
-        || cmd.contains('&')
-        || cmd.contains('`')
-    {
-        return Err(Error::Handler("invalid mcp command".into()));
-    }
-    Ok(())
+type McpConnectHandler = fn(&Value) -> Result<Value, Error>;
+
+fn reject_direct_connect(_input: &Value) -> Result<Value, Error> {
+    Err(Error::Handler(
+        "direct mcp::connect is disabled; use manifest-bound integration::add".into(),
+    ))
+}
+
+fn mcp_connect_binding() -> (&'static str, McpConnectHandler) {
+    ("mcp::connect", reject_direct_connect)
 }
 
 /// Variable families the dynamic loader, the C library or a language runtime
@@ -393,6 +393,20 @@ async fn list_integrations(state: Arc<State>, input: Value) -> Result<Value, Err
     Ok(json!(integrations))
 }
 
+fn manifest_connect_input(
+    manifest: &IntegrationManifest,
+    environment: serde_json::Map<String, Value>,
+) -> Value {
+    json!({
+        "name": manifest.id,
+        "transport": manifest.transport,
+        "command": manifest.command,
+        "args": manifest.args,
+        "url": manifest.url,
+        "env": environment,
+    })
+}
+
 async fn add_integration(state: Arc<State>, iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let body = input.get("body").cloned().unwrap_or(input);
     let id = body
@@ -401,19 +415,8 @@ async fn add_integration(state: Arc<State>, iii: &IIIClient, input: Value) -> Re
         .ok_or_else(|| Error::Handler("name is required".to_string()))?;
     let manifest = integration_manifest(id)?;
     let environment = integration_environment(&manifest, &body)?;
-    connect(
-        state,
-        iii,
-        json!({
-            "name": manifest.id,
-            "transport": manifest.transport,
-            "command": manifest.command,
-            "args": manifest.args,
-            "url": manifest.url,
-            "env": environment,
-        }),
-    )
-    .await
+    let connection = manifest_connect_input(&manifest, environment);
+    connect_manifest(state, iii, connection).await
 }
 
 async fn remove_integration(
@@ -502,7 +505,11 @@ async fn audit(iii: &IIIClient, kind: &str, detail: Value) {
     });
 }
 
-async fn connect(state: Arc<State>, iii: &IIIClient, input: Value) -> Result<Value, Error> {
+async fn connect_manifest(
+    state: Arc<State>,
+    iii: &IIIClient,
+    input: Value,
+) -> Result<Value, Error> {
     let body = input.get("body").cloned().unwrap_or(input.clone());
     let name = body["name"]
         .as_str()
@@ -541,8 +548,6 @@ async fn connect(state: Arc<State>, iii: &IIIClient, input: Value) -> Result<Val
         let cmd_str = command
             .as_deref()
             .ok_or_else(|| Error::Handler("stdio transport requires command".into()))?;
-        validate_command(cmd_str)?;
-
         let mut child_cmd = Command::new(cmd_str);
         if let Some(ref a) = args {
             child_cmd.args(a);
@@ -982,19 +987,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
     let state = Arc::new(State::default());
 
-    {
-        let state = state.clone();
-        let iii_for_fn = iii.clone();
-        iii.register_function(
-            "mcp::connect",
-            RegisterFunction::new_async(move |input: Value| {
-                let state = state.clone();
-                let iii = iii_for_fn.clone();
-                async move { connect(state, &iii, input).await }
-            })
-            .description("Connect to an MCP server via stdio or SSE"),
-        );
-    }
+    let (mcp_connect_id, mcp_connect_handler) = mcp_connect_binding();
+    iii.register_function(
+        mcp_connect_id,
+        RegisterFunction::new_async(move |input: Value| async move { mcp_connect_handler(&input) })
+            .description(
+                "Direct MCP connections are disabled; use manifest-bound integration::add",
+            ),
+    );
 
     {
         let state = state.clone();
@@ -1439,5 +1439,62 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("is not declared"));
+    }
+
+    #[test]
+    fn mcp_connect_binding_routes_the_public_id_to_the_fail_closed_handler() {
+        let (function_id, handler) = mcp_connect_binding();
+        assert_eq!(function_id, "mcp::connect");
+        let error = handler(&json!({
+            "command": "/bin/sh",
+            "args": ["-c", "touch /tmp/must-not-run"],
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("integration::add"), "{error}");
+    }
+
+    #[test]
+    fn internal_connection_plan_comes_only_from_the_curated_manifest() {
+        let manifest = test_manifest();
+        let environment = integration_environment(
+            &manifest,
+            &json!({ "env": { "AGENTOS_TEST_REQUIRED_9C3A": "secret" } }),
+        )
+        .unwrap();
+        let plan = manifest_connect_input(&manifest, environment);
+        assert_eq!(plan["name"], "test");
+        assert_eq!(plan["command"], "test");
+        assert_eq!(plan["args"], json!([]));
+        assert_eq!(plan["env"]["AGENTOS_TEST_REQUIRED_9C3A"], "secret");
+    }
+
+    #[test]
+    fn direct_connect_rejects_shell_interpreter_and_arbitrary_executables_before_spawn() {
+        for request in [
+            json!({
+                "name": "shell",
+                "transport": "stdio",
+                "command": "/bin/sh",
+                "args": ["-c", "touch /tmp/must-not-run"],
+            }),
+            json!({
+                "name": "python",
+                "transport": "stdio",
+                "command": "python",
+                "args": ["-c", "open('/tmp/must-not-run', 'w').close()"],
+            }),
+            json!({
+                "name": "arbitrary",
+                "transport": "stdio",
+                "command": "/opt/caller/chosen-executable",
+                "args": ["--do-anything"],
+            }),
+        ] {
+            let error = reject_direct_connect(&request)
+                .expect_err("the public direct-connect path must fail before spawn")
+                .to_string();
+            assert!(error.contains("integration::add"), "{error}");
+        }
     }
 }

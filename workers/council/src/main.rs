@@ -1,3 +1,7 @@
+use agentos_http_adapter::{
+    TriggerBus,
+    state::{set_op, update_errors, update_payload},
+};
 use iii_sdk::errors::Error;
 use iii_sdk::{
     IIIClient, RegisterFunction,
@@ -285,6 +289,28 @@ async fn list_proposals(
     }))
 }
 
+async fn update_agent_status(
+    iii: &dyn TriggerBus,
+    agent_id: &str,
+    status: &str,
+) -> Result<(), Error> {
+    let response = iii
+        .trigger(TriggerRequest {
+            function_id: "state::update".to_string(),
+            payload: update_payload("agents", agent_id, vec![set_op("status", json!(status))]),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|error| Error::Handler(format!("failed to update agent state: {error}")))?;
+    if let Some(errors) = update_errors(&response) {
+        return Err(Error::Handler(format!(
+            "failed to update agent state: {errors}"
+        )));
+    }
+    Ok(())
+}
+
 async fn override_agent(iii: &IIIClient, req: OverrideRequest) -> Result<Value, Error> {
     let new_status = match req.action.as_str() {
         "pause" => "paused",
@@ -293,19 +319,7 @@ async fn override_agent(iii: &IIIClient, req: OverrideRequest) -> Result<Value, 
         other => return Err(Error::Handler(format!("unknown override action: {other}"))),
     };
 
-    iii.trigger(TriggerRequest {
-        function_id: "state::update".to_string(),
-        payload: json!({
-            "scope": "agents",
-            "key": &req.target_agent_id,
-            "path": "status",
-            "value": new_status,
-        }),
-        action: None,
-        timeout_ms: None,
-    })
-    .await
-    .map_err(|e| Error::Handler(format!("failed to update agent state: {e}")))?;
+    update_agent_status(iii, &req.target_agent_id, new_status).await?;
 
     let _ = log_activity(
         iii,
@@ -589,4 +603,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     iii.shutdown_async().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentos_http_adapter::BusFuture;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingBus {
+        calls: Mutex<Vec<TriggerRequest>>,
+        response: Mutex<Value>,
+    }
+
+    impl RecordingBus {
+        fn set_response(&self, response: Value) {
+            *self.response.lock().unwrap() = response;
+        }
+
+        fn calls(&self) -> Vec<TriggerRequest> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl TriggerBus for RecordingBus {
+        fn trigger(&self, request: TriggerRequest) -> BusFuture<'_> {
+            self.calls.lock().unwrap().push(request);
+            let response = self.response.lock().unwrap().clone();
+            Box::pin(async move { Ok(response) })
+        }
+    }
+
+    #[tokio::test]
+    async fn override_status_dispatches_engine_ops_and_propagates_per_op_errors() {
+        let bus = RecordingBus::default();
+        bus.set_response(json!({ "errors": [] }));
+        update_agent_status(&bus, "agent-1", "paused")
+            .await
+            .unwrap();
+        let calls = bus.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function_id, "state::update");
+        assert_eq!(
+            calls[0].payload,
+            json!({
+                "scope": "agents",
+                "key": "agent-1",
+                "ops": [{ "type": "set", "path": "status", "value": "paused" }],
+            })
+        );
+
+        bus.set_response(json!({ "errors": [{ "code": "set.path.invalid" }] }));
+        let error = update_agent_status(&bus, "agent-2", "terminated")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("set.path.invalid"), "{error}");
+    }
 }
