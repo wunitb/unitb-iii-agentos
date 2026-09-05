@@ -6,6 +6,7 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
+BUS_AUTH_PORT=49129
 ENGINE_PORT=49134
 BOOT_TIMEOUT_SECONDS=${AGENTOS_BOOT_SMOKE_TIMEOUT:-120}
 STAGE_TIMEOUT_SECONDS=${AGENTOS_BOOT_SMOKE_STAGE_TIMEOUT:-45}
@@ -25,6 +26,14 @@ configuration::set
 agent::chat
 integration::add
 integration::remove
+pulse::register
+pulse::invoke
+pulse::status
+pulse::toggle
+swarm::create
+swarm::broadcast
+swarm::dissolve
+a2a::handle_task
 '
 WORKER_MUTATION_FUNCTION_IDS='
 worker::add
@@ -48,9 +57,11 @@ assert_untrusted_denied() {
     fail "untrusted call unexpectedly reached $function_id"
   fi
   if ! grep -F "$function_id" "$output" >/dev/null 2>&1 \
-    || ! grep -F 'not allowed' "$output" >/dev/null 2>&1; then
+    || ! grep -F 'not allowed' "$output" >/dev/null 2>&1 \
+    || ! grep -F 'FORBIDDEN' "$output" >/dev/null 2>&1 \
+    || ! grep -F 'remove from rbac.forbidden_functions' "$output" >/dev/null 2>&1; then
     cat "$output" >&2
-    fail "$function_id failed for a reason other than the RBAC deny"
+    fail "$function_id failed for a reason other than the exact engine RBAC deny"
   fi
   printf 'boot smoke: ok: untrusted %s denied\n' "$function_id"
 }
@@ -71,7 +82,8 @@ worker_mutations_file="$scratch/worker-mutations.txt"
 mkdir -p "$runtime/target/release" "$agentos_home" "$engine_home"
 
 port_is_open() {
-  python3 - "$ENGINE_PORT" <<'PY'
+  port=$1
+  python3 - "$port" <<'PY'
 import socket
 import sys
 
@@ -169,10 +181,12 @@ cleanup() {
     status=1
   fi
 
-  if port_is_open; then
-    printf 'boot smoke: teardown left engine port %s occupied\n' "$ENGINE_PORT" >&2
-    status=1
-  fi
+  for port in "$BUS_AUTH_PORT" "$ENGINE_PORT"; do
+    if port_is_open "$port"; then
+      printf 'boot smoke: teardown left boundary port %s occupied\n' "$port" >&2
+      status=1
+    fi
+  done
   rm -rf "$scratch"
   exit "$status"
 }
@@ -181,7 +195,10 @@ trap 'exit 129' 1
 trap 'exit 130' 2
 trap 'exit 143' 15
 
-port_is_open && fail "engine port $ENGINE_PORT is already occupied before the smoke run"
+for port in "$BUS_AUTH_PORT" "$ENGINE_PORT"; do
+  port_is_open "$port" \
+    && fail "boundary port $port is already occupied before the smoke run"
+done
 
 # This is the portable runtime layout produced by release.yml and validated by
 # the portable-bundle CI job. Copying it keeps every engine and worker write in
@@ -222,7 +239,9 @@ LC_ALL=C sort -u -o "$expected_workers_file" "$expected_workers_file"
 export HOME="$engine_home"
 export AGENTOS_HOME="$agentos_home"
 export III_URL="ws://127.0.0.1:$ENGINE_PORT"
-export IIIWORKER_DISABLE_BUILTIN_DAEMONS=1
+# The product launcher must force this only on its iii child. Clear inherited
+# state so the absence of worker::* proves the launcher contract, not this test.
+unset IIIWORKER_DISABLE_BUILTIN_DAEMONS
 # Exercise first-run key generation. The generated key stays in the isolated
 # runtime .env; this parent shell remains credential-less for the probes below.
 unset AGENTOS_API_KEY

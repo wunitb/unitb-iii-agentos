@@ -34,8 +34,8 @@ const DEFAULT_ENGINE_BUS_PORT: u16 = 49134;
 /// What the daemon found in the config it was pointed at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateStatus {
-    /// No `rbac:` block on `iii-worker-manager`: the gate is off, which is the
-    /// shipped default and not an error.
+    /// No `rbac:` block on `iii-worker-manager`: the gate is off. This is valid
+    /// for diagnostics of legacy/custom configs, but it is not the shipped default.
     NotArmed,
     /// Armed and consistent with what this daemon serves.
     Armed,

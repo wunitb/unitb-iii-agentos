@@ -256,6 +256,17 @@ pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
     "security::docker_exec",
     "hand::trigger",
     "task::spawn_workers",
+    // Externally reachable deputies. Pulse tick stays allowed because it is an
+    // engine registration target whose worker validates trusted engine metadata.
+    // The control/status surface and all swarm/A2A dispatch stay principal-only. (A)(B)(C)
+    "pulse::register",
+    "pulse::invoke",
+    "pulse::status",
+    "pulse::toggle",
+    "swarm::create",
+    "swarm::broadcast",
+    "swarm::dissolve",
+    "a2a::handle_task",
     // authorization, approval and audit state. (B) `agent::create` is the second
     // writer of the contract I1 capability document; denying only
     // `security::set_capabilities` would leave the door next to it open. An
@@ -697,6 +708,35 @@ mod tests {
     }
 
     #[test]
+    fn external_deputy_entrypoints_are_exact_denies_but_pulse_tick_stays_registrable() {
+        let untrusted = auth_result(&headers(json!({})), Some("secret"));
+        let forbidden = untrusted["forbidden_functions"].as_array().unwrap();
+        for id in [
+            "pulse::register",
+            "pulse::invoke",
+            "pulse::status",
+            "pulse::toggle",
+            "swarm::create",
+            "swarm::broadcast",
+            "swarm::dissolve",
+            "a2a::handle_task",
+        ] {
+            assert!(
+                UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&id),
+                "external deputy entrypoint {id} is missing from the exact deny set"
+            );
+            assert!(
+                forbidden.contains(&json!(id)),
+                "external deputy entrypoint {id} is missing from the engine auth result"
+            );
+        }
+        assert!(
+            !UNTRUSTED_FORBIDDEN_FUNCTIONS.contains(&"pulse::tick"),
+            "pulse::tick is a registry target; its worker validates engine metadata"
+        );
+    }
+
+    #[test]
     fn wave_two_mutations_are_forbidden_to_untrusted_sessions() {
         let untrusted = auth_result(&headers(json!({})), Some("secret"));
         let forbidden = untrusted["forbidden_functions"].as_array().unwrap();
@@ -877,6 +917,7 @@ mod tests {
         // here. Each one below maps to a clause of the "what earns an entry"
         // rule in the constant's docs; a new family cannot be added silently.
         const JUSTIFIED_FAMILIES: &[&str] = &[
+            "a2a",           // (A)(C) task dispatch reaches a principal-scoped deputy
             "agent",         // (A) code_execute, (B) create/delete write the I1 document
             "approval",      // (B) an approval a caller grants itself is not a gate
             "control",       // (D) rehydrate replays the trigger factory
@@ -889,9 +930,11 @@ mod tests {
             "memory",        // (C) no tenancy on any of these ids
             "orchestrator",  // (A) executes a plan and writes host files
             "policy",        // (B) set_rules rewrites the rule set
+            "pulse",         // (A)(B)(C) external deputy control; tick validates metadata
             "realm",         // (B) import overwrites a realm document
             "security",      // (B) capabilities, audit chain, signing oracle
             "skillkit",      // (A) install/run spawn npx
+            "swarm",         // (A)(B) creates and dispatches a worker collective
             "taint",         // (B) declassify removes a label
             "task",          // (A) spawn_workers starts work
             "trigger",       // (D) the mint factory

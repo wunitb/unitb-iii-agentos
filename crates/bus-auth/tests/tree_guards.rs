@@ -111,11 +111,27 @@ fn bare_ci_boots_use_a_non_secret_audit_key_instead_of_the_development_fallback(
 fn e2e_smoke_is_prepared_for_the_loopback_fake_provider() {
     let workflow = std::fs::read_to_string(repository_root().join(".github/workflows/ci.yml"))
         .expect("read ci.yml");
-    assert!(workflow.contains("ANTHROPIC_API_KEY: ci-fake-key"));
-    assert!(workflow.contains("AGENTOS_ANTHROPIC_BASE_URL: http://127.0.0.1:39091"));
+    let smoke_job = workflow
+        .split("\n  e2e-smoke:\n")
+        .nth(1)
+        .expect("e2e-smoke job")
+        .split("\n  e2e-full:\n")
+        .next()
+        .expect("e2e-smoke body");
+    let job_env = smoke_job.split("    steps:\n").next().expect("job env");
+    for value in [
+        "AGENTOS_E2E_FAKE_PROVIDER: \"1\"",
+        "ANTHROPIC_API_KEY: agentos-e2e-fake-anthropic-key",
+        "AGENTOS_ANTHROPIC_BASE_URL: http://127.0.0.1:39091",
+    ] {
+        assert!(
+            job_env.contains(value),
+            "{value} must reach both the worker and test process"
+        );
+    }
     assert!(
-        workflow.contains("fake provider"),
-        "the e2e-smoke test-name pattern must select WP-E's fake-provider test"
+        smoke_job.contains("local fake Anthropic provider|realm::create"),
+        "the e2e-smoke pattern must select WP-E's exact fake-provider test and existing smoke cases"
     );
 }
 
@@ -129,11 +145,71 @@ fn boot_smoke_pins_default_armed_security_properties() {
         "WORKER_MUTATION_FUNCTION_IDS",
         "configuration::set",
         "agent::chat",
-        "IIIWORKER_DISABLE_BUILTIN_DAEMONS=1",
+        "unset IIIWORKER_DISABLE_BUILTIN_DAEMONS",
+        "BUS_AUTH_PORT=49129",
         "unset AGENTOS_API_KEY",
     ] {
         assert!(script.contains(marker), "boot smoke is missing `{marker}`");
     }
+    assert!(
+        !script.contains("export IIIWORKER_DISABLE_BUILTIN_DAEMONS=1"),
+        "smoke must prove the product launcher forces the engine flag"
+    );
+}
+
+#[test]
+fn every_ci_job_has_a_bounded_timeout() {
+    let workflow = std::fs::read_to_string(repository_root().join(".github/workflows/ci.yml"))
+        .expect("read ci.yml");
+    let jobs = workflow.split("\njobs:\n").nth(1).expect("jobs section");
+    let lines: Vec<&str> = jobs.lines().collect();
+    let starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| {
+            line.starts_with("  ") && !line.starts_with("    ") && line.trim_end().ends_with(':')
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(starts.len(), 12, "guard the complete CI job inventory");
+    for (position, start) in starts.iter().enumerate() {
+        let end = starts.get(position + 1).copied().unwrap_or(lines.len());
+        let block = lines[*start..end].join("\n");
+        assert!(
+            block.contains("timeout-minutes:"),
+            "CI job {} has no bounded timeout",
+            lines[*start].trim_end_matches(':').trim()
+        );
+    }
+}
+
+#[test]
+fn ci_only_cancels_superseded_pull_request_runs() {
+    let workflow = std::fs::read_to_string(repository_root().join(".github/workflows/ci.yml"))
+        .expect("read ci.yml");
+    assert!(workflow.contains("cancel-in-progress: ${{ github.event_name == 'pull_request' }}"));
+}
+
+#[test]
+fn portable_bundle_contains_the_runtime_security_contract() {
+    let workflow = std::fs::read_to_string(repository_root().join(".github/workflows/ci.yml"))
+        .expect("read ci.yml");
+    for required in [
+        "./bin/agentos-bus-authd",
+        "./runtime/.env.example",
+        "./runtime/iii.lock",
+        "./runtime/workers/env.allowlist",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "portable bundle does not validate {required}"
+        );
+    }
+    assert!(
+        workflow.contains(r"/^\[workspace\.package\]/"),
+        "portable bundle version must be parsed from Cargo.toml's workspace package table"
+    );
+    assert!(!workflow.contains("version=\"0.1.0\""));
 }
 
 /// The bus credential only exists if every worker actually sends it.
@@ -403,10 +479,9 @@ fn no_denied_id_is_fired_by_a_registry_worker_trigger() {
         "found only {} trigger targets - the scan is not looking at the tree",
         targets.len()
     );
-    // Wave 2 deliberately denies the credential-less `agent.inbox` queue
-    // deputy. WP-D removes that unused binding and pins authenticated deputies;
-    // until integration, name the one cross-package transition explicitly
-    // rather than weakening the deny.
+    // INTEGRATION-SEAM(WP-D): delete this exemption after WP-D removes the
+    // credential-less `agent.inbox` queue deputy. Until then, name the one
+    // cross-package transition explicitly rather than weakening the deny.
     const INTENTIONALLY_DISABLED_TARGETS: &[&str] = &["agent::chat"];
     let denied: Vec<String> = targets
         .iter()
