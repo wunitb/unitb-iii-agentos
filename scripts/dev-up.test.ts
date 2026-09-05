@@ -158,7 +158,20 @@ async function runDevUpFixture(
     const iiiStub = join(stubDir, "iii");
     await writeFile(
       iiiStub,
-      `#!/usr/bin/env bash\nif [[ "\${1:-}" == "trigger" ]]; then printf '%s\\n' ${JSON.stringify(health)}; exit 0; fi\nexit 1\n`,
+      `#!/usr/bin/env bash\n` +
+        `if [[ "\${1:-}" == "trigger" ]]; then\n` +
+        // A real health response cannot precede process startup. Preserve that
+        // causal order so the fixture does not report ready while its
+        // background memworkr has not yet written the execution marker.
+        `  for ((attempt=0; attempt<200; attempt++)); do\n` +
+        `    [[ -f ${JSON.stringify(memworkrMarker)} ]] && break\n` +
+        `    sleep 0.01\n` +
+        `  done\n` +
+        `  [[ -f ${JSON.stringify(memworkrMarker)} ]] || exit 1\n` +
+        `  printf '%s\\n' ${JSON.stringify(health)}\n` +
+        `  exit 0\n` +
+        `fi\n` +
+        `exit 1\n`,
     );
     await chmod(iiiStub, 0o755);
   }
