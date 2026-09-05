@@ -108,6 +108,39 @@ describe("chat calls keep the full bounded turn budget", () => {
     expect(forwards[0]).toMatch(/timeout_ms:\s*Some\s*\(CHAT_TIMEOUT_MS\)/);
   });
 
+  it("locks polling-only channel budgets to the canonical chat ceiling", () => {
+    // These workers intentionally have no inbound HTTP adapter. Pulling that
+    // crate in only for a constant would violate the boundary guarded by each
+    // worker's `registers_no_inbound_http_route` regression. Their local
+    // constants are therefore allowed only while they equal the canonical
+    // adapter value and while this list names the whole exception surface.
+    const canonical = read("crates/http-adapter/src/bus.rs").match(
+      /pub const CHAT_TIMEOUT_MS: u64 = ([\d_]+);/,
+    );
+    expect(canonical, "the canonical chat ceiling moved; update this guard deliberately").not.toBeNull();
+
+    const pollingOnly = [
+      "workers/channel-bluesky/src/main.rs",
+      "workers/channel-email/src/main.rs",
+      "workers/channel-mastodon/src/main.rs",
+      "workers/channel-reddit/src/main.rs",
+      "workers/channel-signal/src/main.rs",
+    ];
+    const localBudgetCallers = [...new Set(
+      chatCalls
+        .map(({ path }) => path)
+        .filter((path) => /^const CHAT_TIMEOUT_MS: u64 =/m.test(read(path))),
+    )].sort();
+    expect(localBudgetCallers).toEqual(pollingOnly);
+
+    for (const path of pollingOnly) {
+      const local = read(path).match(/^const CHAT_TIMEOUT_MS: u64 = ([\d_]+);/m);
+      expect(local, `${path} must declare its bounded local chat ceiling`).not.toBeNull();
+      expect(local![1].replaceAll("_", "")).toBe(canonical![1].replaceAll("_", ""));
+      expect(read(path)).not.toContain("agentos_http_adapter");
+    }
+  });
+
   it("scans a meaningful tree and finds the known chat surface", () => {
     expect(rustFiles.length).toBeGreaterThan(100);
     expect(rustFiles).toContain("crates/http-adapter/src/lib.rs");
