@@ -366,6 +366,7 @@ dependencies = [
  "agentos-bus-auth",
  "agentos-http-adapter",
  "anyhow",
+ "chrono",
  "hex",
  "hmac",
  "iii-sdk",

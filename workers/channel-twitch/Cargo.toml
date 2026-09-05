@@ -23,6 +23,9 @@ anyhow.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# EventSub's replay guard parses the RFC 3339 `Twitch-Eventsub-Message-Timestamp`;
+# chrono is already resolved for 20+ members, so this is an edge, not a crate.
+chrono.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 
 [dev-dependencies]

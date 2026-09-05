@@ -27,6 +27,33 @@ fn engine_ws_url() -> String {
     std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string())
 }
 
+/// Where the provider's original bytes come from, decided before any are read.
+#[derive(Debug)]
+enum RawBodySource {
+    /// The engine's `request_body` stream channel: the HTTP path.
+    Channel(StreamChannelRef),
+    /// A `rawBody` string handed over by a bus caller or a test: no HTTP
+    /// request was involved, so there is no channel to prefer.
+    Inline(Vec<u8>),
+}
+
+/// Pick the source of the raw body. The engine's channel ref always outranks
+/// an inline `rawBody`: the adapter no longer flattens `rawBody` out of the
+/// request body, but a handler must not depend on that — a channel ref that is
+/// present and unusable is a refusal, never a fall-through to caller-chosen
+/// bytes.
+fn raw_body_source(req: &Value) -> Result<RawBodySource, String> {
+    if let Some(channel) = req.get("request_body") {
+        let channel: StreamChannelRef = serde_json::from_value(channel.clone())
+            .map_err(|e| format!("request_body channel ref is malformed: {e}"))?;
+        return Ok(RawBodySource::Channel(channel));
+    }
+    if let Some(raw) = req.get("rawBody").and_then(Value::as_str) {
+        return Ok(RawBodySource::Inline(raw.as_bytes().to_vec()));
+    }
+    Err("raw request body unavailable (no request_body channel, no rawBody)".into())
+}
+
 /// The request body exactly as the provider sent it.
 ///
 /// iii 0.22.1 hands HTTP handlers a `body` that is already parsed and
@@ -34,18 +61,15 @@ fn engine_ws_url() -> String {
 /// so no signature can be checked against it. The original bytes are exposed as
 /// the `request_body` stream channel (verified live on 0.22.1, with and without
 /// bus RBAC armed: the channel is keyed by its own access key, not the bus
-/// credential). A `rawBody` string, when present, wins so an adapter that has
-/// already drained the channel — or a test — can hand the bytes over directly.
-/// Absent both, the caller refuses the request: nothing here guesses.
+/// credential), which is read whenever the engine provides it. A `rawBody`
+/// string is accepted only when there is no channel at all, so a bus caller or
+/// a test can hand the bytes over directly. Absent both, the caller refuses the
+/// request: nothing here guesses.
 async fn raw_request_body(req: &Value) -> Result<Vec<u8>, String> {
-    if let Some(raw) = req.get("rawBody").and_then(Value::as_str) {
-        return Ok(raw.as_bytes().to_vec());
-    }
-    let Some(channel) = req.get("request_body") else {
-        return Err("raw request body unavailable (no rawBody, no request_body channel)".into());
+    let channel = match raw_body_source(req)? {
+        RawBodySource::Inline(bytes) => return Ok(bytes),
+        RawBodySource::Channel(channel) => channel,
     };
-    let channel: StreamChannelRef = serde_json::from_value(channel.clone())
-        .map_err(|e| format!("request_body channel ref is malformed: {e}"))?;
     let reader = ChannelReader::new(&engine_ws_url(), &channel);
     let mut bytes = Vec::new();
     loop {
@@ -90,6 +114,31 @@ fn query_param<'a>(req: &'a Value, name: &str) -> Option<&'a str> {
             other => other.as_str(),
         });
     nested.or_else(|| req.get(name).and_then(Value::as_str))
+}
+
+/// True when `code` has exactly the shape LinkedIn documents for
+/// `challengeCode`: "a randomly generated type-4 UUID string created by
+/// LinkedIn" (https://learn.microsoft.com/en-us/linkedin/shared/api-guide/webhook-validation)
+/// — 36 characters, hex groups 8-4-4-4-12, version nibble `4`, variant nibble
+/// `8`–`b`. Case is not significant in a UUID, so both hex cases are accepted.
+///
+/// This is the only thing standing between the GET handshake and the POST
+/// signature: both are HMAC-SHA256 under the same client secret, and the POST
+/// string-to-sign is `"hmacsha256=" || body`. A challenge of that form would
+/// make the handshake sign an arbitrary body. A UUID can never start with
+/// `hmacsha256=`, contain `{`, or exceed 36 bytes, so nothing the handshake
+/// signs can be a POST string-to-sign.
+fn is_uuid_v4(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(i, &b)| match i {
+        8 | 13 | 18 | 23 => b == b'-',
+        14 => b == b'4',
+        19 => matches!(b, b'8' | b'9' | b'a' | b'b' | b'A' | b'B'),
+        _ => b.is_ascii_hexdigit(),
+    })
 }
 
 /// Compute hex-encoded HMAC-SHA256 over `body` using `secret` as the key.
@@ -406,11 +455,21 @@ async fn webhook_handler(
         .unwrap_or("POST")
         .to_uppercase();
 
-    // LinkedIn's GET challenge is query-authenticated and has no signed body.
+    // LinkedIn's GET handshake is not authenticated (LinkedIn is verifying
+    // us) and has no signed body: it asks us to HMAC the challenge under the
+    // client secret. Only a type-4 UUID is ever signed — see `is_uuid_v4` for
+    // why anything else would turn this into a signing oracle for the POST.
     if method == "GET" {
         let challenge = query_param(&input, "challengeCode").unwrap_or("");
         if challenge.is_empty() {
             return Ok(reject(400, "Missing challengeCode"));
+        }
+        if !is_uuid_v4(challenge) {
+            tracing::warn!(
+                length = challenge.len(),
+                "linkedin: refusing to sign a challengeCode that is not a type-4 UUID"
+            );
+            return Ok(reject(400, "challengeCode is not a type-4 UUID"));
         }
         let secret = get_secret(iii, CLIENT_SECRET_KEY).await;
         if secret.is_empty() {
@@ -520,6 +579,26 @@ mod tests {
         assert_eq!(query_param(&json!({}), "k"), None);
     }
     use agentos_http_adapter::fake::FakeBus;
+
+    #[test]
+    fn engine_channel_outranks_an_inline_raw_body() {
+        let channel = json!({ "channel_id": "ch-1", "access_key": "k", "direction": "read" });
+        // Both present (what a request body carrying `rawBody` would produce if
+        // the adapter let it through): the engine's channel is the source.
+        let both = json!({ "request_body": channel, "rawBody": "{\"forged\":true}" });
+        assert!(matches!(
+            raw_body_source(&both).unwrap(),
+            RawBodySource::Channel(StreamChannelRef { channel_id, .. }) if channel_id == "ch-1"
+        ));
+        // Inline alone (a bus caller or a test): accepted.
+        assert!(matches!(
+            raw_body_source(&json!({ "rawBody": "{}" })).unwrap(),
+            RawBodySource::Inline(bytes) if bytes == b"{}"
+        ));
+        // A channel ref that cannot be used is a refusal, never a fall-through.
+        assert!(raw_body_source(&json!({ "request_body": "junk", "rawBody": "{}" })).is_err());
+        assert!(raw_body_source(&json!({})).is_err());
+    }
 
     const DELIVERY: &str = r#"{"elements":[{"notificationId":"n1","entityUrn":"urn:li:msg:thread1","from":"urn:li:person:u1","event":{"com.linkedin.voyager.messaging.event.MessageEvent":{"messageBody":{"text":"hello"}}}}]}"#;
     const SECRET: &str = "linkedin-client-test-secret";
@@ -658,26 +737,97 @@ mod tests {
         assert_eq!(startup_secret(&bus, CLIENT_SECRET_KEY).await, None);
     }
 
+    /// The `challengeCode` LinkedIn's webhook-validation guide shows in its
+    /// worked example (a type-4 UUID; LinkedIn's own `challengeResponse` there
+    /// is under a client secret the guide does not publish, so the digest
+    /// below is under SECRET).
+    const DOCUMENTED_CHALLENGE: &str = "890e4665-4dfe-4ab1-b689-ed553bceeed0";
+
+    #[test]
+    fn challenge_code_must_be_a_type_4_uuid() {
+        assert!(is_uuid_v4(DOCUMENTED_CHALLENGE));
+        assert!(is_uuid_v4(&DOCUMENTED_CHALLENGE.to_uppercase()));
+        for rejected in [
+            "",
+            "challenge-123",
+            // The oracle input: the POST string-to-sign.
+            &format!("hmacsha256={DELIVERY}"),
+            // Version nibble is not 4.
+            "890e4665-4dfe-1ab1-b689-ed553bceeed0",
+            // Variant nibble outside 8–b.
+            "890e4665-4dfe-4ab1-7689-ed553bceeed0",
+            // Wrong length, wrong separators, non-hex.
+            "890e4665-4dfe-4ab1-b689-ed553bceeed",
+            "890e4665-4dfe-4ab1-b689-ed553bceeed00",
+            "890e46654dfe-4ab1-b689-ed553bceeed0-",
+            "890e4665-4dfe-4ab1-b689-ed553bceeeg0",
+            "890e4665-4dfe-4ab1-b689-ed553bceeed0\n",
+        ] {
+            assert!(!is_uuid_v4(rejected), "{rejected:?}");
+        }
+    }
+
     #[tokio::test]
-    async fn get_challenge_remains_json_hmac() {
+    async fn get_challenge_signs_a_uuid_challenge_as_json_hmac() {
         let bus = bus_with_secret(SECRET);
         let response = webhook_handler(
             &bus,
             &reqwest::Client::new(),
             json!({
                 "method": "GET",
-                "query": { "challengeCode": "challenge-123" }
+                "query": { "challengeCode": DOCUMENTED_CHALLENGE }
             }),
         )
         .await
         .unwrap();
         assert_eq!(response["status_code"], 200);
-        assert_eq!(response["body"]["challengeCode"], "challenge-123");
-        // Computed independently with Python's hmac/hashlib over challengeCode.
+        assert_eq!(response["body"]["challengeCode"], DOCUMENTED_CHALLENGE);
+        // Computed independently with Python's hmac/hashlib over the
+        // challengeCode, keyed by SECRET.
         assert_eq!(
             response["body"]["challengeResponse"],
-            "6789db0b29ee94adaa98a816dc583d86e0eea6df1799517f702f40bd912b5020"
+            "17ecb5336bf4636e1eb46345dddc2eb2f923d76ef42595d1712f55e960eb1211"
         );
+    }
+
+    #[tokio::test]
+    async fn get_challenge_is_not_a_signing_oracle_for_the_post_signature() {
+        // Same key, same algorithm: HMAC(secret, "hmacsha256=" || body) IS the
+        // POST signature for `body`. Had the handshake signed this challenge,
+        // its answer would have been exactly SIGNATURE — a valid X-LI-Signature
+        // for DELIVERY, obtainable by anyone who can reach the GET route.
+        let oracle_input = format!("hmacsha256={DELIVERY}");
+        assert_eq!(
+            hmac_sha256_hex(SECRET, oracle_input.as_bytes()).unwrap(),
+            SIGNATURE
+        );
+
+        let bus = bus_with_secret(SECRET);
+        let response = webhook_handler(
+            &bus,
+            &reqwest::Client::new(),
+            json!({
+                "method": "GET",
+                "query": { "challengeCode": oracle_input }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["status_code"], 400);
+        assert!(response["body"].get("challengeResponse").is_none());
+        assert_eq!(bus.call_count("agent::chat"), 0);
+
+        // The rejection is on shape, not on the prefix alone.
+        for challenge in ["challenge-123", "{\"elements\":[]}", &"a".repeat(36)] {
+            let response = webhook_handler(
+                &bus,
+                &reqwest::Client::new(),
+                json!({ "method": "GET", "query": { "challengeCode": challenge } }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response["status_code"], 400, "{challenge}");
+        }
     }
 
     #[test]
@@ -710,5 +860,19 @@ mod tests {
     fn returns_none_when_neither_field_present() {
         let event = json!({});
         assert_eq!(extract_message_text(&event), None);
+    }
+    #[tokio::test]
+    async fn a_caller_supplied_raw_body_does_not_replace_the_engine_channel() {
+        // A validly signed `rawBody` next to a `request_body` ref: the channel
+        // is what gets read. Here the ref is unusable, so the request is
+        // refused instead of being verified against the caller's bytes.
+        let bus = bus_with_secret(SECRET);
+        let mut req = post_request(Some(DELIVERY), Some(SIGNATURE));
+        req["request_body"] = json!("not-a-channel-ref");
+        let response = webhook_handler(&bus, &reqwest::Client::new(), req)
+            .await
+            .unwrap();
+        assert_eq!(response["status_code"], 400);
+        assert_eq!(bus.call_count("agent::chat"), 0);
     }
 }
