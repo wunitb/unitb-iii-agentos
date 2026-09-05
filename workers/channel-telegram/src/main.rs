@@ -1,13 +1,36 @@
+mod admission;
+
+use admission::{Admission, AdmissionDecision};
 use agentos_http_adapter::{CHAT_TIMEOUT_MS, TriggerBus};
 use iii_sdk::errors::Error;
 use iii_sdk::protocol::TriggerAction;
 use iii_sdk::{RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 
 const TELEGRAM_MAX_LEN: usize = 4096;
 const SECRET_TOKEN_KEY: &str = "TELEGRAM_SECRET_TOKEN";
+const MAX_IN_FLIGHT: usize = 32;
+const DEDUPE_CAPACITY: usize = 4096;
+const DEDUPE_RETENTION: Duration = Duration::from_secs(10 * 60);
+const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
+
+#[derive(Clone)]
+struct TelegramApi {
+    client: reqwest::Client,
+    base_url: String,
+}
+
+impl TelegramApi {
+    fn production(client: reqwest::Client) -> Self {
+        Self {
+            client,
+            base_url: TELEGRAM_API_BASE.to_string(),
+        }
+    }
+}
 
 fn split_message(text: &str, max_len: usize) -> Vec<String> {
     if text.chars().count() <= max_len {
@@ -118,7 +141,7 @@ async fn startup_secret(iii: &dyn TriggerBus, key: &str) -> Option<String> {
 
 async fn send_message(
     iii: &dyn TriggerBus,
-    client: &reqwest::Client,
+    api: &TelegramApi,
     chat_id: i64,
     text: &str,
 ) -> Result<(), Error> {
@@ -127,8 +150,9 @@ async fn send_message(
         return Err(Error::Handler("TELEGRAM_BOT_TOKEN not configured".into()));
     }
     for chunk in split_message(text, TELEGRAM_MAX_LEN) {
-        let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
-        let res = client
+        let url = format!("{}/bot{bot_token}/sendMessage", api.base_url);
+        let res = api
+            .client
             .post(&url)
             .header("Content-Type", "application/json")
             // Send as plain text. Telegram Markdown would need every `_`,
@@ -154,42 +178,27 @@ async fn send_message(
     Ok(())
 }
 
-async fn webhook_handler(
-    iii: &dyn TriggerBus,
-    client: &reqwest::Client,
-    input: Value,
-) -> Result<Value, Error> {
-    let secret_token = get_secret(iii, SECRET_TOKEN_KEY).await;
-    if !verify_telegram_update(&secret_token, &input) {
-        return Ok(json!({
-            "status_code": 401,
-            "body": { "error": "Missing or invalid webhook signature" },
-        }));
-    }
-
-    let update = input.get("body").cloned().unwrap_or_else(|| input.clone());
-    let message = update
-        .get("message")
-        .or_else(|| update.get("edited_message"))
-        .cloned()
-        .unwrap_or(Value::Null);
-
-    let text = message.get("text").and_then(|t| t.as_str()).unwrap_or("");
-    if text.is_empty() {
-        return Ok(json!({ "status_code": 200, "body": { "ok": true } }));
-    }
-
+/// Complete one authenticated, admitted Telegram update in the background.
+async fn process_update(
+    iii: Arc<dyn TriggerBus>,
+    api: TelegramApi,
+    message: Value,
+) -> Result<(), Error> {
+    let text = message
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let chat_id = message
         .get("chat")
-        .and_then(|c| c.get("id"))
-        .and_then(|i| i.as_i64())
+        .and_then(|chat| chat.get("id"))
+        .and_then(Value::as_i64)
         .unwrap_or(0);
     let user_id = message
         .get("from")
-        .and_then(|f| f.get("id"))
-        .and_then(|i| i.as_i64());
-
-    let agent_id = resolve_agent(iii, "telegram", &chat_id.to_string()).await;
+        .and_then(|from| from.get("id"))
+        .and_then(Value::as_i64);
+    let agent_id = resolve_agent(iii.as_ref(), "telegram", &chat_id.to_string()).await;
 
     let chat_response = iii
         .trigger(TriggerRequest {
@@ -204,16 +213,14 @@ async fn webhook_handler(
             timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
-        .map_err(|e| Error::Handler(e.to_string()))?;
+        .map_err(|error| Error::Handler(format!("agent::chat failed: {error}")))?;
 
     let reply = chat_response
         .get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string();
-
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if !reply.is_empty() {
-        send_message(iii, client, chat_id, &reply).await?;
+        send_message(iii.as_ref(), &api, chat_id, reply).await?;
     }
 
     let _ = iii
@@ -228,25 +235,91 @@ async fn webhook_handler(
             timeout_ms: None,
         })
         .await;
+    Ok(())
+}
 
-    Ok(json!({ "status_code": 200, "body": { "ok": true } }))
+/// Authenticate before reading the update, then promptly acknowledge bounded
+/// in-process admission. The owned task/dedupe set prevents duplicate turns
+/// only during this process lifetime; it is not a durable/exactly-once queue.
+async fn webhook_handler(
+    iii: Arc<dyn TriggerBus>,
+    api: TelegramApi,
+    admission: Admission,
+    input: Value,
+) -> Result<Value, Error> {
+    let secret_token = get_secret(iii.as_ref(), SECRET_TOKEN_KEY).await;
+    if !verify_telegram_update(&secret_token, &input) {
+        return Ok(json!({
+            "status_code": 401,
+            "body": { "error": "Missing or invalid webhook signature" },
+        }));
+    }
+
+    // Telegram authenticates with a header rather than a body HMAC. Do not
+    // inspect or admit the parsed body until that header has been verified.
+    let update = input.get("body").cloned().unwrap_or_else(|| input.clone());
+    let message = update
+        .get("message")
+        .or_else(|| update.get("edited_message"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let text = message
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if text.is_empty() {
+        return Ok(json!({ "status_code": 200, "body": { "ok": true } }));
+    }
+
+    let Some(update_id) = update.get("update_id").and_then(Value::as_i64) else {
+        return Ok(json!({
+            "status_code": 400,
+            "body": { "error": "Authenticated Telegram message is missing update_id" },
+        }));
+    };
+    // This worker has one configured bot/webhook token, so the admission
+    // instance itself scopes Telegram's per-bot update_id sequence.
+    let delivery_key = format!("telegram:{update_id}");
+    let task_iii = iii.clone();
+    let decision = admission.admit(delivery_key, async move {
+        if let Err(error) = process_update(task_iii, api, message).await {
+            tracing::error!(%error, "accepted Telegram delivery failed");
+        }
+    });
+    match decision {
+        AdmissionDecision::Accepted => Ok(json!({
+            "status_code": 200,
+            "body": { "accepted": true },
+        })),
+        AdmissionDecision::Duplicate => Ok(json!({
+            "status_code": 200,
+            "body": { "accepted": true, "duplicate": true },
+        })),
+        AdmissionDecision::Overloaded => Ok(json!({
+            "status_code": 503,
+            "body": { "error": "Webhook admission overloaded; retry delivery" },
+        })),
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let ws_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
-    let client = reqwest::Client::new();
+    let iii = Arc::new(register_worker(&ws_url, agentos_bus_auth::init_options()));
+    let api = TelegramApi::production(reqwest::Client::new());
+    let admission = Admission::new(MAX_IN_FLIGHT, DEDUPE_CAPACITY, DEDUPE_RETENTION);
 
     let iii_clone = iii.clone();
-    let client_clone = client.clone();
+    let api_clone = api.clone();
+    let admission_clone = admission.clone();
     iii.register_function(
         "channel::telegram::webhook",
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_clone.clone();
-            let client = client_clone.clone();
-            async move { webhook_handler(&iii, &client, input).await }
+            let api = api_clone.clone();
+            let admission = admission_clone.clone();
+            async move { webhook_handler(iii, api, admission, input).await }
         })
         .description("Handle Telegram webhook"),
     );
@@ -255,7 +328,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // deliveries exists. Without it every delivery would be refused anyway,
     // and an unauthenticated route is not worth exposing. The handler re-reads
     // the token per request, so a rotation takes effect without a restart.
-    if startup_secret(&iii, SECRET_TOKEN_KEY).await.is_some() {
+    if startup_secret(iii.as_ref(), SECRET_TOKEN_KEY)
+        .await
+        .is_some()
+    {
         agentos_http_adapter::register_http_trigger(
             &iii,
             "channel::telegram::webhook".to_string(),
@@ -272,6 +348,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("channel-telegram worker started");
     tokio::signal::ctrl_c().await?;
+    admission.shutdown().await;
     iii.shutdown_async().await;
     Ok(())
 }
@@ -280,6 +357,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use agentos_http_adapter::fake::FakeBus;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const SECRET: &str = "telegram-webhook-secret";
 
@@ -303,7 +382,7 @@ mod tests {
         })
     }
 
-    fn bus_with_secret(secret: &str) -> FakeBus {
+    fn bus_with_secret(secret: &str) -> Arc<FakeBus> {
         let bus = FakeBus::new();
         let secret = secret.to_string();
         bus.on("vault::get", move |payload| {
@@ -319,7 +398,96 @@ mod tests {
         bus.on_value("state::get", json!({ "agentId": "default" }));
         bus.on_value("agent::chat", json!({ "content": "" }));
         bus.on_value("security::audit", json!({}));
-        bus
+        Arc::new(bus)
+    }
+
+    fn test_admission() -> Admission {
+        Admission::new(4, 64, Duration::from_secs(600))
+    }
+
+    fn test_api() -> TelegramApi {
+        TelegramApi::production(reqwest::Client::new())
+    }
+
+    async fn test_handle(bus: &Arc<FakeBus>, admission: &Admission, input: Value) -> Value {
+        webhook_handler(bus.clone(), test_api(), admission.clone(), input)
+            .await
+            .unwrap()
+    }
+
+    async fn wait_for_calls(bus: &FakeBus, function_id: &str, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bus.call_count(function_id) < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background task did not make expected bus call");
+    }
+
+    struct FakeProvider {
+        base_url: String,
+        calls: Arc<AtomicUsize>,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for FakeProvider {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn spawn_fake_provider(delay: Duration) -> FakeProvider {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake provider");
+        let addr = listener.local_addr().expect("fake provider address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let task_calls = calls.clone();
+        let task_requests = requests.clone();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut bytes = vec![0_u8; 16 * 1024];
+                let count = stream.read(&mut bytes).await.unwrap_or_default();
+                task_requests
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(String::from_utf8_lossy(&bytes[..count]).to_string());
+                tokio::time::sleep(delay).await;
+                let body = "{}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+                task_calls.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        FakeProvider {
+            base_url: format!("http://{addr}"),
+            calls,
+            requests,
+            handle,
+        }
+    }
+
+    async fn wait_for_provider(provider: &FakeProvider, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while provider.calls.load(Ordering::SeqCst) < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background task did not reach fake provider");
+    }
+
+    fn request_with_id(token: Option<&str>, update_id: i64) -> Value {
+        let mut req = request(token);
+        req["body"]["update_id"] = json!(update_id);
+        req
     }
 
     #[test]
@@ -360,10 +528,10 @@ mod tests {
     #[tokio::test]
     async fn valid_token_reaches_agent_chat() {
         let bus = bus_with_secret(SECRET);
-        let response = webhook_handler(&bus, &reqwest::Client::new(), request(Some(SECRET)))
-            .await
-            .unwrap();
+        let admission = test_admission();
+        let response = test_handle(&bus, &admission, request(Some(SECRET))).await;
         assert_eq!(response["status_code"], 200);
+        wait_for_calls(bus.as_ref(), "agent::chat", 1).await;
         let chats = bus.calls_to("agent::chat");
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].payload["message"], "hello");
@@ -378,9 +546,8 @@ mod tests {
     async fn wrong_or_missing_token_is_rejected_before_dispatch() {
         for token in [Some("wrong"), None] {
             let bus = bus_with_secret(SECRET);
-            let response = webhook_handler(&bus, &reqwest::Client::new(), request(token))
-                .await
-                .unwrap();
+            let admission = test_admission();
+            let response = test_handle(&bus, &admission, request(token)).await;
             assert_eq!(response["status_code"], 401);
             assert_eq!(bus.call_count("agent::chat"), 0);
             assert_eq!(bus.call_count("state::get"), 0);
@@ -390,16 +557,18 @@ mod tests {
     #[tokio::test]
     async fn missing_secret_refuses_delivery_and_route() {
         let bus = bus_with_secret("");
-        let response = webhook_handler(&bus, &reqwest::Client::new(), request(Some(SECRET)))
-            .await
-            .unwrap();
+        let admission = test_admission();
+        let response = test_handle(&bus, &admission, request(Some(SECRET))).await;
         assert_eq!(response["status_code"], 401);
         assert_eq!(bus.call_count("agent::chat"), 0);
-        assert_eq!(startup_secret(&bus, "TELEGRAM_SECRET_TOKEN").await, None);
+        assert_eq!(
+            startup_secret(bus.as_ref(), "TELEGRAM_SECRET_TOKEN").await,
+            None
+        );
 
         let configured = bus_with_secret(SECRET);
         assert_eq!(
-            startup_secret(&configured, "TELEGRAM_SECRET_TOKEN")
+            startup_secret(configured.as_ref(), "TELEGRAM_SECRET_TOKEN")
                 .await
                 .as_deref(),
             Some(SECRET)
@@ -417,5 +586,254 @@ mod tests {
         let text = "a".repeat(5000);
         let chunks = split_message(&text, 4096);
         assert!(chunks.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn admission_deduplicates_concurrent_delivery_ids() {
+        let admission = Admission::new(1, 8, Duration::from_secs(600));
+        let first = admission.admit("delivery-1".to_string(), async {});
+        let duplicate = admission.admit("delivery-1".to_string(), async {});
+        assert_eq!(first, AdmissionDecision::Accepted);
+        assert_eq!(duplicate, AdmissionDecision::Duplicate);
+        admission.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_authenticated_update_starts_one_turn() {
+        let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
+        for _ in 0..2 {
+            let response = test_handle(&bus, &admission, request(Some(SECRET))).await;
+            assert_eq!(response["status_code"], 200);
+        }
+        wait_for_calls(bus.as_ref(), "agent::chat", 1).await;
+        assert_eq!(bus.call_count("agent::chat"), 1);
+    }
+
+    #[tokio::test]
+    async fn slow_chat_is_acknowledged_before_the_turn_finishes() {
+        let provider = spawn_fake_provider(Duration::from_millis(200)).await;
+        let bus = bus_with_secret(SECRET);
+        bus.on("vault::get", |payload| {
+            Ok(json!({
+                "value": match payload["key"].as_str().unwrap_or_default() {
+                    "TELEGRAM_SECRET_TOKEN" => SECRET,
+                    "TELEGRAM_BOT_TOKEN" => "bot-token",
+                    _ => "",
+                }
+            }))
+        });
+        bus.on_value("agent::chat", json!({ "content": "slow reply" }));
+        let admission = Admission::new(1, 8, Duration::from_secs(600));
+        let api = TelegramApi {
+            client: reqwest::Client::new(),
+            base_url: provider.base_url.clone(),
+        };
+        let started = std::time::Instant::now();
+        let response = webhook_handler(bus.clone(), api, admission.clone(), request(Some(SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(response["status_code"], 200);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !provider
+                    .requests
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted task did not reach slow fake provider");
+        tokio::time::timeout(Duration::from_secs(1), admission.shutdown())
+            .await
+            .expect("owned task shutdown timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simultaneous_retries_start_one_turn() {
+        let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
+        let req = request(Some(SECRET));
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let spawn_delivery = |req: Value| {
+            let bus = bus.clone();
+            let admission = admission.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                webhook_handler(bus, test_api(), admission, req)
+                    .await
+                    .unwrap()
+            })
+        };
+        let first = spawn_delivery(req.clone());
+        let second = spawn_delivery(req);
+        barrier.wait().await;
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap()["status_code"], 200);
+        assert_eq!(second.unwrap()["status_code"], 200);
+        wait_for_calls(bus.as_ref(), "agent::chat", 1).await;
+        assert_eq!(bus.call_count("agent::chat"), 1);
+    }
+
+    #[tokio::test]
+    async fn overload_is_refused_before_ack_and_duplicate_still_acks() {
+        let bus = bus_with_secret(SECRET);
+        let admission = Admission::new(1, 8, Duration::from_secs(600));
+        assert_eq!(
+            admission.admit("telegram:123".to_string(), std::future::pending()),
+            AdmissionDecision::Accepted
+        );
+        let duplicate = test_handle(&bus, &admission, request_with_id(Some(SECRET), 123)).await;
+        let overloaded = test_handle(&bus, &admission, request_with_id(Some(SECRET), 124)).await;
+        assert_eq!(duplicate["status_code"], 200);
+        assert_eq!(overloaded["status_code"], 503);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+        tokio::time::timeout(Duration::from_secs(1), admission.shutdown())
+            .await
+            .expect("owned task shutdown timed out");
+    }
+
+    #[tokio::test]
+    async fn reordered_unique_update_ids_are_both_admitted() {
+        let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
+        for update_id in [200, 100] {
+            let response =
+                test_handle(&bus, &admission, request_with_id(Some(SECRET), update_id)).await;
+            assert_eq!(response["status_code"], 200);
+        }
+        wait_for_calls(bus.as_ref(), "agent::chat", 2).await;
+        assert_eq!(bus.call_count("agent::chat"), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_token_does_not_poison_update_id() {
+        let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
+        let rejected = test_handle(&bus, &admission, request(Some("wrong"))).await;
+        let accepted = test_handle(&bus, &admission, request(Some(SECRET))).await;
+        assert_eq!(rejected["status_code"], 401);
+        assert_eq!(accepted["status_code"], 200);
+        wait_for_calls(bus.as_ref(), "agent::chat", 1).await;
+        assert_eq!(bus.call_count("agent::chat"), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_failure_stays_accepted_and_is_not_retried() {
+        let bus = bus_with_secret(SECRET);
+        bus.on_error("agent::chat", "provider failed");
+        let admission = test_admission();
+        for _ in 0..2 {
+            let response = test_handle(&bus, &admission, request(Some(SECRET))).await;
+            assert_eq!(response["status_code"], 200);
+            assert_eq!(response["body"]["accepted"], true);
+            assert!(response["body"].get("ok").is_none());
+        }
+        wait_for_calls(bus.as_ref(), "agent::chat", 1).await;
+        assert_eq!(bus.call_count("agent::chat"), 1);
+        assert_eq!(bus.call_count("security::audit"), 0);
+    }
+
+    #[tokio::test]
+    async fn positive_reply_posts_once_to_fake_provider() {
+        let provider = spawn_fake_provider(Duration::ZERO).await;
+        let bus = bus_with_secret(SECRET);
+        bus.on("vault::get", |payload| {
+            Ok(json!({
+                "value": match payload["key"].as_str().unwrap_or_default() {
+                    "TELEGRAM_SECRET_TOKEN" => SECRET,
+                    "TELEGRAM_BOT_TOKEN" => "bot-token",
+                    _ => "",
+                }
+            }))
+        });
+        bus.on_value("agent::chat", json!({ "content": "the reply" }));
+        let admission = test_admission();
+        let api = TelegramApi {
+            client: reqwest::Client::new(),
+            base_url: provider.base_url.clone(),
+        };
+        let response = webhook_handler(bus.clone(), api, admission.clone(), request(Some(SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(response["status_code"], 200);
+        wait_for_provider(&provider, 1).await;
+        wait_for_calls(bus.as_ref(), "security::audit", 1).await;
+        let requests = provider
+            .requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("POST /botbot-token/sendMessage"));
+        assert!(requests[0].contains("the reply"));
+        let chats = bus.calls_to("agent::chat");
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].timeout_ms, Some(CHAT_TIMEOUT_MS));
+    }
+
+    #[tokio::test]
+    async fn dedupe_cache_refuses_early_eviction_and_expires_by_ttl() {
+        let admission = Admission::new(2, 1, Duration::from_millis(20));
+        assert_eq!(
+            admission.admit("first".to_string(), async {}),
+            AdmissionDecision::Accepted
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            admission.admit("second".to_string(), async {}),
+            AdmissionDecision::Overloaded
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            admission.admit("second".to_string(), async {}),
+            AdmissionDecision::Accepted
+        );
+        admission.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_non_message_update_keeps_compatibility() {
+        let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
+        let mut req = request(Some(SECRET));
+        req["body"] = json!({ "update_id": 123, "callback_query": { "id": "q1" } });
+        let response = test_handle(&bus, &admission, req).await;
+        assert_eq!(response["status_code"], 200);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+    }
+
+    #[tokio::test]
+    async fn authenticated_message_without_update_id_is_refused_without_dispatch() {
+        let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
+        let mut req = request(Some(SECRET));
+        req["body"].as_object_mut().unwrap().remove("update_id");
+        let response = test_handle(&bus, &admission, req).await;
+        assert_eq!(response["status_code"], 400);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+    }
+
+    #[tokio::test]
+    async fn in_flight_delivery_never_expires_into_a_duplicate_turn() {
+        let admission = Admission::new(2, 8, Duration::from_millis(10));
+        assert_eq!(
+            admission.admit("still-running".to_string(), std::future::pending()),
+            AdmissionDecision::Accepted
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            admission.admit("still-running".to_string(), async {}),
+            AdmissionDecision::Duplicate
+        );
+        tokio::time::timeout(Duration::from_secs(1), admission.shutdown())
+            .await
+            .expect("owned task shutdown timed out");
     }
 }

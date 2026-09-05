@@ -1,3 +1,6 @@
+mod admission;
+
+use admission::{Admission, AdmissionDecision};
 use agentos_http_adapter::{CHAT_TIMEOUT_MS, TriggerBus};
 use hmac::{Hmac, Mac};
 use iii_sdk::channels::{ChannelReader, StreamChannelRef};
@@ -5,6 +8,7 @@ use iii_sdk::errors::Error;
 use iii_sdk::{RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
 use sha2::Sha256;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -12,6 +16,24 @@ type HmacSha256 = Hmac<Sha256>;
 const SLACK_API_BASE: &str = "https://slack.com/api";
 const MAX_MESSAGE_LEN: usize = 4000;
 const SIGNING_SECRET_KEY: &str = "SLACK_SIGNING_SECRET";
+const MAX_IN_FLIGHT: usize = 32;
+const DEDUPE_CAPACITY: usize = 4096;
+const DEDUPE_RETENTION: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Clone)]
+struct SlackApi {
+    client: reqwest::Client,
+    base_url: String,
+}
+
+impl SlackApi {
+    fn production(client: reqwest::Client) -> Self {
+        Self {
+            client,
+            base_url: SLACK_API_BASE.to_string(),
+        }
+    }
+}
 
 /// Upper bound on a provider delivery we are willing to read before verifying it.
 const MAX_RAW_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -232,7 +254,7 @@ fn verify_slack_signature_at(
 /// Returns Slack's response from the LAST chunk.
 /// Slack docs: https://api.slack.com/methods/chat.postMessage
 async fn slack_post_message(
-    client: &reqwest::Client,
+    api: &SlackApi,
     bot_token: &str,
     channel: &str,
     text: &str,
@@ -248,8 +270,9 @@ async fn slack_post_message(
         if let Some(ts) = thread_ts {
             body["thread_ts"] = json!(ts);
         }
-        let resp = client
-            .post(format!("{SLACK_API_BASE}/chat.postMessage"))
+        let resp = api
+            .client
+            .post(format!("{}/chat.postMessage", api.base_url))
             .bearer_auth(bot_token)
             .json(&body)
             .send()
@@ -306,28 +329,81 @@ async fn authenticate(iii: &dyn TriggerBus, req: &Value) -> Result<Value, Value>
     serde_json::from_slice(&raw).map_err(|_| reject(400, "Body is not valid JSON"))
 }
 
+/// Complete one authenticated, admitted Slack message in the background.
+async fn process_message(
+    iii: Arc<dyn TriggerBus>,
+    api: SlackApi,
+    event: Value,
+) -> Result<(), Error> {
+    let channel = event
+        .get("channel")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let text = event
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let ts = event
+        .get("ts")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let thread_ts = event
+        .get("thread_ts")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let session_anchor = thread_ts.clone().unwrap_or_else(|| ts.clone());
+    let agent_id = resolve_agent(iii.as_ref(), &channel).await;
+
+    let chat = iii
+        .trigger(TriggerRequest {
+            function_id: "agent::chat".to_string(),
+            payload: json!({
+                "agentId": &agent_id,
+                "principal": { "agentId": &agent_id },
+                "message": text,
+                "sessionId": format!("slack:{channel}:{session_anchor}"),
+            }),
+            action: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
+        })
+        .await
+        .map_err(|error| Error::Handler(format!("agent::chat failed: {error}")))?;
+
+    let reply = chat
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !reply.is_empty() {
+        let bot_token = get_secret(iii.as_ref(), "SLACK_BOT_TOKEN").await;
+        slack_post_message(&api, &bot_token, &channel, reply, thread_ts.as_deref()).await?;
+    }
+    Ok(())
+}
+
 /// Handle Slack Events API webhook delivery.
-/// Mirrors `channel::slack::events` in src/channels/slack.ts.
 ///
-/// Behavior:
-///   1. Require `SLACK_SIGNING_SECRET` and authenticate the raw request.
-///   2. A verified `url_verification` echoes its challenge.
-///   3. For non-bot `message` events: dispatch to `agent::chat` and post the reply.
-///   4. Always return 200 for accepted events so Slack does not retry.
+/// Authentication and parsing of the signed bytes finish before admission.
+/// Accepted user-message events are acknowledged after bounded in-process
+/// admission; their turn continues in an owned task. The acknowledgment is not
+/// a durable/exactly-once guarantee: a process crash can lose accepted work.
 async fn handle_events(
-    iii: &dyn TriggerBus,
-    client: &reqwest::Client,
+    iii: Arc<dyn TriggerBus>,
+    api: SlackApi,
+    admission: Admission,
     req: Value,
 ) -> Result<Value, Error> {
-    let body = match authenticate(iii, &req).await {
+    let body = match authenticate(iii.as_ref(), &req).await {
         Ok(body) => body,
         Err(response) => return Ok(response),
     };
 
-    if body.get("type").and_then(|v| v.as_str()) == Some("url_verification") {
+    if body.get("type").and_then(Value::as_str) == Some("url_verification") {
         let challenge = body
             .get("challenge")
-            .and_then(|v| v.as_str())
+            .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
         return Ok(json!({
@@ -336,76 +412,54 @@ async fn handle_events(
         }));
     }
 
-    // Dispatch user messages to agent::chat, then post the reply back to the channel.
-    // Excludes message subtypes (message_changed/deleted/etc) which lack top-level
-    // user/text fields and would otherwise dispatch with empty content.
-    let event = body.get("event").cloned().unwrap_or(json!({}));
-    let is_user_message = event.get("type").and_then(|v| v.as_str()) == Some("message")
+    let event = body.get("event").cloned().unwrap_or_else(|| json!({}));
+    let is_user_message = event.get("type").and_then(Value::as_str) == Some("message")
         && event.get("subtype").is_none()
         && event.get("bot_id").is_none()
-        && event.get("user").and_then(|v| v.as_str()).is_some()
-        && event.get("text").and_then(|v| v.as_str()).is_some();
-
-    if is_user_message {
-        let channel = event
-            .get("channel")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let text = event
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let ts = event
-            .get("ts")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let thread_ts = event
-            .get("thread_ts")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let session_anchor = thread_ts.clone().unwrap_or_else(|| ts.clone());
-
-        let agent_id = resolve_agent(iii, &channel).await;
-
-        let chat = iii
-            .trigger(TriggerRequest {
-                function_id: "agent::chat".to_string(),
-                payload: json!({
-                    "agentId": &agent_id,
-                    "principal": { "agentId": &agent_id },
-                    "message": text,
-                    "sessionId": format!("slack:{channel}:{session_anchor}"),
-                }),
-                action: None,
-                timeout_ms: Some(CHAT_TIMEOUT_MS),
-            })
-            .await
-            .map_err(|e| Error::Handler(format!("agent::chat failed: {e}")))?;
-
-        let reply = chat
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-
-        if !reply.is_empty() {
-            let bot_token = get_secret(iii, "SLACK_BOT_TOKEN").await;
-            // Only thread the reply when the inbound event was already in a thread.
-            // Top-level messages get top-level replies.
-            if let Err(e) =
-                slack_post_message(client, &bot_token, &channel, reply, thread_ts.as_deref()).await
-            {
-                tracing::error!(channel = %channel, error = %e, "failed to post Slack reply");
-            }
-        }
+        && event.get("user").and_then(Value::as_str).is_some()
+        && event.get("text").and_then(Value::as_str).is_some();
+    if !is_user_message {
+        return Ok(json!({ "status_code": 200, "body": { "ok": true } }));
     }
 
-    Ok(json!({
-        "status_code": 200,
-        "body": { "ok": true }
-    }))
+    let Some(event_id) = body
+        .get("event_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(reject(
+            400,
+            "Authenticated Slack message is missing event_id",
+        ));
+    };
+    // Slack documents event_id as globally unique. Team and app still scope it
+    // defensively when one process serves a single configured Slack app.
+    let team_id = body.get("team_id").and_then(Value::as_str).unwrap_or("-");
+    let app_id = body
+        .get("api_app_id")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let delivery_key = format!("slack:{team_id}:{app_id}:{event_id}");
+
+    let task_iii = iii.clone();
+    let decision = admission.admit(delivery_key, async move {
+        if let Err(error) = process_message(task_iii, api, event).await {
+            tracing::error!(%error, "accepted Slack delivery failed");
+        }
+    });
+    match decision {
+        AdmissionDecision::Accepted => Ok(json!({
+            "status_code": 200,
+            "body": { "accepted": true },
+        })),
+        AdmissionDecision::Duplicate => Ok(json!({
+            "status_code": 200,
+            "body": { "accepted": true, "duplicate": true },
+        })),
+        AdmissionDecision::Overloaded => {
+            Ok(reject(503, "Webhook admission overloaded; retry delivery"))
+        }
+    }
 }
 
 #[tokio::main]
@@ -413,49 +467,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let ws_url = engine_ws_url();
-    let iii = register_worker(&ws_url, agentos_bus_auth::init_options());
-    let client = reqwest::Client::new();
+    let iii = Arc::new(register_worker(&ws_url, agentos_bus_auth::init_options()));
+    let api = SlackApi::production(reqwest::Client::new());
+    let admission = Admission::new(MAX_IN_FLIGHT, DEDUPE_CAPACITY, DEDUPE_RETENTION);
 
     // channel::slack::events — preserve the exact ID registered by the TS port.
     let iii_clone = iii.clone();
-    let client_clone = client.clone();
+    let api_clone = api.clone();
+    let admission_clone = admission.clone();
     iii.register_function(
         "channel::slack::events",
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_clone.clone();
-            let client = client_clone.clone();
-            async move { handle_events(&iii, &client, input).await }
+            let api = api_clone.clone();
+            let admission = admission_clone.clone();
+            async move { handle_events(iii, api, admission, input).await }
         })
         .description("Handle Slack Events API webhook"),
     );
 
     // channel::slack::send — outbound helper for other workers (agent::chat etc).
-    // Not present in the TS port (was an internal helper); exposed here so cross-worker
-    // callers do not need to duplicate Slack auth/HTTP logic.
     let iii_clone = iii.clone();
-    let client_clone = client.clone();
+    let api_clone = api.clone();
     iii.register_function(
         "channel::slack::send",
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_clone.clone();
-            let client = client_clone.clone();
+            let api = api_clone.clone();
             async move {
                 let channel = input
                     .get("channel")
-                    .and_then(|v| v.as_str())
+                    .and_then(Value::as_str)
                     .ok_or_else(|| Error::Handler("missing channel".into()))?
                     .to_string();
                 let text = input
                     .get("text")
-                    .and_then(|v| v.as_str())
+                    .and_then(Value::as_str)
                     .ok_or_else(|| Error::Handler("missing text".into()))?
                     .to_string();
                 let thread_ts = input
                     .get("thread_ts")
-                    .and_then(|v| v.as_str())
+                    .and_then(Value::as_str)
                     .map(String::from);
-                let bot_token = get_secret(&iii, "SLACK_BOT_TOKEN").await;
-                slack_post_message(&client, &bot_token, &channel, &text, thread_ts.as_deref()).await
+                let bot_token = get_secret(iii.as_ref(), "SLACK_BOT_TOKEN").await;
+                slack_post_message(&api, &bot_token, &channel, &text, thread_ts.as_deref()).await
             }
         })
         .description("Post a message to a Slack channel via chat.postMessage"),
@@ -465,7 +520,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // signature exists. Without it every delivery would be refused anyway, and
     // an unverifiable route is not worth exposing. The handler re-reads the
     // secret per request, so a rotation takes effect without a restart.
-    if startup_secret(&iii, SIGNING_SECRET_KEY).await.is_some() {
+    if startup_secret(iii.as_ref(), SIGNING_SECRET_KEY)
+        .await
+        .is_some()
+    {
         agentos_http_adapter::register_http_trigger(
             &iii,
             "channel::slack::events".to_string(),
@@ -482,6 +540,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("channel-slack worker started");
     tokio::signal::ctrl_c().await?;
+    admission.shutdown().await;
     iii.shutdown_async().await;
     Ok(())
 }
@@ -490,6 +549,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use agentos_http_adapter::fake::FakeBus;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn engine_channel_outranks_an_inline_raw_body() {
@@ -514,7 +575,7 @@ mod tests {
     const SECRET: &str = "slack-signing-secret";
     const URL_VERIFICATION: &str =
         r#"{"type":"url_verification","challenge":"abc123","token":"deprecated"}"#;
-    const MESSAGE: &str = r#"{"type":"event_callback","event":{"type":"message","user":"U1","text":"hello","channel":"C1","ts":"1710000000.000100"}}"#;
+    const MESSAGE: &str = r#"{"type":"event_callback","event_id":"Ev-123","team_id":"T1","api_app_id":"A1","event":{"type":"message","user":"U1","text":"hello","channel":"C1","ts":"1710000000.000100"}}"#;
 
     #[test]
     fn split_short_text_returns_single_chunk() {
@@ -581,7 +642,7 @@ mod tests {
         })
     }
 
-    fn bus_with_secret(secret: &str) -> FakeBus {
+    fn bus_with_secret(secret: &str) -> Arc<FakeBus> {
         let bus = FakeBus::new();
         let secret = secret.to_string();
         bus.on("vault::get", move |payload| {
@@ -596,7 +657,89 @@ mod tests {
         });
         bus.on_value("state::get", json!({ "agentId": "default" }));
         bus.on_value("agent::chat", json!({ "content": "" }));
-        bus
+        Arc::new(bus)
+    }
+
+    fn test_admission() -> Admission {
+        Admission::new(4, 64, Duration::from_secs(600))
+    }
+
+    fn test_api() -> SlackApi {
+        SlackApi::production(reqwest::Client::new())
+    }
+
+    async fn test_handle(bus: &Arc<FakeBus>, admission: &Admission, req: Value) -> Value {
+        handle_events(bus.clone(), test_api(), admission.clone(), req)
+            .await
+            .unwrap()
+    }
+
+    async fn wait_for_calls(bus: &FakeBus, function_id: &str, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bus.call_count(function_id) < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background task did not make expected bus call");
+    }
+
+    struct FakeProvider {
+        base_url: String,
+        calls: Arc<AtomicUsize>,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for FakeProvider {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn spawn_fake_provider(response_body: &'static str, delay: Duration) -> FakeProvider {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake provider");
+        let addr = listener.local_addr().expect("fake provider address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let task_calls = calls.clone();
+        let task_requests = requests.clone();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut bytes = vec![0_u8; 16 * 1024];
+                let count = stream.read(&mut bytes).await.unwrap_or_default();
+                task_requests
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(String::from_utf8_lossy(&bytes[..count]).to_string());
+                tokio::time::sleep(delay).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+                task_calls.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        FakeProvider {
+            base_url: format!("http://{addr}"),
+            calls,
+            requests,
+            handle,
+        }
+    }
+
+    async fn wait_for_provider(provider: &FakeProvider, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while provider.calls.load(Ordering::SeqCst) < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background task did not reach fake provider");
     }
 
     #[test]
@@ -650,15 +793,15 @@ mod tests {
     #[tokio::test]
     async fn signed_url_verification_echoes_challenge() {
         let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
         let ts = now_ts();
         let signature = sign(SECRET, &ts, URL_VERIFICATION.as_bytes());
-        let response = handle_events(
+        let response = test_handle(
             &bus,
-            &reqwest::Client::new(),
+            &admission,
             request(URL_VERIFICATION, Some(&signature), Some(&ts)),
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(response["status_code"], 200);
         assert_eq!(response["body"], json!({ "challenge": "abc123" }));
         assert_eq!(bus.call_count("agent::chat"), 0);
@@ -667,13 +810,8 @@ mod tests {
     #[tokio::test]
     async fn unsigned_url_verification_is_rejected() {
         let bus = bus_with_secret(SECRET);
-        let response = handle_events(
-            &bus,
-            &reqwest::Client::new(),
-            request(URL_VERIFICATION, None, None),
-        )
-        .await
-        .unwrap();
+        let admission = test_admission();
+        let response = test_handle(&bus, &admission, request(URL_VERIFICATION, None, None)).await;
         assert_eq!(response["status_code"], 401);
         assert_eq!(bus.call_count("agent::chat"), 0);
     }
@@ -681,16 +819,17 @@ mod tests {
     #[tokio::test]
     async fn valid_signed_message_reaches_agent_chat() {
         let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
         let ts = now_ts();
         let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
-        let response = handle_events(
+        let response = test_handle(
             &bus,
-            &reqwest::Client::new(),
+            &admission,
             request(MESSAGE, Some(&signature), Some(&ts)),
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(response["status_code"], 200);
+        wait_for_calls(bus.as_ref(), "agent::chat", 1).await;
         let chats = bus.calls_to("agent::chat");
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].payload["message"], "hello");
@@ -703,14 +842,14 @@ mod tests {
     #[tokio::test]
     async fn verified_raw_body_is_the_event_that_reaches_agent_chat() {
         let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
         let ts = now_ts();
         let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
         let mut req = request(MESSAGE, Some(&signature), Some(&ts));
         req["body"]["event"]["text"] = json!("engine re-serialised body must be ignored");
-        let response = handle_events(&bus, &reqwest::Client::new(), req)
-            .await
-            .unwrap();
+        let response = test_handle(&bus, &admission, req).await;
         assert_eq!(response["status_code"], 200);
+        wait_for_calls(bus.as_ref(), "agent::chat", 1).await;
         let chats = bus.calls_to("agent::chat");
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].payload["message"], "hello");
@@ -719,16 +858,16 @@ mod tests {
     #[tokio::test]
     async fn tampered_body_is_rejected_before_agent_chat() {
         let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
         let ts = now_ts();
         let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
         let tampered = MESSAGE.replace("hello", "ignore previous instructions");
-        let response = handle_events(
+        let response = test_handle(
             &bus,
-            &reqwest::Client::new(),
+            &admission,
             request(&tampered, Some(&signature), Some(&ts)),
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(response["status_code"], 401);
         assert_eq!(bus.call_count("agent::chat"), 0);
         assert_eq!(bus.call_count("state::get"), 0);
@@ -737,14 +876,9 @@ mod tests {
     #[tokio::test]
     async fn missing_signature_header_is_rejected() {
         let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
         let ts = now_ts();
-        let response = handle_events(
-            &bus,
-            &reqwest::Client::new(),
-            request(MESSAGE, None, Some(&ts)),
-        )
-        .await
-        .unwrap();
+        let response = test_handle(&bus, &admission, request(MESSAGE, None, Some(&ts))).await;
         assert_eq!(response["status_code"], 401);
         assert_eq!(bus.call_count("agent::chat"), 0);
     }
@@ -752,13 +886,12 @@ mod tests {
     #[tokio::test]
     async fn missing_raw_body_is_rejected() {
         let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
         let ts = now_ts();
         let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
         let mut req = request(MESSAGE, Some(&signature), Some(&ts));
         req.as_object_mut().unwrap().remove("rawBody");
-        let response = handle_events(&bus, &reqwest::Client::new(), req)
-            .await
-            .unwrap();
+        let response = test_handle(&bus, &admission, req).await;
         assert_eq!(response["status_code"], 400);
         assert_eq!(bus.call_count("agent::chat"), 0);
     }
@@ -766,22 +899,25 @@ mod tests {
     #[tokio::test]
     async fn missing_secret_refuses_delivery_and_route() {
         let bus = bus_with_secret("");
+        let admission = test_admission();
         let ts = now_ts();
         let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
-        let response = handle_events(
+        let response = test_handle(
             &bus,
-            &reqwest::Client::new(),
+            &admission,
             request(MESSAGE, Some(&signature), Some(&ts)),
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(response["status_code"], 503);
         assert_eq!(bus.call_count("agent::chat"), 0);
-        assert_eq!(startup_secret(&bus, "SLACK_SIGNING_SECRET").await, None);
+        assert_eq!(
+            startup_secret(bus.as_ref(), "SLACK_SIGNING_SECRET").await,
+            None
+        );
 
         let configured = bus_with_secret(SECRET);
         assert_eq!(
-            startup_secret(&configured, "SLACK_SIGNING_SECRET")
+            startup_secret(configured.as_ref(), "SLACK_SIGNING_SECRET")
                 .await
                 .as_deref(),
             Some(SECRET)
@@ -872,14 +1008,334 @@ mod tests {
         // is what gets read. Here the ref is unusable, so the request is
         // refused instead of being verified against the caller's bytes.
         let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
         let ts = now_ts();
         let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
         let mut req = request(MESSAGE, Some(&signature), Some(&ts));
         req["request_body"] = json!("not-a-channel-ref");
-        let response = handle_events(&bus, &reqwest::Client::new(), req)
-            .await
-            .unwrap();
+        let response = test_handle(&bus, &admission, req).await;
         assert_eq!(response["status_code"], 400);
         assert_eq!(bus.call_count("agent::chat"), 0);
+    }
+
+    #[tokio::test]
+    async fn admission_deduplicates_concurrent_delivery_ids() {
+        let admission = Admission::new(1, 8, Duration::from_secs(600));
+        let first = admission.admit("delivery-1".to_string(), async {});
+        let duplicate = admission.admit("delivery-1".to_string(), async {});
+        assert_eq!(first, AdmissionDecision::Accepted);
+        assert_eq!(duplicate, AdmissionDecision::Duplicate);
+        admission.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_signed_delivery_starts_one_turn() {
+        let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
+        let ts = now_ts();
+        let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
+        for _ in 0..2 {
+            let response = test_handle(
+                &bus,
+                &admission,
+                request(MESSAGE, Some(&signature), Some(&ts)),
+            )
+            .await;
+            assert_eq!(response["status_code"], 200);
+        }
+        wait_for_calls(bus.as_ref(), "agent::chat", 1).await;
+        assert_eq!(bus.call_count("agent::chat"), 1);
+    }
+
+    #[tokio::test]
+    async fn slow_chat_is_acknowledged_before_the_turn_finishes() {
+        let provider = spawn_fake_provider(r#"{"ok":true}"#, Duration::from_millis(200)).await;
+        let bus = bus_with_secret(SECRET);
+        bus.on("vault::get", |payload| {
+            Ok(json!({
+                "value": match payload["key"].as_str().unwrap_or_default() {
+                    "SLACK_SIGNING_SECRET" => SECRET,
+                    "SLACK_BOT_TOKEN" => "bot-token",
+                    _ => "",
+                }
+            }))
+        });
+        bus.on_value("agent::chat", json!({ "content": "slow reply" }));
+        let admission = Admission::new(1, 8, Duration::from_secs(600));
+        let api = SlackApi {
+            client: reqwest::Client::new(),
+            base_url: provider.base_url.clone(),
+        };
+        let ts = now_ts();
+        let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
+        let started = std::time::Instant::now();
+        let response = handle_events(
+            bus.clone(),
+            api,
+            admission.clone(),
+            request(MESSAGE, Some(&signature), Some(&ts)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["status_code"], 200);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !provider
+                    .requests
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted task did not reach slow fake provider");
+        tokio::time::timeout(Duration::from_secs(1), admission.shutdown())
+            .await
+            .expect("owned task shutdown timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simultaneous_retries_start_one_turn() {
+        let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
+        let ts = now_ts();
+        let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
+        let req = request(MESSAGE, Some(&signature), Some(&ts));
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let spawn_delivery = |req: Value| {
+            let bus = bus.clone();
+            let admission = admission.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                handle_events(bus, test_api(), admission, req)
+                    .await
+                    .unwrap()
+            })
+        };
+        let first = spawn_delivery(req.clone());
+        let second = spawn_delivery(req);
+        barrier.wait().await;
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap()["status_code"], 200);
+        assert_eq!(second.unwrap()["status_code"], 200);
+        wait_for_calls(bus.as_ref(), "agent::chat", 1).await;
+        assert_eq!(bus.call_count("agent::chat"), 1);
+    }
+
+    #[tokio::test]
+    async fn overload_is_refused_before_ack_and_duplicate_still_acks() {
+        let bus = bus_with_secret(SECRET);
+        let admission = Admission::new(1, 8, Duration::from_secs(600));
+        assert_eq!(
+            admission.admit("slack:T1:A1:Ev-123".to_string(), std::future::pending(),),
+            AdmissionDecision::Accepted
+        );
+        let ts = now_ts();
+        let first_body = MESSAGE.to_string();
+        let second_body = MESSAGE.replace("Ev-123", "Ev-124");
+        let first_sig = sign(SECRET, &ts, first_body.as_bytes());
+        let second_sig = sign(SECRET, &ts, second_body.as_bytes());
+        let duplicate = test_handle(
+            &bus,
+            &admission,
+            request(&first_body, Some(&first_sig), Some(&ts)),
+        )
+        .await;
+        let overloaded = test_handle(
+            &bus,
+            &admission,
+            request(&second_body, Some(&second_sig), Some(&ts)),
+        )
+        .await;
+        assert_eq!(duplicate["status_code"], 200);
+        assert_eq!(overloaded["status_code"], 503);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+        tokio::time::timeout(Duration::from_secs(1), admission.shutdown())
+            .await
+            .expect("owned task shutdown timed out");
+    }
+
+    #[tokio::test]
+    async fn reordered_unique_event_ids_are_both_admitted() {
+        let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
+        let ts = now_ts();
+        for id in ["Ev-200", "Ev-100"] {
+            let body = MESSAGE.replace("Ev-123", id);
+            let signature = sign(SECRET, &ts, body.as_bytes());
+            let response = test_handle(
+                &bus,
+                &admission,
+                request(&body, Some(&signature), Some(&ts)),
+            )
+            .await;
+            assert_eq!(response["status_code"], 200);
+        }
+        wait_for_calls(bus.as_ref(), "agent::chat", 2).await;
+        assert_eq!(bus.call_count("agent::chat"), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_signature_does_not_poison_delivery_id() {
+        let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
+        let ts = now_ts();
+        let rejected = test_handle(
+            &bus,
+            &admission,
+            request(MESSAGE, Some("v0=deadbeef"), Some(&ts)),
+        )
+        .await;
+        let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
+        let accepted = test_handle(
+            &bus,
+            &admission,
+            request(MESSAGE, Some(&signature), Some(&ts)),
+        )
+        .await;
+        assert_eq!(rejected["status_code"], 401);
+        assert_eq!(accepted["status_code"], 200);
+        wait_for_calls(bus.as_ref(), "agent::chat", 1).await;
+        assert_eq!(bus.call_count("agent::chat"), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_failure_stays_accepted_and_is_not_retried() {
+        let bus = bus_with_secret(SECRET);
+        bus.on_error("agent::chat", "provider failed");
+        let admission = test_admission();
+        let ts = now_ts();
+        let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
+        for _ in 0..2 {
+            let response = test_handle(
+                &bus,
+                &admission,
+                request(MESSAGE, Some(&signature), Some(&ts)),
+            )
+            .await;
+            assert_eq!(response["status_code"], 200);
+            assert_eq!(response["body"]["accepted"], true);
+            assert!(response["body"].get("ok").is_none());
+        }
+        wait_for_calls(bus.as_ref(), "agent::chat", 1).await;
+        assert_eq!(bus.call_count("agent::chat"), 1);
+    }
+
+    #[tokio::test]
+    async fn positive_reply_posts_once_to_fake_provider() {
+        let provider = spawn_fake_provider(r#"{"ok":true}"#, Duration::ZERO).await;
+        let bus = bus_with_secret(SECRET);
+        bus.on("vault::get", |payload| {
+            Ok(json!({
+                "value": match payload["key"].as_str().unwrap_or_default() {
+                    "SLACK_SIGNING_SECRET" => SECRET,
+                    "SLACK_BOT_TOKEN" => "bot-token",
+                    _ => "",
+                }
+            }))
+        });
+        bus.on_value("agent::chat", json!({ "content": "the reply" }));
+        let admission = test_admission();
+        let api = SlackApi {
+            client: reqwest::Client::new(),
+            base_url: provider.base_url.clone(),
+        };
+        let ts = now_ts();
+        let signature = sign(SECRET, &ts, MESSAGE.as_bytes());
+        let response = handle_events(
+            bus.clone(),
+            api,
+            admission.clone(),
+            request(MESSAGE, Some(&signature), Some(&ts)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["status_code"], 200);
+        wait_for_provider(&provider, 1).await;
+        let requests = provider
+            .requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("POST /chat.postMessage"));
+        assert!(requests[0].contains("the reply"));
+        let chats = bus.calls_to("agent::chat");
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].timeout_ms, Some(CHAT_TIMEOUT_MS));
+    }
+
+    #[tokio::test]
+    async fn dedupe_cache_refuses_early_eviction_and_expires_by_ttl() {
+        let admission = Admission::new(2, 1, Duration::from_millis(20));
+        assert_eq!(
+            admission.admit("first".to_string(), async {}),
+            AdmissionDecision::Accepted
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            admission.admit("second".to_string(), async {}),
+            AdmissionDecision::Overloaded
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            admission.admit("second".to_string(), async {}),
+            AdmissionDecision::Accepted
+        );
+        admission.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn signed_non_message_event_keeps_compatibility_without_delivery_id() {
+        let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
+        let body = r#"{"type":"event_callback","event":{"type":"reaction_added"}}"#;
+        let ts = now_ts();
+        let signature = sign(SECRET, &ts, body.as_bytes());
+        let response =
+            test_handle(&bus, &admission, request(body, Some(&signature), Some(&ts))).await;
+        assert_eq!(response["status_code"], 200);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+    }
+
+    #[tokio::test]
+    async fn signed_message_without_event_id_is_refused_without_dispatch() {
+        let bus = bus_with_secret(SECRET);
+        let admission = test_admission();
+        let mut body: Value = serde_json::from_str(MESSAGE).unwrap();
+        body.as_object_mut().unwrap().remove("event_id");
+        let body = serde_json::to_string(&body).unwrap();
+        let ts = now_ts();
+        let signature = sign(SECRET, &ts, body.as_bytes());
+        let response = test_handle(
+            &bus,
+            &admission,
+            request(&body, Some(&signature), Some(&ts)),
+        )
+        .await;
+        assert_eq!(response["status_code"], 400);
+        assert_eq!(bus.call_count("agent::chat"), 0);
+    }
+
+    #[tokio::test]
+    async fn in_flight_delivery_never_expires_into_a_duplicate_turn() {
+        let admission = Admission::new(2, 8, Duration::from_millis(10));
+        assert_eq!(
+            admission.admit("still-running".to_string(), std::future::pending()),
+            AdmissionDecision::Accepted
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            admission.admit("still-running".to_string(), async {}),
+            AdmissionDecision::Duplicate
+        );
+        tokio::time::timeout(Duration::from_secs(1), admission.shutdown())
+            .await
+            .expect("owned task shutdown timed out");
     }
 }
