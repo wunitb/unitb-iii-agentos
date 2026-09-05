@@ -1,4 +1,4 @@
-use agentos_http_adapter::TriggerBus;
+use agentos_http_adapter::{CHAT_TIMEOUT_MS, TriggerBus};
 use data_encoding::{BASE64, BASE64URL_NOPAD};
 use hmac::{Hmac, Mac};
 use iii_sdk::channels::{ChannelReader, StreamChannelRef};
@@ -709,7 +709,7 @@ async fn handle_webhook(
                 "sessionId": format!("teams:{conversation_id}"),
             }),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
         .map_err(|e| Error::Handler(format!("agent::chat failed: {e}")))?;

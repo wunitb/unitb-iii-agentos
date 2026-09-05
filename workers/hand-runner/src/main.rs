@@ -1,3 +1,4 @@
+use agentos_http_adapter::CHAT_TIMEOUT_MS;
 use iii_sdk::errors::Error;
 use iii_sdk::{
     IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker, trigger::Trigger,
@@ -95,7 +96,14 @@ async fn run_hand(iii: &IIIClient, hand: Hand) -> Result<Value, Error> {
     let started = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339();
     let kickoff = build_kickoff_prompt(&hand);
-    let timeout_ms = hand.agent.max_iterations.map(|n| n.saturating_mul(5000));
+    // A configured hand keeps its five-second-per-iteration budget, capped by
+    // the product's five-minute chat ceiling. An omitted iteration limit must
+    // not become `None`: iii-sdk 0.22.1 would silently cut the run off at 30 s.
+    let timeout_ms = hand
+        .agent
+        .max_iterations
+        .map_or(CHAT_TIMEOUT_MS, |n| n.saturating_mul(5000))
+        .min(CHAT_TIMEOUT_MS);
 
     let chat_result = iii
         .trigger(TriggerRequest {
@@ -110,7 +118,7 @@ async fn run_hand(iii: &IIIClient, hand: Hand) -> Result<Value, Error> {
                 "model": hand.agent.model,
             }),
             action: None,
-            timeout_ms,
+            timeout_ms: Some(timeout_ms),
         })
         .await;
 

@@ -1,3 +1,4 @@
+use agentos_http_adapter::CHAT_TIMEOUT_MS;
 use iii_sdk::errors::Error;
 use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
@@ -178,7 +179,7 @@ async fn invoke_pulse(iii: &IIIClient, req: InvokeRequest) -> Result<Value, Erro
             "context": context,
         }),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await;
 

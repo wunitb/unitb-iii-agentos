@@ -1,3 +1,4 @@
+use agentos_http_adapter::CHAT_TIMEOUT_MS;
 use iii_sdk::errors::Error;
 use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
@@ -565,7 +566,7 @@ async fn handle_task(iii: &IIIClient, input: Value) -> Result<Value, Error> {
                         "sessionId": session_id,
                     }),
                     action: None,
-                    timeout_ms: None,
+                    timeout_ms: Some(CHAT_TIMEOUT_MS),
                 })
                 .await;
 

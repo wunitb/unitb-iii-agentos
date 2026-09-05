@@ -1,4 +1,4 @@
-use agentos_http_adapter::TriggerBus;
+use agentos_http_adapter::{CHAT_TIMEOUT_MS, TriggerBus};
 use hmac::{Hmac, Mac};
 use iii_sdk::channels::{ChannelReader, StreamChannelRef};
 use iii_sdk::errors::Error;
@@ -407,7 +407,7 @@ async fn process_element(
                 "sessionId": format!("linkedin:{thread_id}"),
             }),
             action: None,
-            timeout_ms: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
         .map_err(|e| Error::Handler(format!("agent::chat failed: {e}")))?;

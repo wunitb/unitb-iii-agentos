@@ -1,4 +1,4 @@
-use agentos_http_adapter::TriggerBus;
+use agentos_http_adapter::{CHAT_TIMEOUT_MS, TriggerBus};
 use ed25519_dalek::{Signature, VerifyingKey};
 use iii_sdk::channels::{ChannelReader, StreamChannelRef};
 use iii_sdk::errors::Error;
@@ -358,7 +358,7 @@ async fn webhook_handler(
                     "sessionId": format!("discord:{channel_id}"),
                 }),
                 action: None,
-                timeout_ms: None,
+                timeout_ms: Some(CHAT_TIMEOUT_MS),
             })
             .await
             .map_err(|e| Error::Handler(e.to_string()))?;

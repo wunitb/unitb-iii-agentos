@@ -57,12 +57,17 @@ pub fn register_http_trigger(
                         "body": { "error": "unauthorized" },
                     }));
                 }
+                // One bounded ceiling intentionally covers every adapted route. The adapter
+                // cannot infer whether a transport-neutral function starts a chat turn, and a
+                // shorter generic budget would again let the edge abandon work that is still
+                // running. Fast routes return immediately; this five-minute value is a ceiling,
+                // not a delay, and matches the deepest chat path's existing contract.
                 let result = iii
                     .trigger(TriggerRequest {
                         function_id,
                         payload: normalize_http_request(request),
                         action: None,
-                        timeout_ms: None,
+                        timeout_ms: Some(CHAT_TIMEOUT_MS),
                     })
                     .await?;
                 Ok(into_http_response(result))
