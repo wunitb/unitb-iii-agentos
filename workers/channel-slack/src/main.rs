@@ -374,7 +374,8 @@ async fn handle_events(
             .trigger(TriggerRequest {
                 function_id: "agent::chat".to_string(),
                 payload: json!({
-                    "agentId": agent_id,
+                    "agentId": &agent_id,
+                    "principal": { "agentId": &agent_id },
                     "message": text,
                     "sessionId": format!("slack:{channel}:{session_anchor}"),
                 }),
@@ -693,6 +694,10 @@ mod tests {
         let chats = bus.calls_to("agent::chat");
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].payload["message"], "hello");
+        assert_eq!(
+            chats[0].payload["principal"],
+            json!({ "agentId": "default" })
+        );
     }
 
     #[tokio::test]

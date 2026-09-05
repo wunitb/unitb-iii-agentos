@@ -1754,6 +1754,13 @@ mod tests {
         assert_eq!(dispatched["principal"], json!({ "agentId": "agent-1" }));
         assert_eq!(dispatched["prompt"], "x");
 
+        let step = step_with("Chat", "agent::chat", Some("agent-1"));
+        let payload = step_payload(&step, &vars, None).expect("payload");
+        assert_eq!(
+            dispatch_payload(&step, payload, "agent-1")["principal"],
+            json!({ "agentId": "agent-1" })
+        );
+
         // A nested workflow is a deputy too (review F2/F1): it is labelled, so
         // the inner run binds its steps to this step's principal.
         let step = step_with("Run", "workflow::run", Some("agent-1"));

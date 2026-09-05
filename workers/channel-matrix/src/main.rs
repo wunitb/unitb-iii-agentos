@@ -319,7 +319,8 @@ async fn handle_event(
         .trigger(TriggerRequest {
             function_id: "agent::chat".to_string(),
             payload: json!({
-                "agentId": agent_id,
+                "agentId": &agent_id,
+                "principal": { "agentId": &agent_id },
                 "message": text,
                 "sessionId": format!("matrix:{room_id}"),
             }),
@@ -615,6 +616,10 @@ mod tests {
         let chats = bus.calls_to("agent::chat");
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].payload["message"], "hello agent");
+        assert_eq!(
+            chats[0].payload["principal"],
+            json!({ "agentId": "default" })
+        );
         assert_eq!(
             chats[0].payload["sessionId"],
             "matrix:!636q39766251:example.com"

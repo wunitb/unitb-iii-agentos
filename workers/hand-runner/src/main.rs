@@ -109,7 +109,8 @@ async fn run_hand(iii: &IIIClient, hand: Hand) -> Result<Value, Error> {
         .trigger(TriggerRequest {
             function_id: "agent::chat".to_string(),
             payload: json!({
-                "agentId": hand.id,
+                "agentId": &hand.id,
+                "principal": { "agentId": &hand.id },
                 "message": kickoff,
                 "functions": hand.functions.allowed,
                 "systemPrompt": hand.agent.system_prompt,
