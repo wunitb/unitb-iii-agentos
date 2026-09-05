@@ -940,6 +940,21 @@ fn scoped_service_environment(
     scoped
 }
 
+fn scoped_tui_environment(
+    dotenv: &BTreeMap<String, String>,
+    parent: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut scoped = parent
+        .iter()
+        .filter(|(name, _)| is_process_baseline(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(bearer) = api_client::selected_api_bearer(dotenv, parent) {
+        scoped.insert("AGENTOS_API_KEY".to_string(), bearer);
+    }
+    scoped
+}
+
 fn scoped_worker_environment(
     declared: &[String],
     dotenv: &BTreeMap<String, String>,
@@ -3080,10 +3095,16 @@ async fn main() -> Result<()> {
 
         Commands::Tui => {
             println!("{} Starting TUI...", "→".blue());
-            let runtime_dir = runtime_paths().ok().map(|paths| paths.runtime_dir);
-            match find_tui_binary(runtime_dir.as_deref()) {
+            let paths = runtime_paths()?;
+            let dotenv = bootstrap::load_dotenv(&paths.runtime_dir)?;
+            let parent = unicode_environment(std::env::vars_os());
+            let environment = scoped_tui_environment(&dotenv, &parent);
+            match find_tui_binary(Some(&paths.runtime_dir)) {
                 Some(tui_path) => {
-                    let status = Command::new(&tui_path).status()?;
+                    let status = Command::new(&tui_path)
+                        .env_clear()
+                        .envs(environment)
+                        .status()?;
                     std::process::exit(status.code().unwrap_or(1));
                 }
                 None => {

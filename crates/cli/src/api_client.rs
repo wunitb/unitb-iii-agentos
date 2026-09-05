@@ -103,20 +103,32 @@ fn validate_base(raw: &str) -> Result<Url> {
     Ok(url)
 }
 
+fn selected_setting(
+    name: &str,
+    dotenv: &BTreeMap<String, String>,
+    shell: &BTreeMap<String, String>,
+) -> Option<String> {
+    dotenv
+        .get(name)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| shell.get(name).filter(|value| !value.trim().is_empty()))
+        .cloned()
+}
+
+pub(crate) fn selected_api_bearer(
+    dotenv: &BTreeMap<String, String>,
+    shell: &BTreeMap<String, String>,
+) -> Option<String> {
+    selected_setting("AGENTOS_API_KEY", dotenv, shell)
+}
+
 fn resolve_api_settings(
     dotenv: &BTreeMap<String, String>,
     shell: &BTreeMap<String, String>,
 ) -> (String, Option<String>) {
-    let selected = |name: &str| {
-        dotenv
-            .get(name)
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| shell.get(name).filter(|value| !value.trim().is_empty()))
-            .cloned()
-    };
     (
-        selected("AGENTOS_API_URL").unwrap_or_else(|| API_BASE.to_string()),
-        selected("AGENTOS_API_KEY"),
+        selected_setting("AGENTOS_API_URL", dotenv, shell).unwrap_or_else(|| API_BASE.to_string()),
+        selected_api_bearer(dotenv, shell),
     )
 }
 
