@@ -223,7 +223,8 @@ make_release() {
 
   printf '#!/bin/sh\necho "agentos %s"\n' "$tag" > "$stage/bin/agentos"
   printf '#!/bin/sh\necho "agentos-tui %s"\n' "$tag" > "$stage/bin/agentos-tui"
-  chmod +x "$stage/bin/agentos" "$stage/bin/agentos-tui"
+  printf '#!/bin/sh\necho "agentos-bus-authd %s"\n' "$tag" > "$stage/bin/agentos-bus-authd"
+  chmod +x "$stage/bin/agentos" "$stage/bin/agentos-tui" "$stage/bin/agentos-bus-authd"
 
   cat > "$stage/runtime/config.yaml" <<EOF
 # release: "$tag"
@@ -309,11 +310,51 @@ test_fresh_install_places_binaries_and_runtime() {
 
   assert_exists "$BIN_DIR/agentos" fresh_install
   assert_exists "$BIN_DIR/agentos-tui" fresh_install
+  assert_exists "$BIN_DIR/agentos-bus-authd" fresh_install
   [ -x "$BIN_DIR/agentos" ] || fail "fresh_install: agentos is not executable"
+  [ -x "$BIN_DIR/agentos-bus-authd" ] || fail "fresh_install: agentos-bus-authd is not executable"
   assert_file_content "$AGENTOS_HOME/runtime/RELEASE" "1.0.0" fresh_install
   assert_exists "$AGENTOS_HOME/runtime/workers/echo/iii.worker.yaml" fresh_install
   assert_absent "$AGENTOS_HOME/runtime.new" fresh_install
   assert_absent "$AGENTOS_HOME/runtime.old" fresh_install
+}
+
+test_fresh_install_authd_is_discovered_by_real_cli() {
+  make_release v1.0.0
+  local stage="$SANDBOX/stage-v1.0.0"
+  local real_cli="$REPO_ROOT/target/debug/agentos"
+  local marker="$SANDBOX/authd.discovered"
+  local log="$SANDBOX/authd-discovery.log"
+  local auth_addr
+  auth_addr="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+  if [ ! -x "$real_cli" ]; then
+    fail "authd_discovery: native copied CLI fixture is missing: $real_cli"
+    return
+  fi
+  cp "$real_cli" "$stage/bin/agentos"
+  cat > "$stage/bin/agentos-bus-authd" <<EOF
+#!/bin/sh
+echo discovered > "$marker"
+exec sleep 30
+EOF
+  chmod +x "$stage/bin/agentos" "$stage/bin/agentos-bus-authd"
+  tar -czf "$AGENTOS_TEST_FIXTURE_DIR/release.tar.gz" -C "$stage" bin runtime
+
+  run_installer v1.0.0 || return
+  [ -x "$BIN_DIR/agentos-bus-authd" ] \
+    || fail "authd_discovery: installed authd is missing or not executable"
+
+  AGENTOS_CONFIG="$AGENTOS_HOME/runtime/config.yaml" \
+    AGENTOS_BUS_AUTH_ADDR="127.0.0.1:$auth_addr" \
+    AGENTOS_VERSION=v1.0.0 \
+    "$BIN_DIR/agentos" up --no-tui --timeout 1 > "$log" 2>&1
+  if [ ! -f "$marker" ]; then
+    fail "authd_discovery: real installed CLI did not discover/start its sibling authd"
+    sed 's/^/       | /' "$log" >&2
+  fi
+  if grep -q 'agentos-bus-authd was not found' "$log"; then
+    fail "authd_discovery: real installed CLI reported its sibling authd missing"
+  fi
 }
 
 test_fresh_install_resolves_latest_release() {
@@ -507,6 +548,30 @@ OPERATOR
   assert_file_contains "$config.bak" "host: 0.0.0.0" bus_host
 }
 
+test_upgrade_refuses_missing_authd_before_mutation() {
+  make_release v1.0.0
+  run_installer v1.0.0 || return
+
+  local runtime_before binaries_before status log stage
+  runtime_before="$(tree_manifest "$AGENTOS_HOME/runtime")"
+  binaries_before="$(tree_manifest "$BIN_DIR")"
+  make_release v2.0.0
+  stage="$SANDBOX/stage-v2.0.0"
+  rm "$stage/bin/agentos-bus-authd"
+  tar -czf "$AGENTOS_TEST_FIXTURE_DIR/release.tar.gz" -C "$stage" bin runtime
+  log="$SANDBOX/missing-authd.log"
+  AGENTOS_VERSION=v2.0.0 bash "$INSTALLER" > "$log" 2>&1
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    fail "missing_authd: installer accepted a release without agentos-bus-authd"
+  fi
+  assert_file_contains "$log" "regular executable agentos-bus-authd" missing_authd
+  assert_equal "$(tree_manifest "$AGENTOS_HOME/runtime")" "$runtime_before" missing_authd_runtime
+  assert_equal "$(tree_manifest "$BIN_DIR")" "$binaries_before" missing_authd_binaries
+  assert_absent "$AGENTOS_HOME/runtime.new" missing_authd
+  assert_absent "$AGENTOS_HOME/runtime.old" missing_authd
+}
+
 test_upgrade_refuses_conflicting_security_topology_before_swap() {
   make_release v1.0.0
   run_installer v1.0.0 || return
@@ -520,8 +585,9 @@ workers:
         auth_function_id: attacker::allow_all
   - name: state
 OPERATOR
-  local before status log
+  local before binaries_before status log
   before="$(tree_manifest "$AGENTOS_HOME/runtime")"
+  binaries_before="$(tree_manifest "$BIN_DIR")"
   make_release v2.0.0
   log="$SANDBOX/conflict.log"
   AGENTOS_VERSION=v2.0.0 bash "$INSTALLER" > "$log" 2>&1
@@ -531,6 +597,7 @@ OPERATOR
   fi
   assert_file_contains "$log" "conflicting bus security topology" security_conflict
   assert_equal "$(tree_manifest "$AGENTOS_HOME/runtime")" "$before" security_conflict
+  assert_equal "$(tree_manifest "$BIN_DIR")" "$binaries_before" security_conflict_binaries
   assert_absent "$AGENTOS_HOME/runtime.new" security_conflict
   assert_absent "$AGENTOS_HOME/runtime.old" security_conflict
 }
@@ -670,11 +737,13 @@ test_published_installer_is_identical() {
 
 ALL_TESTS=(
   test_fresh_install_places_binaries_and_runtime
+  test_fresh_install_authd_is_discovered_by_real_cli
   test_fresh_install_resolves_latest_release
   test_upgrade_preserves_user_config
   test_upgrade_applies_release_security_defaults
   test_upgrade_removes_unsafe_worker_entries_from_adopted_config
   test_upgrade_migrates_unarmed_config_to_secure_topology
+  test_upgrade_refuses_missing_authd_before_mutation
   test_upgrade_refuses_conflicting_security_topology_before_swap
   test_upgrade_pins_the_bus_worker_to_loopback
   test_upgrade_forces_the_bus_host_and_keeps_other_keys

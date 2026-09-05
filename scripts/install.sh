@@ -459,21 +459,39 @@ download_and_install() {
   fi
 
   tar -xzf "$archive_path" -C "$tmp_dir"
-  [ -x "$tmp_dir/bin/$binary_name" ] \
-    || err "Could not find $binary_name in $asset"
-  [ -d "$tmp_dir/runtime" ] || err "Could not find runtime in $asset"
-
-  mkdir -p "$INSTALL_DIR" "$AGENTOS_HOME"
-  cp "$tmp_dir/bin/$binary_name" "$INSTALL_DIR/$binary_name"
-  chmod +x "$INSTALL_DIR/$binary_name"
-  if [ -x "$tmp_dir/bin/agentos-tui" ]; then
-    cp "$tmp_dir/bin/agentos-tui" "$INSTALL_DIR/agentos-tui"
-    chmod +x "$INSTALL_DIR/agentos-tui"
-  fi
-
   runtime_dir="$AGENTOS_HOME/runtime"
   runtime_stage="$AGENTOS_HOME/runtime.new"
   runtime_retired="$AGENTOS_HOME/runtime.old"
+
+  # Validate every release input consumed below, plus the live topology, before
+  # changing any installed executable or runtime path.
+  local executable relative_path
+  for executable in "$binary_name" agentos-tui agentos-bus-authd; do
+    if [ ! -f "$tmp_dir/bin/$executable" ] || [ -L "$tmp_dir/bin/$executable" ] || [ ! -x "$tmp_dir/bin/$executable" ]; then
+      err "Could not find regular executable $executable in $asset"
+    fi
+  done
+  if [ ! -d "$tmp_dir/runtime" ] || [ -L "$tmp_dir/runtime" ]; then
+    err "Could not find regular runtime directory in $asset"
+  fi
+  if [ ! -s "$tmp_dir/runtime/.iii-version" ] || [ -L "$tmp_dir/runtime/.iii-version" ]; then
+    err "Release runtime must contain a non-empty regular .iii-version"
+  fi
+  for relative_path in "${RELEASE_GOVERNED_PATHS[@]}"; do
+    if [ -e "$tmp_dir/runtime/$relative_path" ] && { [ ! -f "$tmp_dir/runtime/$relative_path" ] || [ -L "$tmp_dir/runtime/$relative_path" ]; }; then
+      err "Release governance input $relative_path must be a regular file"
+    fi
+  done
+  preflight_release_security_defaults "$tmp_dir/runtime" "$runtime_dir"
+  if [ -d "$runtime_retired" ]; then
+    preflight_release_security_defaults "$tmp_dir/runtime" "$runtime_retired"
+  fi
+
+  mkdir -p "$INSTALL_DIR" "$AGENTOS_HOME"
+  for executable in "$binary_name" agentos-tui agentos-bus-authd; do
+    cp "$tmp_dir/bin/$executable" "$INSTALL_DIR/$executable"
+    chmod +x "$INSTALL_DIR/$executable"
+  done
 
   # Finish an upgrade that was interrupted mid-swap, so operator state is never
   # stranded in the retired tree.
@@ -485,11 +503,6 @@ download_and_install() {
       mv "$runtime_retired" "$runtime_dir"
     fi
   fi
-
-  # Validate the release authority and the adopted config before creating a
-  # stage or moving either live runtime directory. A partial or unknown topology
-  # leaves the old tree byte-identical and produces no runtime.old/runtime.new.
-  preflight_release_security_defaults "$tmp_dir/runtime" "$runtime_dir"
 
   # The stage only ever holds release payload, so a stage left over by an
   # interrupted run is always safe to discard.
