@@ -18,6 +18,7 @@
   <a href="https://www.agentsos.sh">website</a> ·
   <a href="ARCHITECTURE.md">architecture</a> ·
   <a href="INSTALL_STACK.md">complete stack install</a> ·
+  <a href="SECURITY.md">security</a> ·
   <a href="#-03--quickstart">quickstart</a> ·
   <a href="#-06--workers">workers</a>
 </p>
@@ -70,12 +71,17 @@ $EDITOR .env   # set CODEX_PROXY_API_KEY for http://127.0.0.1:8317/v1
 # 4. build the workspace
 cargo build --workspace --release
 
-# 5. bring the stack up: engine, workers, then the chat TUI
+# 5a. Linux: start an owned detached stack, then the chat TUI
 ./target/release/agentos up
+
+# 5b. macOS: keep the stack in the foreground; open the TUI separately
+./target/release/agentos start
+# in another terminal: ./target/release/agentos tui
 ```
 
-Step 3 is about the **model** credential only. You never write
-`AGENTOS_API_KEY` by hand.
+Step 3 is about the **model** credential only. Leave `AGENTOS_API_KEY` and
+`AUDIT_HMAC_KEY` empty; the guarded launcher generates both as independent
+32-byte keys and keeps the active `.env` mode `0600`.
 
 Quickstart uses the local Codex proxy at `http://127.0.0.1:8317/v1`, which is
 just the credential that happens to be easiest to get. A request that names no
@@ -98,31 +104,38 @@ creates it for you:
 
 | you run | it does |
 |---|---|
-| `agentos up`, `agentos onboard`, `agentos start` | If `AGENTOS_API_KEY` is absent or empty in the active `.env`, generate a fresh 32-byte random key, write it into that `.env` — filling an existing empty `AGENTOS_API_KEY=` line **in place**, appending the line only when the name is absent — set the file to mode `0600`, and print the path it wrote to. An existing non-empty value is never overwritten. Writing in place matters: `.env.example` ships `AGENTOS_API_KEY=` already declared, so appending would produce two assignments of one name and `scripts/dev-up.sh` would then refuse to start with `duplicate dotenv variable`. |
+| Linux `agentos up`, or Linux/macOS `agentos onboard` / `agentos start` | If `AGENTOS_API_KEY` or `AUDIT_HMAC_KEY` is absent or empty in the active `.env`, generate a distinct fresh 32-byte random key for each, fill its declared line **in place**, set the file to mode `0600`, and print the path. Existing non-empty values are never overwritten. Writing in place matters: `scripts/dev-up.sh` refuses a `duplicate dotenv variable`. |
 | any command | **Never** invents a provider credential. `CODEX_PROXY_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and friends are yours to supply; AgentOS only reads them. |
 | `agentos doctor` | Reports, explicitly and separately: (a) whether `AGENTOS_API_KEY` is present, (b) which provider credential is present, (c) the default route that results — the first provider in the preference order above whose credential is present, or `provider_credential_missing` when none is. A missing `AGENTOS_API_KEY` is reported as *the cause*, not as "missing identities". |
 | `agentos start` | Loads the same active `.env` as `agentos up` and generates the key the same way. There is exactly one configuration path. |
 
 So the shortest honest first run is: install iii, put one model credential in
-`.env`, `cargo build --workspace --release`, `agentos up`. The bearer token
-appears in `.env` on its own, mode `0600`, and `agentos doctor` tells you which
-of the three things above is missing when something does not work.
+`.env`, build, then use `agentos up` on Linux or foreground `agentos start` on
+macOS. The bearer token appears in `.env` on its own, mode `0600`, and
+`agentos doctor` names what is missing.
 
-`agentos up` runs one ordered policy and never builds or installs anything: it
+On Linux, `agentos up` runs one ordered policy and never builds or installs anything: it
 resolves the config, verifies the iii binary (missing → `bash scripts/install-iii.sh`),
-reuses an engine already healthy on port 49134 or boots `iii --config config.yaml`
-detached and waits for health with a bounded timeout, verifies every Rust worker
-release binary (missing → `cargo build --workspace --release`), starts the workers
-unless their canonical identities are already connected, waits for the complete
-identity set to register on the bus, and only then hands the terminal to
-`agentos-tui`. A partial stack starts only its missing workers. `up` loads the
-active runtime's `.env` without overriding explicit shell exports and passes those
-values to the engine, workers, and TUI; the TUI sends `AGENTOS_API_KEY` as a bearer
-token on protected routes. Each stage reports its own failure and stops before the
+starts `agentos-bus-authd` before an RBAC-armed engine, refuses to reuse an engine
+whose live gate cannot be verified, or boots `iii --config config.yaml` detached
+with builtin mutation daemons disabled. It then verifies every Rust worker release
+binary (missing → `cargo build --workspace --release`), starts only missing worker
+identities, waits for the complete identity set, and hands the terminal to
+`agentos-tui`. Non-empty active `.env` assignments take precedence over shell
+exports. Each Rust worker receives a cleared process environment plus a small safe
+baseline, its identity, and only the keys declared for it in
+`workers/env.allowlist`; the TUI sends `AGENTOS_API_KEY` on protected routes. Each stage reports its own failure and stops before the
 next one; `--timeout` (default 30s) bounds the engine wait and then the worker wait.
 
 ```bash
-agentos up --no-tui   # engine + workers only; leaves them running, no TUI
+# Linux owned detached lifecycle
+agentos up --no-tui
+agentos stop --grace-seconds 5   # accepted range 0..60 seconds; default 5
+
+# macOS foreground lifecycle (Ctrl+C stops the owned children)
+agentos start
+# another terminal: agentos tui
+
 agentos doctor        # readiness report; diagnostic only, changes nothing
 ```
 
@@ -131,10 +144,11 @@ connected worker count and any missing canonical identities, worker and TUI
 binary readiness, which config discovery mode is in effect, and the three
 first-run facts above: `AGENTOS_API_KEY` presence, the provider credential in
 use, and the resulting default route.
-`scripts/dev-up.sh` still starts only the workers against an engine you booted
-yourself.
+`scripts/dev-up.sh` applies the same env policy, authd-before-engine order, and
+unverifiable-engine refusal for development. It consumes an already-initialized
+`.env`; run a CLI first-run command to generate the machine keys before using it.
 
-Engine boots on port 49134. `agentos up` starts the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source registers 301 literal function ids, which resolve to 301 distinct function ids (`bun run counts`). The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
+Engine boots on port 49134. Linux `agentos up` and foreground `agentos start` start the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source registers 301 literal function ids, which resolve to 301 distinct function ids (`bun run counts`). The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
 
 Prefer driving by HTTP? Same thing without the TUI:
 
@@ -154,12 +168,15 @@ AGENTOS_E2E_MODEL=claude-sonnet-4-20250514 bun run test:e2e
 
 The full-stack release installer supports Linux `x86_64` and `aarch64`, and
 macOS `aarch64`. Upstream iii `v0.22.1` does not publish the required
-`iii-worker` runtime for macOS `x86_64`:
+`iii-worker` runtime for macOS `x86_64`. Only the Linux owned detached
+`up`/`stop` lifecycle has runtime proof; building a macOS artifact is not proof
+that detached lifecycle works there. macOS `aarch64` uses foreground `start`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/wunitb/unitb-iii-agentos/main/scripts/install.sh | bash
 agentos init --quick
-agentos up
+agentos up      # Linux detached lifecycle
+# macOS instead: agentos start; then run `agentos tui` in another terminal
 ```
 
 The installer needs network access, `curl`, `tar`, and `sha256sum` or `shasum`.
@@ -306,6 +323,23 @@ website/         agentsos.sh — design.md aesthetic, three themes
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full primitive flow and worker manifest spec.
 
+
+### Security boundary
+
+The default `config.yaml` arms tiered bus RBAC. It narrows what a credential-less
+loopback caller may invoke or register, but the raw bus is not a hostile local-user
+sandbox: generic registry/state compatibility remains, and every shipped worker
+shares the operator `AGENTOS_API_KEY`. Keep the engine on loopback and run it under
+a trusted OS account.
+
+The process bridge is off by default. Enabling
+`AGENTOS_ENABLE_PROCESS_BRIDGE=1` grants executable authority to trusted bearer
+holders; executable basename checks and a cleared child environment are not an
+inode or argument sandbox, and descendant processes can outlive direct-child
+teardown. Integration catalog entries are trusted manifests and may invoke `npx`,
+so their registry and transitive package supply chain must be reviewed. See
+[`SECURITY.md`](SECURITY.md) for the supported threat model and reporting path.
+
 ## § 09 · How changes reach this repository
 
 Nothing in this repository launches an agent session of its own, and no work is merged that the repository's own gates have not passed.
@@ -360,8 +394,10 @@ bun run test:e2e                                                     # live engi
 The Rust commands are offline only when the Rust toolchain and all locked
 registry/source artifacts are already cached. `uv run` may download pytest and
 the Bun command requires an installed lockfile-matching dependency tree.
-The E2E command is not offline: it needs a running engine/workers stack and
-model credentials for chat assertions.
+The credential-free fake-provider E2E proves request shape and multi-turn history
+without network egress. It is not evidence for any real provider account, billing
+path, rate limit, or production network. The separate live E2E command needs a
+running stack, credentials, egress, and explicit authorization.
 
 ## § 12 · Versioning
 
@@ -372,7 +408,11 @@ model credentials for chat assertions.
 | iii-sdk (Rust) | pinned at `=0.22.1`; contract test checks every manifest |
 | iii-sdk (Node) | pinned at `0.22.1`; root package manager is Bun |
 | iii-sdk (Python) | pinned at `0.22.1`; worker manifest and pyproject are checked |
-| agentos | `0.1.0` — stable contract on iii v0.22.1 |
+| agentos | `0.2.0` — stable contract on iii v0.22.1 |
+
+iii `v0.23` is the latest stable upstream line, but compatibility is deferred:
+AgentOS remains on `v0.22.1` until SDK wire shapes, RBAC hooks, registry assets,
+all supported platforms, boot, and the full test matrix are validated together.
 
 ## § 13 · Provenance and license
 

@@ -18,7 +18,7 @@ That is expected: skip section 3 entirely.
 
 ## Prerequisites
 
-- Linux `x86_64`/`aarch64` or macOS `aarch64`
+- Linux `x86_64`/`aarch64` or macOS `aarch64` release artifacts. The owned detached `agentos up`/`agentos stop` lifecycle is Linux-only; macOS uses foreground `agentos start`.
 - Git, curl, tar, Rust/Cargo, Python 3.11+, Node.js 20+
 - `sha256sum` or `shasum` — the installer and `scripts/memworkr-sync.sh` verify digests with them
 - `file` — `scripts/install-iii.sh:64` exits without it
@@ -50,12 +50,17 @@ ${EDITOR:-vi} .env
 cargo build --workspace --release
 ```
 
-`.env.example` is the dotenv template and the allowlist `scripts/dev-up.sh` enforces: it declares every
-variable the workers read, with empty values. Set at least one model credential
-(`ANTHROPIC_API_KEY`, or `CODEX_PROXY_API_KEY` for a local OpenAI-compatible proxy).
+`.env.example` is the dotenv schema. `workers/env.allowlist` assigns the permitted
+subset to each shipped Rust worker. Both guarded launchers clear inherited worker
+environments, add a small safe baseline and exact identity, then add only that
+worker's declared keys. Non-empty dotenv assignments override shell exports. Set at
+least one model credential (`ANTHROPIC_API_KEY`, or `CODEX_PROXY_API_KEY` for a local
+OpenAI-compatible proxy).
 
-Leave `AGENTOS_API_KEY` empty. `agentos up`, `agentos start` and `agentos onboard` generate a 32-byte key
-into the active `.env` with mode 0600 on first run and never overwrite an existing value. Every protected
+Leave `AGENTOS_API_KEY` and `AUDIT_HMAC_KEY` empty. Linux `agentos up`,
+Linux/macOS `agentos start`, and `agentos onboard` generate distinct 32-byte keys into the active `.env` with
+mode 0600 on first run and never overwrite existing values. `scripts/dev-up.sh`
+consumes that initialized file; it does not invent keys. Every protected
 HTTP route needs it (`crates/http-adapter/src/lib.rs`): without it almost every worker exits while
 registering its routes.
 
@@ -116,42 +121,49 @@ functions.
 
 ## 4. Start AgentOS
 
-Either start the whole stack with the CLI:
+Use a guarded launcher. Do not start `iii` first and do not loop over
+`target/release/agentos-*`: that bypasses authd ordering, engine verification, the
+worker env policy, and the worker identity checks.
+
+On Linux, use the owned detached lifecycle:
 
 ```bash
 cd "$HOME/unitb-stack/unitb-iii-agentos"
-./target/release/agentos up            # engine, workers, TUI (add --no-tui to stay headless)
+./target/release/agentos up            # add --no-tui to stay headless
+./target/release/agentos stop --grace-seconds 5  # later; range 0..60, default 5
 ```
 
-or drive the engine and the workers separately, which is what the memworkr path needs. First terminal:
+On macOS `aarch64`, keep the stack in the foreground. Open the TUI in a second
+terminal:
 
 ```bash
-cd "$HOME/unitb-stack/unitb-iii-agentos"
-iii --config config.yaml
+./target/release/agentos start
+# another terminal
+./target/release/agentos tui
 ```
 
-Second terminal:
+For the Linux development or optional memworkr helper, initialize the keys once
+through the CLI before using it:
 
 ```bash
-cd "$HOME/unitb-stack/unitb-iii-agentos"
+./target/release/agentos onboard
 bash scripts/dev-up.sh
 ```
 
-If `config.yaml` arms bus RBAC (`rbac.auth_function_id`), `agentos-bus-authd` must be listening **before**
-the engine starts: iii 0.22.1 calls the auth function for every bus connection, so with the gate armed and
-no daemon the engine refuses every worker. `agentos up` and `agentos start` start it first and stop it with
-the stack. In the two-terminal flow above, start it before the engine:
+The default `config.yaml` arms bus RBAC. The CLI generates missing machine keys;
+these launch paths start `agentos-bus-authd` before an engine they start, force
+builtin mutation daemons off, and apply `workers/env.allowlist`. If an engine is
+already listening but its live gate cannot be verified, they refuse it rather than
+silently reusing or killing an unrelated process.
 
-```bash
-./target/release/agentos-bus-authd --listen=127.0.0.1:49129 &   # must match iii-bridge url in config.yaml
-```
+`dev-up.sh` starts memworkr only when a synced version is active and its recorded
+digest matches, then waits for schema-v6 `memory::health`. A memworkr problem
+degrades to a warning; the AgentOS workers keep running.
 
-`scripts/dev-up.sh` also starts it when it is not already listening; the engine's `iii-bridge` retries, so a
-late daemon only costs the connections made in that window. It refuses to start without `AGENTOS_API_KEY`.
-
-`dev-up.sh` starts every release worker binary, then starts memworkr only when a synced version is active
-and its recorded digest matches, and waits for schema-v6 `memory::health`. Any memworkr problem degrades to
-a warning; the AgentOS workers keep running.
+Only the Linux owned detached lifecycle has runtime proof. The release workflow
+building a macOS archive proves compilation and package shape, not detached process
+ownership or stop behavior on macOS. This limit does not remove the macOS artifact
+or the supported foreground `start` path.
 
 ### Desktop chat console (opt-in)
 
@@ -202,7 +214,7 @@ worker identities, the machine key, which provider credential is present, the re
 bus-auth daemon, and which agents have a capability document. A check it prints red is a stack that will
 fail at runtime, whatever the health endpoint says.
 
-`agentos up` ends in the TUI by itself. On the two-terminal path, open it and send a message:
+Linux `agentos up` ends in the TUI by itself. With macOS foreground `agentos start`, open the TUI in the second terminal and send a message:
 
 ```bash
 ./target/release/agentos tui
@@ -225,11 +237,27 @@ reaches a box that was installed before it:
 - Nothing is rewritten when your `config.yaml` already satisfies all of the above, and a `config.yaml` with
   no `workers:` roster is not touched at all.
 
-**Bus RBAC is not armed for you.** The `rbac:` block and the `iii-bridge` entry are additions to
-`config.yaml`, not corrections to it, and inserting a nested block into a file the operator owns is not
-something the installer will guess at. An upgraded install keeps the pre-RBAC behaviour until you copy both
-blocks from the release's `config.yaml` yourself. `./target/release/agentos doctor` tells you which state
-you are in on its `Bus auth` line, and `agentos up` starts the daemon as soon as the gate is armed.
+Fresh release installs use the default-on `rbac:` and `iii-bridge` topology from
+the release. An older operator-owned `config.yaml` is not silently rewritten with a
+nested RBAC block during upgrade. Such an installation keeps its earlier unarmed
+policy until the operator reviews and copies both blocks from the release
+`config.yaml`. `agentos doctor` reports that state; do not claim an upgraded host is
+armed until the live check says so.
+
+## Security and compatibility limits
+
+The bus is a loopback, single-operator boundary, not a hostile local-user sandbox.
+The shared `AGENTOS_API_KEY` gives trusted processes operator authority, and generic
+registry/state compatibility remains available below the sensitive-call denies.
+The opt-in process bridge gives bearer holders executable authority without inode or
+argument sandboxing; direct-child teardown does not guarantee descendant teardown.
+Trusted integration manifests may execute `npx`, so review package-registry and
+transitive dependency risk. See [`SECURITY.md`](SECURITY.md).
+
+Credential-free tests use a local fake provider and do not prove real-provider
+credentials, billing, limits, or egress. iii `v0.23` is the latest stable upstream
+line, but AgentOS remains on `v0.22.1` until compatibility is validated across RBAC,
+SDK wire shapes, registry assets, every supported platform, boot, and the full suite.
 
 ## Updates
 

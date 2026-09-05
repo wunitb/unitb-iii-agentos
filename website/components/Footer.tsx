@@ -82,7 +82,7 @@ export default function Footer() {
           <div className="flex items-center gap-3 text-fg-3">
             <Wordmark size={20} />
             <span className="font-mono text-[10.5px] tracking-[0.18em] uppercase">
-              agentos · apache-2.0 · v0.1.0
+              agentos · apache-2.0 · v0.2.0
             </span>
           </div>
           <div className="font-mono text-[10.5px] tracking-[0.18em] uppercase text-fg-3">
