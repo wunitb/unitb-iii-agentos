@@ -1452,6 +1452,7 @@ async fn main() -> Result<()> {
                 ..
             } = runtime_paths()?;
             let first_run = !agentos_home.exists();
+            let lifecycle_lock = lifecycle::try_lock(&agentos_home)?;
             initialize_agentos_home(&agentos_home)?;
             if first_run {
                 println!("{} First run detected. Initializing...", "→".blue());
@@ -1553,6 +1554,10 @@ async fn main() -> Result<()> {
                     worker_log.display()
                 );
             }
+
+            // Foreground ownership stays with this process. Release the lock
+            // once its key/bootstrap/spawn transaction is complete.
+            drop(lifecycle_lock);
 
             let rust_worker_count = worker_specs
                 .iter()
@@ -2137,6 +2142,7 @@ async fn main() -> Result<()> {
 
             lifecycle::ensure_supported()?;
             let paths = runtime_paths()?;
+            let lifecycle_lock = lifecycle::try_lock(&paths.agentos_home)?;
             initialize_agentos_home(&paths.agentos_home)?;
             // A clean machine has no AGENTOS_API_KEY, and without it almost
             // every worker exits while registering its HTTP routes. Only touch
@@ -2163,6 +2169,7 @@ async fn main() -> Result<()> {
             .await?;
             let outcome = outcome?;
             effects.persist_started()?;
+            drop(lifecycle_lock);
             if let bootstrap::UpOutcome::Tui(code) = outcome {
                 std::process::exit(code);
             }
