@@ -1,0 +1,58 @@
+[
+  {
+    "name": "export, quotes, inline comments, and escapes",
+    "source": "export CODEX_PROXY_API_KEY=quoted\\#literal\nANTHROPIC_API_KEY=cloud-secret # deployment note\nOPENAI_API_KEY='open # literal'\nAGENTOS_DEFAULT_MODEL=\"line\\nnext\"\n",
+    "inherited": {},
+    "expected": {
+      "CODEX_PROXY_API_KEY": "quoted\\#literal",
+      "ANTHROPIC_API_KEY": "cloud-secret",
+      "OPENAI_API_KEY": "open # literal",
+      "AGENTOS_DEFAULT_MODEL": "line\nnext"
+    }
+  },
+  {
+    "name": "empty values fall back to inherited values",
+    "source": "CODEX_PROXY_API_KEY=   \nANTHROPIC_API_KEY=\t\n",
+    "inherited": {
+      "CODEX_PROXY_API_KEY": "inherited-codex",
+      "ANTHROPIC_API_KEY": "inherited-anthropic"
+    },
+    "expected": {
+      "CODEX_PROXY_API_KEY": "inherited-codex",
+      "ANTHROPIC_API_KEY": "inherited-anthropic"
+    }
+  },
+  {
+    "name": "shell syntax stays literal",
+    "source": "CODEX_PROXY_API_KEY=$(printf exploited)\nANTHROPIC_API_KEY=$HOME\n",
+    "inherited": {},
+    "expected": {
+      "CODEX_PROXY_API_KEY": "$(printf exploited)",
+      "ANTHROPIC_API_KEY": "$HOME"
+    }
+  },
+  {
+    "name": "duplicate names are rejected",
+    "source": "CODEX_PROXY_API_KEY=first\nCODEX_PROXY_API_KEY=second\n",
+    "inherited": {},
+    "error": "duplicate dotenv variable 'CODEX_PROXY_API_KEY' on line 2"
+  },
+  {
+    "name": "unmatched double quote is rejected",
+    "source": "CODEX_PROXY_API_KEY=\"unterminated\n",
+    "inherited": {},
+    "error": "unclosed double quote on line 1"
+  },
+  {
+    "name": "unknown escape is rejected",
+    "source": "CODEX_PROXY_API_KEY=\"bad\\q\"\n",
+    "inherited": {},
+    "error": "unsupported dotenv escape \\q on line 1"
+  },
+  {
+    "name": "space before a key is rejected",
+    "source": " CODEX_PROXY_API_KEY=value\n",
+    "inherited": {},
+    "error": "invalid dotenv variable name on line 1"
+  }
+]

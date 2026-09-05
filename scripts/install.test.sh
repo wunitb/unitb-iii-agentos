@@ -225,7 +225,37 @@ make_release() {
   printf '#!/bin/sh\necho "agentos-tui %s"\n' "$tag" > "$stage/bin/agentos-tui"
   chmod +x "$stage/bin/agentos" "$stage/bin/agentos-tui"
 
-  printf 'release: "%s"\n' "$tag" > "$stage/runtime/config.yaml"
+  cat > "$stage/runtime/config.yaml" <<EOF
+# release: "$tag"
+workers:
+  - name: iii-worker-manager
+    config:
+      host: 127.0.0.1
+      rbac:
+        auth_function_id: agentos::bus_auth
+        on_function_registration_function_id: agentos::bus_on_register
+        on_trigger_registration_function_id: agentos::bus_on_trigger
+        on_trigger_type_registration_function_id: agentos::bus_on_trigger_type
+        expose_functions:
+          - match("*")
+  - name: iii-bridge
+    config:
+      url: ws://127.0.0.1:49129
+      forward:
+        - local_function: agentos::bus_auth
+          remote_function: agentos::bus_auth
+          timeout_ms: 5000
+        - local_function: agentos::bus_on_register
+          remote_function: agentos::bus_on_register
+          timeout_ms: 5000
+        - local_function: agentos::bus_on_trigger
+          remote_function: agentos::bus_on_trigger
+          timeout_ms: 5000
+        - local_function: agentos::bus_on_trigger_type
+          remote_function: agentos::bus_on_trigger_type
+          timeout_ms: 5000
+  - name: state
+EOF
   printf 'release = "%s"\n' "$tag" > "$stage/runtime/config/default.toml"
   printf 'name: echo\nruntime: rust\n' > "$stage/runtime/workers/echo/iii.worker.yaml"
   printf '%s\n' "$tag" > "$stage/runtime/RELEASE"
@@ -376,7 +406,7 @@ OPERATOR
 
 # A config that already satisfies every release-governed rule is not rewritten:
 # no backup, no reformatting, no gratuitous churn on upgrade.
-test_upgrade_keeps_a_clean_config_untouched() {
+test_upgrade_migrates_unarmed_config_to_secure_topology() {
   make_release v1.0.0
   run_installer v1.0.0 || return
 
@@ -385,17 +415,37 @@ workers:
   - name: iii-worker-manager
     config:
       host: 127.0.0.1
+      port: 49134
+      handshake_timeout_ms: 7000
   - name: state
+  - name: operator-worker
 user: true
 OPERATOR
-  local before
-  before="$(cat "$AGENTOS_HOME/runtime/config.yaml")"
 
   make_release v2.0.0
   run_installer v2.0.0 || return
 
-  assert_file_content "$AGENTOS_HOME/runtime/config.yaml" "$before" clean_config
-  assert_absent "$AGENTOS_HOME/runtime/config.yaml.bak" clean_config
+  local config="$AGENTOS_HOME/runtime/config.yaml"
+  for expected in \
+    "auth_function_id: agentos::bus_auth" \
+    "on_function_registration_function_id: agentos::bus_on_register" \
+    "on_trigger_registration_function_id: agentos::bus_on_trigger" \
+    "on_trigger_type_registration_function_id: agentos::bus_on_trigger_type" \
+    "- name: iii-bridge" \
+    "url: ws://127.0.0.1:49129"; do
+    assert_file_contains "$config" "$expected" secure_migration
+  done
+  assert_file_contains "$config" "port: 49134" secure_migration
+  assert_file_contains "$config" "handshake_timeout_ms: 7000" secure_migration
+  assert_file_contains "$config" "operator-worker" secure_migration
+  assert_file_contains "$config" "user: true" secure_migration
+  assert_exists "$config.bak" secure_migration
+
+  # A second upgrade is idempotent and does not add duplicate topology.
+  make_release v3.0.0
+  run_installer v3.0.0 || return
+  assert_equal "$(grep -c 'auth_function_id: agentos::bus_auth' "$config")" "1" secure_idempotent
+  assert_equal "$(grep -cE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*iii-bridge[[:space:]]*$' "$config")" "1" secure_idempotent
 }
 
 # Regression: the engine bus worker is mandatory. If config.yaml does not
@@ -455,6 +505,34 @@ OPERATOR
   assert_file_contains "$config" "port: 49134" bus_host
   assert_file_contains "$config" "handshake_timeout_ms: 5000" bus_host
   assert_file_contains "$config.bak" "host: 0.0.0.0" bus_host
+}
+
+test_upgrade_refuses_conflicting_security_topology_before_swap() {
+  make_release v1.0.0
+  run_installer v1.0.0 || return
+
+  cat > "$AGENTOS_HOME/runtime/config.yaml" <<'OPERATOR'
+workers:
+  - name: iii-worker-manager
+    config:
+      host: 127.0.0.1
+      rbac:
+        auth_function_id: attacker::allow_all
+  - name: state
+OPERATOR
+  local before status log
+  before="$(tree_manifest "$AGENTOS_HOME/runtime")"
+  make_release v2.0.0
+  log="$SANDBOX/conflict.log"
+  AGENTOS_VERSION=v2.0.0 bash "$INSTALLER" > "$log" 2>&1
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    fail "security_conflict: installer accepted a conflicting RBAC topology"
+  fi
+  assert_file_contains "$log" "conflicting bus security topology" security_conflict
+  assert_equal "$(tree_manifest "$AGENTOS_HOME/runtime")" "$before" security_conflict
+  assert_absent "$AGENTOS_HOME/runtime.new" security_conflict
+  assert_absent "$AGENTOS_HOME/runtime.old" security_conflict
 }
 
 test_upgrade_leaves_a_config_without_a_worker_roster_alone() {
@@ -596,7 +674,8 @@ ALL_TESTS=(
   test_upgrade_preserves_user_config
   test_upgrade_applies_release_security_defaults
   test_upgrade_removes_unsafe_worker_entries_from_adopted_config
-  test_upgrade_keeps_a_clean_config_untouched
+  test_upgrade_migrates_unarmed_config_to_secure_topology
+  test_upgrade_refuses_conflicting_security_topology_before_swap
   test_upgrade_pins_the_bus_worker_to_loopback
   test_upgrade_forces_the_bus_host_and_keeps_other_keys
   test_upgrade_leaves_a_config_without_a_worker_roster_alone

@@ -76,12 +76,12 @@ fn parse_dotenv(source: &str, path: &Path) -> Result<BTreeMap<String, String>> {
 fn parse_dotenv_all(source: &str, path: &Path) -> Result<BTreeMap<String, String>> {
     let mut values = BTreeMap::new();
     for (index, raw_line) in source.lines().enumerate() {
-        let mut line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let mut line = raw_line.trim_end();
+        if line.is_empty() || line.trim_start().starts_with('#') {
             continue;
         }
         if let Some(rest) = line.strip_prefix("export ") {
-            line = rest.trim_start();
+            line = rest;
         }
         let Some((key, raw_value)) = line.split_once('=') else {
             anyhow::bail!(
@@ -90,7 +90,6 @@ fn parse_dotenv_all(source: &str, path: &Path) -> Result<BTreeMap<String, String
                 index + 1
             );
         };
-        let key = key.trim();
         if key.is_empty()
             || !key
                 .chars()
@@ -98,15 +97,17 @@ fn parse_dotenv_all(source: &str, path: &Path) -> Result<BTreeMap<String, String
             || key.as_bytes()[0].is_ascii_digit()
         {
             anyhow::bail!(
-                "Invalid dotenv key at {}:{}: {key}",
-                path.display(),
-                index + 1
+                "Invalid dotenv variable name on line {} in {}: {key}",
+                index + 1,
+                path.display()
             );
         }
-        // First assignment wins within `.env`, matching common dotenv behavior
-        // and avoiding surprising overrides.
         if values.contains_key(key) {
-            continue;
+            anyhow::bail!(
+                "Duplicate dotenv variable '{key}' on line {} in {}",
+                index + 1,
+                path.display()
+            );
         }
         let value = parse_dotenv_value(raw_value.trim(), path, index + 1)?;
         values.insert(key.to_string(), value);
@@ -117,33 +118,38 @@ fn parse_dotenv_all(source: &str, path: &Path) -> Result<BTreeMap<String, String
 fn parse_dotenv_value(value: &str, path: &Path, line: usize) -> Result<String> {
     if let Some(quoted) = value.strip_prefix('"') {
         let Some(quoted) = quoted.strip_suffix('"') else {
-            anyhow::bail!("Unclosed double quote at {}:{line}", path.display());
+            anyhow::bail!("Unclosed double quote on line {line} in {}", path.display());
         };
         let mut parsed = String::new();
-        let mut escaped = false;
-        for character in quoted.chars() {
-            if escaped {
-                parsed.push(match character {
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    other => other,
-                });
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else {
+        let mut characters = quoted.chars();
+        while let Some(character) = characters.next() {
+            if character != '\\' {
                 parsed.push(character);
+                continue;
             }
-        }
-        if escaped {
-            parsed.push('\\');
+            let Some(escaped) = characters.next() else {
+                anyhow::bail!(
+                    "Dangling dotenv escape on line {line} in {}",
+                    path.display()
+                );
+            };
+            parsed.push(match escaped {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '\\' => '\\',
+                '"' => '"',
+                other => anyhow::bail!(
+                    "Unsupported dotenv escape \\{other} on line {line} in {}",
+                    path.display()
+                ),
+            });
         }
         return Ok(parsed);
     }
     if let Some(quoted) = value.strip_prefix('\'') {
         let Some(quoted) = quoted.strip_suffix('\'') else {
-            anyhow::bail!("Unclosed single quote at {}:{line}", path.display());
+            anyhow::bail!("Unclosed single quote on line {line} in {}", path.display());
         };
         return Ok(quoted.to_string());
     }
@@ -1810,6 +1816,7 @@ pub(crate) struct SystemEffects {
     engine: Option<std::process::Child>,
     bus_auth: Option<std::process::Child>,
     workers: Vec<RunningWorker>,
+    owned: Vec<crate::lifecycle::OwnedCandidate>,
 }
 
 impl SystemEffects {
@@ -1822,7 +1829,23 @@ impl SystemEffects {
             engine: None,
             bus_auth: None,
             workers: Vec::new(),
+            owned: Vec::new(),
         }
+    }
+
+    pub(crate) fn persist_started(&mut self) -> Result<()> {
+        let captured = self
+            .owned
+            .iter()
+            .map(crate::lifecycle::OwnedCandidate::finalize)
+            .collect::<Result<Vec<_>>>();
+        let result =
+            captured.and_then(|owned| crate::lifecycle::persist_owned(&self.agentos_home, owned));
+        if let Err(error) = result {
+            self.shutdown_started();
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Values this invocation would hand to a child process: a non-empty active
@@ -2011,6 +2034,8 @@ impl Bootstrap for SystemEffects {
             true,
         )?;
         let pid = daemon.id();
+        self.owned
+            .push(crate::lifecycle::OwnedCandidate::spawned("bus-auth", pid));
         self.bus_auth = Some(daemon);
         Ok(pid)
     }
@@ -2034,6 +2059,8 @@ impl Bootstrap for SystemEffects {
             true,
         )?;
         let pid = engine.id();
+        self.owned
+            .push(crate::lifecycle::OwnedCandidate::spawned("engine", pid));
         self.engine = Some(engine);
         Ok(pid)
     }
@@ -2067,6 +2094,12 @@ impl Bootstrap for SystemEffects {
         };
         let before = self.workers.len();
         crate::launch_workers(workers, &launch, &mut self.workers)?;
+        for running in &self.workers[before..] {
+            self.owned.push(crate::lifecycle::OwnedCandidate::spawned(
+                "worker",
+                running.child.id(),
+            ));
+        }
         Ok(self.workers.len() - before)
     }
 
@@ -2088,6 +2121,7 @@ impl Bootstrap for SystemEffects {
             let _ = daemon.wait();
         }
         self.bus_auth = None;
+        self.owned.clear();
     }
 
     fn run_tui(&mut self, binary: &Path) -> Result<i32> {
@@ -3387,24 +3421,27 @@ mod tests {
     }
 
     #[test]
-    fn dotenv_parser_handles_empty_input_duplicates_and_blank_values() {
+    fn dotenv_parser_handles_empty_input_and_blank_values_but_rejects_duplicates() {
         assert!(
             parse_dotenv("", Path::new("/runtime/.env"))
                 .expect("empty dotenv is valid")
                 .is_empty()
         );
-        let values = parse_dotenv(
-            "AGENTOS_TEST_DUPLICATE=first\nAGENTOS_TEST_DUPLICATE=second\nAGENTOS_TEST_EMPTY=\n",
-            Path::new("/runtime/.env"),
-        )
-        .expect("parse edge-case dotenv");
-        assert_eq!(
-            values.get("AGENTOS_TEST_DUPLICATE").map(String::as_str),
-            Some("first")
-        );
+        let values = parse_dotenv("AGENTOS_TEST_EMPTY=\n", Path::new("/runtime/.env"))
+            .expect("parse blank dotenv value");
         assert!(
             !values.contains_key("AGENTOS_TEST_EMPTY"),
             "blank dotenv assignments must fall back to the shell at spawn time"
+        );
+        let duplicate = parse_dotenv(
+            "AGENTOS_TEST_DUPLICATE=first\nAGENTOS_TEST_DUPLICATE=second\n",
+            Path::new("/runtime/.env"),
+        )
+        .expect_err("duplicates must fail")
+        .to_string();
+        assert!(
+            duplicate.contains("Duplicate dotenv variable"),
+            "{duplicate}"
         );
         assert!(
             load_dotenv(Path::new("/agentos-test-path-that-does-not-exist"))
@@ -3413,11 +3450,45 @@ mod tests {
         );
     }
 
+    #[derive(serde::Deserialize)]
+    struct DotenvCorpusCase {
+        name: String,
+        source: String,
+        inherited: BTreeMap<String, String>,
+        expected: Option<BTreeMap<String, String>>,
+        error: Option<String>,
+    }
+
+    #[test]
+    fn rust_dotenv_parser_matches_the_shared_corpus() {
+        let cases: Vec<DotenvCorpusCase> =
+            serde_json::from_str(include_str!("../tests/fixtures/dotenv-corpus.json"))
+                .expect("parse shared dotenv corpus");
+        for case in cases {
+            let result = parse_dotenv(&case.source, Path::new("/runtime/.env"));
+            if let Some(expected_error) = case.error {
+                let error = result
+                    .expect_err(&case.name)
+                    .to_string()
+                    .to_ascii_lowercase();
+                assert!(
+                    error.contains(&expected_error.to_ascii_lowercase()),
+                    "{}: {error}",
+                    case.name
+                );
+                continue;
+            }
+            let mut actual = case.inherited;
+            actual.extend(result.expect(&case.name));
+            assert_eq!(actual, case.expected.unwrap_or_default(), "{}", case.name);
+        }
+    }
+
     #[test]
     fn dotenv_parser_rejects_invalid_keys_and_unclosed_quotes() {
         for (source, expected) in [
-            ("9INVALID=value", "Invalid dotenv key"),
-            ("BAD-KEY=value", "Invalid dotenv key"),
+            ("9INVALID=value", "Invalid dotenv variable name"),
+            ("BAD-KEY=value", "Invalid dotenv variable name"),
             ("KEY='unterminated", "Unclosed single quote"),
             ("KEY=\"unterminated", "Unclosed double quote"),
         ] {
@@ -3425,7 +3496,8 @@ mod tests {
                 .expect_err("malformed dotenv must fail")
                 .to_string();
             assert!(error.contains(expected), "{source:?}: {error}");
-            assert!(error.contains("/runtime/.env:1"), "{source:?}: {error}");
+            assert!(error.contains("/runtime/.env"), "{source:?}: {error}");
+            assert!(error.contains("1"), "{source:?}: {error}");
         }
     }
 

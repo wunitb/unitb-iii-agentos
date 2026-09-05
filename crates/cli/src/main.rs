@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use api_client::AgentosApiClient;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use serde_json::{Value, json};
@@ -10,7 +11,9 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+mod api_client;
 mod bootstrap;
+mod lifecycle;
 
 const API_BASE: &str = "http://localhost:3111";
 const TUI_BINARY: &str = "agentos-tui";
@@ -881,6 +884,58 @@ fn is_process_baseline(name: &str) -> bool {
     PROCESS_BASELINE_ENV.contains(&name) || name.starts_with("LC_")
 }
 
+fn unicode_environment(
+    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> BTreeMap<String, String> {
+    environment
+        .into_iter()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
+}
+
+// The iii registry launches these native provider workers inside the engine
+// process tree. Keep only their documented credential/runtime knobs plus the
+// common process baseline; AgentOS worker/channel/integration secrets stay out.
+const ENGINE_ENV: &[&str] = &[
+    "III_URL",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "CODEX_HOME",
+    "PROVIDER_ANTHROPIC_CACHE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "III_DISABLE_TRACE_PAYLOADS",
+    "III_TRACE_PAYLOAD_MAX_BYTES",
+    "TOKIO_WORKER_THREADS",
+];
+const BUS_AUTH_ENV: &[&str] = &["AGENTOS_API_KEY"];
+
+fn scoped_service_environment(
+    allowed: &[&str],
+    dotenv: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let parent = unicode_environment(std::env::vars_os());
+    let mut scoped = parent
+        .iter()
+        .filter(|(name, _)| is_process_baseline(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for name in allowed {
+        if let Some(value) = dotenv.get(*name).filter(|value| !value.is_empty()) {
+            scoped.insert((*name).to_string(), value.clone());
+        } else if let Some(value) = parent.get(*name) {
+            scoped.insert((*name).to_string(), value.clone());
+        }
+    }
+    scoped
+}
+
 fn scoped_worker_environment(
     declared: &[String],
     dotenv: &BTreeMap<String, String>,
@@ -1213,8 +1268,8 @@ fn detach_process(command: &mut Command) {
 pub(crate) struct WorkerLaunch<'a> {
     pub(crate) runtime_dir: &'a Path,
     pub(crate) log_path: &'a Path,
-    /// Values loaded from the runtime `.env`. Explicit shell exports are not
-    /// included here and continue to be inherited normally.
+    /// Values loaded from the runtime `.env`. After `env_clear`, only declared
+    /// non-empty dotenv values or declared shell fallbacks are restored.
     pub(crate) env: &'a BTreeMap<String, String>,
     /// Keep the workers running after this process exits.
     pub(crate) detached: bool,
@@ -1234,7 +1289,7 @@ pub(crate) fn launch_workers(
         let Some(binary) = worker.binary.as_ref() else {
             continue;
         };
-        let parent_env = std::env::vars().collect::<BTreeMap<_, _>>();
+        let parent_env = unicode_environment(std::env::vars_os());
         let scoped_env = scoped_worker_environment(&worker.env, launch.env, &parent_env);
         let mut command = Command::new(binary);
         command
@@ -1291,7 +1346,8 @@ pub(crate) fn spawn_bus_auth(
         // the check follows `--config`, not the working directory.
         .arg(format!("--config={}", config_path.display()))
         .current_dir(runtime_dir)
-        .envs(env)
+        .env_clear()
+        .envs(scoped_service_environment(BUS_AUTH_ENV, env))
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err));
     if detached {
@@ -1319,7 +1375,8 @@ pub(crate) fn spawn_engine(
         .arg("--config")
         .arg(config_path)
         .current_dir(runtime_dir)
-        .envs(env)
+        .env_clear()
+        .envs(scoped_service_environment(ENGINE_ENV, env))
         // AgentOS owns this engine lifecycle. The built-in daemon would expose
         // worker::* mutation functions outside the packaged-worker boundary.
         .env("IIIWORKER_DISABLE_BUILTIN_DAEMONS", "1")
@@ -1336,8 +1393,11 @@ pub(crate) fn spawn_engine(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = reqwest::Client::new();
-    let api_base = get_api_url();
+    // Resolve API URL/key only in commands that use the API. Local lifecycle
+    // commands such as `stop` must still work when an unrelated dotenv entry is
+    // malformed or the API configuration is invalid.
+    let client = || AgentosApiClient::from_runtime();
+    let api_base = || client().map(|value| value.base_url());
 
     match cli.command {
         Commands::Init { quick } => {
@@ -1522,17 +1582,23 @@ async fn main() -> Result<()> {
         }
 
         Commands::Stop => {
-            println!("{} Stopping agentos engine...", "→".blue());
-            println!("{} Engine stopped.", "✓".green());
+            let paths = runtime_paths()?;
+            println!("{} Stopping AgentOS-owned processes...", "→".blue());
+            match lifecycle::stop_owned(&paths.agentos_home)? {
+                lifecycle::StopOutcome::NothingRecorded => {
+                    println!(
+                        "{} No owned process record; nothing was signalled.",
+                        "✓".green()
+                    );
+                }
+                lifecycle::StopOutcome::Stopped(count) => {
+                    println!("{} Stopped {count} owned process groups.", "✓".green());
+                }
+            }
         }
 
         Commands::Status { json: is_json } => {
-            let resp: Value = client
-                .get(format!("{}/api/health", api_base))
-                .send()
-                .await?
-                .json()
-                .await?;
+            let resp: Value = client()?.get("/api/health").send().await?.json().await?;
             if is_json {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
@@ -1549,12 +1615,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Health { json: is_json } => {
-            let resp: Value = client
-                .get(format!("{}/api/health", api_base))
-                .send()
-                .await?
-                .json()
-                .await?;
+            let resp: Value = client()?.get("/api/health").send().await?.json().await?;
             if is_json {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
@@ -1570,12 +1631,7 @@ async fn main() -> Result<()> {
 
         Commands::Agent(cmd) => match cmd {
             AgentCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/agents", api_base))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/agents").send().await?.json().await?;
                 if let Some(agents) = resp.as_array() {
                     println!(
                         "{:<20} {:<15} {:<30}",
@@ -1595,8 +1651,8 @@ async fn main() -> Result<()> {
             }
             AgentCmd::New { template } => {
                 let tmpl = template.unwrap_or_else(|| "assistant".into());
-                let resp: Value = client
-                    .post(format!("{}/api/agents", api_base))
+                let resp: Value = client()?
+                    .post("/api/agents")
                     .json(&json!({ "name": tmpl, "tags": ["template"] }))
                     .send()
                     .await?
@@ -1633,8 +1689,8 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    let resp: Value = client
-                        .post(format!("{}/api/agents/{}/message", api_base, agent))
+                    let resp: Value = client()?
+                        .post(format!("/api/agents/{}/message", agent))
                         .json(&json!({ "message": input }))
                         .send()
                         .await?
@@ -1649,15 +1705,15 @@ async fn main() -> Result<()> {
             }
             AgentCmd::Kill { agent } => {
                 let agent = validate_id(&agent)?;
-                client
-                    .delete(format!("{}/api/agents/{}", api_base, agent))
+                client()?
+                    .delete(format!("/api/agents/{}", agent))
                     .send()
                     .await?;
                 println!("{} Agent {} terminated", "✓".green(), agent);
             }
             AgentCmd::Spawn { template } => {
-                let resp: Value = client
-                    .post(format!("{}/api/agents", api_base))
+                let resp: Value = client()?
+                    .post("/api/agents")
                     .json(&json!({ "name": template, "tags": ["spawned"] }))
                     .send()
                     .await?
@@ -1673,8 +1729,8 @@ async fn main() -> Result<()> {
 
         Commands::Workflow(cmd) => match cmd {
             WorkflowCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/workflows", api_base))
+                let resp: Value = client()?
+                    .get("/api/workflows")
                     .send()
                     .await?
                     .error_for_status()?
@@ -1684,8 +1740,8 @@ async fn main() -> Result<()> {
             }
             WorkflowCmd::Show { id } => {
                 let id = validate_id(&id)?;
-                let resp: Value = client
-                    .get(format!("{}/api/workflows/{}", api_base, id))
+                let resp: Value = client()?
+                    .get(format!("/api/workflows/{}", id))
                     .send()
                     .await?
                     .error_for_status()?
@@ -1696,8 +1752,8 @@ async fn main() -> Result<()> {
             WorkflowCmd::Create { file } => {
                 let content = std::fs::read_to_string(&file)?;
                 let workflow = parse_workflow_document(&content)?;
-                let resp: Value = client
-                    .post(format!("{}/api/workflows", api_base))
+                let resp: Value = client()?
+                    .post("/api/workflows")
                     .json(&workflow)
                     .send()
                     .await?
@@ -1729,8 +1785,8 @@ async fn main() -> Result<()> {
                     let agent = validate_id(&agent)?;
                     body["agentId"] = Value::String(agent.to_string());
                 }
-                let resp: Value = client
-                    .post(format!("{}/api/workflows/{}/run", api_base, id))
+                let resp: Value = client()?
+                    .post(format!("/api/workflows/{}/run", id))
                     .json(&body)
                     .send()
                     .await?
@@ -1741,10 +1797,10 @@ async fn main() -> Result<()> {
             }
             WorkflowCmd::Runs { id, limit, offset } => {
                 let id = validate_id(&id)?;
-                let resp: Value = client
+                let resp: Value = client()?
                     .get(format!(
-                        "{}/api/workflows/{}/runs?limit={}&offset={}",
-                        api_base, id, limit, offset
+                        "/api/workflows/{}/runs?limit={}&offset={}",
+                        id, limit, offset
                     ))
                     .send()
                     .await?
@@ -1755,8 +1811,8 @@ async fn main() -> Result<()> {
             }
             WorkflowCmd::Status { run_id } => {
                 let run_id = validate_id(&run_id)?;
-                let resp: Value = client
-                    .get(format!("{}/api/workflow-runs/{}", api_base, run_id))
+                let resp: Value = client()?
+                    .get(format!("/api/workflow-runs/{}", run_id))
                     .send()
                     .await?
                     .error_for_status()?
@@ -1768,8 +1824,8 @@ async fn main() -> Result<()> {
 
         Commands::Skill(cmd) => match cmd {
             SkillCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/skillkit/list", api_base))
+                let resp: Value = client()?
+                    .get("/api/skillkit/list")
                     .send()
                     .await?
                     .json()
@@ -1793,8 +1849,8 @@ async fn main() -> Result<()> {
                 }
             }
             SkillCmd::Install { id } => {
-                let resp: Value = client
-                    .post(format!("{}/api/skillkit/install", api_base))
+                let resp: Value = client()?
+                    .post("/api/skillkit/install")
                     .json(&json!({ "id": id }))
                     .send()
                     .await?
@@ -1810,8 +1866,8 @@ async fn main() -> Result<()> {
             }
             SkillCmd::Remove { id } => {
                 let id = validate_id(&id)?;
-                let resp: Value = client
-                    .post(format!("{}/api/skillkit/uninstall", api_base))
+                let resp: Value = client()?
+                    .post("/api/skillkit/uninstall")
                     .json(&json!({ "id": id }))
                     .send()
                     .await?
@@ -1826,10 +1882,9 @@ async fn main() -> Result<()> {
                 println!("{} Removed skill: {}", "✓".green(), id);
             }
             SkillCmd::Search { query } => {
-                let resp: Value = client
+                let resp: Value = client()?
                     .get(format!(
-                        "{}/api/skillkit/search?query={}",
-                        api_base,
+                        "/api/skillkit/search?query={}",
                         urlencoding::encode(&query)
                     ))
                     .send()
@@ -1849,12 +1904,7 @@ async fn main() -> Result<()> {
 
         Commands::Models(cmd) => match cmd {
             ModelsCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/models", api_base))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/models").send().await?.json().await?;
                 if let Some(models) = resp.as_array() {
                     println!(
                         "{:<25} {:<15} {:<12} {:<10} {}",
@@ -1878,8 +1928,8 @@ async fn main() -> Result<()> {
                 }
             }
             ModelsCmd::Aliases => {
-                let resp: Value = client
-                    .get(format!("{}/api/models/aliases", api_base))
+                let resp: Value = client()?
+                    .get("/api/models/aliases")
                     .send()
                     .await?
                     .json()
@@ -1891,12 +1941,7 @@ async fn main() -> Result<()> {
                 }
             }
             ModelsCmd::Providers => {
-                let resp: Value = client
-                    .get(format!("{}/api/providers", api_base))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/providers").send().await?.json().await?;
                 if let Some(providers) = resp.as_array() {
                     for p in providers {
                         let available = p["available"].as_bool().unwrap_or(false);
@@ -1915,12 +1960,7 @@ async fn main() -> Result<()> {
                 }
             }
             ModelsCmd::Describe { model } => {
-                let resp: Value = client
-                    .get(format!("{}/api/models", api_base))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/models").send().await?.json().await?;
                 if let Some(models) = resp.as_array() {
                     if let Some(m) = models.iter().find(|m| m["id"].as_str() == Some(&model)) {
                         println!("{}", serde_json::to_string_pretty(m)?);
@@ -1934,8 +1974,8 @@ async fn main() -> Result<()> {
         Commands::Security(cmd) => match cmd {
             SecurityCmd::Audit => {
                 println!("{} Fetching audit trail...", "→".blue());
-                let resp: Value = client
-                    .get(format!("{}/api/security/audit/verify", api_base))
+                let resp: Value = client()?
+                    .get("/api/security/audit/verify")
                     .send()
                     .await?
                     .json()
@@ -1950,8 +1990,8 @@ async fn main() -> Result<()> {
                 );
             }
             SecurityCmd::Verify => {
-                let resp: Value = client
-                    .get(format!("{}/api/security/audit/verify", api_base))
+                let resp: Value = client()?
+                    .get("/api/security/audit/verify")
                     .send()
                     .await?
                     .json()
@@ -1959,8 +1999,8 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             }
             SecurityCmd::Scan { text } => {
-                let resp: Value = client
-                    .post(format!("{}/api/security/scan", api_base))
+                let resp: Value = client()?
+                    .post("/api/security/scan")
                     .json(&json!({ "text": text }))
                     .send()
                     .await?
@@ -1979,17 +2019,12 @@ async fn main() -> Result<()> {
 
         Commands::Approvals(cmd) => match cmd {
             ApprovalsCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/approvals", api_base))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/approvals").send().await?.json().await?;
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             }
             ApprovalsCmd::Approve { id } => {
-                let resp: Value = client
-                    .post(format!("{}/api/approvals/decide", api_base))
+                let resp: Value = client()?
+                    .post("/api/approvals/decide")
                     .json(&json!({ "requestId": id, "decision": "approve" }))
                     .send()
                     .await?
@@ -2004,8 +2039,8 @@ async fn main() -> Result<()> {
                 );
             }
             ApprovalsCmd::Reject { id } => {
-                let resp: Value = client
-                    .post(format!("{}/api/approvals/decide", api_base))
+                let resp: Value = client()?
+                    .post("/api/approvals/decide")
                     .json(&json!({ "requestId": id, "decision": "deny" }))
                     .send()
                     .await?
@@ -2047,8 +2082,8 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let resp: Value = client
-                    .post(format!("{}/api/agents/{}/message", api_base, agent_id))
+                let resp: Value = client()?
+                    .post(format!("/api/agents/{}/message", agent_id))
                     .json(&json!({ "message": input }))
                     .send()
                     .await?
@@ -2068,8 +2103,8 @@ async fn main() -> Result<()> {
             json: is_json,
         } => {
             let agent = validate_id(&agent)?;
-            let resp: Value = client
-                .post(format!("{}/api/agents/{}/message", api_base, agent))
+            let resp: Value = client()?
+                .post(format!("/api/agents/{}/message", agent))
                 .json(&json!({ "message": text }))
                 .send()
                 .await?
@@ -2083,6 +2118,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Dashboard => {
+            let api_base = api_base()?;
             println!("{} Opening dashboard at {}/dashboard", "→".blue(), api_base);
             let _ = std::process::Command::new("open")
                 .arg(format!("{}/dashboard", api_base))
@@ -2092,6 +2128,7 @@ async fn main() -> Result<()> {
         Commands::Up { no_tui, timeout } => {
             use std::io::Write as _;
 
+            lifecycle::ensure_supported()?;
             let paths = runtime_paths()?;
             initialize_agentos_home(&paths.agentos_home)?;
             // A clean machine has no AGENTOS_API_KEY, and without it almost
@@ -2110,13 +2147,15 @@ async fn main() -> Result<()> {
                 stage_timeout: Duration::from_secs(timeout),
                 poll_interval: Duration::from_millis(250),
             };
-            let outcome = tokio::task::spawn_blocking(move || {
+            let (outcome, mut effects) = tokio::task::spawn_blocking(move || {
                 let mut out = std::io::stdout();
                 let outcome = bootstrap::run_up(&mut effects, &paths, &options, &mut out);
                 let _ = out.flush();
-                outcome
+                (outcome, effects)
             })
-            .await??;
+            .await?;
+            let outcome = outcome?;
+            effects.persist_started()?;
             if let bootstrap::UpOutcome::Tui(code) = outcome {
                 std::process::exit(code);
             }
@@ -2150,12 +2189,7 @@ async fn main() -> Result<()> {
 
         Commands::Trigger(cmd) => match cmd {
             TriggerCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/triggers", get_api_url()))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/triggers").send().await?.json().await?;
                 if let Some(triggers) = resp.as_array() {
                     println!(
                         "{:<20} {:<15} {:<20} {:<30}",
@@ -2181,8 +2215,8 @@ async fn main() -> Result<()> {
                 function_id,
                 trigger_type,
             } => {
-                let resp: Value = client
-                    .post(format!("{}/api/triggers", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/triggers")
                     .json(&json!({ "functionId": function_id, "type": trigger_type }))
                     .send()
                     .await?
@@ -2196,8 +2230,8 @@ async fn main() -> Result<()> {
             }
             TriggerCmd::Delete { id } => {
                 let id = validate_id(&id)?;
-                client
-                    .delete(format!("{}/api/triggers/{}", get_api_url(), id))
+                client()?
+                    .delete(format!("/api/triggers/{}", id))
                     .send()
                     .await?;
                 println!("{} Deleted trigger: {}", "✓".green(), id);
@@ -2206,12 +2240,7 @@ async fn main() -> Result<()> {
 
         Commands::Channel(cmd) => match cmd {
             ChannelCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/channels", get_api_url()))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/channels").send().await?.json().await?;
                 if let Some(channels) = resp.as_array() {
                     println!(
                         "{:<20} {:<15} {:<15} {:<30}",
@@ -2240,8 +2269,8 @@ async fn main() -> Result<()> {
                 }
             }
             ChannelCmd::Setup { channel } => {
-                let resp: Value = client
-                    .post(format!("{}/api/channels", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/channels")
                     .json(&json!({ "channel": channel }))
                     .send()
                     .await?
@@ -2258,8 +2287,8 @@ async fn main() -> Result<()> {
             }
             ChannelCmd::Test { channel } => {
                 let channel = validate_id(&channel)?;
-                let resp: Value = client
-                    .post(format!("{}/api/channels/{}/test", get_api_url(), channel))
+                let resp: Value = client()?
+                    .post(format!("/api/channels/{}/test", channel))
                     .send()
                     .await?
                     .json()
@@ -2401,10 +2430,9 @@ async fn main() -> Result<()> {
         Commands::Memory(cmd) => match cmd {
             MemoryCmd::Get { agent, key } => {
                 let agent = validate_id(&agent)?;
-                let resp: Value = client
+                let resp: Value = client()?
                     .get(format!(
-                        "{}/api/memory/{}?agent={}",
-                        get_api_url(),
+                        "/api/memory/{}?agent={}",
                         urlencoding::encode(&key),
                         urlencoding::encode(agent)
                     ))
@@ -2416,8 +2444,8 @@ async fn main() -> Result<()> {
             }
             MemoryCmd::Set { agent, key, value } => {
                 let agent = validate_id(&agent)?;
-                let resp: Value = client
-                    .post(format!("{}/api/memory", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/memory")
                     .json(&json!({ "agent": agent, "key": key, "value": value }))
                     .send()
                     .await?
@@ -2434,10 +2462,9 @@ async fn main() -> Result<()> {
             }
             MemoryCmd::Delete { agent, key } => {
                 let agent = validate_id(&agent)?;
-                client
+                client()?
                     .delete(format!(
-                        "{}/api/memory/{}?agent={}",
-                        get_api_url(),
+                        "/api/memory/{}?agent={}",
                         urlencoding::encode(&key),
                         urlencoding::encode(agent)
                     ))
@@ -2447,12 +2474,8 @@ async fn main() -> Result<()> {
             }
             MemoryCmd::List { agent } => {
                 let agent = validate_id(&agent)?;
-                let resp: Value = client
-                    .get(format!(
-                        "{}/api/memory?agent={}",
-                        get_api_url(),
-                        urlencoding::encode(agent)
-                    ))
+                let resp: Value = client()?
+                    .get(format!("/api/memory?agent={}", urlencoding::encode(agent)))
                     .send()
                     .await?
                     .json()
@@ -2485,10 +2508,7 @@ async fn main() -> Result<()> {
         Commands::Logs { lines, follow } => {
             if follow {
                 println!("{} Streaming logs (Ctrl+C to stop)...\n", "→".blue());
-                let resp = client
-                    .get(format!("{}/api/dashboard/logs/stream", get_api_url()))
-                    .send()
-                    .await?;
+                let resp = client()?.get("/api/dashboard/logs/stream").send().await?;
                 let mut stream = resp.bytes_stream();
                 use futures_util::StreamExt;
                 while let Some(chunk) = stream.next().await {
@@ -2512,12 +2532,8 @@ async fn main() -> Result<()> {
                     }
                 }
             } else {
-                let resp: Value = client
-                    .get(format!(
-                        "{}/api/dashboard/logs?lines={}",
-                        get_api_url(),
-                        lines
-                    ))
+                let resp: Value = client()?
+                    .get(format!("/api/dashboard/logs?lines={}", lines))
                     .send()
                     .await?
                     .json()
@@ -2534,8 +2550,8 @@ async fn main() -> Result<()> {
 
         Commands::Vault(cmd) => match cmd {
             VaultCmd::Init => {
-                let resp: Value = client
-                    .post(format!("{}/api/vault/init", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/vault/init")
                     .send()
                     .await?
                     .json()
@@ -2547,24 +2563,15 @@ async fn main() -> Result<()> {
                 );
             }
             VaultCmd::Set { key, value } => {
-                client
-                    .post(format!(
-                        "{}/api/vault/{}",
-                        get_api_url(),
-                        urlencoding::encode(&key)
-                    ))
+                client()?
+                    .post(format!("/api/vault/{}", urlencoding::encode(&key)))
                     .json(&json!({ "value": value }))
                     .send()
                     .await?;
                 println!("{} Vault secret set: {}", "✓".green(), key.cyan());
             }
             VaultCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/vault", get_api_url()))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/vault").send().await?.json().await?;
                 if let Some(secrets) = resp.as_array() {
                     println!("{:<30} {:<20}", "KEY".bold(), "CREATED".bold());
                     for s in secrets {
@@ -2579,12 +2586,8 @@ async fn main() -> Result<()> {
                 }
             }
             VaultCmd::Remove { key } => {
-                client
-                    .delete(format!(
-                        "{}/api/vault/{}",
-                        get_api_url(),
-                        urlencoding::encode(&key)
-                    ))
+                client()?
+                    .delete(format!("/api/vault/{}", urlencoding::encode(&key)))
                     .send()
                     .await?;
                 println!("{} Vault secret removed: {}", "✓".green(), key);
@@ -2594,8 +2597,8 @@ async fn main() -> Result<()> {
         Commands::Migrate(cmd) => match cmd {
             MigrateCmd::Scan => {
                 println!("{} Scanning for migratable resources...", "→".blue());
-                let resp: Value = client
-                    .post(format!("{}/api/migrate/scan", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/migrate/scan")
                     .send()
                     .await?
                     .json()
@@ -2625,8 +2628,8 @@ async fn main() -> Result<()> {
                     "→".blue(),
                     if dry_run { " (dry run)" } else { "" }
                 );
-                let resp: Value = client
-                    .post(format!("{}/api/migrate/openclaw", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/migrate/openclaw")
                     .json(&json!({ "dryRun": dry_run }))
                     .send()
                     .await?
@@ -2645,8 +2648,8 @@ async fn main() -> Result<()> {
                     "→".blue(),
                     if dry_run { " (dry run)" } else { "" }
                 );
-                let resp: Value = client
-                    .post(format!("{}/api/migrate/langchain", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/migrate/langchain")
                     .json(&json!({ "dryRun": dry_run }))
                     .send()
                     .await?
@@ -2660,8 +2663,8 @@ async fn main() -> Result<()> {
                 );
             }
             MigrateCmd::Report => {
-                let resp: Value = client
-                    .get(format!("{}/api/migrate/report", get_api_url()))
+                let resp: Value = client()?
+                    .get("/api/migrate/report")
                     .send()
                     .await?
                     .json()
@@ -2673,8 +2676,8 @@ async fn main() -> Result<()> {
         Commands::Replay(cmd) => match cmd {
             ReplayCmd::Get { session_id } => {
                 let session_id = validate_id(&session_id)?;
-                let resp: Value = client
-                    .get(format!("{}/api/replay/{}", get_api_url(), session_id))
+                let resp: Value = client()?
+                    .get(format!("/api/replay/{}", session_id))
                     .send()
                     .await?
                     .json()
@@ -2719,15 +2722,11 @@ async fn main() -> Result<()> {
             }
             ReplayCmd::List { agent } => {
                 let url = if let Some(ref agent) = agent {
-                    format!(
-                        "{}/api/replay/search?agentId={}",
-                        get_api_url(),
-                        urlencoding::encode(agent)
-                    )
+                    format!("/api/replay/search?agentId={}", urlencoding::encode(agent))
                 } else {
-                    format!("{}/api/replay/search", get_api_url())
+                    "/api/replay/search".to_string()
                 };
-                let resp: Value = client.get(&url).send().await?.json().await?;
+                let resp: Value = client()?.get(&url).send().await?.json().await?;
                 if let Some(sessions) = resp.as_array() {
                     println!(
                         "{:<36} {:<20} {:<10} {:<25}",
@@ -2753,12 +2752,8 @@ async fn main() -> Result<()> {
             }
             ReplayCmd::Summary { session_id } => {
                 let session_id = validate_id(&session_id)?;
-                let resp: Value = client
-                    .get(format!(
-                        "{}/api/replay/{}/summary",
-                        get_api_url(),
-                        session_id
-                    ))
+                let resp: Value = client()?
+                    .get(format!("/api/replay/{}/summary", session_id))
                     .send()
                     .await?
                     .json()
@@ -2787,15 +2782,11 @@ async fn main() -> Result<()> {
         Commands::Sessions(cmd) => match cmd {
             SessionsCmd::List { agent } => {
                 let url = if let Some(ref agent) = agent {
-                    format!(
-                        "{}/api/sessions?agent={}",
-                        get_api_url(),
-                        urlencoding::encode(agent)
-                    )
+                    format!("/api/sessions?agent={}", urlencoding::encode(agent))
                 } else {
-                    format!("{}/api/sessions", get_api_url())
+                    "/api/sessions".to_string()
                 };
-                let resp: Value = client.get(&url).send().await?.json().await?;
+                let resp: Value = client()?.get(&url).send().await?.json().await?;
                 if let Some(sessions) = resp.as_array() {
                     println!(
                         "{:<36} {:<20} {:<15} {:<20}",
@@ -2819,8 +2810,8 @@ async fn main() -> Result<()> {
             }
             SessionsCmd::Delete { id } => {
                 let id = validate_id(&id)?;
-                client
-                    .delete(format!("{}/api/sessions/{}", get_api_url(), id))
+                client()?
+                    .delete(format!("/api/sessions/{}", id))
                     .send()
                     .await?;
                 println!("{} Session deleted: {}", "✓".green(), id);
@@ -2829,12 +2820,7 @@ async fn main() -> Result<()> {
 
         Commands::Cron(cmd) => match cmd {
             CronCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/cron", get_api_url()))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/cron").send().await?.json().await?;
                 if let Some(jobs) = resp.as_array() {
                     println!(
                         "{:<20} {:<20} {:<20} {:<10}",
@@ -2866,8 +2852,8 @@ async fn main() -> Result<()> {
                 expression,
                 function_id,
             } => {
-                let resp: Value = client
-                    .post(format!("{}/api/cron", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/cron")
                     .json(&json!({ "expression": expression, "functionId": function_id }))
                     .send()
                     .await?
@@ -2881,16 +2867,13 @@ async fn main() -> Result<()> {
             }
             CronCmd::Delete { id } => {
                 let id = validate_id(&id)?;
-                client
-                    .delete(format!("{}/api/cron/{}", get_api_url(), id))
-                    .send()
-                    .await?;
+                client()?.delete(format!("/api/cron/{}", id)).send().await?;
                 println!("{} Deleted cron job: {}", "✓".green(), id);
             }
             CronCmd::Enable { id } => {
                 let id = validate_id(&id)?;
-                client
-                    .patch(format!("{}/api/cron/{}", get_api_url(), id))
+                client()?
+                    .patch(format!("/api/cron/{}", id))
                     .json(&json!({ "enabled": true }))
                     .send()
                     .await?;
@@ -2898,8 +2881,8 @@ async fn main() -> Result<()> {
             }
             CronCmd::Disable { id } => {
                 let id = validate_id(&id)?;
-                client
-                    .patch(format!("{}/api/cron/{}", get_api_url(), id))
+                client()?
+                    .patch(format!("/api/cron/{}", id))
                     .json(&json!({ "enabled": false }))
                     .send()
                     .await?;
@@ -2909,15 +2892,11 @@ async fn main() -> Result<()> {
 
         Commands::Integrations { query } => {
             let url = if let Some(ref q) = query {
-                format!(
-                    "{}/api/integrations?query={}",
-                    get_api_url(),
-                    urlencoding::encode(q)
-                )
+                format!("/api/integrations?query={}", urlencoding::encode(q))
             } else {
-                format!("{}/api/integrations", get_api_url())
+                "/api/integrations".to_string()
             };
-            let resp: Value = client.get(&url).send().await?.json().await?;
+            let resp: Value = client()?.get(&url).send().await?.json().await?;
             if let Some(integrations) = resp.as_array() {
                 println!(
                     "{:<25} {:<15} {:<15} {:<30}",
@@ -3012,7 +2991,7 @@ async fn main() -> Result<()> {
                 "default_model".into(),
                 toml::Value::String(default_model.clone()),
             );
-            config.insert("api_url".into(), toml::Value::String(get_api_url()));
+            config.insert("api_url".into(), toml::Value::String(api_base()?));
 
             let config_path = config_dir.join("config.toml");
             std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
@@ -3039,11 +3018,7 @@ async fn main() -> Result<()> {
 
             println!("{} Resetting AgentOS...", "→".blue());
 
-            match client
-                .delete(format!("{}/api/state/reset", get_api_url()))
-                .send()
-                .await
-            {
+            match client()?.delete("/api/state/reset").send().await {
                 Ok(_) => println!("  {} Server state cleared", "✓".green()),
                 Err(_) => println!(
                     "  {} Server not reachable (skipping remote reset)",
@@ -3067,8 +3042,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Add { name, key } => {
-            let resp: Value = client
-                .post(format!("{}/api/integrations", get_api_url()))
+            let resp: Value = client()?
+                .post("/api/integrations")
                 .json(&json!({ "name": name, "key": key }))
                 .send()
                 .await?
@@ -3082,12 +3057,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Remove { name } => {
-            client
-                .delete(format!(
-                    "{}/api/integrations/{}",
-                    get_api_url(),
-                    urlencoding::encode(&name)
-                ))
+            client()?
+                .delete(format!("/api/integrations/{}", urlencoding::encode(&name)))
                 .send()
                 .await?;
             println!("{} Removed: {}", "✓".green(), name);
@@ -3137,10 +3108,6 @@ async fn main() -> Result<()> {
 
 fn agentos_config_path() -> Result<PathBuf> {
     Ok(agentos_home_dir()?.join("config.toml"))
-}
-
-fn get_api_url() -> String {
-    std::env::var("AGENTOS_API_URL").unwrap_or_else(|_| API_BASE.to_string())
 }
 
 fn format_epoch_ms(ms: u64) -> String {
@@ -3252,34 +3219,6 @@ mod tests {
     #[test]
     fn test_api_base_constant() {
         assert_eq!(API_BASE, "http://localhost:3111");
-    }
-
-    #[test]
-    fn test_get_api_url_default() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var_os("AGENTOS_API_URL");
-        unsafe {
-            std::env::remove_var("AGENTOS_API_URL");
-        }
-        let result = get_api_url();
-        restore_test_env("AGENTOS_API_URL", previous);
-        assert_eq!(result, "http://localhost:3111");
-    }
-
-    #[test]
-    fn test_get_api_url_custom() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var_os("AGENTOS_API_URL");
-        unsafe {
-            std::env::set_var("AGENTOS_API_URL", "http://custom:8080");
-        }
-        let url = get_api_url();
-        restore_test_env("AGENTOS_API_URL", previous);
-        assert_eq!(url, "http://custom:8080");
     }
 
     #[test]
@@ -4011,7 +3950,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn agentos_engine_spawn_forces_builtin_daemons_disabled() {
+    fn agentos_engine_spawn_rebuilds_a_bounded_environment() {
         let root = std::env::temp_dir().join(format!(
             "agentos-engine-env-{}-{}",
             std::process::id(),
@@ -4025,10 +3964,7 @@ mod tests {
         let capture = root.join("captured");
         std::fs::write(
             &engine,
-            format!(
-                "#!/bin/sh\nprintf '%s' \"$IIIWORKER_DISABLE_BUILTIN_DAEMONS\" > '{}'\n",
-                capture.display()
-            ),
+            format!("#!/bin/sh\nenv | sort > '{}'\n", capture.display()),
         )
         .expect("write fake engine");
         let mut permissions = std::fs::metadata(&engine).unwrap().permissions();
@@ -4040,16 +3976,96 @@ mod tests {
             Path::new("config.yaml"),
             &root,
             &log,
-            &BTreeMap::from([(
-                "IIIWORKER_DISABLE_BUILTIN_DAEMONS".to_string(),
-                "0".to_string(),
-            )]),
+            &BTreeMap::from([
+                (
+                    "IIIWORKER_DISABLE_BUILTIN_DAEMONS".to_string(),
+                    "0".to_string(),
+                ),
+                (
+                    "ANTHROPIC_API_KEY".to_string(),
+                    "native-anthropic".to_string(),
+                ),
+                ("OPENAI_API_KEY".to_string(), "native-openai".to_string()),
+                (
+                    "HTTPS_PROXY".to_string(),
+                    "http://proxy.invalid".to_string(),
+                ),
+                ("AUDIT_HMAC_KEY".to_string(), "must-not-leak".to_string()),
+                ("SLACK_BOT_TOKEN".to_string(), "must-not-leak".to_string()),
+                ("MONGODB_URI".to_string(), "must-not-leak".to_string()),
+                ("PARENT_CANARY".to_string(), "must-not-leak".to_string()),
+            ]),
             false,
         )
         .expect("spawn fake engine");
         assert!(child.wait().unwrap().success());
-        assert_eq!(std::fs::read_to_string(capture).unwrap(), "1");
+        let captured = std::fs::read_to_string(capture).unwrap();
+        assert!(captured.contains("IIIWORKER_DISABLE_BUILTIN_DAEMONS=1\n"));
+        assert!(captured.contains("ANTHROPIC_API_KEY=native-anthropic\n"));
+        assert!(captured.contains("OPENAI_API_KEY=native-openai\n"));
+        assert!(captured.contains("HTTPS_PROXY=http://proxy.invalid\n"));
+        for forbidden in [
+            "AUDIT_HMAC_KEY",
+            "SLACK_BOT_TOKEN",
+            "MONGODB_URI",
+            "PARENT_CANARY",
+        ] {
+            assert!(
+                !captured.contains(forbidden),
+                "engine leaked {forbidden}: {captured}"
+            );
+        }
         std::fs::remove_dir_all(root).expect("clean up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bus_auth_spawn_receives_only_its_api_key_and_process_baseline() {
+        let root = std::env::temp_dir().join(format!(
+            "agentos-auth-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let daemon = root.join("agentos-bus-authd");
+        let capture = root.join("captured");
+        std::fs::write(
+            &daemon,
+            format!("#!/bin/sh\nenv | sort > '{}'\n", capture.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&daemon).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&daemon, permissions).unwrap();
+        let env = BTreeMap::from([
+            ("AGENTOS_API_KEY".to_string(), "machine-key".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "must-not-leak".to_string()),
+            ("AUDIT_HMAC_KEY".to_string(), "must-not-leak".to_string()),
+            ("PARENT_CANARY".to_string(), "must-not-leak".to_string()),
+        ]);
+        let mut child = spawn_bus_auth(
+            &daemon,
+            "127.0.0.1:49129".parse().unwrap(),
+            &root.join("config.yaml"),
+            &root,
+            &root.join("auth.log"),
+            &env,
+            false,
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+        let captured = std::fs::read_to_string(capture).unwrap();
+        assert!(captured.contains("AGENTOS_API_KEY=machine-key\n"));
+        for forbidden in ["ANTHROPIC_API_KEY", "AUDIT_HMAC_KEY", "PARENT_CANARY"] {
+            assert!(
+                !captured.contains(forbidden),
+                "authd leaked {forbidden}: {captured}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4080,6 +4096,23 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_environment_skips_non_utf8_entries_instead_of_panicking() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let values = unicode_environment([
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from_vec(vec![0xff]), OsString::from("secret")),
+            (OsString::from("BROKEN"), OsString::from_vec(vec![0xff])),
+        ]);
+        assert_eq!(
+            values,
+            BTreeMap::from([("PATH".to_string(), "/bin".to_string())])
+        );
     }
 
     #[test]

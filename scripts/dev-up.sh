@@ -22,6 +22,28 @@ if [[ "$TARGET_DIR" != /* ]]; then
 fi
 RELEASE_DIR="$TARGET_DIR/release"
 
+stop_workers() {
+    if [[ ! -f "$PIDFILE" ]]; then
+        echo "no PID file at $PIDFILE — nothing to stop"
+        return 0
+    fi
+    while read -r pid; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done < "$PIDFILE"
+    rm -f "$PIDFILE"
+    echo "stopped."
+}
+
+build_requested=0
+case "${1:-}" in
+    '') ;;
+    stop|--stop) stop_workers; exit 0 ;;
+    --build) build_requested=1 ;;
+    *) echo "error: unknown argument: ${1}" >&2; exit 2 ;;
+esac
+
 env_file="$ROOT/.env"
 if [[ -e "$env_file" || -L "$env_file" ]]; then
     if [[ -L "$env_file" || ! -f "$env_file" ]]; then
@@ -90,12 +112,66 @@ if [[ -e "$env_file" || -L "$env_file" ]]; then
         done
     fi
 
+    parse_dotenv_value() {
+        local raw="$1" line="$2" inner output character escaped index
+        parsed_value="$raw"
+        parsed_value="${parsed_value#"${parsed_value%%[![:space:]]*}"}"
+        parsed_value="${parsed_value%"${parsed_value##*[![:space:]]}"}"
+        case "$parsed_value" in
+            '"'*)
+                [[ ${#parsed_value} -ge 2 && "${parsed_value: -1}" == '"' ]] || {
+                    echo "error: unclosed double quote on line $line" >&2; return 1;
+                }
+                inner="${parsed_value:1:${#parsed_value}-2}"
+                output=""
+                index=0
+                while [[ $index -lt ${#inner} ]]; do
+                    character="${inner:index:1}"
+                    index=$((index + 1))
+                    if [[ "$character" != "\\" ]]; then
+                        output+="$character"
+                        continue
+                    fi
+                    [[ $index -lt ${#inner} ]] || {
+                        echo "error: dangling dotenv escape on line $line" >&2; return 1;
+                    }
+                    escaped="${inner:index:1}"
+                    index=$((index + 1))
+                    case "$escaped" in
+                        n) output+=$'\n' ;;
+                        r) output+=$'\r' ;;
+                        t) output+=$'\t' ;;
+                        \\) output+="\\" ;;
+                        '"') output+='"' ;;
+                        *) echo "error: unsupported dotenv escape \\$escaped on line $line" >&2; return 1 ;;
+                    esac
+                done
+                parsed_value="$output"
+                ;;
+            "'"*)
+                [[ ${#parsed_value} -ge 2 && "${parsed_value: -1}" == "'" ]] || {
+                    echo "error: unclosed single quote on line $line" >&2; return 1;
+                }
+                parsed_value="${parsed_value:1:${#parsed_value}-2}"
+                ;;
+            *)
+                if [[ "$parsed_value" == *" #"* ]]; then
+                    parsed_value="${parsed_value%% \#*}"
+                    parsed_value="${parsed_value%"${parsed_value##*[![:space:]]}"}"
+                fi
+                ;;
+        esac
+    }
+
     seen_names=$'\n'
     line_number=0
     while IFS= read -r env_line || [[ -n "$env_line" ]]; do
         line_number=$((line_number + 1))
         case "$env_line" in
             ''|'#'*) continue ;;
+            'export '*) env_line="${env_line#export }" ;;
+        esac
+        case "$env_line" in
             *=*) ;;
             *)
                 echo "error: malformed dotenv entry on line $line_number" >&2
@@ -104,15 +180,12 @@ if [[ -e "$env_file" || -L "$env_file" ]]; then
         esac
         name="${env_line%%=*}"
         value="${env_line#*=}"
-        value="${value#"${value%%[![:space:]]*}"}"
-        value="${value%"${value##*[![:space:]]}"}"
-        case "$value" in
-            '"'*'"' | "'"*"'") value="${value:1:${#value}-2}" ;;
-        esac
         if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
             echo "error: invalid dotenv variable name on line $line_number" >&2
             exit 1
         fi
+        parse_dotenv_value "$value" "$line_number" || exit 1
+        value="$parsed_value"
         case "$allowed_names" in
             *$'\n'"$name"$'\n'*) ;;
             *)
@@ -141,26 +214,34 @@ fi
 
 export III_URL="${III_URL:-ws://localhost:49134}"
 
-stop_workers() {
-    if [[ ! -f "$PIDFILE" ]]; then
-        echo "no PID file at $PIDFILE — nothing to stop"
-        return 0
+PROCESS_BASELINE_ENV=(PATH HOME USER LOGNAME SHELL TERM AGENTOS_HOME TMPDIR TMP TEMP LANG LANGUAGE SSL_CERT_FILE SSL_CERT_DIR NIX_SSL_CERT_FILE RUST_BACKTRACE RUST_LOG)
+ENGINE_ENV=(III_URL ANTHROPIC_API_KEY OPENAI_API_KEY CODEX_HOME PROVIDER_ANTHROPIC_CACHE HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy III_DISABLE_TRACE_PAYLOADS III_TRACE_PAYLOAD_MAX_BYTES TOKIO_WORKER_THREADS)
+BUS_AUTH_ENV=(AGENTOS_API_KEY)
+service_env_args=()
+
+add_service_env() {
+    local name="$1"
+    if [[ ${!name+x} ]]; then
+        service_env_args+=("$name=${!name}")
     fi
-    while read -r pid; do
-        if kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-        fi
-    done < "$PIDFILE"
-    rm -f "$PIDFILE"
-    echo "stopped."
 }
 
-if [[ "${1:-}" == "stop" ]]; then
-    stop_workers
-    exit 0
-fi
+build_service_environment() {
+    local kind="$1" name
+    service_env_args=()
+    for name in "${PROCESS_BASELINE_ENV[@]}"; do add_service_env "$name"; done
+    while IFS= read -r name; do
+        [[ "$name" == LC_* ]] && add_service_env "$name"
+    done < <(compgen -e)
+    if [[ "$kind" == engine ]]; then
+        for name in "${ENGINE_ENV[@]}"; do add_service_env "$name"; done
+    else
+        for name in "${BUS_AUTH_ENV[@]}"; do add_service_env "$name"; done
+    fi
+}
 
-if [[ "${1:-}" == "--build" ]]; then
+
+if [[ $build_requested -eq 1 ]]; then
     echo "▸ cargo build --workspace --release"
     (cd "$ROOT" && cargo build --workspace --release)
 fi
@@ -306,7 +387,8 @@ else
         if bus_auth_listening; then
             echo "▸ bus-auth daemon already listening on $BUS_AUTH_ADDR"
         elif [[ -x "$BUS_AUTH_BIN" ]]; then
-            "$BUS_AUTH_BIN" "--listen=$BUS_AUTH_ADDR" >> "$ROOT/.agentos-bus-authd.log" 2>&1 &
+            build_service_environment auth
+            (cd "$ROOT" && exec env -i "${service_env_args[@]}" "$BUS_AUTH_BIN" "--listen=$BUS_AUTH_ADDR" "--config=$CONFIG") >> "$ROOT/.agentos-bus-authd.log" 2>&1 &
             echo $! >> "$PIDFILE"
             spawned=$((spawned + 1))
             for _ in {1..20}; do
@@ -327,7 +409,9 @@ else
     fi
 
     command -v iii >/dev/null 2>&1 || { echo "error: iii is not on PATH" >&2; stop_workers >/dev/null; exit 1; }
-    IIIWORKER_DISABLE_BUILTIN_DAEMONS=1 iii --config "$CONFIG" >> "$ROOT/.agentos-engine.log" 2>&1 &
+    build_service_environment engine
+    service_env_args+=("IIIWORKER_DISABLE_BUILTIN_DAEMONS=1")
+    (cd "$ROOT" && exec env -i "${service_env_args[@]}" iii --config "$CONFIG") >> "$ROOT/.agentos-engine.log" 2>&1 &
     echo $! >> "$PIDFILE"
     spawned=$((spawned + 1))
     for _ in {1..20}; do
