@@ -66,7 +66,7 @@ assert_untrusted_denied() {
   printf 'boot smoke: ok: untrusted %s denied\n' "$function_id"
 }
 
-for command in cp grep iii mktemp pgrep python3 timeout; do
+for command in bun cp grep iii mktemp pgrep python3 timeout; do
   command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
 [ -x "$REPO_ROOT/target/release/agentos" ]   || fail "release binary not found: $REPO_ROOT/target/release/agentos"
@@ -75,7 +75,8 @@ scratch=$(mktemp -d "${TMPDIR:-/tmp}/agentos-boot-smoke.XXXXXX")
 runtime="$scratch/runtime"
 agentos_home="$scratch/home"
 engine_home="$scratch/engine-home"
-registry_file="$scratch/functions.json"
+untrusted_registry_file="$scratch/functions-untrusted.json"
+authenticated_registry_file="$scratch/functions-authenticated.json"
 expected_workers_file="$scratch/expected-workers.txt"
 required_functions_file="$scratch/required-functions.txt"
 worker_mutations_file="$scratch/worker-mutations.txt"
@@ -273,7 +274,8 @@ if [ "$boot_status" -ne 0 ]; then
   exit 1
 fi
 
-if ! iii trigger engine::functions::list --json '{}' --timeout-ms 5000 > "$registry_file"; then
+if ! iii trigger engine::functions::list --json '{}' --timeout-ms 5000 \
+  > "$untrusted_registry_file"; then
   fail "allowed untrusted engine::functions::list failed after agentos up"
 fi
 printf 'boot smoke: ok: allowed untrusted engine::functions::list works\n'
@@ -281,6 +283,18 @@ printf 'boot smoke: ok: allowed untrusted engine::functions::list works\n'
 for function_id in $UNTRUSTED_DENIED_FUNCTION_IDS; do
   assert_untrusted_denied "$function_id"
 done
+
+# Engine 0.22.1 filters the function inventory by the caller's RBAC view. Keep
+# the bare call above as reachability proof, then use a one-process SDK client
+# authenticated from the generated scratch .env for completeness assertions.
+# The credential is never placed in argv, logs, or this parent environment.
+[ -f "$runtime/.env" ] || fail "agentos up did not generate the isolated runtime .env"
+if ! timeout --signal=TERM --kill-after=5s 15 \
+  bun --no-env-file "$SCRIPT_DIR/authenticated-registry.ts" "$runtime/.env" \
+  > "$authenticated_registry_file"; then
+  fail "authenticated engine::functions::list failed after agentos up"
+fi
+printf 'boot smoke: ok: authenticated full registry inventory works\n'
 
 # Registration sites and why they are product-critical:
 # - workers/llm-router/src/main.rs:1652,1666 route and complete every chat turn.
@@ -290,7 +304,7 @@ done
 # - workers/cron/src/main.rs:628 creates scheduled AgentOS actions.
 printf '%s\n' "$REQUIRED_FUNCTION_IDS" > "$required_functions_file"
 printf '%s\n' "$WORKER_MUTATION_FUNCTION_IDS" > "$worker_mutations_file"
-python3 - "$registry_file" "$expected_workers_file" "$required_functions_file" \
+python3 - "$authenticated_registry_file" "$expected_workers_file" "$required_functions_file" \
   "$worker_mutations_file" <<'PY'
 import json
 import sys
