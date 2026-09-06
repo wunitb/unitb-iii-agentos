@@ -291,7 +291,7 @@ done
 [ -f "$runtime/.env" ] || fail "agentos up did not generate the isolated runtime .env"
 if ! timeout --signal=TERM --kill-after=5s 15 \
   bun --no-env-file "$SCRIPT_DIR/authenticated-registry.ts" "$runtime/.env" \
-  > "$authenticated_registry_file"; then
+    "$authenticated_registry_file"; then
   fail "authenticated engine::functions::list failed after agentos up"
 fi
 printf 'boot smoke: ok: authenticated full registry inventory works\n'
@@ -314,14 +314,12 @@ registry_path = Path(sys.argv[1])
 expected_path = Path(sys.argv[2])
 required_ids = Path(sys.argv[3]).read_text().split()
 worker_mutation_ids = Path(sys.argv[4]).read_text().split()
-text = registry_path.read_text()
 try:
-    registry = json.loads(text)
-except json.JSONDecodeError:
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end < start:
-        raise SystemExit("boot smoke: engine registry was not JSON")
-    registry = json.loads(text[start : end + 1])
+    registry = json.loads(registry_path.read_text())
+except json.JSONDecodeError as error:
+    raise SystemExit(
+        "boot smoke: authenticated engine registry was not JSON: " + error.msg
+    ) from error
 if "functions" not in registry and isinstance(registry.get("result"), dict):
     registry = registry["result"]
 functions = registry.get("functions")

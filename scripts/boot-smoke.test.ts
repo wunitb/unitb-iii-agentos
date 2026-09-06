@@ -51,6 +51,7 @@ async function processExists(pid: number): Promise<boolean> {
 async function runSmokeFixture(options: {
   denialMode?: DenialMode;
   completeRegistry?: boolean;
+  authenticatedNoise?: boolean;
   requireBuiltinDisableUnset?: boolean;
 } = {}): Promise<{
   exitCode: number;
@@ -163,6 +164,9 @@ exit 65
 `,
   );
   await chmod(iii, 0o755);
+  const authenticatedOutput = options.authenticatedNoise
+    ? `sdk-prefix\n${JSON.stringify({ functions })}\nsdk-suffix`
+    : JSON.stringify({ functions });
   const bun = join(stub, "bun");
   await writeFile(
     bun,
@@ -172,9 +176,10 @@ case "$*" in *${generatedApiKey}*) echo secret-leaked-to-argv >&2; exit 70;; esa
 [ "$1" = --no-env-file ] || { echo dotenv-autoload-not-disabled >&2; exit 72; }
 [ "\${2##*/}" = authenticated-registry.ts ] || { echo wrong-helper >&2; exit 73; }
 [ "$3" = "$PWD/.env" ] || { echo wrong-dotenv-path >&2; exit 74; }
-grep -Fx 'AGENTOS_API_KEY=${generatedApiKey}' "$3" >/dev/null || { echo generated-key-not-read >&2; exit 75; }
+[ "\${4##*/}" = functions-authenticated.json ] || { echo wrong-output-path >&2; exit 75; }
+grep -Fx 'AGENTOS_API_KEY=${generatedApiKey}' "$3" >/dev/null || { echo generated-key-not-read >&2; exit 76; }
 printf '%s\n' authenticated > "$SMOKE_AUTHENTICATED_PROBE_FILE"
-printf '%s\n' '${JSON.stringify({ functions })}'
+printf '%s\n' '${authenticatedOutput}' > "$4"
 `,
   );
   await chmod(bun, 0o755);
@@ -267,9 +272,11 @@ describe("boot smoke contract", () => {
     expect(source).toContain(
       'bun --no-env-file "$SCRIPT_DIR/authenticated-registry.ts" "$runtime/.env"',
     );
+    expect(source).toContain('"$authenticated_registry_file"');
     expect(source).toContain(
       'python3 - "$authenticated_registry_file" "$expected_workers_file" "$required_functions_file"',
     );
+    expect(source).not.toContain('text.find("{")');
   });
 
   it("names a missing function after accepting exact engine RBAC denials", async () => {
@@ -302,6 +309,13 @@ describe("boot smoke contract", () => {
     expect(result.authenticatedProbe).toBe("authenticated");
     expect(result.stdout + result.stderr).not.toContain(generatedApiKey);
     expect(result.stderr).not.toContain("reason other than the exact engine RBAC deny");
+    await expectFixtureReaped(result);
+  });
+
+  it("rejects an authenticated inventory with any non-JSON prefix or suffix", async () => {
+    const result = await runSmokeFixture({ authenticatedNoise: true, completeRegistry: true });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("authenticated engine registry was not JSON");
     await expectFixtureReaped(result);
   });
 
