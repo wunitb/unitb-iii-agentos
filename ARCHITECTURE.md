@@ -222,7 +222,7 @@ push with `AGENTOS_FULL_E2E_ENABLED`. The workflow starts from
 
 | job | gate |
 |---|---|
-| `rust` | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` (dev profile, 2,002 test attributes; 3 live-engine checks ignored by default) + `cargo build --workspace --release` + `cargo audit` + `cargo deny check` (advisories, bans, licences, sources — policy in `deny.toml`) |
+| `rust` | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` (dev profile, 2,139 test attributes; 3 live-engine checks ignored by default) + `cargo build --workspace --release` + `cargo audit` + `cargo deny check` (advisories, bans, licences, sources — policy in `deny.toml`) |
 | `boot-smoke` | downloads the release binaries built by `rust`, boots a scratch runtime through `agentos up --no-tui`, and requires every local worker identity plus the six functions that make the AgentOS layer usable; no provider credential or model call |
 | `node-unit` | `bun run typecheck`, `bun run test:unit` (tests of the software), `bun run test:governance` (build-evidence and documentation contracts), `bun run counts:check` (every published number recomputed from the tree) |
 | `dependency-review` | `actions/dependency-review-action` with `fail-on-severity: moderate`, pull requests only |
