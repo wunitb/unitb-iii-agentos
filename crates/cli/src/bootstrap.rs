@@ -717,6 +717,13 @@ pub(crate) trait Diagnostics {
     /// Stable names of connected non-engine workers, `None` when the engine
     /// cannot answer `engine::functions::list`.
     fn connected_worker_ids(&self) -> Option<BTreeSet<String>>;
+    /// Registered function IDs from the authenticated engine inventory.
+    fn registered_function_ids(&self) -> Option<BTreeSet<String>>;
+    /// Set the maximum duration of one authenticated engine probe.
+    fn set_probe_timeout(&mut self, _timeout: Duration) {}
+    /// End any temporary authenticated diagnostic session within the caller's
+    /// existing readiness bound.
+    fn shutdown_probes(&mut self, _timeout: Duration) {}
     /// The keys stored in a state scope, `None` when the engine cannot answer
     /// `state::list_keys`. Read-only: `doctor` never writes state.
     fn state_keys(&self, scope: &str) -> Option<Vec<String>>;
@@ -1281,6 +1288,21 @@ fn capability_item(probes: &dyn Diagnostics) -> ReadinessItem {
 /// These are bus identities (`crate::bus_identity`), not directory names, so
 /// the set is comparable to what the engine's registry reports and cannot be
 /// satisfied by an engine worker that merely shares a directory name.
+const REQUIRED_ENGINE_FUNCTIONS: [&str; 5] = [
+    "state::get",
+    "state::set",
+    "state::list",
+    "state::delete",
+    "state::update",
+];
+
+fn required_engine_functions() -> BTreeSet<String> {
+    REQUIRED_ENGINE_FUNCTIONS
+        .iter()
+        .map(|function| (*function).to_string())
+        .collect()
+}
+
 fn required_worker_ids(workers: &[WorkerSpec]) -> BTreeSet<String> {
     workers
         .iter()
@@ -1306,14 +1328,21 @@ fn missing_worker_ids(required: &BTreeSet<String>, connected: &BTreeSet<String>)
     required.difference(connected).cloned().collect()
 }
 
+fn missing_engine_functions(registered: &BTreeSet<String>) -> Vec<String> {
+    required_engine_functions()
+        .difference(registered)
+        .cloned()
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // bootstrap policy (`agentos up`)
 // ---------------------------------------------------------------------------
 
 pub(crate) struct UpOptions {
     pub(crate) launch_tui: bool,
-    /// Upper bound on each readiness wait: engine health, then worker
-    /// connections.
+    /// Upper bound on each readiness wait: engine health, native function
+    /// registration, then worker connections.
     pub(crate) stage_timeout: Duration,
     pub(crate) poll_interval: Duration,
 }
@@ -1328,15 +1357,17 @@ pub(crate) enum UpOutcome {
 }
 
 /// Brings the stack up in order: config, engine binary, TUI binary, engine
-/// health, worker binaries, workers, TUI. A failed stage stops the sequence and
-/// tears down whatever this invocation started.
+/// health, native state functions, worker binaries, workers, TUI. A failed
+/// stage stops the sequence and tears down whatever this invocation started.
 pub(crate) fn run_up(
     effects: &mut dyn Bootstrap,
     paths: &RuntimePaths,
     options: &UpOptions,
     out: &mut dyn Write,
 ) -> Result<UpOutcome> {
+    effects.set_probe_timeout(options.stage_timeout);
     let outcome = up_stages(effects, paths, options, out);
+    effects.shutdown_probes(options.stage_timeout);
     if outcome.is_err() {
         effects.shutdown_started();
     }
@@ -1458,7 +1489,14 @@ fn up_stages(
         &format!("{} release binaries", required.len()),
     )?;
 
-    // 7. workers: compare canonical identities, never aggregate counts. On a
+    // Native state is an engine dependency of Rust workers such as swarm and
+    // workflow. A healthy socket and worker-name inventory can precede its
+    // function registrations, so gate worker spawn on the authenticated
+    // function inventory rather than an arbitrary delay.
+    await_engine_functions(effects, options)?;
+    stage_ok(out, "State", "native functions registered")?;
+
+    // 8. workers: compare canonical identities, never aggregate counts. On a
     //    partial stack only missing workers are launched, preserving the
     //    already-connected processes and avoiding duplicate registrations.
     let already_connected = await_worker_identity_report(effects, options)?;
@@ -1514,7 +1552,7 @@ fn up_stages(
     // report success against a dead bus.
     ensure_engine_alive(effects)?;
 
-    // 8. Hand the prepared TUI path back to the entry point. It must persist
+    // 9. Hand the prepared TUI path back to the entry point. It must persist
     // ownership and release the lifecycle transaction before waiting here.
     match tui_binary {
         Some(path) => Ok(UpOutcome::Tui(path)),
@@ -1710,6 +1748,35 @@ fn await_engine(effects: &mut dyn Bootstrap, options: &UpOptions) -> Result<()> 
     )
 }
 
+fn await_engine_functions(effects: &mut dyn Bootstrap, options: &UpOptions) -> Result<()> {
+    let (poll, deadline) = poll_plan(options);
+    let mut reported = None;
+    loop {
+        if let Some(registered) = effects.registered_function_ids() {
+            let missing = missing_engine_functions(&registered);
+            if missing.is_empty() {
+                return Ok(());
+            }
+            reported = Some(missing);
+        }
+        let now = effects.now();
+        if now >= deadline {
+            break;
+        }
+        effects.sleep(poll.min(deadline.saturating_duration_since(now)));
+    }
+    let seconds = options.stage_timeout.as_secs_f32();
+    match reported {
+        Some(missing) => anyhow::bail!(
+            "native engine functions are still missing within {seconds}s: {}",
+            missing.join(", ")
+        ),
+        None => anyhow::bail!(
+            "the engine did not report its native function inventory within {seconds}s"
+        ),
+    }
+}
+
 /// Waits for the engine to answer the worker-identity query before deciding
 /// what to launch. `None` is an unknown state, while `Some(empty)` is a valid
 /// report that means every required worker still needs to be started.
@@ -1811,6 +1878,8 @@ pub(crate) struct SystemEffects {
     config_path: PathBuf,
     runtime_dir: PathBuf,
     launch_env: BTreeMap<String, String>,
+    inventory_client: std::sync::OnceLock<Option<iii_sdk::IIIClient>>,
+    probe_timeout: Duration,
     engine: Option<std::process::Child>,
     bus_auth: Option<std::process::Child>,
     workers: Vec<RunningWorker>,
@@ -1824,6 +1893,8 @@ impl SystemEffects {
             config_path: paths.config_path.clone(),
             runtime_dir: paths.runtime_dir.clone(),
             launch_env,
+            inventory_client: std::sync::OnceLock::new(),
+            probe_timeout: Duration::from_secs(1),
             engine: None,
             bus_auth: None,
             workers: Vec::new(),
@@ -1859,6 +1930,70 @@ impl SystemEffects {
                     .filter(|value| !value.trim().is_empty())
             })
     }
+
+    fn authenticated_engine_client(&self) -> Option<&iii_sdk::IIIClient> {
+        self.inventory_client
+            .get_or_init(|| {
+                let parent = crate::unicode_environment(std::env::vars_os());
+                let bearer = crate::api_client::selected_api_bearer(&self.launch_env, &parent)?;
+                let headers = std::collections::HashMap::from([(
+                    agentos_bus_auth::client::AUTHORIZATION_HEADER.to_string(),
+                    format!("Bearer {bearer}"),
+                )]);
+                Some(iii_sdk::register_worker(
+                    &format!("ws://{}", engine_endpoint()),
+                    iii_sdk::InitOptions {
+                        headers: Some(headers),
+                        ..iii_sdk::InitOptions::default()
+                    },
+                ))
+            })
+            .as_ref()
+    }
+
+    fn trigger_engine(&self, function_id: &str, payload: Value) -> Option<Value> {
+        let client = self.authenticated_engine_client()?.clone();
+        let request = iii_sdk::protocol::TriggerRequest {
+            function_id: function_id.to_string(),
+            payload,
+            action: None,
+            timeout_ms: Some(self.probe_timeout.as_millis().min(u128::from(u64::MAX)) as u64),
+        };
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            runtime.block_on(client.trigger(request)).ok()
+        })
+        .join()
+        .ok()
+        .flatten()
+    }
+
+    fn engine_inventory(&self) -> Option<Value> {
+        self.trigger_engine("engine::functions::list", json!({}))
+    }
+
+    fn shutdown_inventory_client(&self, timeout: Duration) {
+        if let Some(Some(client)) = self.inventory_client.get() {
+            let client = client.clone();
+            let (done, finished) = std::sync::mpsc::sync_channel(0);
+            // The pinned SDK's synchronous `shutdown()` joins its connection
+            // thread. Run that join off-thread and bound our wait by the same
+            // stage timeout that governed connect and trigger readiness.
+            if std::thread::Builder::new()
+                .name("agentos-inventory-shutdown".to_string())
+                .spawn(move || {
+                    client.shutdown();
+                    let _ = done.send(());
+                })
+                .is_ok()
+            {
+                let _ = finished.recv_timeout(timeout);
+            }
+        }
+    }
 }
 
 fn reported_worker_ids(registry: &Value) -> Option<BTreeSet<String>> {
@@ -1888,6 +2023,19 @@ fn reported_worker_ids(registry: &Value) -> Option<BTreeSet<String>> {
     )
 }
 
+fn reported_function_ids(registry: &Value) -> Option<BTreeSet<String>> {
+    Some(
+        registry
+            .get("functions")?
+            .as_array()?
+            .iter()
+            .filter_map(|function| function["function_id"].as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
 /// `state::list_keys` answers `{"keys": [...]}` on iii 0.22.1 (verified against
 /// the pinned engine). `state::list` returns a bare array of *values* with no
 /// key, so it cannot answer "which agent has a document" and is not used here.
@@ -1904,6 +2052,7 @@ fn reported_state_keys(response: &Value) -> Option<Vec<String>> {
     )
 }
 
+#[cfg(test)]
 fn parse_registry_output(output: &[u8]) -> Option<Value> {
     serde_json::from_slice(output).ok().or_else(|| {
         let text = String::from_utf8_lossy(output);
@@ -1941,44 +2090,23 @@ impl Diagnostics for SystemEffects {
     }
 
     fn connected_worker_ids(&self) -> Option<BTreeSet<String>> {
-        let binary = self.engine_binary().ok()?;
-        let output = std::process::Command::new(binary)
-            .args([
-                "trigger",
-                "engine::functions::list",
-                "--json",
-                "{}",
-                "--timeout-ms",
-                "1000",
-            ])
-            .envs(&self.launch_env)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        reported_worker_ids(&parse_registry_output(&output.stdout)?)
+        reported_worker_ids(&self.engine_inventory()?)
+    }
+
+    fn registered_function_ids(&self) -> Option<BTreeSet<String>> {
+        reported_function_ids(&self.engine_inventory()?)
+    }
+
+    fn set_probe_timeout(&mut self, timeout: Duration) {
+        self.probe_timeout = timeout.min(Duration::from_secs(1));
+    }
+
+    fn shutdown_probes(&mut self, timeout: Duration) {
+        self.shutdown_inventory_client(timeout);
     }
 
     fn state_keys(&self, scope: &str) -> Option<Vec<String>> {
-        let binary = self.engine_binary().ok()?;
-        let payload = json!({ "scope": scope }).to_string();
-        let output = std::process::Command::new(binary)
-            .args([
-                "trigger",
-                "state::list_keys",
-                "--json",
-                &payload,
-                "--timeout-ms",
-                "1000",
-            ])
-            .envs(&self.launch_env)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        reported_state_keys(&parse_registry_output(&output.stdout)?)
+        reported_state_keys(&self.trigger_engine("state::list_keys", json!({ "scope": scope }))?)
     }
 
     fn bus_auth_binary(&self) -> Option<PathBuf> {
@@ -2209,6 +2337,11 @@ mod tests {
         engine_start_error: Option<String>,
         /// Stable worker identities the engine reports; `None` when silent.
         connected: RefCell<Option<BTreeSet<String>>>,
+        /// Registered engine functions; `None` when the inventory is silent.
+        registered_functions: RefCell<Option<BTreeSet<String>>>,
+        function_probes: Cell<usize>,
+        /// Overrides a silent function inventory from this probe onwards.
+        functions_from_probe: Option<(usize, BTreeSet<String>)>,
         /// The bus-auth daemon binary, when it is built.
         bus_auth_binary: Option<PathBuf>,
         /// Listening from this probe onwards; `None` never listens.
@@ -2254,6 +2387,9 @@ mod tests {
                 stop_checks: Cell::new(0),
                 engine_start_error: None,
                 connected: RefCell::new(Some(ours(&["core", "memory"]))),
+                registered_functions: RefCell::new(Some(required_engine_functions())),
+                function_probes: Cell::new(0),
+                functions_from_probe: None,
                 bus_auth_binary: Some(PathBuf::from("/release/agentos-bus-authd")),
                 bus_auth_healthy_from: Some(0),
                 bus_auth_probes: Cell::new(0),
@@ -2335,6 +2471,21 @@ mod tests {
                 && probe >= *threshold
             {
                 return Some(connected.clone());
+            }
+            None
+        }
+
+        fn registered_function_ids(&self) -> Option<BTreeSet<String>> {
+            let probe = self.function_probes.get();
+            self.function_probes.set(probe + 1);
+            let registered = self.registered_functions.borrow().clone();
+            if registered.is_some() {
+                return registered;
+            }
+            if let Some((threshold, registered)) = &self.functions_from_probe
+                && probe >= *threshold
+            {
+                return Some(registered.clone());
             }
             None
         }
@@ -2509,6 +2660,40 @@ mod tests {
             fake.events(),
             vec!["start_engine".to_string(), "shutdown_started".to_string()]
         );
+        assert!(!fake.events().contains(&"start_workers".to_string()));
+    }
+
+    #[test]
+    fn up_waits_for_state_functions_before_starting_rust_workers() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(Some(BTreeSet::new())),
+            registered_functions: RefCell::new(None),
+            functions_from_probe: Some((2, required_engine_functions())),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        assert_eq!(outcome.unwrap(), UpOutcome::Ready);
+        assert_eq!(fake.function_probes.get(), 3);
+        assert!(fake.started_workers.get());
+    }
+
+    #[test]
+    fn up_refuses_permanently_missing_state_functions_before_worker_spawn() {
+        let config = existing_config();
+        let mut fake = Fake {
+            connected: RefCell::new(Some(BTreeSet::new())),
+            registered_functions: RefCell::new(Some(ids(&["state::get", "state::list"]))),
+            ..Fake::default()
+        };
+        let (outcome, _) = up(&mut fake, &options(false), &config);
+        let error = outcome
+            .expect_err("missing state functions must fail")
+            .to_string();
+        assert!(error.contains("state::delete"), "{error}");
+        assert!(error.contains("state::set"), "{error}");
+        assert!(error.contains("state::update"), "{error}");
+        assert!(!fake.started_workers.get());
         assert!(!fake.events().contains(&"start_workers".to_string()));
     }
 
@@ -4349,6 +4534,26 @@ mod tests {
             Some(ids(&["core"]))
         );
         assert_eq!(reported_worker_ids(&json!({ "functions": 62 })), None);
+    }
+
+    #[test]
+    fn engine_function_list_reports_registered_function_ids() {
+        assert_eq!(
+            reported_function_ids(&json!({
+                "functions": [
+                    {"function_id": "state::get", "worker_name": "state"},
+                    {"function_id": "state::set"},
+                    {"function_id": "", "worker_name": "ignored"},
+                    {"worker_name": "missing-id"}
+                ]
+            })),
+            Some(ids(&["state::get", "state::set"]))
+        );
+        assert_eq!(
+            reported_function_ids(&json!({ "functions": [] })),
+            Some(BTreeSet::new())
+        );
+        assert_eq!(reported_function_ids(&json!({ "functions": 5 })), None);
     }
 
     #[test]
