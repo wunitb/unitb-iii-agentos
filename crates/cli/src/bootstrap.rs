@@ -719,6 +719,11 @@ pub(crate) trait Diagnostics {
     fn connected_worker_ids(&self) -> Option<BTreeSet<String>>;
     /// Registered function IDs from the authenticated engine inventory.
     fn registered_function_ids(&self) -> Option<BTreeSet<String>>;
+    /// Set the maximum duration of one authenticated engine probe.
+    fn set_probe_timeout(&mut self, _timeout: Duration) {}
+    /// End any temporary authenticated diagnostic session within the caller's
+    /// existing readiness bound.
+    fn shutdown_probes(&mut self, _timeout: Duration) {}
     /// The keys stored in a state scope, `None` when the engine cannot answer
     /// `state::list_keys`. Read-only: `doctor` never writes state.
     fn state_keys(&self, scope: &str) -> Option<Vec<String>>;
@@ -1360,7 +1365,9 @@ pub(crate) fn run_up(
     options: &UpOptions,
     out: &mut dyn Write,
 ) -> Result<UpOutcome> {
+    effects.set_probe_timeout(options.stage_timeout);
     let outcome = up_stages(effects, paths, options, out);
+    effects.shutdown_probes(options.stage_timeout);
     if outcome.is_err() {
         effects.shutdown_started();
     }
@@ -1871,6 +1878,8 @@ pub(crate) struct SystemEffects {
     config_path: PathBuf,
     runtime_dir: PathBuf,
     launch_env: BTreeMap<String, String>,
+    inventory_client: std::sync::OnceLock<Option<iii_sdk::IIIClient>>,
+    probe_timeout: Duration,
     engine: Option<std::process::Child>,
     bus_auth: Option<std::process::Child>,
     workers: Vec<RunningWorker>,
@@ -1884,6 +1893,8 @@ impl SystemEffects {
             config_path: paths.config_path.clone(),
             runtime_dir: paths.runtime_dir.clone(),
             launch_env,
+            inventory_client: std::sync::OnceLock::new(),
+            probe_timeout: Duration::from_secs(1),
             engine: None,
             bus_auth: None,
             workers: Vec::new(),
@@ -1920,30 +1931,68 @@ impl SystemEffects {
             })
     }
 
-    fn authenticated_cli_environment(&self) -> BTreeMap<String, String> {
-        let parent = crate::unicode_environment(std::env::vars_os());
-        crate::scoped_authenticated_environment(&self.launch_env, &parent)
+    fn authenticated_engine_client(&self) -> Option<&iii_sdk::IIIClient> {
+        self.inventory_client
+            .get_or_init(|| {
+                let parent = crate::unicode_environment(std::env::vars_os());
+                let bearer = crate::api_client::selected_api_bearer(&self.launch_env, &parent)?;
+                let headers = std::collections::HashMap::from([(
+                    agentos_bus_auth::client::AUTHORIZATION_HEADER.to_string(),
+                    format!("Bearer {bearer}"),
+                )]);
+                Some(iii_sdk::register_worker(
+                    &format!("ws://{}", engine_endpoint()),
+                    iii_sdk::InitOptions {
+                        headers: Some(headers),
+                        ..iii_sdk::InitOptions::default()
+                    },
+                ))
+            })
+            .as_ref()
+    }
+
+    fn trigger_engine(&self, function_id: &str, payload: Value) -> Option<Value> {
+        let client = self.authenticated_engine_client()?.clone();
+        let request = iii_sdk::protocol::TriggerRequest {
+            function_id: function_id.to_string(),
+            payload,
+            action: None,
+            timeout_ms: Some(self.probe_timeout.as_millis().min(u128::from(u64::MAX)) as u64),
+        };
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            runtime.block_on(client.trigger(request)).ok()
+        })
+        .join()
+        .ok()
+        .flatten()
     }
 
     fn engine_inventory(&self) -> Option<Value> {
-        let binary = self.engine_binary().ok()?;
-        let output = std::process::Command::new(binary)
-            .args([
-                "trigger",
-                "engine::functions::list",
-                "--json",
-                "{}",
-                "--timeout-ms",
-                "1000",
-            ])
-            .env_clear()
-            .envs(self.authenticated_cli_environment())
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
+        self.trigger_engine("engine::functions::list", json!({}))
+    }
+
+    fn shutdown_inventory_client(&self, timeout: Duration) {
+        if let Some(Some(client)) = self.inventory_client.get() {
+            let client = client.clone();
+            let (done, finished) = std::sync::mpsc::sync_channel(0);
+            // The pinned SDK's synchronous `shutdown()` joins its connection
+            // thread. Run that join off-thread and bound our wait by the same
+            // stage timeout that governed connect and trigger readiness.
+            if std::thread::Builder::new()
+                .name("agentos-inventory-shutdown".to_string())
+                .spawn(move || {
+                    client.shutdown();
+                    let _ = done.send(());
+                })
+                .is_ok()
+            {
+                let _ = finished.recv_timeout(timeout);
+            }
         }
-        parse_registry_output(&output.stdout)
     }
 }
 
@@ -2003,6 +2052,7 @@ fn reported_state_keys(response: &Value) -> Option<Vec<String>> {
     )
 }
 
+#[cfg(test)]
 fn parse_registry_output(output: &[u8]) -> Option<Value> {
     serde_json::from_slice(output).ok().or_else(|| {
         let text = String::from_utf8_lossy(output);
@@ -2047,26 +2097,16 @@ impl Diagnostics for SystemEffects {
         reported_function_ids(&self.engine_inventory()?)
     }
 
+    fn set_probe_timeout(&mut self, timeout: Duration) {
+        self.probe_timeout = timeout.min(Duration::from_secs(1));
+    }
+
+    fn shutdown_probes(&mut self, timeout: Duration) {
+        self.shutdown_inventory_client(timeout);
+    }
+
     fn state_keys(&self, scope: &str) -> Option<Vec<String>> {
-        let binary = self.engine_binary().ok()?;
-        let payload = json!({ "scope": scope }).to_string();
-        let output = std::process::Command::new(binary)
-            .args([
-                "trigger",
-                "state::list_keys",
-                "--json",
-                &payload,
-                "--timeout-ms",
-                "1000",
-            ])
-            .env_clear()
-            .envs(self.authenticated_cli_environment())
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        reported_state_keys(&parse_registry_output(&output.stdout)?)
+        reported_state_keys(&self.trigger_engine("state::list_keys", json!({ "scope": scope }))?)
     }
 
     fn bus_auth_binary(&self) -> Option<PathBuf> {

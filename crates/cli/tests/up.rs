@@ -10,9 +10,14 @@ use std::net::TcpListener;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
+
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::oneshot;
+use tokio_tungstenite::{accept_hdr_async, tungstenite::Message};
 
 const ENGINE_PORT: u16 = 49134;
 
@@ -54,6 +59,144 @@ fn wait_for_file(path: &Path) -> bool {
     }
     false
 }
+
+struct FakeEngine {
+    shutdown: Option<oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl FakeEngine {
+    fn bind(fixture: &Fixture) -> Option<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", ENGINE_PORT)).ok()?;
+        listener.set_nonblocking(true).ok()?;
+        let inventory_count = fixture.inventory_count.clone();
+        let state_ready_after = fixture.state_ready_after.clone();
+        let worker_pid = fixture.worker_pid.clone();
+        let worker_started_before_state = fixture.worker_started_before_state.clone();
+        let inventory_env = fixture.inventory_env.clone();
+        let (shutdown, mut shutdown_rx) = oneshot::channel();
+        let thread = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build fake engine runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("adopt fake engine listener");
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        accepted = listener.accept() => {
+                            let Ok((stream, _)) = accepted else { continue };
+                            let inventory_count = inventory_count.clone();
+                            let state_ready_after = state_ready_after.clone();
+                            let worker_pid = worker_pid.clone();
+                            let worker_started_before_state = worker_started_before_state.clone();
+                            let inventory_env = inventory_env.clone();
+                            tokio::spawn(async move {
+                                let authenticated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let auth_for_handshake = authenticated.clone();
+                                let inventory_env_for_handshake = inventory_env.clone();
+                                let websocket = accept_hdr_async(stream, move |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+                                    let header = request
+                                        .headers()
+                                        .get("authorization")
+                                        .and_then(|value| value.to_str().ok())
+                                        .unwrap_or("absent");
+                                    let trusted = header
+                                        .strip_prefix("Bearer ")
+                                        .is_some_and(|token| !token.is_empty());
+                                    auth_for_handshake.store(trusted, std::sync::atomic::Ordering::SeqCst);
+                                    if let Ok(mut log) = fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(&inventory_env_for_handshake)
+                                    {
+                                        let _ = writeln!(log, "{header}");
+                                    }
+                                    Ok(response)
+                                })
+                                .await;
+                                let Ok(mut websocket) = websocket else { return };
+                                while let Some(Ok(message)) = websocket.next().await {
+                                    let Message::Text(text) = message else { continue };
+                                    let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
+                                    if frame.get("type").and_then(Value::as_str) != Some("invokefunction")
+                                        || frame.get("function_id").and_then(Value::as_str) != Some("engine::functions::list")
+                                    {
+                                        continue;
+                                    }
+                                    let count = fs::read_to_string(&inventory_count)
+                                        .ok()
+                                        .and_then(|value| value.trim().parse::<usize>().ok())
+                                        .unwrap_or(0)
+                                        + 1;
+                                    let _ = fs::write(&inventory_count, format!("{count}\n"));
+                                    let threshold = fs::read_to_string(&state_ready_after)
+                                        .ok()
+                                        .and_then(|value| value.trim().parse::<usize>().ok())
+                                        .unwrap_or(1);
+                                    let ready = count >= threshold;
+                                    if !ready && worker_pid.is_file() {
+                                        let _ = fs::write(&worker_started_before_state, "early");
+                                    }
+                                    let mut functions = vec![json!({
+                                        "function_id": "llm::chat",
+                                        "worker_name": "llm-router"
+                                    })];
+                                    if authenticated.load(std::sync::atomic::Ordering::SeqCst) && ready {
+                                        functions.extend(REQUIRED_STATE_FUNCTIONS.map(|function_id| {
+                                            json!({ "function_id": function_id })
+                                        }));
+                                    }
+                                    if worker_pid.is_file() {
+                                        functions.push(json!({
+                                            "function_id": "echo::run",
+                                            "worker_name": "agentos-echo"
+                                        }));
+                                    }
+                                    let Some(invocation_id) = frame.get("invocation_id").cloned() else { continue };
+                                    let response = json!({
+                                        "type": "invocationresult",
+                                        "invocation_id": invocation_id,
+                                        "function_id": "engine::functions::list",
+                                        "result": { "functions": functions }
+                                    });
+                                    if websocket.send(Message::Text(response.to_string().into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+        });
+        Some(Self {
+            shutdown: Some(shutdown),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for FakeEngine {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+const REQUIRED_STATE_FUNCTIONS: [&str; 5] = [
+    "state::get",
+    "state::set",
+    "state::list",
+    "state::delete",
+    "state::update",
+];
 
 /// A fresh-clone-equivalent layout: runtime config, one worker manifest with a
 /// release binary, a fake engine, and a fake TUI.
@@ -125,29 +268,7 @@ impl Fixture {
         write_executable(
             &bin.join("iii"),
             &format!(
-                r#"#!/bin/sh
-if [ "$1" = "--version" ]; then echo 'iii 0.22.1'; exit 0; fi
-if [ "$1" = "trigger" ]; then
-  count=0; [ ! -f '{}' ] || count=$(cat '{}'); count=$((count + 1)); printf '%s\n' "$count" > '{}'
-  threshold=$(cat '{}'); ready=false; [ "$count" -lt "$threshold" ] || ready=true
-  if [ "$ready" = false ] && [ -f '{}' ]; then printf early > '{}'; fi
-  printf '%s|%s\n' "${{AGENTOS_API_KEY-}}" "${{OTHER_SECRET-unset}}" > '{}'
-  printf '{{"functions":[{{"function_id":"llm::chat","worker_name":"llm-router"}}'
-  if [ "$ready" = true ]; then printf ',{{"function_id":"state::get"}},{{"function_id":"state::set"}},{{"function_id":"state::list"}},{{"function_id":"state::delete"}},{{"function_id":"state::update"}}'; fi
-  if [ -f '{}' ]; then printf ',{{"function_id":"echo::run","worker_name":"agentos-echo"}}'; fi
-  printf ']}}\n'; exit 0
-fi
-echo started > '{}'
-exec sleep 60
-"#,
-                inventory_count.display(),
-                inventory_count.display(),
-                inventory_count.display(),
-                state_ready_after.display(),
-                worker_pid.display(),
-                worker_started_before_state.display(),
-                inventory_env.display(),
-                worker_pid.display(),
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'iii 0.22.1'; exit 0; fi\necho started > '{}'\nexec sleep 60\n",
                 engine_marker.display()
             ),
         );
@@ -178,6 +299,10 @@ exec sleep 60
             worker_started_before_state,
             inventory_env,
         }
+    }
+
+    fn engine(&self) -> Option<FakeEngine> {
+        FakeEngine::bind(self)
     }
 
     fn state_ready_after(&self, inventory_probe: usize) {
@@ -427,7 +552,7 @@ fn up_waits_for_native_state_inventory_before_worker_spawn() {
     let _guard = engine_port_lock();
     let fixture = Fixture::new("state-dependencies-late");
     fixture.state_ready_after(3);
-    let Ok(engine) = TcpListener::bind(("127.0.0.1", ENGINE_PORT)) else {
+    let Some(engine) = fixture.engine() else {
         eprintln!("skipped: port {ENGINE_PORT} is already in use by another engine");
         fixture.cleanup();
         return;
@@ -454,10 +579,16 @@ fn up_waits_for_native_state_inventory_before_worker_spawn() {
         .parse()
         .unwrap();
     assert!(probes >= 3, "state inventory was not retried: {probes}");
-    assert_eq!(
-        fs::read_to_string(&fixture.inventory_env).unwrap().trim(),
-        "fresh-clone-key|unset",
-        "inventory was not authenticated with a scoped environment"
+    let handshake_headers = fs::read_to_string(&fixture.inventory_env).unwrap();
+    assert!(
+        handshake_headers
+            .lines()
+            .any(|header| header == "Bearer fresh-clone-key"),
+        "inventory did not receive the selected bearer handshake header: {handshake_headers}"
+    );
+    assert!(
+        !handshake_headers.contains("must-not-cross"),
+        "unrelated secret reached a handshake: {handshake_headers}"
     );
     drop(engine);
     fixture.cleanup();
@@ -468,7 +599,7 @@ fn up_refuses_permanently_missing_native_state_before_worker_spawn() {
     let _guard = engine_port_lock();
     let fixture = Fixture::new("state-dependencies-missing");
     fixture.state_ready_after(1000);
-    let Ok(engine) = TcpListener::bind(("127.0.0.1", ENGINE_PORT)) else {
+    let Some(engine) = fixture.engine() else {
         eprintln!("skipped: port {ENGINE_PORT} is already in use by another engine");
         fixture.cleanup();
         return;
@@ -509,7 +640,7 @@ fn up_refuses_permanently_missing_native_state_before_worker_spawn() {
 fn up_reuses_a_healthy_engine_and_starts_workers_without_the_tui() {
     let _guard = engine_port_lock();
     let fixture = Fixture::new("reuse-engine");
-    let Ok(engine) = TcpListener::bind(("127.0.0.1", ENGINE_PORT)) else {
+    let Some(engine) = fixture.engine() else {
         eprintln!("skipped: port {ENGINE_PORT} is already in use by another engine");
         fixture.cleanup();
         return;
@@ -580,7 +711,7 @@ fn up_reuses_a_healthy_engine_and_starts_workers_without_the_tui() {
 fn up_runs_the_tui_in_the_foreground_and_propagates_its_exit_code() {
     let _guard = engine_port_lock();
     let fixture = Fixture::new("foreground-tui");
-    let Ok(engine) = TcpListener::bind(("127.0.0.1", ENGINE_PORT)) else {
+    let Some(engine) = fixture.engine() else {
         eprintln!("skipped: port {ENGINE_PORT} is already in use by another engine");
         fixture.cleanup();
         return;
@@ -606,7 +737,7 @@ fn up_runs_the_tui_in_the_foreground_and_propagates_its_exit_code() {
 fn up_hands_off_ownership_before_waiting_for_the_tui() {
     let _guard = engine_port_lock();
     let fixture = Fixture::new("tui-ownership-handoff");
-    let Ok(engine) = TcpListener::bind(("127.0.0.1", ENGINE_PORT)) else {
+    let Some(engine) = fixture.engine() else {
         eprintln!("skipped: port {ENGINE_PORT} is already in use by another engine");
         fixture.cleanup();
         return;
@@ -750,7 +881,7 @@ fn up_gives_up_within_the_health_timeout_when_the_engine_never_listens() {
 fn up_fails_when_a_started_worker_dies_before_reaching_the_bus() {
     let _guard = engine_port_lock();
     let fixture = Fixture::new("worker-dies");
-    let Ok(engine) = TcpListener::bind(("127.0.0.1", ENGINE_PORT)) else {
+    let Some(engine) = fixture.engine() else {
         eprintln!("skipped: port {ENGINE_PORT} is already in use by another engine");
         fixture.cleanup();
         return;
@@ -841,7 +972,7 @@ fn up_writes_the_machine_api_key_before_starting_anything() {
 fn up_hands_the_generated_api_key_to_the_launched_processes() {
     let _guard = engine_port_lock();
     let fixture = Fixture::new("propagate-api-key");
-    let Ok(engine) = TcpListener::bind(("127.0.0.1", ENGINE_PORT)) else {
+    let Some(engine) = fixture.engine() else {
         eprintln!("skipped: port {ENGINE_PORT} is already in use by another engine");
         fixture.cleanup();
         return;

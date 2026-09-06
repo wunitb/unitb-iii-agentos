@@ -940,7 +940,7 @@ fn scoped_service_environment(
     scoped
 }
 
-fn scoped_authenticated_environment(
+fn scoped_tui_environment(
     dotenv: &BTreeMap<String, String>,
     parent: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
@@ -953,13 +953,6 @@ fn scoped_authenticated_environment(
         scoped.insert("AGENTOS_API_KEY".to_string(), bearer);
     }
     scoped
-}
-
-fn scoped_tui_environment(
-    dotenv: &BTreeMap<String, String>,
-    parent: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    scoped_authenticated_environment(dotenv, parent)
 }
 
 fn scoped_worker_environment(
