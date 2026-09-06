@@ -2584,15 +2584,21 @@ summary" },
 
     #[test]
     fn channel_vault_reads_present_the_worker_bearer_or_nothing() {
-        let payload = vault_read_payload("SLACK_BOT_TOKEN");
-        assert_eq!(payload["key"], "SLACK_BOT_TOKEN");
-        match agentos_bus_auth::handshake_headers() {
-            Some(headers) => assert_eq!(
-                payload["headers"]["authorization"],
-                json!(headers["authorization"])
-            ),
-            None => assert!(payload["headers"].is_null()),
-        }
+        with_api_key(Some("vault-worker-key"), || {
+            assert_eq!(
+                vault_read_payload("SLACK_BOT_TOKEN"),
+                json!({
+                    "key": "SLACK_BOT_TOKEN",
+                    "headers": { "authorization": "Bearer vault-worker-key" },
+                }),
+            );
+        });
+        with_api_key(None, || {
+            assert_eq!(
+                vault_read_payload("SLACK_BOT_TOKEN"),
+                json!({ "key": "SLACK_BOT_TOKEN", "headers": null }),
+            );
+        });
     }
 
     #[test]
