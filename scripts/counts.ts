@@ -19,6 +19,7 @@
 import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { countRustAttributes } from "./rust-attributes.js";
 
 export const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
 
@@ -455,10 +456,9 @@ export function collectCounts(): Counts {
   let rustTestAttributes = 0;
   let ignoredRustTests = 0;
   for (const file of listRustSources()) {
-    const text = read(file);
-    rustTestAttributes += countMatches(text, /#\[test\]/g);
-    rustTestAttributes += countMatches(text, /#\[tokio::test/g);
-    ignoredRustTests += countMatches(text, /#\[ignore/g);
+    const attributes = countRustAttributes(read(file));
+    rustTestAttributes += attributes.tests;
+    ignoredRustTests += attributes.ignored;
   }
 
   const router = read("workers/llm-router/src/main.rs");
