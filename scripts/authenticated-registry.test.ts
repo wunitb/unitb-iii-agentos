@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { readGeneratedApiKey } from "./authenticated-registry";
+import { readGeneratedApiKey } from "./authenticated-registry.js";
 
 const generatedKey = "0123456789abcdef".repeat(4);
 const execFileAsync = promisify(execFile);
