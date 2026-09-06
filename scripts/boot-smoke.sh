@@ -204,7 +204,7 @@ done
 # This is the portable runtime layout produced by release.yml and validated by
 # the portable-bundle CI job. Copying it keeps every engine and worker write in
 # /tmp instead of changing the checkout under test.
-for path in .iii-version config.yaml iii.lock config agents hands identity integrations plugin workflows workers; do
+for path in .env.example .iii-version config.yaml iii.lock config agents hands identity integrations plugin workflows workers; do
   [ -e "$REPO_ROOT/$path" ] && cp -R "$REPO_ROOT/$path" "$runtime/"
 done
 for binary in "$REPO_ROOT/target/release/agentos" "$REPO_ROOT"/target/release/agentos-*; do

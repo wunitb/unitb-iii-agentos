@@ -53,6 +53,7 @@ async function runSmokeFixture(options: {
   completeRegistry?: boolean;
   authenticatedNoise?: boolean;
   requireBuiltinDisableUnset?: boolean;
+  requireTemplateCopy?: boolean;
 } = {}): Promise<{
   exitCode: number;
   stdout: string;
@@ -62,6 +63,7 @@ async function runSmokeFixture(options: {
   portProbes: string[];
   untrustedProbe: string;
   authenticatedProbe: string;
+  copiedTemplate: string;
 }> {
   const denialMode = options.denialMode ?? "rbac";
   const root = await mkdtemp(join(tmpdir(), "agentos-boot-smoke-test-"));
@@ -74,6 +76,8 @@ async function runSmokeFixture(options: {
   const portProbeFile = join(root, "port-probe.seen");
   const untrustedProbeFile = join(root, "untrusted-probe.seen");
   const authenticatedProbeFile = join(root, "authenticated-probe.seen");
+  const templateContents = "# exact portable template\nAGENTOS_API_KEY=\nPROVIDER_KEY=fixture\n";
+  const copiedTemplateFile = join(root, "copied-template.seen");
   await Promise.all([
     mkdir(scripts, { recursive: true }),
     mkdir(release, { recursive: true }),
@@ -85,6 +89,7 @@ async function runSmokeFixture(options: {
     writeFile(join(root, "config.yaml"), "workers: []\n"),
     writeFile(join(root, "iii.lock"), "# fixture\n"),
     writeFile(join(root, ".iii-version"), "0.22.1\n"),
+    writeFile(join(root, ".env.example"), templateContents),
   ]);
 
   for (const name of ["agent-core", "llm-router", "memory", "context-manager", "cron", "other"]) {
@@ -105,10 +110,16 @@ async function runSmokeFixture(options: {
   const builtinEnvCheck = options.requireBuiltinDisableUnset
     ? 'test -z "${IIIWORKER_DISABLE_BUILTIN_DAEMONS:-}" || { echo inherited-builtin-disable >&2; exit 65; }\n'
     : "";
+  const templateCopyCheck = options.requireTemplateCopy
+    ? 'cmp -s .env.example "$SMOKE_SOURCE_TEMPLATE" || { echo template-not-copied-byte-for-byte >&2; exit 66; }\n' +
+      'test ! -e .env || { echo runtime-env-preloaded >&2; exit 67; }\n' +
+      'printf copied > "$SMOKE_COPIED_TEMPLATE_FILE"\n'
+    : "";
   await writeFile(
     agentos,
     "#!/bin/sh\n" +
       "test \"$1 $2\" = \"up --no-tui\" || exit 64\n" +
+      templateCopyCheck +
       `printf '%s\n' 'AGENTOS_API_KEY=${generatedApiKey}' > .env\n` +
       // Model the real iii-worker helper: it is reparented after this stub
       // exits, its argv contains no scratch path yet, and only its inherited
@@ -207,6 +218,8 @@ printf '%s\n' '${authenticatedOutput}' > "$4"
         SMOKE_PORT_PROBE_FILE: portProbeFile,
         SMOKE_UNTRUSTED_PROBE_FILE: untrustedProbeFile,
         SMOKE_AUTHENTICATED_PROBE_FILE: authenticatedProbeFile,
+        SMOKE_SOURCE_TEMPLATE: join(root, ".env.example"),
+        SMOKE_COPIED_TEMPLATE_FILE: copiedTemplateFile,
         ...(options.requireBuiltinDisableUnset
           ? { IIIWORKER_DISABLE_BUILTIN_DAEMONS: "inherited-test-value" }
           : {}),
@@ -236,6 +249,10 @@ printf '%s\n' '${authenticatedOutput}' > "$4"
     (value) => value.trim(),
     () => "",
   );
+  const copiedTemplate = await readFile(copiedTemplateFile, "utf8").then(
+    (value) => value.trim(),
+    () => "",
+  );
   return {
     exitCode,
     stdout,
@@ -245,6 +262,7 @@ printf '%s\n' '${authenticatedOutput}' > "$4"
     portProbes,
     untrustedProbe,
     authenticatedProbe,
+    copiedTemplate,
   };
 }
 
@@ -330,6 +348,15 @@ describe("boot smoke contract", () => {
     const result = await runSmokeFixture({ denialMode: "success", completeRegistry: true });
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("untrusted call unexpectedly reached agentos::bus_auth");
+    await expectFixtureReaped(result);
+  });
+
+  it("copies the full template byte-for-byte before up generates runtime .env", async () => {
+    const result = await runSmokeFixture({ completeRegistry: true, requireTemplateCopy: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("template-not-copied-byte-for-byte");
+    expect(result.stderr).not.toContain("runtime-env-preloaded");
+    expect(result.copiedTemplate).toBe("copied");
     await expectFixtureReaped(result);
   });
 
