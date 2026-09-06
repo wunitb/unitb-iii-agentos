@@ -70,6 +70,10 @@ struct Fixture {
     tui_env: PathBuf,
     bus_auth_env: PathBuf,
     bus_auth_pid: PathBuf,
+    inventory_count: PathBuf,
+    state_ready_after: PathBuf,
+    worker_started_before_state: PathBuf,
+    inventory_env: PathBuf,
 }
 
 impl Fixture {
@@ -113,10 +117,36 @@ impl Fixture {
         let tui_env = root.join("tui.env");
         let bus_auth_env = root.join("bus-auth.env");
         let bus_auth_pid = root.join("bus-auth.pid");
+        let inventory_count = root.join("inventory.count");
+        let state_ready_after = root.join("state-ready-after");
+        let worker_started_before_state = root.join("worker-started-before-state");
+        let inventory_env = root.join("inventory.env");
+        fs::write(&state_ready_after, "1\n").expect("write state readiness threshold");
         write_executable(
             &bin.join("iii"),
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'iii 0.22.1'; exit 0; fi\nif [ \"$1\" = \"trigger\" ]; then if [ -f '{}' ]; then printf '%s\\n' '{{\"workers\":[{{\"name\":\"agentos-echo\",\"runtime\":\"rust\",\"status\":\"connected\"}}]}}'; else printf '%s\\n' '{{\"workers\":[]}}'; fi; exit 0; fi\necho started > '{}'\nexec sleep 60\n",
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'iii 0.22.1'; exit 0; fi
+if [ "$1" = "trigger" ]; then
+  count=0; [ ! -f '{}' ] || count=$(cat '{}'); count=$((count + 1)); printf '%s\n' "$count" > '{}'
+  threshold=$(cat '{}'); ready=false; [ "$count" -lt "$threshold" ] || ready=true
+  if [ "$ready" = false ] && [ -f '{}' ]; then printf early > '{}'; fi
+  printf '%s|%s\n' "${{AGENTOS_API_KEY-}}" "${{OTHER_SECRET-unset}}" > '{}'
+  printf '{{"functions":[{{"function_id":"llm::chat","worker_name":"llm-router"}}'
+  if [ "$ready" = true ]; then printf ',{{"function_id":"state::get"}},{{"function_id":"state::set"}},{{"function_id":"state::list"}},{{"function_id":"state::delete"}},{{"function_id":"state::update"}}'; fi
+  if [ -f '{}' ]; then printf ',{{"function_id":"echo::run","worker_name":"agentos-echo"}}'; fi
+  printf ']}}\n'; exit 0
+fi
+echo started > '{}'
+exec sleep 60
+"#,
+                inventory_count.display(),
+                inventory_count.display(),
+                inventory_count.display(),
+                state_ready_after.display(),
+                worker_pid.display(),
+                worker_started_before_state.display(),
+                inventory_env.display(),
                 worker_pid.display(),
                 engine_marker.display()
             ),
@@ -143,7 +173,16 @@ impl Fixture {
             tui_env,
             bus_auth_env,
             bus_auth_pid,
+            inventory_count,
+            state_ready_after,
+            worker_started_before_state,
+            inventory_env,
         }
+    }
+
+    fn state_ready_after(&self, inventory_probe: usize) {
+        fs::write(&self.state_ready_after, format!("{inventory_probe}\n"))
+            .expect("set state readiness threshold");
     }
 
     /// A copy of the CLI inside the fixture, so `current_exe().parent()` is the
@@ -381,6 +420,89 @@ fn terminate(pid: i32) {
         .arg("-TERM")
         .arg(pid.to_string())
         .status();
+}
+
+#[test]
+fn up_waits_for_native_state_inventory_before_worker_spawn() {
+    let _guard = engine_port_lock();
+    let fixture = Fixture::new("state-dependencies-late");
+    fixture.state_ready_after(3);
+    let Ok(engine) = TcpListener::bind(("127.0.0.1", ENGINE_PORT)) else {
+        eprintln!("skipped: port {ENGINE_PORT} is already in use by another engine");
+        fixture.cleanup();
+        return;
+    };
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_agentos"));
+    let output = fixture.up(
+        &cli,
+        &["--no-tui", "--timeout", "2"],
+        &fixture.path_with_engine(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.worker_pid.is_file(), "worker never started");
+    assert!(
+        !fixture.worker_started_before_state.exists(),
+        "worker started before native state functions registered"
+    );
+    let probes: usize = fs::read_to_string(&fixture.inventory_count)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(probes >= 3, "state inventory was not retried: {probes}");
+    assert_eq!(
+        fs::read_to_string(&fixture.inventory_env).unwrap().trim(),
+        "fresh-clone-key|unset",
+        "inventory was not authenticated with a scoped environment"
+    );
+    drop(engine);
+    fixture.cleanup();
+}
+
+#[test]
+fn up_refuses_permanently_missing_native_state_before_worker_spawn() {
+    let _guard = engine_port_lock();
+    let fixture = Fixture::new("state-dependencies-missing");
+    fixture.state_ready_after(1000);
+    let Ok(engine) = TcpListener::bind(("127.0.0.1", ENGINE_PORT)) else {
+        eprintln!("skipped: port {ENGINE_PORT} is already in use by another engine");
+        fixture.cleanup();
+        return;
+    };
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_agentos"));
+    let output = fixture.up(
+        &cli,
+        &["--no-tui", "--timeout", "1"],
+        &fixture.path_with_engine(),
+    );
+    assert!(
+        !output.status.success(),
+        "permanently missing state was accepted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for dependency in [
+        "state::get",
+        "state::set",
+        "state::list",
+        "state::delete",
+        "state::update",
+    ] {
+        assert!(stderr.contains(dependency), "{stderr}");
+    }
+    assert!(
+        !fixture.worker_pid.exists(),
+        "worker spawned before dependencies"
+    );
+    assert!(
+        !fixture.worker_env.exists(),
+        "worker wrote environment before dependencies"
+    );
+    drop(engine);
+    fixture.cleanup();
 }
 
 #[test]
