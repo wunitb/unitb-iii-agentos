@@ -279,13 +279,15 @@ struct ProcessIdentity {
 }
 
 #[cfg(target_os = "linux")]
-fn process_identity(pid: u32) -> Result<ProcessIdentity> {
-    let stat_path = format!("/proc/{pid}/stat");
-    let stat = fs::read_to_string(&stat_path)
-        .with_context(|| format!("Cannot read process identity {stat_path}"))?;
+fn process_state_is_dead(state: &str) -> bool {
+    matches!(state, "Z" | "X" | "x")
+}
+
+#[cfg(target_os = "linux")]
+fn parse_process_stat(stat: &str, stat_path: &Path) -> Result<(u64, bool)> {
     let (_, fields) = stat
         .rsplit_once(") ")
-        .with_context(|| format!("Malformed process identity {stat_path}"))?;
+        .with_context(|| format!("Malformed process identity {}", stat_path.display()))?;
     let fields = fields.split_whitespace().collect::<Vec<_>>();
     let state = fields
         .first()
@@ -296,18 +298,56 @@ fn process_identity(pid: u32) -> Result<ProcessIdentity> {
         .context("Process stat has no start token")?
         .parse::<u64>()
         .context("Process start token is not numeric")?;
-    let zombie = state == "Z";
-    let executable = if zombie {
-        PathBuf::new()
-    } else {
-        fs::canonicalize(format!("/proc/{pid}/exe"))
-            .with_context(|| format!("Cannot resolve executable for pid {pid}"))?
+    Ok((start_token, process_state_is_dead(state)))
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity_at(
+    pid: u32,
+    stat_path: &Path,
+    executable_path: &Path,
+) -> Result<Option<ProcessIdentity>> {
+    let stat = match fs::read_to_string(stat_path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Cannot read process identity {}", stat_path.display()));
+        }
     };
-    Ok(ProcessIdentity {
+    let (start_token, zombie) = parse_process_stat(&stat, stat_path)?;
+    if zombie {
+        return Ok(Some(ProcessIdentity {
+            start_token,
+            executable: PathBuf::new(),
+            zombie: true,
+        }));
+    }
+    let executable = match fs::read_link(executable_path) {
+        Ok(executable) => executable,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Cannot resolve executable for pid {pid}"));
+        }
+    };
+    Ok(Some(ProcessIdentity {
         start_token,
         executable,
-        zombie,
-    })
+        zombie: false,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity_if_present(pid: u32) -> Result<Option<ProcessIdentity>> {
+    let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let executable_path = PathBuf::from(format!("/proc/{pid}/exe"));
+    process_identity_at(pid, &stat_path, &executable_path)
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity(pid: u32) -> Result<ProcessIdentity> {
+    process_identity_if_present(pid)?
+        .with_context(|| format!("Process {pid} exited before its identity could be read"))
 }
 
 fn record_path(agentos_home: &Path) -> PathBuf {
@@ -422,16 +462,16 @@ pub(crate) fn persist_owned(agentos_home: &Path, mut started: Vec<OwnedProcess>)
     if let Some(existing) = read_record(agentos_home)? {
         for process in existing.record.processes {
             #[cfg(target_os = "linux")]
-            match process_identity(process.pid) {
-                Err(_) => {} // a fully exited prior process is stale, not authority
-                Ok(identity) if identity.zombie => {}
-                Ok(identity)
+            match process_identity_if_present(process.pid)? {
+                None => {} // a fully exited prior process is stale, not authority
+                Some(identity) if identity.zombie => {}
+                Some(identity)
                     if identity.start_token == process.start_token
                         && identity.executable == process.executable =>
                 {
                     started.push(process);
                 }
-                Ok(_) => anyhow::bail!(
+                Some(_) => anyhow::bail!(
                     "refusing to replace lifecycle record: pid {} no longer matches its recorded identity",
                     process.pid
                 ),
@@ -492,39 +532,26 @@ pub(crate) fn persist_owned(agentos_home: &Path, mut started: Vec<OwnedProcess>)
 }
 
 #[cfg(target_os = "linux")]
-fn verify_identity(process: &OwnedProcess) -> Result<()> {
-    let identity = process_identity(process.pid)?;
-    if identity.zombie
-        || identity.start_token != process.start_token
-        || identity.executable != process.executable
-    {
+fn verify_identity(process: &OwnedProcess) -> Result<bool> {
+    let Some(identity) = process_identity_if_present(process.pid)? else {
+        return Ok(false);
+    };
+    if identity.zombie {
+        return Ok(false);
+    }
+    if identity.start_token != process.start_token || identity.executable != process.executable {
         anyhow::bail!(
             "refusing pid {} for role {}: recorded process identity no longer matches",
             process.pid,
             process.role
         );
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(target_os = "linux")]
 fn leader_is_running(process: &OwnedProcess) -> Result<bool> {
-    match process_identity(process.pid) {
-        Ok(identity) if identity.zombie => Ok(false),
-        Ok(identity)
-            if identity.start_token == process.start_token
-                && identity.executable == process.executable =>
-        {
-            Ok(true)
-        }
-        Ok(_) => anyhow::bail!(
-            "refusing pid {} for role {}: recorded process identity no longer matches",
-            process.pid,
-            process.role
-        ),
-        Err(_error) if !Path::new(&format!("/proc/{}/exe", process.pid)).exists() => Ok(false),
-        Err(error) => Err(error),
-    }
+    verify_identity(process)
 }
 
 #[cfg(target_os = "linux")]
@@ -541,7 +568,9 @@ unsafe extern "C" {
 
 #[cfg(target_os = "linux")]
 fn signal_verified_group(process: &OwnedProcess, signal: i32) -> Result<()> {
-    verify_identity(process)?;
+    if !verify_identity(process)? {
+        return Ok(());
+    }
     let group = i32::try_from(process.process_group).context("process group does not fit i32")?;
     // Linux/POSIX: a negative pid addresses exactly that process group.
     if unsafe { kill(-group, signal) } != 0 && leader_is_running(process)? {
@@ -557,7 +586,13 @@ fn signal_verified_group(process: &OwnedProcess, signal: i32) -> Result<()> {
 fn live_group_members(process_group: u32) -> Result<Vec<u32>> {
     let mut members = Vec::new();
     for entry in fs::read_dir("/proc").context("Cannot enumerate /proc for owned descendants")? {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).context("Cannot inspect /proc entry for owned descendants");
+            }
+        };
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -588,7 +623,7 @@ fn live_group_members(process_group: u32) -> Result<Vec<u32>> {
             .context("Process stat has no process group")?
             .parse::<u32>()
             .context("Process group is not numeric")?;
-        if group == process_group && state != "Z" {
+        if group == process_group && !process_state_is_dead(state) {
             members.push(pid);
         }
     }
@@ -669,7 +704,7 @@ pub(crate) fn stop_owned(agentos_home: &Path, grace: Duration) -> Result<StopOut
     // tampered entry makes the whole operation non-destructive.
     #[cfg(target_os = "linux")]
     for process in &record.processes {
-        verify_identity(process)?;
+        let _ = verify_identity(process)?;
     }
     record
         .processes
@@ -823,6 +858,89 @@ mod tests {
         );
         drop(released);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn group_scan_excludes_every_linux_dead_process_state() {
+        for state in ["Z", "X", "x"] {
+            assert!(
+                process_state_is_dead(state),
+                "group scan treated {state} as a live descendant"
+            );
+        }
+        for state in ["R", "S", "D", "T", "t", "W", "I"] {
+            assert!(
+                !process_state_is_dead(state),
+                "live state {state} was excluded"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_reader_treats_only_confirmed_disappearance_as_gone() {
+        let root = root("identity-read-races");
+        let executable = root.join("exe");
+        fs::write(&executable, "fixture").unwrap();
+        assert!(
+            process_identity_at(42, &root.join("missing-stat"), &executable)
+                .unwrap()
+                .is_none(),
+            "a missing stat file is a process that has already gone"
+        );
+
+        let stat_dir = root.join("stat-directory");
+        fs::create_dir(&stat_dir).unwrap();
+        let error = process_identity_at(42, &stat_dir, &executable)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Cannot read process identity"), "{error}");
+
+        let stat_path = root.join("stat");
+        fs::copy("/proc/self/stat", &stat_path).unwrap();
+        assert!(
+            process_identity_at(42, &stat_path, &root.join("missing-exe"))
+                .unwrap()
+                .is_none(),
+            "a vanished /proc executable link is a process that has gone"
+        );
+        let executable_dir = root.join("exe-directory");
+        fs::create_dir(&executable_dir).unwrap();
+        let error = process_identity_at(42, &stat_path, &executable_dir)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Cannot resolve executable"), "{error}");
+        let deleted_target = root.join("deleted-target");
+        let deleted_link = root.join("deleted-executable-link");
+        std::os::unix::fs::symlink(&deleted_target, &deleted_link).unwrap();
+        let identity = process_identity_at(42, &stat_path, &deleted_link)
+            .unwrap()
+            .expect("a readable link to a deleted executable is still identity evidence");
+        assert_eq!(identity.executable, deleted_target);
+
+        fs::remove_file(&stat_path).unwrap();
+        fs::write(&stat_path, "malformed").unwrap();
+        let error = process_identity_at(42, &stat_path, &executable)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Malformed process identity"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn process_that_vanished_before_stop_is_retired_as_gone() {
+        let root = root("vanished-before-stop");
+        let mut child = spawn_sleep();
+        let process = capture(&child, "worker");
+        persist_owned(&root, vec![process]).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let outcome = stop_owned(&root, Duration::from_millis(100));
+        let record_remains = record_path(&root).exists();
+        fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(outcome.unwrap(), StopOutcome::Stopped(1));
+        assert!(!record_remains, "vanished ownership record was preserved");
     }
 
     #[test]
