@@ -36,6 +36,7 @@ const deniedFunctionIds = [
 ];
 
 type DenialMode = "rbac" | "generic" | "success";
+const generatedApiKey = "0123456789abcdef".repeat(4);
 
 async function processExists(pid: number): Promise<boolean> {
   try {
@@ -50,13 +51,17 @@ async function processExists(pid: number): Promise<boolean> {
 async function runSmokeFixture(options: {
   denialMode?: DenialMode;
   completeRegistry?: boolean;
+  authenticatedNoise?: boolean;
   requireBuiltinDisableUnset?: boolean;
 } = {}): Promise<{
   exitCode: number;
+  stdout: string;
   stderr: string;
   tmpRoot: string;
   childPid: number;
   portProbes: string[];
+  untrustedProbe: string;
+  authenticatedProbe: string;
 }> {
   const denialMode = options.denialMode ?? "rbac";
   const root = await mkdtemp(join(tmpdir(), "agentos-boot-smoke-test-"));
@@ -67,6 +72,8 @@ async function runSmokeFixture(options: {
   const tmpRoot = join(root, "tmp");
   const childPidFile = join(root, "child.pid");
   const portProbeFile = join(root, "port-probe.seen");
+  const untrustedProbeFile = join(root, "untrusted-probe.seen");
+  const authenticatedProbeFile = join(root, "authenticated-probe.seen");
   await Promise.all([
     mkdir(scripts, { recursive: true }),
     mkdir(release, { recursive: true }),
@@ -102,6 +109,7 @@ async function runSmokeFixture(options: {
     agentos,
     "#!/bin/sh\n" +
       "test \"$1 $2\" = \"up --no-tui\" || exit 64\n" +
+      `printf '%s\n' 'AGENTOS_API_KEY=${generatedApiKey}' > .env\n` +
       // Model the real iii-worker helper: it is reparented after this stub
       // exits, its argv contains no scratch path yet, and only its inherited
       // scratch HOME proves ownership before the delayed exec.
@@ -129,6 +137,10 @@ async function runSmokeFixture(options: {
   // Ensure every expected worker identity is represented even though the
   // function assertion must fail first on the deliberately absent id.
   functions.push({ function_id: "fixture::other", worker_name: "agentos-other" });
+  // Engine 0.22.1 filters this inventory for an untrusted session. These
+  // product-critical ids exist but are deliberately hidden from the bare CLI.
+  const hiddenFromUntrusted = new Set(["agent::chat", "memory::recall", "cron::create"]);
+  const bareFunctions = functions.filter(({ function_id }) => !hiddenFromUntrusted.has(function_id));
   const iii = join(stub, "iii");
   const deniedCase = deniedFunctionIds.join("|");
   const deniedResponse = denialMode === "rbac"
@@ -140,7 +152,8 @@ async function runSmokeFixture(options: {
     iii,
     `#!/bin/sh
 if [ "$1" = trigger ] && [ "$2" = engine::functions::list ]; then
-  printf '%s\n' '${JSON.stringify({ functions })}'
+  printf '%s\n' filtered > "$SMOKE_UNTRUSTED_PROBE_FILE"
+  printf '%s\n' '${JSON.stringify({ functions: bareFunctions })}'
   exit 0
 fi
 case "$2" in
@@ -151,6 +164,25 @@ exit 65
 `,
   );
   await chmod(iii, 0o755);
+  const authenticatedOutput = options.authenticatedNoise
+    ? `sdk-prefix\n${JSON.stringify({ functions })}\nsdk-suffix`
+    : JSON.stringify({ functions });
+  const bun = join(stub, "bun");
+  await writeFile(
+    bun,
+    `#!/bin/sh
+case "$*" in *${generatedApiKey}*) echo secret-leaked-to-argv >&2; exit 70;; esac
+[ -z "\${AGENTOS_API_KEY:-}" ] || { echo secret-exported-to-helper >&2; exit 71; }
+[ "$1" = --no-env-file ] || { echo dotenv-autoload-not-disabled >&2; exit 72; }
+[ "\${2##*/}" = authenticated-registry.ts ] || { echo wrong-helper >&2; exit 73; }
+[ "$3" = "$PWD/.env" ] || { echo wrong-dotenv-path >&2; exit 74; }
+[ "\${4##*/}" = functions-authenticated.json ] || { echo wrong-output-path >&2; exit 75; }
+grep -Fx 'AGENTOS_API_KEY=${generatedApiKey}' "$3" >/dev/null || { echo generated-key-not-read >&2; exit 76; }
+printf '%s\n' authenticated > "$SMOKE_AUTHENTICATED_PROBE_FILE"
+printf '%s\n' '${authenticatedOutput}' > "$4"
+`,
+  );
+  await chmod(bun, 0o755);
   const realPython = (await execFileAsync("/bin/sh", ["-c", "command -v python3"])).stdout.trim();
   const python = join(stub, "python3");
   await writeFile(
@@ -164,29 +196,56 @@ exit 65
   await chmod(python, 0o755);
 
   let exitCode = 0;
+  let stdout = "";
   let stderr = "";
   try {
-    await execFileAsync("/bin/sh", [join(scripts, "boot-smoke.sh")], {
+    const result = await execFileAsync("/bin/sh", [join(scripts, "boot-smoke.sh")], {
       env: {
         PATH: `${stub}:${process.env.PATH}`,
         TMPDIR: tmpRoot,
         SMOKE_CHILD_PID_FILE: childPidFile,
         SMOKE_PORT_PROBE_FILE: portProbeFile,
+        SMOKE_UNTRUSTED_PROBE_FILE: untrustedProbeFile,
+        SMOKE_AUTHENTICATED_PROBE_FILE: authenticatedProbeFile,
         ...(options.requireBuiltinDisableUnset
           ? { IIIWORKER_DISABLE_BUILTIN_DAEMONS: "inherited-test-value" }
           : {}),
       },
       timeout: 15_000,
     });
+    stdout = result.stdout;
+    stderr = result.stderr;
   } catch (error) {
-    const commandError = error as { code?: number | string | null; stderr?: string };
+    const commandError = error as {
+      code?: number | string | null;
+      stdout?: string;
+      stderr?: string;
+    };
     if (typeof commandError.code !== "number") throw error;
     exitCode = commandError.code;
+    stdout = commandError.stdout ?? "";
     stderr = commandError.stderr ?? "";
   }
   const childPid = Number((await readFile(childPidFile, "utf8")).trim());
   const portProbes = (await readFile(portProbeFile, "utf8")).trim().split(/\s+/);
-  return { exitCode, stderr, tmpRoot, childPid, portProbes };
+  const untrustedProbe = await readFile(untrustedProbeFile, "utf8").then(
+    (value) => value.trim(),
+    () => "",
+  );
+  const authenticatedProbe = await readFile(authenticatedProbeFile, "utf8").then(
+    (value) => value.trim(),
+    () => "",
+  );
+  return {
+    exitCode,
+    stdout,
+    stderr,
+    tmpRoot,
+    childPid,
+    portProbes,
+    untrustedProbe,
+    authenticatedProbe,
+  };
 }
 
 afterEach(async () => {
@@ -211,25 +270,52 @@ describe("boot smoke contract", () => {
       [...deniedFunctionIds].sort(),
     );
     expect(source).toContain(
-      'python3 - "$registry_file" "$expected_workers_file" "$required_functions_file"',
+      'bun --no-env-file "$SCRIPT_DIR/authenticated-registry.ts" "$runtime/.env"',
     );
+    expect(source).toContain('"$authenticated_registry_file"');
+    expect(source).toContain(
+      'python3 - "$authenticated_registry_file" "$expected_workers_file" "$required_functions_file"',
+    );
+    expect(source).not.toContain('text.find("{")');
   });
 
   it("names a missing function after accepting exact engine RBAC denials", async () => {
-    const { exitCode, stderr, tmpRoot, childPid, portProbes } = await runSmokeFixture();
+    const {
+      exitCode,
+      stdout,
+      stderr,
+      tmpRoot,
+      childPid,
+      portProbes,
+      untrustedProbe,
+      authenticatedProbe,
+    } = await runSmokeFixture();
 
     expect(exitCode).not.toBe(0);
     expect(stderr).toContain("missing function id(s): agentos::llm::complete");
+    expect(untrustedProbe).toBe("filtered");
+    expect(authenticatedProbe).toBe("authenticated");
+    expect(stdout + stderr).not.toContain(generatedApiKey);
     expect(portProbes).toContain("49129");
     expect(portProbes).toContain("49134");
     expect(await readdir(tmpRoot)).toEqual([]);
     expect(await processExists(childPid)).toBe(false);
   });
 
-  it("accepts exact FORBIDDEN responses and a complete registry", async () => {
+  it("keeps filtered bare reachability separate from the authenticated inventory", async () => {
     const result = await runSmokeFixture({ completeRegistry: true });
     expect(result.exitCode).toBe(0);
+    expect(result.untrustedProbe).toBe("filtered");
+    expect(result.authenticatedProbe).toBe("authenticated");
+    expect(result.stdout + result.stderr).not.toContain(generatedApiKey);
     expect(result.stderr).not.toContain("reason other than the exact engine RBAC deny");
+    await expectFixtureReaped(result);
+  });
+
+  it("rejects an authenticated inventory with any non-JSON prefix or suffix", async () => {
+    const result = await runSmokeFixture({ authenticatedNoise: true, completeRegistry: true });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("authenticated engine registry was not JSON");
     await expectFixtureReaped(result);
   });
 

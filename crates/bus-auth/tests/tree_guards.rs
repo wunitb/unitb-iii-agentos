@@ -148,12 +148,25 @@ fn boot_smoke_pins_default_armed_security_properties() {
         "unset IIIWORKER_DISABLE_BUILTIN_DAEMONS",
         "BUS_AUTH_PORT=49129",
         "unset AGENTOS_API_KEY",
+        "untrusted_registry_file",
+        "authenticated_registry_file",
+        "authenticated-registry.ts",
+        "bun --no-env-file",
+        "bun cp grep iii",
     ] {
         assert!(script.contains(marker), "boot smoke is missing `{marker}`");
     }
     assert!(
         !script.contains("export IIIWORKER_DISABLE_BUILTIN_DAEMONS=1"),
         "smoke must prove the product launcher forces the engine flag"
+    );
+    assert!(
+        script.contains("python3 - \"$authenticated_registry_file\" \"$expected_workers_file\""),
+        "required functions, worker identities, and builtin absence need the full authenticated view"
+    );
+    assert!(
+        !script.contains("export AGENTOS_API_KEY"),
+        "the generated credential must stay out of the untrusted parent probe environment"
     );
 }
 
