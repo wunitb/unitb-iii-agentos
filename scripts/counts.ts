@@ -569,7 +569,7 @@ export function publishedNumbers(counts: Counts): PublishedNumber[] {
     // README prose
     { file: "README.md", label: "thesis worker count", pattern: /(\d+) narrow workers/g, expected: workers, occurrences: 1 },
     { file: "README.md", label: "thesis rust worker count", pattern: /(\d+) Rust binaries plus one Python worker/g, expected: rust, occurrences: 1 },
-    { file: "README.md", label: "quickstart rust worker count", pattern: /starts the (\d+) Rust workers/g, expected: rust, occurrences: 1 },
+    { file: "README.md", label: "quickstart rust worker count", pattern: /\bstarts? the (\d+) Rust workers/g, expected: rust, occurrences: 1 },
     { file: "README.md", label: "registration count", pattern: /source registers (\d+) literal function/g, expected: registrations, occurrences: 1 },
     { file: "README.md", label: "distinct function ids", pattern: /(\d+) distinct function ids/g, expected: functions, occurrences: 1 },
     { file: "README.md", label: "worker section subtitle", pattern: /^(\d+) Rust \+ 1 Python, grouped by responsibility\./gm, expected: rust, occurrences: 1 },
