@@ -141,7 +141,7 @@ impl FakeEngine {
                                         let _ = fs::write(&worker_started_before_state, "early");
                                     }
                                     let mut functions = vec![json!({
-                                        "function_id": "llm::chat",
+                                        "function_id": "fixture::native",
                                         "worker_name": "llm-router"
                                     })];
                                     if authenticated.load(std::sync::atomic::Ordering::SeqCst) && ready {
