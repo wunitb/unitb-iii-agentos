@@ -279,6 +279,11 @@ struct ProcessIdentity {
 }
 
 #[cfg(target_os = "linux")]
+fn process_state_is_dead(state: &str) -> bool {
+    matches!(state, "Z" | "X" | "x")
+}
+
+#[cfg(target_os = "linux")]
 fn parse_process_stat(stat: &str, stat_path: &Path) -> Result<(u64, bool)> {
     let (_, fields) = stat
         .rsplit_once(") ")
@@ -293,7 +298,7 @@ fn parse_process_stat(stat: &str, stat_path: &Path) -> Result<(u64, bool)> {
         .context("Process stat has no start token")?
         .parse::<u64>()
         .context("Process start token is not numeric")?;
-    Ok((start_token, matches!(state, "Z" | "X" | "x")))
+    Ok((start_token, process_state_is_dead(state)))
 }
 
 #[cfg(target_os = "linux")]
@@ -618,7 +623,7 @@ fn live_group_members(process_group: u32) -> Result<Vec<u32>> {
             .context("Process stat has no process group")?
             .parse::<u32>()
             .context("Process group is not numeric")?;
-        if group == process_group && state != "Z" {
+        if group == process_group && !process_state_is_dead(state) {
             members.push(pid);
         }
     }
@@ -853,6 +858,22 @@ mod tests {
         );
         drop(released);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn group_scan_excludes_every_linux_dead_process_state() {
+        for state in ["Z", "X", "x"] {
+            assert!(
+                process_state_is_dead(state),
+                "group scan treated {state} as a live descendant"
+            );
+        }
+        for state in ["R", "S", "D", "T", "t", "W", "I"] {
+            assert!(
+                !process_state_is_dead(state),
+                "live state {state} was excluded"
+            );
+        }
     }
 
     #[test]
