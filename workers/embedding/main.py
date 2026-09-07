@@ -2,9 +2,17 @@ import asyncio
 import os
 from iii import InitOptions, register_worker
 
+def init_options():
+    key = os.getenv("AGENTOS_API_KEY")
+    return InitOptions(
+        worker_name="embedding",
+        headers={"Authorization": f"Bearer {key}"} if key else None,
+    )
+
+
 iii = register_worker(
     os.getenv("III_URL", "ws://localhost:49134"),
-    InitOptions(worker_name="embedding"),
+    init_options(),
 )
 
 model = None

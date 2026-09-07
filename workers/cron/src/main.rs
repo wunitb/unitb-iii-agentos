@@ -429,6 +429,8 @@ fn register_managed_trigger(iii: &IIIClient, record: &Value) -> Result<Trigger, 
         function_id: function_id.to_string(),
         config,
         metadata,
+        namespace: None,
+        trigger_namespace: None,
     })
 }
 

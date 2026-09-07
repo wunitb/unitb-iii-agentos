@@ -9,6 +9,20 @@ use std::path::{Path, PathBuf};
 
 use agentos_bus_auth::policy::UNTRUSTED_FORBIDDEN_FUNCTIONS;
 
+fn ci_runs() -> Vec<String> {
+    let source = std::fs::read_to_string(repository_root().join(".github/workflows/ci.yml"))
+        .expect("read CI");
+    let workflow: serde_yaml::Value = serde_yaml::from_str(&source).expect("parse CI");
+    let jobs = workflow["jobs"].as_mapping().expect("CI jobs");
+    let runs: Vec<String> = jobs
+        .values()
+        .flat_map(|job| job["steps"].as_sequence().expect("job steps"))
+        .filter_map(|step| step["run"].as_str().map(str::to_owned))
+        .collect();
+    assert!(!runs.is_empty(), "CI run-step scan must not be empty");
+    runs
+}
+
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -52,122 +66,81 @@ fn relative(root: &Path, path: &Path) -> String {
 }
 
 #[test]
-fn direct_ci_engine_boots_start_bus_auth_first_and_disable_builtin_daemons() {
-    let workflow = std::fs::read_to_string(repository_root().join(".github/workflows/ci.yml"))
-        .expect("read ci.yml");
-    let lines: Vec<&str> = workflow.lines().collect();
-    let boots: Vec<usize> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.contains("iii --config config.yaml"))
-        .map(|(index, _)| index)
-        .collect();
-    assert_eq!(boots.len(), 2, "guard every direct iii boot in ci.yml");
-
-    for boot in boots {
-        let block_start = (0..boot)
-            .rev()
-            .find(|index| lines[*index].trim() == "run: |")
-            .expect("engine boot is inside a multiline run block");
-        let before_boot = lines[block_start..boot].join("\n");
-        assert!(
-            before_boot.contains("agentos-bus-authd"),
-            "direct iii boot at line {} does not start bus auth first",
-            boot + 1
-        );
-        assert!(
-            before_boot.contains("/dev/tcp/127.0.0.1/49129"),
-            "direct iii boot at line {} does not wait for bus auth",
-            boot + 1
-        );
-        assert!(
-            before_boot.contains("IIIWORKER_DISABLE_BUILTIN_DAEMONS=1"),
-            "direct iii boot at line {} can expose worker::* mutations",
-            boot + 1
-        );
-    }
-
-    assert_eq!(
-        workflow.matches("kill \"$BUS_AUTH_PID\"").count(),
-        2,
-        "both direct-boot jobs must clean up their bus-auth daemon"
-    );
-}
-
-#[test]
-fn bare_ci_boots_use_a_non_secret_audit_key_instead_of_the_development_fallback() {
-    let workflow = std::fs::read_to_string(repository_root().join(".github/workflows/ci.yml"))
-        .expect("read ci.yml");
-    const CI_AUDIT_KEY: &str =
-        "AUDIT_HMAC_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    assert_eq!(
-        workflow.matches(CI_AUDIT_KEY).count(),
-        2,
-        "both bare iii CI boots bypass key generation and need the explicit test key"
-    );
-}
-
-#[test]
-fn e2e_smoke_is_prepared_for_the_loopback_fake_provider() {
-    let workflow = std::fs::read_to_string(repository_root().join(".github/workflows/ci.yml"))
-        .expect("read ci.yml");
-    let smoke_job = workflow
-        .split("\n  e2e-smoke:\n")
-        .nth(1)
-        .expect("e2e-smoke job")
-        .split("\n  e2e-full:\n")
-        .next()
-        .expect("e2e-smoke body");
-    let job_env = smoke_job.split("    steps:\n").next().expect("job env");
-    for value in [
-        "AGENTOS_E2E_FAKE_PROVIDER: \"1\"",
-        "ANTHROPIC_API_KEY: agentos-e2e-fake-anthropic-key",
-        "AGENTOS_ANTHROPIC_BASE_URL: http://127.0.0.1:39091",
-    ] {
-        assert!(
-            job_env.contains(value),
-            "{value} must reach both the worker and test process"
-        );
-    }
+fn ci_product_boots_use_oci_instead_of_unowned_host_engines() {
+    let runs = ci_runs();
     assert!(
-        smoke_job.contains("local fake Anthropic provider|realm::create"),
-        "the e2e-smoke pattern must select WP-E's exact fake-provider test and existing smoke cases"
+        runs.iter()
+            .any(|run| run.contains("bash scripts/boot-smoke.sh"))
     );
+    assert!(
+        runs.iter()
+            .any(|run| run.contains("python3 scripts/oci-smoke.py --report"))
+    );
+    for run in runs {
+        assert!(
+            !run.contains("iii --config config.yaml"),
+            "product engines must not start in the checkout"
+        );
+        assert!(
+            !run.contains("pkill -f"),
+            "CI must not sweep unrelated processes"
+        );
+    }
 }
 
 #[test]
-fn boot_smoke_pins_default_armed_security_properties() {
-    let script = std::fs::read_to_string(repository_root().join("scripts/boot-smoke.sh"))
-        .expect("read boot-smoke.sh");
+fn oci_boots_use_product_generated_private_machine_keys() {
+    let root = repository_root();
+    let entry =
+        std::fs::read_to_string(root.join("scripts/container-entrypoint.py")).expect("entrypoint");
+    let smoke = std::fs::read_to_string(root.join("scripts/oci-smoke.py")).expect("smoke");
+    assert!(entry.contains(r#"["agentos", "up", "--no-tui"]"#));
+    assert!(smoke.contains("AGENTOS_API_KEY="));
+    assert!(smoke.contains("AUDIT_HMAC_KEY="));
+    assert!(smoke.contains("read_api_key(home)"));
+    assert!(smoke.contains("runtime dotenv is not private"));
+}
+
+#[test]
+fn e2e_smoke_requires_the_private_fake_provider_and_json_result_gate() {
+    let source =
+        std::fs::read_to_string(repository_root().join(".github/workflows/ci.yml")).expect("CI");
+    let workflow: serde_yaml::Value = serde_yaml::from_str(&source).expect("parse CI");
+    let job = &workflow["jobs"]["e2e-smoke"];
+    assert!(job["env"]["AGENTOS_API_KEY"].is_null());
+    assert!(job["env"]["ANTHROPIC_API_KEY"].is_null());
+    let steps = job["steps"].as_sequence().expect("e2e smoke steps");
+    let run = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("credential-free worker integration tests"))
+        .expect("actual acceptance step")["run"]
+        .as_str()
+        .expect("run body");
+    assert!(run.contains("python3 scripts/oci-smoke.py --report"));
+    assert!(run.contains("bun scripts/assert-oci-results.ts"));
+    assert!(!run.contains("--live-e2e"));
+}
+
+#[test]
+fn boot_smoke_keeps_security_views_and_owned_cleanup_as_required_checks() {
+    let root = repository_root();
+    let wrapper = std::fs::read_to_string(root.join("scripts/boot-smoke.sh")).expect("wrapper");
+    let smoke = std::fs::read_to_string(root.join("scripts/oci-smoke.py")).expect("smoke");
+    assert!(wrapper.contains("exec python3"));
+    assert!(wrapper.contains("oci-smoke.py"));
     for marker in [
-        "boot deadlocked",
         "UNTRUSTED_DENIED_FUNCTION_IDS",
         "WORKER_MUTATION_FUNCTION_IDS",
         "configuration::set",
         "agent::chat",
-        "unset IIIWORKER_DISABLE_BUILTIN_DAEMONS",
-        "BUS_AUTH_PORT=49129",
-        "unset AGENTOS_API_KEY",
-        "untrusted_registry_file",
-        "authenticated_registry_file",
-        "authenticated-registry.ts",
-        "bun --no-env-file",
-        "bun cp grep iii",
+        "validate_access(registry, public)",
+        "include_internal",
+        "owned teardown failed",
     ] {
-        assert!(script.contains(marker), "boot smoke is missing `{marker}`");
+        assert!(smoke.contains(marker), "OCI smoke lacks {marker}");
     }
-    assert!(
-        !script.contains("export IIIWORKER_DISABLE_BUILTIN_DAEMONS=1"),
-        "smoke must prove the product launcher forces the engine flag"
-    );
-    assert!(
-        script.contains("python3 - \"$authenticated_registry_file\" \"$expected_workers_file\""),
-        "required functions, worker identities, and builtin absence need the full authenticated view"
-    );
-    assert!(
-        !script.contains("export AGENTOS_API_KEY"),
-        "the generated credential must stay out of the untrusted parent probe environment"
-    );
+    assert!(!smoke.contains("process.kill"));
+    assert!(!smoke.contains("pkill"));
 }
 
 #[test]

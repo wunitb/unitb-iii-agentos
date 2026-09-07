@@ -22,26 +22,59 @@ function isRepositorySource(path: string): boolean {
 }
 
 function configuredWorkers(source: string): string[] {
-  return [...source.matchAll(/^\s*-\s+name:\s*([^\s#]+)/gm)].map(
+  return [...source.matchAll(/^\s*-\s+name:\s*([^\s]+)/gm)].map(
     (match) => match[1],
   );
 }
 
-function engine0221Name(name: string): string {
+function engine023Name(name: string): string {
   return deprecatedAliases.get(name) ?? name;
 }
 
-describe("iii 0.22.1 engine config", () => {
+describe("iii 0.23 OCI engine config", () => {
   it("boots without deprecated/canonical worker collisions", async () => {
     const source = await Bun.file(new URL("config.yaml", repository)).text();
     const workers = configuredWorkers(source);
-    const canonical = workers.map(engine0221Name);
+    const canonical = workers.map(engine023Name);
 
-    expect(workers).toContain("queue");
-    expect(workers).toContain("state");
-    expect(workers).toContain("cron");
+    const compose = Bun.YAML.parse(await Bun.file(new URL("worker-compose.yaml", repository)).text()) as { containers: Record<string, { version: string; worker: string }>; engine?: unknown; namespace: string };
+    const lock = Bun.YAML.parse(await Bun.file(new URL("iii.lock", repository)).text()) as { workers: Record<string, { version: string }> };
+    expect(compose.engine).toBeUndefined();
+    expect(compose.namespace).toBe("default");
+    for (const name of ["queue", "state", "cron", "llm-router", "context-manager", "iii-directory", "provider-anthropic", "provider-openai", "provider-openai-codex", "session-manager"]) {
+      expect(workers).not.toContain(name);
+      expect(compose.containers[name].worker).toBe(`package://api.workers.iii.dev/${name}`);
+      expect(compose.containers[name].version).toBe(String(lock.workers[name].version));
+    }
+    for (const [name, version, config] of [["http", "0.21.9", "iii-http"], ["pubsub", "0.21.5", "iii-pubsub"]]) {
+      expect(compose.containers[name].worker).toBe(`package://api.workers.iii.dev/${name}`);
+      expect(compose.containers[name].version).toBe(version);
+      expect((compose.containers[name] as { config_name?: string }).config_name).toBe(config);
+    }
+    expect(Object.keys(compose.containers)).toHaveLength(12);
+    for (const worker of Object.values(compose.containers)) {
+      expect((worker as { working_dir?: string }).working_dir).toBe(".");
+    }
+    for (const name of ["shell", "console", "harness", "iii-bridge"]) expect(compose.containers[name]).toBeUndefined();
+    for (const name of workers) expect(["configuration", "iii-worker-manager#raw", "iii-worker-manager", "iii-stream", "iii-http-functions", "iii-sandbox"]).toContain(name);
     expect(workers.filter((name) => deprecatedAliases.has(name))).toEqual([]);
     expect(new Set(canonical).size).toBe(canonical.length);
+  });
+
+  it("declares only scoped provider credentials for Compose children", async () => {
+    const compose = Bun.YAML.parse(await Bun.file(new URL("worker-compose.yaml", repository)).text()) as { containers: Record<string, { environment: Record<string, string> }> };
+    for (const [name, worker] of Object.entries(compose.containers)) {
+      expect(worker.environment.AGENTOS_API_KEY).toBeUndefined();
+      expect(worker.environment.III_URL).toBeUndefined();
+      expect(worker.environment.TOKIO_WORKER_THREADS).toBe("${TOKIO_WORKER_THREADS:-2}");
+      expect(worker.environment.III_DISABLE_TRACE_PAYLOADS).toBeDefined();
+      if (!["llm-router", "provider-anthropic"].includes(name)) expect(worker.environment.ANTHROPIC_API_KEY).toBeUndefined();
+      if (!["llm-router", "provider-openai"].includes(name)) expect(worker.environment.OPENAI_API_KEY).toBeUndefined();
+      if (name !== "provider-openai-codex") expect(worker.environment.CODEX_HOME).toBeUndefined();
+    }
+    expect(compose.containers["provider-anthropic"].environment.ANTHROPIC_API_KEY).toBe("${ANTHROPIC_API_KEY:-}");
+    expect(compose.containers["provider-openai"].environment.OPENAI_API_KEY).toBe("${OPENAI_API_KEY:-}");
+    expect(compose.containers["provider-openai-codex"].environment.CODEX_HOME).toBe("${CODEX_HOME:-}");
   });
 
   it("stores canonical configuration under canonical worker ids", async () => {
@@ -77,20 +110,25 @@ describe("iii 0.22.1 engine config", () => {
     ).not.toMatch(/^\s*-\s*name:\s*harness\s*$/m);
   });
 
-  // The bus carries every AgentOS function and has no authentication of its own.
-  // `iii-worker-manager` is mandatory: when config.yaml omits it the engine appends
-  // it with WorkerManagerConfig::default(), whose host is 0.0.0.0 — which is how the
-  // bus became reachable from the LAN. Losing this entry is silent, so it is asserted.
-  it("pins the engine bus to loopback", async () => {
-    const root = await Bun.file(new URL("config.yaml", repository)).text();
-    const entry = /^\s*-\s*name:\s*iii-worker-manager\s*$/m.exec(root);
-    expect(entry, "config.yaml does not declare iii-worker-manager; the bus would bind 0.0.0.0").not.toBeNull();
-
-    const rest = root.slice(entry!.index + entry![0].length);
-    const nextEntry = /^\s*-\s*name:/m.exec(rest);
-    const block = nextEntry ? rest.slice(0, nextEntry.index) : rest;
-    expect(block, "iii-worker-manager must pin host: 127.0.0.1").toMatch(/^\s*host:\s*127\.0\.0\.1\s*$/m);
-    expect(block, "the bus must not be bound to all interfaces").not.toMatch(/0\.0\.0\.0/);
+  it("allows only the fixed container-private raw manager plus the fully gated edge", async () => {
+    const root = Bun.YAML.parse(await Bun.file(new URL("config.yaml", repository)).text()) as { workers: { name: string; config?: Record<string, unknown> }[] };
+    const managers = root.workers.filter((entry) => entry.name.split("#")[0] === "iii-worker-manager");
+    expect(managers).toHaveLength(2);
+    expect(managers.find((entry) => entry.name === "iii-worker-manager#raw")?.config).toEqual({ host: "127.0.0.1", port: 49129 });
+    expect(managers.find((entry) => entry.name === "iii-worker-manager")?.config).toEqual({
+      host: "0.0.0.0", port: 49134,
+      rbac: {
+        auth_function_id: "agentos::bus_auth",
+        on_function_registration_function_id: "agentos::bus_on_register",
+        on_trigger_registration_function_id: "agentos::bus_on_trigger",
+        on_trigger_type_registration_function_id: "agentos::bus_on_trigger_type",
+        expose_functions: ['match("*")'],
+      },
+    });
+    const http = Bun.YAML.parse(await Bun.file(new URL("config/iii-http.yaml", repository)).text()) as { value: { host: string } };
+    const stream = Bun.YAML.parse(await Bun.file(new URL("config/iii-stream.yaml", repository)).text()) as { value: { host: string } };
+    expect(http.value.host).toBe("0.0.0.0");
+    expect(stream.value.host).toBe("127.0.0.1");
   });
 
   it("keeps the shell worker confined to the checkout if it is opted in", async () => {
@@ -115,4 +153,9 @@ describe("iii 0.22.1 engine config", () => {
       }
     }
   });
+});
+
+it("uses the pinned registry cron worker's local lock adapter in a single OCI runtime", async () => {
+  const cron = Bun.YAML.parse(await Bun.file(new URL("config/cron.yaml", repository)).text()) as { value: { adapter: { name: string } } };
+  expect(cron.value.adapter.name).toBe("local");
 });

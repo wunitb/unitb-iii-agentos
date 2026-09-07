@@ -4,7 +4,7 @@ This file governs the repository root and all descendants unless a nearer `AGENT
 
 ## Project
 
-AgentOS is UnitB's independent continuation of `iii-experimental/agentos`, migrated to the stable iii version pinned by `.iii-version` (**v0.22.1**) under Apache-2.0. It is a Rust workspace of narrow iii workers and three client/transport crates, plus the Python embedding worker, TypeScript examples and live-stack e2e harness, website, declarative content, and engine/runtime configuration. Workers register functions and triggers with the iii engine; they do not share in-process state.
+AgentOS is UnitB's independent continuation of `iii-experimental/agentos`, migrated to the stable iii version pinned by `.iii-version` (**v0.23.0**) under Apache-2.0. It is a Rust workspace of narrow iii workers and three client/transport crates, plus the Python embedding worker, TypeScript examples and live-stack e2e harness, website, declarative content, and engine/runtime configuration. Workers register functions and triggers with the iii engine; they do not share in-process state.
 
 ## Repository map
 
@@ -38,12 +38,12 @@ linter CI runs. Do not prefix commands with `rustup run`; if you change the pin,
 | Rust build | root: `cargo build --workspace --release --offline --locked` | Rust 1.90 and the same Cargo cache prerequisite; produces `target/` artifacts. |
 | Rust tests | root: `cargo test --workspace --offline --locked` | Dev profile — the same profile CI runs; the release build exists for the shipped binaries, not for tests. Live-engine tests are ignored by default. Target one package with `cargo test -p <workspace-package> --offline --locked`; do not broaden unrelated packages. |
 | Supply-chain policy | root: `cargo deny check` | **Not offline.** Needs `cargo-deny` (CI pins 0.20.2) and fetches the RustSec advisory database. Policy and every dated exception live in `deny.toml`; a new duplicate version, licence or registry fails the build. |
-| Root TypeScript checks | root: `bun run check` | Bun and root `node_modules` must match `bun.lock`. Chains `typecheck`, `test:unit` (tests of the software), `test:governance` (build-evidence and documentation contracts), `counts:check` (every published number recomputed from the tree) and the npm-locked website build. `bun install --frozen-lockfile` is connected setup, not an offline guarantee. |
+| Root TypeScript checks | root: `bun run check` | Bun and root `node_modules` must match `bun.lock`. Chains `typecheck`, `test:unit` (tests of the software), `test:governance` (build-evidence and documentation contracts), `test:scripts` (the Vitest script suite), `counts:check` (every published number recomputed from the tree) and the npm-locked website build. `bun install --frozen-lockfile` is connected setup, not an offline guarantee. |
 | Live TypeScript e2e | root: `bun run test:e2e` | **Not offline.** Requires installed root dependencies, `AGENTOS_E2E=1` (set by the script), a running iii engine and workers at `AGENTOS_BASE_URL`/`III_URL`, and model credentials for the chat assertion (`AGENTOS_API_KEY` or configured provider). The smoke name only selects health/chat tests; it still needs the live stack. |
 | Website build | `website/`: `npm run build` | Node/npm and a **writable** `website/node_modules` installed from `website/package-lock.json`; produces `website/dist/`. `npm ci --no-audit --no-fund` is connected setup unless the complete npm cache is intentionally used offline. |
-| Python embedding tests | `workers/embedding/`: `python -m pytest test_main.py -q` | Python >=3.11 and pytest already installed. CI installs only pytest, so the test's mocked iii and absent `sentence_transformers` use the fallback path. This is not an offline guarantee if a locally installed `sentence_transformers` tries to download its model; remove it or ensure that model is cached. |
+| Python embedding tests | root: `python -m pytest workers/embedding -q` | Python >=3.11, pytest and the pinned iii SDK already installed. CI includes both the mocked embedding tests and real SDK contract checks. SentenceTransformers is optional; if installed, its model must be cached to avoid a download. |
 
-From root, `bash scripts/install-iii.sh` reads `.iii-version`, rejects prerelease pins, and checksum-verifies the pinned iii v0.22.1 release; it is connected setup, never an offline command. From root, starting a development stack also needs a built release workspace, `iii --config config.yaml`, and usually `.env` credentials (mode 600) before `bash scripts/dev-up.sh`.
+From root, `bash scripts/install-iii.sh` reads `.iii-version`, rejects prerelease pins, and checksum-verifies the pinned iii v0.23.0 release; it is connected setup, never an offline command. The migrated source uses `bash scripts/oci-stack.sh build` and `up` with Podman/Docker, not a native host engine. Run fixture acceptance in a private scratch `AGENTOS_OCI_HOME`; preserve existing native homes. Host ports are assigned dynamically and reported by `status`. Product startup cannot skip the OCI boundary or weaken bus hooks to make a check pass.
 
 ## Portability and release boundaries
 
@@ -100,4 +100,5 @@ worktrees, archives, credentials, and operator data unless their removal is spec
 Run live acceptance in a scratch runtime, never in the source tree. The root Vitest configuration limits
 discovery to this checkout's `scripts/` and `examples/`; `.worktrees/` and `.upstream-iii/` are not additional
 test suites. Historical review reports remain evidence, not current execution instructions. Current
-assessment and remaining release blockers are tracked in `docs/TAKEOVER-2026-09-06.md`.
+migration scope and verification boundaries are tracked in `docs/III-023-MIGRATION.md`;
+`docs/TAKEOVER-2026-09-06.md` remains a dated pre-release record, not the current engine pin.

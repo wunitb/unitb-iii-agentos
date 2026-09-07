@@ -89,7 +89,7 @@ publish = false
 [workspace.dependencies]
 agentos-bus-auth = { path = "crates/bus-auth" }
 agentos-http-adapter = { path = "crates/http-adapter" }
-iii-sdk = "=0.22.1"
+iii-sdk = "=0.23.0"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

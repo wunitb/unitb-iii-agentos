@@ -657,6 +657,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         function_id: "hook::fire".to_string(),
         config: json!({ "topic": "hooks.fire" }),
         metadata: None,
+        namespace: None,
+        trigger_namespace: None,
     })?;
 
     tracing::info!("hooks worker started");

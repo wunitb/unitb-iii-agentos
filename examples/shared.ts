@@ -6,6 +6,16 @@ export const OTEL_CONFIG = {
   enabled: process.env.OTEL_ENABLED !== "false",
 };
 
+/** Preserve worker identity and telemetry while authenticating at the gated bus. */
+export function workerOptions(workerName: string, env: NodeJS.ProcessEnv = process.env) {
+  const key = env.AGENTOS_API_KEY;
+  return {
+    workerName,
+    otel: OTEL_CONFIG,
+    ...(key ? { headers: { Authorization: `Bearer ${key}` } } : {}),
+  };
+}
+
 type HttpTriggerConfig = {
   api_path: string;
   http_method: string;

@@ -91,11 +91,11 @@ describe("dotenv template contract", () => {
     expect(declaredNames(template)).toContain("AGENTOS_API_KEY");
   });
 
-  it("keeps the dev-up allowlist derived rather than hand-maintained", async () => {
+  it("delegates environment handling to the guarded OCI launcher", async () => {
     const devUp = await read("./dev-up.sh");
-    // A second, hand-maintained list is how SLACK_BOT_TOKEN ended up rejected
-    // while MEMWORKR_* was accepted.
     expect(devUp).not.toContain("trusted_runtime_names");
-    expect(devUp).toContain('done < "$ROOT/.env.example"');
+    expect(devUp).not.toContain('source "$ROOT/.env"');
+    expect(devUp).toContain('launcher="$ROOT/scripts/oci-stack.sh"');
+    expect(devUp).toContain('exec bash "$launcher" "$@"');
   });
 });

@@ -126,6 +126,11 @@ impl FakeEngine {
                                     {
                                         continue;
                                     }
+                                    assert_eq!(
+                                        frame["data"]["include_internal"],
+                                        json!(true),
+                                        "readiness must request internal post-bind handlers on iii 0.23"
+                                    );
                                     let count = fs::read_to_string(&inventory_count)
                                         .ok()
                                         .and_then(|value| value.trim().parse::<usize>().ok())

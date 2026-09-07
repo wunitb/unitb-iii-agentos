@@ -76,7 +76,34 @@ async fn main() -> anyhow::Result<()> {
         .map(str::to_string);
     check_config(config_path.as_deref())?;
 
-    let listener = TcpListener::bind(&addr).await?;
+    if let Some(url) = arguments
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--worker="))
+    {
+        config::require_container()?;
+        let source = config::discover(config_path.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("worker mode requires an explicit OCI engine config"))?;
+        let yaml = std::fs::read_to_string(source.path())?;
+        anyhow::ensure!(
+            config::requires_container(&yaml) && config::inspect(&yaml) == GateStatus::Armed,
+            "worker mode requires the exact OCI raw/edge topology"
+        );
+        return agentos_bus_auth::daemon::serve_worker(url, key).await;
+    }
+    if let Some(source) = config::discover(config_path.as_deref()) {
+        let yaml = std::fs::read_to_string(source.path())?;
+        anyhow::ensure!(
+            !config::requires_container(&yaml),
+            "OCI config requires --worker={}, not a bridge listener",
+            config::RAW_WORKER_URL
+        );
+    }
+    let endpoint: std::net::SocketAddr = addr.parse()?;
+    anyhow::ensure!(
+        endpoint.ip().is_loopback(),
+        "legacy policy listener must bind loopback"
+    );
+    let listener = TcpListener::bind(endpoint).await?;
     tracing::info!(%addr, "bus-auth daemon listening");
     serve(listener, key).await
 }

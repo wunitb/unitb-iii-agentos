@@ -20,9 +20,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALLER="${INSTALLER:-$SCRIPT_DIR/install.sh}"
 ORIG_PATH="$PATH"
-# The engine version the release bundle pins, taken from the same file the real
-# bundle ships (release.yml copies .iii-version into runtime/).
-III_PINNED_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/.iii-version")"
+# Archived native fixture: never inherit the current checkout's OCI engine pin.
+III_PINNED_VERSION=0.22.1
 
 TESTS_RUN=0
 TESTS_FAILED=0
@@ -205,7 +204,8 @@ fi
 exit 0
 STUB
 
-  chmod +x "$SANDBOX/stub/curl" "$SANDBOX/stub/iii"
+  printf '#!/bin/sh\nexit 0\n' > "$SANDBOX/stub/iii-worker"
+  chmod +x "$SANDBOX/stub/curl" "$SANDBOX/stub/iii" "$SANDBOX/stub/iii-worker"
 }
 
 # make_release <version> [extra-relative-path ...]
@@ -325,7 +325,7 @@ test_fresh_install_places_binaries_and_runtime() {
 test_fresh_install_authd_is_discovered_by_real_cli() {
   make_release v1.0.0
   local stage="$SANDBOX/stage-v1.0.0"
-  local real_cli="$REPO_ROOT/target/debug/agentos"
+  local real_cli="${AGENTOS_INSTALL_TEST_CLI:-$REPO_ROOT/target/release/agentos}"
   local marker="$SANDBOX/authd.discovered"
   local log="$SANDBOX/authd-discovery.log"
   local auth_addr
@@ -789,7 +789,43 @@ test_published_installer_is_identical() {
   fi
 }
 
+test_oci_bundle_refused_before_any_native_mutation() {
+  make_release v1.0.0
+  run_installer v1.0.0 || return
+  seed_runtime_state
+  printf '%s' "$SENTINEL_ENV" > "$AGENTOS_HOME/runtime/.env"
+  local before bins_before stage pin log
+  before="$(tree_manifest "$AGENTOS_HOME")"
+  bins_before="$(tree_manifest "$BIN_DIR")"
+  for pin in 0.23.0 1.0.0 0.23.0-rc.1 invalid; do
+    make_release v2.0.0
+    stage="$SANDBOX/stage-v2.0.0"
+    printf '%s\n' "$pin" > "$stage/runtime/.iii-version"
+    tar -czf "$AGENTOS_TEST_FIXTURE_DIR/release.tar.gz" -C "$stage" bin runtime
+    log="$SANDBOX/unsupported-$pin.log"
+    if AGENTOS_VERSION=v2.0.0 bash "$INSTALLER" > "$log" 2>&1; then
+      fail "native installer accepted unsupported pin $pin"
+    fi
+    assert_file_contains "$log" 'requires scripts/oci-stack.sh' unsupported_pin
+    assert_equal "$(tree_manifest "$AGENTOS_HOME")" "$before" unsupported_pin_state
+    assert_equal "$(tree_manifest "$BIN_DIR")" "$bins_before" unsupported_pin_bins
+  done
+}
+
+test_oci_override_cannot_bypass_native_release_pin() {
+  make_release v1.0.0
+  local log="$SANDBOX/override.log"
+  if III_VERSION=0.23.0 AGENTOS_VERSION=v1.0.0 bash "$INSTALLER" > "$log" 2>&1; then
+    fail 'unsupported override was accepted'
+  fi
+  assert_absent "$AGENTOS_HOME/runtime" override
+  assert_absent "$BIN_DIR/agentos" override
+  assert_file_contains "$log" 'Native installation supports archived iii 0.22.x' override
+}
+
 ALL_TESTS=(
+  test_oci_bundle_refused_before_any_native_mutation
+  test_oci_override_cannot_bypass_native_release_pin
   test_fresh_install_places_binaries_and_runtime
   test_fresh_install_authd_is_discovered_by_real_cli
   test_fresh_install_resolves_latest_release

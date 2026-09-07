@@ -88,10 +88,10 @@ describe("fake-provider result gate", () => {
     const start = ci.indexOf("      - name: credential-free worker integration tests");
     expect(start).toBeGreaterThan(-1);
     const step = ci.slice(start, ci.indexOf("\n      - name:", start + 1));
-    expect(step).toContain('--reporter=json');
-    expect(step).toContain('--outputFile="$report"');
-    expect(step).toContain('bun scripts/assert-e2e-results.ts "$report"');
-    expect(step.indexOf('bun scripts/assert-e2e-results.ts')).toBeGreaterThan(step.indexOf('bunx vitest'));
+    expect(step).toContain('python3 scripts/oci-smoke.py --report "$report"');
+    expect(step).toContain('bun scripts/assert-oci-results.ts "$report"');
+    expect(step.indexOf('bun scripts/assert-oci-results.ts')).toBeGreaterThan(step.indexOf('python3 scripts/oci-smoke.py'));
+    expect(step).not.toContain('--live-e2e');
   });
 
   it("fails closed on invalid report structure without echoing report contents", async () => {

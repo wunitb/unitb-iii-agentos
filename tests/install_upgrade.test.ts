@@ -28,11 +28,9 @@ async function upgradeFixture(
   beforeInstall?: (paths: UpgradeFixturePaths) => Promise<void>,
 ) {
   const root = await mkdtemp(join(tmpdir(), "agentos-install-upgrade-"));
-  const iiiVersion = (
-    await Bun.file(new URL(".iii-version", repository)).text()
-  ).trim();
+  const iiiVersion = "0.22.1"; // Archived native fixture, not the OCI checkout pin.
   const releaseVersion = (await Bun.file(new URL("package.json", repository)).json()).version;
-  const releaseConfig = `release: default\n${await Bun.file(new URL("config.yaml", repository)).text()}`;
+  const releaseConfig = "release: default\nworkers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n      rbac:\n        auth_function_id: agentos::bus_auth\n        on_function_registration_function_id: agentos::bus_on_register\n        on_trigger_registration_function_id: agentos::bus_on_trigger\n        on_trigger_type_registration_function_id: agentos::bus_on_trigger_type\n        expose_functions:\n          - match(\"*\")\n  - name: iii-bridge\n    config:\n      url: ws://127.0.0.1:49129\n      forward:\n        - local_function: agentos::bus_auth\n          remote_function: agentos::bus_auth\n          timeout_ms: 5000\n        - local_function: agentos::bus_on_register\n          remote_function: agentos::bus_on_register\n          timeout_ms: 5000\n        - local_function: agentos::bus_on_trigger\n          remote_function: agentos::bus_on_trigger\n          timeout_ms: 5000\n        - local_function: agentos::bus_on_trigger_type\n          remote_function: agentos::bus_on_trigger_type\n          timeout_ms: 5000\n  - name: state\n";
   sandboxes.push(root);
   const home = join(root, "home");
   const agentosHome = join(home, ".agentos");

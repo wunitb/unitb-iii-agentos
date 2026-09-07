@@ -10,8 +10,8 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-apache_2.0-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Apache 2.0"></a>
   <img src="https://img.shields.io/badge/workers-63-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Workers">
   <img src="https://img.shields.io/badge/functions-301-0c0b0a?style=flat-square&labelColor=f2ede1" alt="Functions">
-  <img src="https://img.shields.io/badge/rust_tests-2156_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="2,156 Rust tests">
-  <img src="https://img.shields.io/badge/iii--sdk-0.22.1-d96e2e?style=flat-square&labelColor=f2ede1" alt="iii-sdk 0.22.1">
+  <img src="https://img.shields.io/badge/rust_tests-2161_total-0c0b0a?style=flat-square&labelColor=f2ede1" alt="2,161 Rust tests">
+  <img src="https://img.shields.io/badge/iii--sdk-0.23.0-d96e2e?style=flat-square&labelColor=f2ede1" alt="iii-sdk 0.23.0">
 </p>
 
 <p align="center">
@@ -56,115 +56,118 @@ That's the whole protocol. Workers stay narrow; everything else lives in the eng
 
 ## § 03 · Quickstart
 
-```bash
-# 1. clone this repository
-git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos
+See [migration scope and verification boundaries](docs/III-023-MIGRATION.md).
 
-# 2. install pinned platform-matched iii, worker, and console binaries
-#    (iii-init is installed only on Linux; upstream macOS assets are Linux binaries)
-bash scripts/install-iii.sh
-
-# 3. configure a model credential
-install -m 600 .env.example .env
-$EDITOR .env   # set CODEX_PROXY_API_KEY for http://127.0.0.1:8317/v1
-
-# 4. build the workspace
-cargo build --workspace --release
-
-# 5a. Linux: start an owned detached stack, then the chat TUI
-./target/release/agentos up
-
-# 5b. macOS: keep the stack in the foreground; open the TUI separately
-./target/release/agentos start
-# in another terminal: ./target/release/agentos tui
-```
-
-Step 3 is about the **model** credential only. Leave `AGENTOS_API_KEY` and
-`AUDIT_HMAC_KEY` empty; the guarded launcher generates both as independent
-32-byte keys and keeps the active `.env` mode `0600`.
-
-Quickstart uses the local Codex proxy at `http://127.0.0.1:8317/v1`, which is
-just the credential that happens to be easiest to get. A request that names no
-provider and no model is routed automatically: `llm-router` walks a fixed
-preference order — `anthropic`, `openai`, `google`, `codex`, `groq`, `deepseek`,
-`mistral`, `together`, `fireworks`, `openrouter` — and takes the **first
-provider whose credential is present**. If none is present it refuses with
-`provider_credential_missing`, naming the variables you could set, instead of
-sending a request that would come back as somebody else's 401. Naming a provider
-and model explicitly always wins over the automatic choice.
-
-Every HTTP route is authenticated except routes explicitly registered with
-`auth: false` such as `/api/health`. There is no global auth-disable switch.
-
-### First run — what generates what
-
-`AGENTOS_API_KEY` is AgentOS's own bearer token between the TUI/CLI and the
-engine's HTTP routes. It is **not** a model credential, and the first run
-creates it for you:
-
-| you run | it does |
-|---|---|
-| Linux `agentos up`, or Linux/macOS `agentos onboard` / `agentos start` | If `AGENTOS_API_KEY` or `AUDIT_HMAC_KEY` is absent or empty in the active `.env`, generate a distinct fresh 32-byte random key for each, fill its declared line **in place**, set the file to mode `0600`, and print the path. Existing non-empty values are never overwritten. Writing in place matters: `scripts/dev-up.sh` refuses a `duplicate dotenv variable`. |
-| any command | **Never** invents a provider credential. `CODEX_PROXY_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and friends are yours to supply; AgentOS only reads them. |
-| `agentos doctor` | Reports, explicitly and separately: (a) whether `AGENTOS_API_KEY` is present, (b) which provider credential is present, (c) the default route that results — the first provider in the preference order above whose credential is present, or `provider_credential_missing` when none is. A missing `AGENTOS_API_KEY` is reported as *the cause*, not as "missing identities". |
-| `agentos start` | Loads the same active `.env` as `agentos up` and generates the key the same way. There is exactly one configuration path. |
-
-So the shortest honest first run is: install iii, put one model credential in
-`.env`, build, then use `agentos up` on Linux or foreground `agentos start` on
-macOS. The bearer token appears in `.env` on its own, mode `0600`, and
-`agentos doctor` names what is missing.
-
-On Linux, `agentos up` runs one ordered policy and never builds or installs anything: it
-resolves the config, verifies the iii binary (missing → `bash scripts/install-iii.sh`),
-starts `agentos-bus-authd` before an RBAC-armed engine, refuses to reuse an engine
-whose live gate cannot be verified, or boots `iii --config config.yaml` detached
-with builtin mutation daemons disabled. It then verifies every Rust worker release
-binary (missing → `cargo build --workspace --release`), starts only missing worker
-identities, waits for the complete identity set, and hands the terminal to
-`agentos-tui`. Non-empty active `.env` assignments take precedence over shell
-exports. Each Rust worker receives a cleared process environment plus a small safe
-baseline, its identity, and only the keys declared for it in
-`workers/env.allowlist`; the TUI sends `AGENTOS_API_KEY` on protected routes. Each stage reports its own failure and stops before the
-next one; `--timeout` (default 30s) bounds the engine wait and then the worker wait.
+The current source targets stable iii **v0.23.0**. Its supported startup path is
+a non-root OCI container, using **Podman or Docker**. Install and start one of
+those runtimes first; on macOS it must run Linux containers. The host needs Git,
+Bash and Python 3.11+; Rust and the pinned iii binaries are built/installed inside
+the image. First build needs network access and enough space for a Rust workspace.
 
 ```bash
-# Linux owned detached lifecycle
-agentos up --no-tui
-agentos stop --grace-seconds 5   # accepted range 0..60 seconds; default 5
+git clone https://github.com/wunitb/unitb-iii-agentos.git
+cd unitb-iii-agentos
 
-# macOS foreground lifecycle (Ctrl+C stops the owned children)
-agentos start
-# another terminal: agentos tui
-
-agentos doctor        # readiness report; diagnostic only, changes nothing
+# A separate persistent home; never point this at an existing native installation.
+export AGENTOS_OCI_HOME="$HOME/.agentos-oci"
+bash scripts/oci-stack.sh build
+bash scripts/oci-stack.sh up
+bash scripts/oci-stack.sh status
+bash scripts/oci-stack.sh doctor
 ```
 
-`agentos doctor` prints the iii binary path and version, engine health, the
-connected worker count and any missing canonical identities, worker and TUI
-binary readiness, which config discovery mode is in effect, and the three
-first-run facts above: `AGENTOS_API_KEY` presence, the provider credential in
-use, and the resulting default route.
-`scripts/dev-up.sh` applies the same env policy, authd-before-engine order, and
-unverifiable-engine refusal for development. It consumes an already-initialized
-`.env`; run a CLI first-run command to generate the machine keys before using it.
+`up` is headless. It creates the private home with mode `0700`, generates distinct
+`AGENTOS_API_KEY` and `AUDIT_HMAC_KEY` values, and keeps
+`$AGENTOS_OCI_HOME/runtime/.env` mode `0600`. These machine keys are **not** model
+credentials. Generated machine keys are independent 32-byte random values; existing
+non-empty keys are never overwritten. Empty declarations are replaced in place,
+not appended: duplicate assignments fail with `Duplicate dotenv variable`. Commands
+print file paths and status, not generated values. Provider credentials are never
+fabricated. Inside OCI, `agentos doctor` reports the default route and names a
+missing bearer as the cause instead of only reporting missing identities.
 
-Engine boots on port 49134. Linux `agentos up` and foreground `agentos start` start the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source registers 301 literal function ids, which resolve to 301 distinct function ids (`bun run counts`). The TUI opens on Chat — type a message, hit Enter, the agent replies. `/help` shows the full keymap. `Ctrl+W` browses the worker catalog.
+A credential-free boot can be healthy while `doctor` still names
+Provider, Route or Capabilities as missing; that is not ready-to-chat acceptance.
 
-Prefer driving by HTTP? Same thing without the TUI:
+Configure your provider through the interactive setup, then restart the owned
+container so worker environments pick up the change:
 
 ```bash
-curl -X POST http://127.0.0.1:3111/v1/realms \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"prod","description":"production"}'
+bash scripts/oci-stack.sh exec agentos onboard
+bash scripts/oci-stack.sh stop
+bash scripts/oci-stack.sh up
+bash scripts/oci-stack.sh doctor
+bash scripts/oci-stack.sh exec agentos agent new assistant
+# Use the returned agent ID with: bash scripts/oci-stack.sh exec agentos agent chat AGENT_ID
+bash scripts/oci-stack.sh exec agentos tui
 ```
 
-The live chat E2E test defaults to `gpt-5.6-sol`. To target a non-Codex backend, override it for the test command:
+Onboarding configures credentials/model preferences; it does not manufacture a
+provider account. `agentos agent new assistant` creates an agent through the
+authenticated API and initializes its canonical capability document. Use the
+returned ID with `agentos agent chat AGENT_ID`, or select that agent in the TUI.
+Grant only the capabilities needed before invoking tools. Never put credentials in
+Git, shell arguments, screenshots or issue reports. For providers other than the
+interactive Anthropic option, edit the private runtime `.env`, not checkout `.env`.
+Non-empty active `.env` values take precedence over process exports.
+
+The default provider is the first configured credential in this order:
+`anthropic`, `openai`, `google`, `codex`, `groq`, `deepseek`, `mistral`, `together`,
+`fireworks`, `openrouter`. Explicit provider/model selection takes precedence.
+With no credential the router returns `provider_credential_missing`. Container
+loopback is **not host loopback**: a host-only model proxy needs an explicitly
+reachable endpoint; the quickstart never assumes a service on a fixed host port.
+
+### Lifecycle, ports and persistent data
 
 ```bash
-AGENTOS_E2E_MODEL=claude-sonnet-4-20250514 bun run test:e2e
+bash scripts/oci-stack.sh logs
+bash scripts/oci-stack.sh status
+bash scripts/oci-stack.sh stop
+# Restart the same home without deleting configuration or data:
+bash scripts/oci-stack.sh up
 ```
 
-### Installed releases and portability
+The launcher publishes only the API and authenticated bus on **host loopback**,
+with dynamically assigned host ports reported by `status`. Do not assume host
+ports `3111` or `49134`. The raw engine bus stays inside the container; host
+`agentos up`/`agentos start` must not be used with this OCI-only config.
+Within the container, the CLI coordinates policy registration, engine readiness,
+Compose infrastructure, and authenticated product workers. Stop is tied to the
+recorded immutable container identity, not a sweep of matching process names.
+
+The private home retains operator `runtime/config.yaml`, `runtime/config/`,
+`runtime/.env` and `runtime/data/` across stop/up. A home with a different engine
+pin is refused rather than silently translated. `AGENTOS_OCI_RUNTIME` explicitly
+selects a Podman/Docker executable; `AGENTOS_OCI_IMAGE` selects an image whose
+engine label must match the checkout. Neither option bypasses the ownership or
+loopback-only publication checks.
+
+**Upgrade policy:** same-engine image rebuilds support `stop`, `build`, `up`
+against the same home, preserving operator configuration and data. Engine-version
+changes and native-to-OCI conversion are **not automatic data migrations**. Stop
+the old deployment, retain its complete home and exact old image/release, and use
+a new `AGENTOS_OCI_HOME` for the new engine. Configure the new home independently;
+import application records only after validating the storage/schema contract.
+Never change `.iii-version` in an old home to bypass the guard or copy a native
+`config.yaml` into the OCI topology. Existing data stays in the original home;
+no reset, deletion or in-place schema conversion is performed by the launcher.
+
+`runtime/config.yaml`, `runtime/config/`, `runtime/.env`, `runtime/data/` and
+home-level state remain operator-owned. Binaries, manifests, Compose declarations,
+and bundled personas/integrations are image-managed and may be refreshed on
+startup; keep custom material outside those managed paths.
+
+Inside the container, engine boots on port 49134. Linux `agentos up` and foreground `agentos start` start the 62 Rust workers; the Python embedding worker is packaged separately and needs its Python `>=3.11` venv setup before it can connect. The source registers 301 literal function ids, which resolve to 301 distinct function ids (`bun run counts`). The TUI opens on Chat; `/help` shows the keymap and `Ctrl+W` browses the worker catalog.
+
+HTTP routes are authenticated except explicit `auth: false` routes such as
+`/api/health`; there is no global authentication-disable switch. Use the API
+endpoint from `status` and the private bearer credential for protected routes.
+
+### Archived native v0.2.0 releases (iii 0.22.1 only)
+
+This subsection describes the already-published native release, **not** how to
+run the migrated source checkout. Use the OCI quickstart above for iii v0.23.0.
 
 The full-stack release installer supports Linux `x86_64` and `aarch64`, and
 macOS `aarch64`. Upstream iii `v0.22.1` does not publish the required
@@ -203,7 +206,7 @@ start from any working directory without a checkout. Upgrades replace release
 payload while retaining operator configuration, `$AGENTOS_HOME/runtime/data/**`,
 and the runtime `.env` file.
 
-The engine and `iii-worker` runtime must match the stable version in
+For an archived native bundle, the engine and `iii-worker` runtime must match its stable version in
 `.iii-version` (`v0.22.1`), installed in `PATH` or by
 `bash scripts/install-iii.sh` (which downloads and verifies both binaries).
 Installers reject prerelease pins unless a maintainer explicitly changes the
@@ -316,7 +319,8 @@ integrations/    MCP server configs (TOML, consumed by mcp-client)
 agents/          agent templates
 workflows/       workflow definitions (YAML)
 plugin/          reusable agent/command/skill/hook bundles
-config.yaml      iii v0.22.1 engine and configuration-worker boot list
+config.yaml      iii v0.23.0 native managers and private runtime topology
+worker-compose.yaml  pinned registry infrastructure and scoped environments
 config/           committed values for ten iii worker configurations
 website/         agentsos.sh — design.md aesthetic, three themes
 ```
@@ -326,11 +330,12 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full primitive flow and worker ma
 
 ### Security boundary
 
-The default `config.yaml` arms tiered bus RBAC. It narrows what a credential-less
-loopback caller may invoke or register, but the raw bus is not a hostile local-user
-sandbox: generic registry/state compatibility remains, and every shipped worker
-shares the operator `AGENTOS_API_KEY`. Keep the engine on loopback and run it under
-a trusted OS account.
+The default `config.yaml` arms tiered bus RBAC on the authenticated edge. It narrows
+what a credential-less caller may invoke or register; generic registry/state
+compatibility remains, and product workers share the operator `AGENTOS_API_KEY`.
+The raw bootstrap bus is private container loopback and is never host-published.
+This topology is not a hostile same-UID sandbox: use the non-root OCI launcher,
+retain host-loopback publication, and trust the account that owns the runtime.
 
 The process bridge is off by default. Enabling
 `AGENTOS_ENABLE_PROCESS_BRIDGE=1` grants executable authority to trusted bearer
@@ -380,42 +385,47 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked                                      # dev profile, same tests CI runs
 cargo deny check                                                     # advisories + duplicates + licences + sources
-bun run check                                                        # strict TS + unit + governance + counts + website build
-python -m pytest workers/embedding/test_main.py -q
-bun run test:e2e                                                     # live engine + workers; model credentials required
+bun run check                                                        # strict TS + unit + governance + script tests + counts + website build
+python -m pytest workers/embedding -q                               # pytest and pinned iii-sdk required
+bun run test:oci --report /tmp/agentos-oci-acceptance.json             # scratch OCI build + fake-provider acceptance
+bun scripts/assert-oci-results.ts /tmp/agentos-oci-acceptance.json
+bun run test:e2e                                                     # separately configured live stack; explicit provider authorization required
 ```
 
-`bun run check` chains the four Node gates individually available as
-`bun run typecheck`, `bun run test:unit` (tests of the software),
-`bun run test:governance` (build-evidence and documentation contracts) and
-`bun run counts:check` (every published number recomputed from the tree —
-`bun run counts` prints them, `bun run counts:write` fixes the numeric ones).
+`bun run check` chains `typecheck`, `test:unit` (tests of the software),
+`test:governance` (build-evidence and documentation contracts), `test:scripts`
+(the Vitest script suite), `counts:check` and `build:website`.
+Every published number is recomputed from the tree: `bun run counts` prints them,
+`bun run counts:write` fixes the numeric ones.
 
 The Rust commands are offline only when the Rust toolchain and all locked
 registry/source artifacts are already cached. `uv run` may download pytest and
 the Bun command requires an installed lockfile-matching dependency tree.
-The credential-free fake-provider E2E proves request shape and multi-turn history
-without network egress. It is not evidence for any real provider account, billing
-path, rate limit, or production network. The separate live E2E command needs a
-running stack, credentials, egress, and explicit authorization.
+The credential-free OCI fixture proves one real chat turn and its provider request
+shape against container loopback, plus registry, worker calls, restart preservation
+and owned teardown. Artifact setup requires network access; the chat uses no real
+provider. It does not prove multi-turn history, real provider accounts, billing,
+rate limits, or production egress. The separate live E2E command needs a running
+stack, credentials, egress, and explicit authorization.
 
 ## § 12 · Versioning
 
 | | version |
 |---|---|
-| iii version contract | `.iii-version` contains stable `0.22.1` |
+| iii version contract | `.iii-version` contains stable `0.23.0` |
 | iii engine | installers consume `.iii-version` and verify upstream checksums |
-| iii-sdk (Rust) | pinned at `=0.22.1`; contract test checks every manifest |
-| iii-sdk (Node) | pinned at `0.22.1`; root package manager is Bun |
-| iii-sdk (Python) | pinned at `0.22.1`; worker manifest and pyproject are checked |
-| agentos | `0.2.0` — stable contract on iii v0.22.1 |
+| iii-sdk (Rust) | pinned at `=0.23.0`; contract test checks every manifest |
+| iii-sdk (Node) | pinned at `0.23.0`; root package manager is Bun |
+| iii-sdk (Python) | pinned at `0.23.0`; worker manifest and pyproject are checked |
+| agentos | `0.2.0` — source package version, not a new release tag |
 
-iii `v0.23` is the latest stable upstream line, but compatibility is deferred:
-AgentOS remains on `v0.22.1` until SDK wire shapes, RBAC hooks, registry assets,
-all supported platforms, boot, and the full test matrix are validated together.
+The current source migrates to iii `v0.23.0` through OCI. The already-published
+native AgentOS `v0.2.0` bundles still use iii `v0.22.1`; they are not migration
+artifacts and are not retagged. Local checks validate only the host platform.
+See [migration boundaries and checks](docs/III-023-MIGRATION.md).
 
 ## § 13 · Provenance and license
 
-This independent repository started from [`iii-experimental/agentos@caca2b4`](https://github.com/iii-experimental/agentos/commit/caca2b439ff62499f0d4a5af30c2601302238890) and was migrated to the `iii-hq/iii` v0.22.1 engine and SDK contracts. It is not a GitHub fork and carries its own history.
+This independent repository started from [`iii-experimental/agentos@caca2b4`](https://github.com/iii-experimental/agentos/commit/caca2b439ff62499f0d4a5af30c2601302238890) and now targets the `iii-hq/iii` v0.23.0 engine and SDK contracts through OCI. It is not a GitHub fork and carries its own history.
 
 Apache-2.0. Same family as `iii-sdk` and the rest of the iii ecosystem.

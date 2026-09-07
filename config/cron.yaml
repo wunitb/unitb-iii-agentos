@@ -1,6 +1,6 @@
 id: cron
 name: Cron
-description: Cron worker settings — the distributed-lock backend (adapter/transport) used to coordinate scheduled job execution across engine instances.
+description: Cron worker settings — local scheduling locks for this single OCI runtime.
 value:
   adapter:
-    name: kv
+    name: local

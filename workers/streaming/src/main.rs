@@ -115,6 +115,8 @@ fn stream_join_trigger() -> RegisterTriggerInput {
         // config gates every stream instead of one named stream.
         config: json!({}),
         metadata: None,
+        namespace: None,
+        trigger_namespace: None,
     }
 }
 

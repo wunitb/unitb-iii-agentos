@@ -1,17 +1,14 @@
 import { registerWorker } from "iii-sdk";
 import {
   ENGINE_URL,
-  OTEL_CONFIG,
+  workerOptions,
   agentStateWrites,
   registerShutdown,
 } from "./shared.js";
 import { readFileSync, readdirSync, existsSync } from "fs";
 import { join } from "path";
 
-const sdk = registerWorker(ENGINE_URL, {
-  workerName: "crew-demo-runner",
-  otel: OTEL_CONFIG,
-});
+const sdk = registerWorker(ENGINE_URL, workerOptions("crew-demo-runner"));
 registerShutdown(sdk);
 const { trigger: rawTrigger } = sdk;
 const trigger = (id: string, payload: unknown, timeoutMs?: number) =>

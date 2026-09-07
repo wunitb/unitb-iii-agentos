@@ -1,5 +1,26 @@
 # Install the UnitB stack
 
+## Current source: iii v0.23.0 through OCI
+
+Follow [README quickstart](README.md#-03--quickstart) for the current checkout.
+Install a working Podman or Docker runtime, Git, Bash and Python 3.11+, then run
+`bash scripts/oci-stack.sh build` followed by `bash scripts/oci-stack.sh up`.
+Use a separate private `AGENTOS_OCI_HOME` (default `~/.agentos-oci`), not an
+existing `~/.agentos` native home. `status` reports dynamically published
+host-loopback API/bus endpoints; `doctor` reports credential and capability gaps.
+Provider/agent setup is separate from credential-free boot. Container loopback
+does not refer to services on the host. No raw engine endpoint is host-published.
+
+The private memworkr integration and optional safety/channel features require
+their own acceptance; a successful OCI boot does not certify them. Do not attach
+an existing native memworkr database or copy real credentials into a smoke test.
+
+## Archived native guide — v0.2.0 / iii 0.22.1 only
+
+The remaining sections document the previously published native stack. They are
+retained for existing operators and **must not be followed to start the current
+OCI-only source on the host**. Native state is not automatically migrated.
+
 This guide covers two repositories, and it is explicit about which is which:
 
 | Repository | Access | Needed for | Role |

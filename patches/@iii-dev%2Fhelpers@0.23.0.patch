@@ -1,0 +1,73 @@
+diff --git a/dist/telemetry-system-BH119njX.cjs b/dist/telemetry-system-BH119njX.cjs
+index 74c9877c13bf508f16e645ee0f257914c748fb42..4b1e50c4ad676882945c01b7915affe57ecf9823 100644
+--- a/dist/telemetry-system-BH119njX.cjs
++++ b/dist/telemetry-system-BH119njX.cjs
+@@ -1001,7 +1001,7 @@ function initOtel(config = {}) {
+ 		[ATTR_SERVICE_INSTANCE_ID]: serviceInstanceId
+ 	};
+ 	if (serviceNamespace) resourceAttributes[ATTR_SERVICE_NAMESPACE] = serviceNamespace;
+-	const resource = new _opentelemetry_resources.Resource(resourceAttributes);
++	const resource = (0, _opentelemetry_resources.resourceFromAttributes)(resourceAttributes);
+ 	sharedConnection = new SharedEngineConnection(appendOtelPath(engineWsUrl), config.reconnectionConfig);
+ 	const spanExporter = new EngineSpanExporter(sharedConnection);
+ 	const spansScheduledDelayMillis = resolveFlushIntervalMs(config.spansFlushIntervalMs, process.env.OTEL_SPANS_FLUSH_INTERVAL_MS, DEFAULT_OTEL_CONFIG.spansFlushIntervalMs);
+@@ -1043,11 +1043,14 @@ function initOtel(config = {}) {
+ 	const logExporter = new EngineLogExporter(sharedConnection);
+ 	const logsScheduledDelayMillis = resolveFlushIntervalMs(config.logsFlushIntervalMs, process.env.OTEL_LOGS_FLUSH_INTERVAL_MS, DEFAULT_OTEL_CONFIG.logsFlushIntervalMs);
+ 	const logsMaxExportBatchSize = config.logsBatchSize ?? parseIntegerEnv(process.env.OTEL_LOGS_BATCH_SIZE, 1) ?? DEFAULT_OTEL_CONFIG.logsBatchSize;
+-	loggerProvider = new _opentelemetry_sdk_logs.LoggerProvider({ resource });
+-	loggerProvider.addLogRecordProcessor(new _opentelemetry_sdk_logs.BatchLogRecordProcessor(logExporter, {
+-		scheduledDelayMillis: logsScheduledDelayMillis,
+-		maxExportBatchSize: logsMaxExportBatchSize
+-	}));
++	loggerProvider = new _opentelemetry_sdk_logs.LoggerProvider({
++		resource,
++		processors: [new _opentelemetry_sdk_logs.BatchLogRecordProcessor({
++			exporter: logExporter,
++			scheduledDelayMillis: logsScheduledDelayMillis,
++			maxExportBatchSize: logsMaxExportBatchSize
++		})]
++	});
+ 	logger = loggerProvider.getLogger(serviceName);
+ 	console.debug(`[OTel] Logs initialized: delay=${logsScheduledDelayMillis}ms, batch=${logsMaxExportBatchSize}`);
+ }
+diff --git a/dist/telemetry-system-Pyz9irBj.mjs b/dist/telemetry-system-Pyz9irBj.mjs
+index 487d638d2f98e6de81322f807d08f7ef96484ba8..41971e5159c894b78474d01605fb6220f57d7b4c 100644
+--- a/dist/telemetry-system-Pyz9irBj.mjs
++++ b/dist/telemetry-system-Pyz9irBj.mjs
+@@ -1,5 +1,5 @@
+ import { SeverityNumber as SeverityNumber$1 } from "@opentelemetry/api-logs";
+-import { Resource } from "@opentelemetry/resources";
++import { resourceFromAttributes } from "@opentelemetry/resources";
+ import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
+ import { randomUUID } from "node:crypto";
+ import { SpanKind, SpanKind as SpanKind$1, SpanStatusCode, SpanStatusCode as SpanStatusCode$1, context, metrics, propagation, trace } from "@opentelemetry/api";
+@@ -1001,7 +1001,7 @@ function initOtel(config = {}) {
+ 		[ATTR_SERVICE_INSTANCE_ID]: serviceInstanceId
+ 	};
+ 	if (serviceNamespace) resourceAttributes[ATTR_SERVICE_NAMESPACE] = serviceNamespace;
+-	const resource = new Resource(resourceAttributes);
++	const resource = resourceFromAttributes(resourceAttributes);
+ 	sharedConnection = new SharedEngineConnection(appendOtelPath(engineWsUrl), config.reconnectionConfig);
+ 	const spanExporter = new EngineSpanExporter(sharedConnection);
+ 	const spansScheduledDelayMillis = resolveFlushIntervalMs(config.spansFlushIntervalMs, process.env.OTEL_SPANS_FLUSH_INTERVAL_MS, DEFAULT_OTEL_CONFIG.spansFlushIntervalMs);
+@@ -1043,11 +1043,14 @@ function initOtel(config = {}) {
+ 	const logExporter = new EngineLogExporter(sharedConnection);
+ 	const logsScheduledDelayMillis = resolveFlushIntervalMs(config.logsFlushIntervalMs, process.env.OTEL_LOGS_FLUSH_INTERVAL_MS, DEFAULT_OTEL_CONFIG.logsFlushIntervalMs);
+ 	const logsMaxExportBatchSize = config.logsBatchSize ?? parseIntegerEnv(process.env.OTEL_LOGS_BATCH_SIZE, 1) ?? DEFAULT_OTEL_CONFIG.logsBatchSize;
+-	loggerProvider = new LoggerProvider({ resource });
+-	loggerProvider.addLogRecordProcessor(new BatchLogRecordProcessor(logExporter, {
+-		scheduledDelayMillis: logsScheduledDelayMillis,
+-		maxExportBatchSize: logsMaxExportBatchSize
+-	}));
++	loggerProvider = new LoggerProvider({
++		resource,
++		processors: [new BatchLogRecordProcessor({
++			exporter: logExporter,
++			scheduledDelayMillis: logsScheduledDelayMillis,
++			maxExportBatchSize: logsMaxExportBatchSize
++		})]
++	});
+ 	logger = loggerProvider.getLogger(serviceName);
+ 	console.debug(`[OTel] Logs initialized: delay=${logsScheduledDelayMillis}ms, batch=${logsMaxExportBatchSize}`);
+ }

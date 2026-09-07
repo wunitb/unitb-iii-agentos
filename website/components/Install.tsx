@@ -2,39 +2,15 @@ import { useState } from "react";
 import SectionHeader from "./SectionHeader";
 
 const STEPS = [
-  {
-    label: "Clone UnitB AgentOS",
-    cmd: "git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos",
-  },
-  {
-    label: "Create private config; add one model credential",
-    cmd: "install -m 600 .env.example .env && ${EDITOR:-vi} .env",
-  },
-  {
-    label: "Install pinned iii v0.22.1",
-    cmd: "bash scripts/install-iii.sh",
-  },
-  {
-    label: "Build AgentOS",
-    cmd: "cargo build --workspace --release",
-  },
-  {
-    label: "Linux — owned detached lifecycle",
-    cmd: "./target/release/agentos up",
-  },
-  {
-    label: "Linux — stop owned groups later (0..60s, default 5)",
-    cmd: "./target/release/agentos stop --grace-seconds 5",
-  },
-  {
-    label: "macOS — foreground stack",
-    cmd: "./target/release/agentos start",
-  },
-  {
-    label: "macOS — separate terminal UI",
-    cmd: "./target/release/agentos tui",
-  },
-];
+          { label: "Clone UnitB AgentOS", cmd: "git clone https://github.com/wunitb/unitb-iii-agentos && cd unitb-iii-agentos" },
+          { label: "Build iii v0.23.0 in Podman or Docker", cmd: "bash scripts/oci-stack.sh build" },
+          { label: "Start the private OCI runtime", cmd: "bash scripts/oci-stack.sh up" },
+          { label: "Configure your provider interactively", cmd: "bash scripts/oci-stack.sh exec agentos onboard" },
+          { label: "Restart to load provider settings", cmd: "bash scripts/oci-stack.sh stop && bash scripts/oci-stack.sh up" },
+          { label: "Create an agent and its capability document", cmd: "bash scripts/oci-stack.sh exec agentos agent new assistant" },
+          { label: "Open the terminal UI", cmd: "bash scripts/oci-stack.sh exec agentos tui" },
+          { label: "Inspect assigned endpoints and stop owned containers", cmd: "bash scripts/oci-stack.sh status && bash scripts/oci-stack.sh stop" },
+        ];
 
 export default function Install() {
   const [copied, setCopied] = useState<number | null>(null);
@@ -55,7 +31,7 @@ export default function Install() {
         <SectionHeader num="11" label="Install" />
 
         <h2 className="h-display text-[36px] md:text-[48px] mb-12 max-w-[20ch]">
-          Build once. <em>Choose your host lifecycle.</em>
+          Build once. <em>Run through OCI.</em>
         </h2>
 
         <ol className="border-t border-l border-line">
@@ -79,23 +55,23 @@ export default function Install() {
         </ol>
 
         <p className="mt-5 max-w-[80ch] font-mono text-[11px] text-fg-3">
-          Only the Linux owned detached lifecycle has runtime proof. The macOS
-          artifact proves compilation and package shape; use foreground start and
-          a separate TUI there.
+Podman or Docker runs Linux containers on Linux or macOS. Current runtime proof
+            covers Linux AArch64; other hosts need their own verification. Keep provider
+            credentials in the private AGENTOS_OCI_HOME, never in the checkout.
         </p>
 
         <div className="mt-8 grid sm:grid-cols-3 gap-6 text-[12.5px] text-fg-3 font-mono">
           <div>
             <div className="eyebrow mb-1">Engine WS</div>
-            ws://127.0.0.1:49134
+            Authenticated · endpoint from status
           </div>
           <div>
             <div className="eyebrow mb-1">HTTP triggers</div>
-            http://127.0.0.1:3111
+            Host loopback · dynamic port
           </div>
           <div>
             <div className="eyebrow mb-1">Streams</div>
-            ws://127.0.0.1:3112
+            Private to the container
           </div>
         </div>
       </div>

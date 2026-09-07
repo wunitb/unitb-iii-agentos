@@ -456,6 +456,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         function_id: "ledger::spend".to_string(),
         config: json!({ "topic": "cost.incurred" }),
         metadata: None,
+        namespace: None,
+        trigger_namespace: None,
     })?;
 
     tracing::info!("ledger worker started");

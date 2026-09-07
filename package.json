@@ -1,7 +1,7 @@
 {
   "name": "unitb-iii-agentos",
   "version": "0.2.0",
-  "description": "UnitB continuation of AgentOS on iii v0.22.1 primitives",
+  "description": "UnitB continuation of AgentOS on iii v0.23.0 primitives",
   "type": "module",
   "packageManager": "bun@1.3.14",
   "scripts": {
@@ -24,10 +24,11 @@
     "build:website": "bash -lc 'cd website && npm run build'",
     "check": "bun run typecheck && bun run test:unit && bun run test:governance && bun run test:scripts && bun run counts:check && bun run build:website",
     "test:otel:native": "node scripts/native-otel.mjs",
+    "test:oci": "python3 scripts/oci-smoke.py",
     "typecheck:e2e": "tsc --noEmit"
   },
   "dependencies": {
-    "iii-sdk": "0.22.1"
+    "iii-sdk": "0.23.0"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",
@@ -47,6 +48,6 @@
     "@opentelemetry/sdk-trace-node": "2.11.0"
   },
   "patchedDependencies": {
-    "@iii-dev/helpers@0.22.1": "patches/@iii-dev%2Fhelpers@0.22.1.patch"
+    "@iii-dev/helpers@0.23.0": "patches/@iii-dev%2Fhelpers@0.23.0.patch"
   }
 }

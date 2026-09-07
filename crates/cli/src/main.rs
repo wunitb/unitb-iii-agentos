@@ -920,7 +920,7 @@ const ENGINE_ENV: &[&str] = &[
     "III_TRACE_PAYLOAD_MAX_BYTES",
     "TOKIO_WORKER_THREADS",
 ];
-const BUS_AUTH_ENV: &[&str] = &["AGENTOS_API_KEY"];
+const BUS_AUTH_ENV: &[&str] = &["AGENTOS_API_KEY", "AGENTOS_CONTAINER_RUNTIME"];
 
 fn scoped_service_environment(
     allowed: &[&str],
@@ -1360,8 +1360,13 @@ pub(crate) fn spawn_bus_auth(
         .with_context(|| format!("Cannot open log {}", log_path.display()))?;
     let log_err = log_file.try_clone()?;
     let mut command = Command::new(binary);
+    let oci = bootstrap::guard_runtime(config_path)?;
     command
-        .arg(format!("--listen={addr}"))
+        .arg(if oci {
+            format!("--worker={}", agentos_bus_auth::config::RAW_WORKER_URL)
+        } else {
+            format!("--listen={addr}")
+        })
         // The daemon re-reads the config the ENGINE is about to boot and refuses
         // to gate one that names hooks it does not serve. Passed explicitly so
         // the check follows `--config`, not the working directory.
@@ -1388,6 +1393,7 @@ pub(crate) fn spawn_engine(
     env: &BTreeMap<String, String>,
     detached: bool,
 ) -> Result<Child> {
+    bootstrap::guard_runtime(config_path)?;
     let log_file = std::fs::File::create(log_path)
         .with_context(|| format!("Cannot create engine log {}", log_path.display()))?;
     let log_err = log_file.try_clone()?;
@@ -1414,6 +1420,78 @@ pub(crate) fn spawn_engine(
     command
         .spawn()
         .map_err(|error| anyhow::anyhow!("Failed to start iii-engine: {error}. Is it installed?"))
+}
+
+/// Compose remains a separately owned foreground daemon inside the OCI boundary.
+pub(crate) fn spawn_compose(
+    iii: &Path,
+    runtime_dir: &Path,
+    log_path: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<Child> {
+    agentos_bus_auth::config::require_container()?;
+    let manifest = runtime_dir.join("worker-compose.yaml");
+    anyhow::ensure!(
+        manifest.is_file(),
+        "missing {}; reinstall the OCI runtime",
+        manifest.display()
+    );
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let mut command = Command::new(iii);
+    command
+        .args([
+            "compose",
+            "--engine",
+            agentos_bus_auth::config::RAW_WORKER_URL,
+            "--up",
+            "--file",
+        ])
+        .arg(manifest)
+        .current_dir(runtime_dir)
+        .env_clear()
+        .envs(scoped_service_environment(ENGINE_ENV, env))
+        .env("III_URL", agentos_bus_auth::config::RAW_WORKER_URL)
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log));
+    detach_process(&mut command);
+    command.spawn().context("start private Compose daemon")
+}
+
+async fn container_start(paths: RuntimePaths) -> Result<()> {
+    let lock = lifecycle::try_lock(&paths.agentos_home)?;
+    initialize_agentos_home(&paths.agentos_home)?;
+    bootstrap::ensure_api_key(&paths.runtime_dir)?;
+    bootstrap::ensure_audit_key(&paths.runtime_dir)?;
+    let env = bootstrap::load_dotenv(&paths.runtime_dir)?;
+    let home = paths.agentos_home.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut effects = bootstrap::SystemEffects::new(&paths, env);
+        let options = bootstrap::UpOptions {
+            launch_tui: false,
+            stage_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_millis(250),
+        };
+        bootstrap::run_up(&mut effects, &paths, &options, &mut std::io::stdout())?;
+        effects.persist_started()
+    })
+    .await??;
+    drop(lock);
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! { result = tokio::signal::ctrl_c() => { result?; }, _ = term.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
+    tokio::task::spawn_blocking(move || {
+        // stop_owned acquires the lifecycle lock itself.
+        lifecycle::stop_owned(&home, Duration::from_secs(5))
+    })
+    .await??;
+    Ok(())
 }
 
 #[tokio::main]
@@ -1464,6 +1542,9 @@ async fn main() -> Result<()> {
                 runtime_dir,
                 ..
             } = runtime_paths()?;
+            if bootstrap::guard_runtime(&config_yaml)? {
+                return container_start(runtime_paths()?).await;
+            }
             let first_run = !agentos_home.exists();
             let lifecycle_lock = lifecycle::try_lock_foreground(&agentos_home)?;
             initialize_agentos_home(&agentos_home)?;
@@ -1623,7 +1704,27 @@ async fn main() -> Result<()> {
         }
 
         Commands::Status { json: is_json } => {
-            let resp: Value = client()?.get("/api/health").send().await?.json().await?;
+            let paths = runtime_paths()?;
+            if std::fs::read_to_string(&paths.config_path)
+                .ok()
+                .is_some_and(|yaml| agentos_bus_auth::config::requires_container(&yaml))
+            {
+                let env = bootstrap::load_dotenv(&paths.runtime_dir)?;
+                tokio::task::spawn_blocking(move || {
+                    let mut probes = bootstrap::SystemEffects::new(&paths, env);
+                    let result = probes.container_status();
+                    bootstrap::Diagnostics::shutdown_probes(&mut probes, Duration::from_secs(1));
+                    result
+                })
+                .await??;
+            }
+            let resp: Value = client()?
+                .get("/api/health")
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
             if is_json {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
@@ -2155,6 +2256,7 @@ async fn main() -> Result<()> {
 
             lifecycle::ensure_supported()?;
             let paths = runtime_paths()?;
+            bootstrap::guard_runtime(&paths.config_path)?;
             let lifecycle_lock = lifecycle::try_lock(&paths.agentos_home)?;
             initialize_agentos_home(&paths.agentos_home)?;
             // A clean machine has no AGENTOS_API_KEY, and without it almost
@@ -4036,7 +4138,11 @@ mod tests {
         let log = root.join("engine.log");
         let mut child = spawn_engine(
             &engine,
-            Path::new("config.yaml"),
+            &{
+                let config = root.join("config.yaml");
+                std::fs::write(&config, "workers: []\n").unwrap();
+                config
+            },
             &root,
             &log,
             &BTreeMap::from([
@@ -4097,6 +4203,7 @@ mod tests {
             ("AUDIT_HMAC_KEY".to_string(), "must-not-leak".to_string()),
             ("PARENT_CANARY".to_string(), "must-not-leak".to_string()),
         ]);
+        std::fs::write(root.join("config.yaml"), "workers: []\n").unwrap();
         let mut child = spawn_bus_auth(
             &daemon,
             "127.0.0.1:49129".parse().unwrap(),

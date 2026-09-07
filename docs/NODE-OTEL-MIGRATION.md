@@ -1,5 +1,9 @@
 # Node OpenTelemetry migration — 2026-09-06
 
+This dated record describes the iii 0.22.1 dependency remediation. The current
+0.23.0 helper patch and full-span query are described in [the engine migration
+note](III-023-MIGRATION.md); earlier evidence below remains unchanged.
+
 ## Scope and dependency ownership
 
 The engine and all iii SDK pins remain **0.22.1**. Updating `@iii-dev/helpers` to its current stable 0.23.0 would still select the vulnerable OpenTelemetry 1.x dependency family, so an engine/SDK version bump alone is not remediation.

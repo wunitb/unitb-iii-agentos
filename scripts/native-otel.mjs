@@ -51,11 +51,18 @@ async function runNative(port) {
   const config = {
     workers: [
       { name: "iii-worker-manager", config: { host: "127.0.0.1", port } },
-      { name: "iii-observability", config: { enabled: true, exporter: "memory", metrics_enabled: true, metrics_exporter: "memory", logs_enabled: true, logs_console_output: false, sampling_ratio: 1, logs_sampling_ratio: 1 } },
       { name: "configuration", config: { adapter: { name: "fs", config: { directory: "./config" } }, ttl_seconds: 0 } },
     ],
   };
   await mkdir(join(scratch, "config"));
+  // iii 0.23 boots observability internally; its settings belong in the
+  // configuration store, not an unsupported config.yaml worker entry.
+  await writeFile(join(scratch, "config", "iii-observability.yaml"), JSON.stringify({
+    id: "iii-observability",
+    name: "Native OTEL acceptance",
+    description: "Isolated SDK trace, metric and log ingestion acceptance",
+    value: { enabled: true, exporter: "memory", metrics_enabled: true, metrics_exporter: "memory", logs_enabled: true, logs_console_output: false, sampling_ratio: 1, logs_sampling_ratio: 1 },
+  }));
   await mkdir(join(scratch, ".iii"));
   await writeFile(join(scratch, ".iii", "telemetry_dev_optout"), "");
   await writeFile(join(scratch, "config.yaml"), JSON.stringify(config));

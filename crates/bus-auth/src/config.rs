@@ -104,12 +104,30 @@ pub fn inspect(yaml: &str) -> GateStatus {
         Ok(document) => document,
         Err(error) => return GateStatus::Unknown(error.to_string()),
     };
+    // The engine also accepts legacy `modules`; never let that second list
+    // hide an additional ungated manager from this validator.
+    if document.get("modules").is_some() {
+        return GateStatus::Inconsistent(vec!["legacy modules are unsupported; declare all engine entries in workers so every manager is checked".to_string()]);
+    }
     let workers = document
         .get("workers")
         .and_then(Value::as_sequence)
         .map(Vec::as_slice)
         .unwrap_or_default();
 
+    if requires_container(yaml) {
+        if document.as_mapping().is_none_or(|mapping| {
+            mapping.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    Some("workers" | "registration_namespace_grace_ms")
+                )
+            })
+        }) {
+            return GateStatus::Inconsistent(vec!["OCI engine config accepts only workers and registration_namespace_grace_ms; legacy modules must not hide additional managers".to_string()]);
+        }
+        return inspect_container_workers(workers);
+    }
     let managers = worker_entries(workers, WORKER_MANAGER);
     let armed: Vec<(&str, &serde_yaml::Mapping, u16)> = managers
         .iter()
@@ -125,11 +143,16 @@ pub fn inspect(yaml: &str) -> GateStatus {
         .map(|(name, _)| name.as_str())
         .collect();
 
-    if armed.is_empty() && malformed.is_empty() {
+    if managers.is_empty() {
         return GateStatus::NotArmed;
     }
 
     let mut problems = Vec::new();
+    for (name, config) in &managers {
+        if !config.is_mapping() || config.get("rbac").is_none() {
+            problems.push(format!("`{name}` is an ungated or malformed manager; only the exact OCI private raw manager may omit rbac"));
+        }
+    }
     // Name every problem when more than one manager is declared, so "which
     // one" is never a guess.
     let label = |name: &str| -> String {
@@ -268,6 +291,146 @@ pub fn inspect(yaml: &str) -> GateStatus {
 const WORKER_MANAGER: &str = "iii-worker-manager";
 const BRIDGE: &str = "iii-bridge";
 
+pub const RAW_MANAGER: &str = "iii-worker-manager#raw";
+// The mandatory upstream worker is injected unless its exact bare name exists.
+// Keep the gated edge bare, otherwise a third ungated default is created.
+pub const EDGE_MANAGER: &str = "iii-worker-manager";
+pub const RAW_WORKER_URL: &str = "ws://127.0.0.1:49129";
+
+/// An operator-misconfiguration guard, NOT a hostile same-UID sandbox.
+pub fn require_container() -> anyhow::Result<()> {
+    anyhow::ensure!(
+        std::env::var("AGENTOS_CONTAINER_RUNTIME").as_deref() == Ok("1")
+            && (Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()),
+        "iii 0.23 private raw manager requires OCI: use scripts/oci-stack.sh; native agentos up/start is refused"
+    );
+    Ok(())
+}
+
+pub fn requires_container(yaml: &str) -> bool {
+    let Ok(document) = serde_yaml::from_str::<Value>(yaml) else {
+        return false;
+    };
+    document
+        .get("workers")
+        .and_then(Value::as_sequence)
+        .is_some_and(|workers| {
+            workers.iter().any(|worker| {
+                matches!(
+                    worker.get("name").and_then(Value::as_str),
+                    Some(RAW_MANAGER | "iii-worker-manager#edge")
+                )
+            })
+        })
+}
+
+fn inspect_container_workers(workers: &[Value]) -> GateStatus {
+    let mut problems = Vec::new();
+    let managers = worker_entries(workers, WORKER_MANAGER);
+    if managers.len() != 2 {
+        problems.push(
+            "OCI requires exactly two managers: private #raw and gated bare iii-worker-manager"
+                .to_string(),
+        );
+    }
+    let mut names = BTreeSet::new();
+    for worker in workers {
+        let name = worker
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if worker.as_mapping().is_none_or(|mapping| {
+            mapping
+                .keys()
+                .any(|key| !matches!(key.as_str(), Some("name" | "config")))
+        }) {
+            problems.push(format!(
+                "`{name}` has malformed or unexpected worker fields"
+            ));
+        }
+        if !names.insert(name) {
+            problems.push(format!("duplicate engine worker `{name}`"));
+        }
+        if !matches!(
+            name,
+            RAW_MANAGER
+                | EDGE_MANAGER
+                | "configuration"
+                | "iii-stream"
+                | "iii-http-functions"
+                | "iii-sandbox"
+        ) {
+            problems.push(format!("`{name}` is not an allowed OCI engine worker; registry primitives belong in worker-compose.yaml"));
+        }
+    }
+    for (name, host, port) in [
+        (RAW_MANAGER, "127.0.0.1", 49129),
+        (EDGE_MANAGER, "0.0.0.0", 49134),
+    ] {
+        let Some((_, config)) = managers.iter().find(|(entry, _)| entry == name) else {
+            problems.push(format!("missing `{name}`"));
+            continue;
+        };
+        let Some(mapping) = config.as_mapping() else {
+            problems.push(format!("`{name}.config` must be a mapping"));
+            continue;
+        };
+        if config.get("host").and_then(Value::as_str) != Some(host)
+            || config.get("port").and_then(Value::as_u64) != Some(port)
+        {
+            problems.push(format!("`{name}` must bind exactly {host}:{port}"));
+        }
+        for key in mapping.keys() {
+            let allowed = match key.as_str() {
+                Some("host" | "port") => true,
+                Some("rbac") => name == EDGE_MANAGER,
+                _ => false,
+            };
+            if !allowed {
+                problems.push(format!(
+                    "`{name}` has an unexpected manager setting: {key:?}"
+                ));
+            }
+        }
+        if name == RAW_MANAGER {
+            continue;
+        }
+        let Some(rbac) = config.get("rbac").and_then(Value::as_mapping) else {
+            problems.push(format!("`{name}.rbac` must arm all four hooks"));
+            continue;
+        };
+        for key in rbac.keys() {
+            if !key
+                .as_str()
+                .is_some_and(|key| RBAC_CONFIG_KEYS.contains(&key))
+            {
+                let key = key
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{key:?}"));
+                problems.push(format!("`{name}.rbac.{key}` is an unknown RBAC key"));
+            }
+        }
+        for (key, expected) in ARMED_HOOKS {
+            if rbac.get(Value::from(*key)).and_then(Value::as_str) != Some(*expected) {
+                problems.push(format!("`{name}.rbac.{key}` must name `{expected}`"));
+            }
+        }
+        if rbac.get(Value::from("expose_functions"))
+            != Some(&Value::Sequence(vec![Value::from("match(\"*\")")]))
+        {
+            problems.push(format!(
+                "`{name}.rbac.expose_functions` must be exactly the wildcard match"
+            ));
+        }
+    }
+    if problems.is_empty() {
+        GateStatus::Armed
+    } else {
+        GateStatus::Inconsistent(problems)
+    }
+}
+
 /// Every `(display name, config mapping)` whose worker type is `base`.
 ///
 /// The display name mirrors `assign_instance_ids` in the engine
@@ -289,10 +452,8 @@ fn worker_entries<'a>(workers: &'a [Value], base: &str) -> Vec<(String, &'a Valu
         };
         *count += 1;
         let worker_type = name.split('#').next().unwrap_or(name);
-        if worker_type == base
-            && let Some(config) = entry.get("config")
-        {
-            found.push((display, config));
+        if worker_type == base {
+            found.push((display, entry.get("config").unwrap_or(&Value::Null)));
         }
     }
     found
@@ -417,14 +578,56 @@ fn split_ws_authority(url: &str) -> Option<(&str, Option<u16>)> {
 mod tests {
     use super::*;
 
-    /// The default engine configuration this repository ships, byte for byte.
+    /// Legacy bridge fixture, kept explicit so migration does not erase coverage.
     fn shipped_config() -> String {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .expect("crates/bus-auth is two levels below the repository root")
-            .join("config.yaml");
-        std::fs::read_to_string(path).expect("read config.yaml")
+        format!("workers:\n{}{}", armed_entry_yaml("iii-worker-manager", "auth_function_id").replace("      port: 49134\n", ""), bridge_entry_yaml(RAW_WORKER_URL).replace("          remote_function: agentos::bus_on_trigger_type\n", "          remote_function: agentos::bus_on_trigger_type\n          timeout_ms: 5000\n"))
+    }
+
+    fn container_config() -> &'static str {
+        include_str!("../../../config.yaml")
+    }
+
+    #[test]
+    fn oci_topology_rejects_missing_extra_ungated_and_malformed_managers() {
+        assert_eq!(inspect(container_config()), GateStatus::Armed);
+        assert!(requires_container(container_config()));
+        for appended in [
+            "  - name: iii-worker-manager\n",
+            "  - name: iii-worker-manager#extra\n    config: {}\n",
+            "  - name: iii-worker-manager#raw\n    config: {}\n",
+            "  - name: iii-bridge\n    config: {}\n",
+            "  - name: state\n",
+        ] {
+            assert!(
+                matches!(
+                    inspect(&format!("{}{appended}", container_config())),
+                    GateStatus::Inconsistent(_)
+                ),
+                "{appended}"
+            );
+        }
+        for (old, new) in [
+            ("host: 127.0.0.1", "host: 0.0.0.0"),
+            ("port: 49129", "port: 49134"),
+            ("port: 49129", "port: wrong"),
+            (
+                "name: iii-worker-manager\n",
+                "name: iii-worker-manager#edge\n",
+            ),
+            ("iii-worker-manager#raw", "iii-worker-manager#other"),
+            ("auth_function_id:", "auth_function_idd:"),
+            ("agentos::bus_on_trigger_type", "agentos::typo"),
+            ("match(\"*\")", "match(\"state::*\")"),
+            ("      port: 49129", "      port: 49129\n      rbac: {}"),
+        ] {
+            assert!(
+                matches!(
+                    inspect(&container_config().replace(old, new)),
+                    GateStatus::Inconsistent(_)
+                ),
+                "{old} -> {new}"
+            );
+        }
     }
 
     #[test]
@@ -771,10 +974,14 @@ mod tests {
     #[test]
     fn an_unrelated_document_is_not_reported_as_armed() {
         assert_eq!(inspect("workers: []"), GateStatus::NotArmed);
-        assert_eq!(
+        assert!(matches!(
             inspect("workers:\n  - name: iii-worker-manager\n    config:\n      host: 127.0.0.1\n"),
-            GateStatus::NotArmed
-        );
+            GateStatus::Inconsistent(_)
+        ));
+        assert!(matches!(
+            inspect("workers:\n  - name: iii-worker-manager\n"),
+            GateStatus::Inconsistent(_)
+        ));
     }
 
     /// "Could not tell" must not read as "the gate is off".

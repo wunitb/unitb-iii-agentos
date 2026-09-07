@@ -6,23 +6,23 @@ describe("README bootstrap quickstart", () => {
   it("documents build, up, no-TUI, and doctor as the supported flow", async () => {
     const readme = await Bun.file(new URL("README.md", repository)).text();
 
-    expect(readme).toContain("cargo build --workspace --release");
-    expect(readme).toContain("./target/release/agentos up");
-    expect(readme).toContain("agentos up --no-tui");
-    expect(readme).toContain("agentos doctor");
+    expect(readme).toContain("bash scripts/oci-stack.sh build");
+    expect(readme).toContain("bash scripts/oci-stack.sh up");
+    expect(readme).toContain("`up` is headless");
+    expect(readme).toContain("bash scripts/oci-stack.sh doctor");
     expect(readme).toContain("The TUI opens on Chat");
   });
 
   it("documents the first-run key contract that `up` and `onboard` implement", async () => {
     const readme = await Bun.file(new URL("README.md", repository)).text();
     const section = readme.slice(
-      readme.indexOf("### First run — what generates what"),
-      readme.indexOf("### Installed releases and portability"),
+      readme.indexOf("## § 03 · Quickstart"),
+      readme.indexOf("### Archived native v0.2.0"),
     );
     expect(section.length, "README has no first-run section").toBeGreaterThan(400);
 
     // The generated identity: who, what, where, and the mode.
-    expect(section).toContain("agentos up");
+    expect(section).toContain("scripts/oci-stack.sh up");
     expect(section).toContain("agentos onboard");
     expect(section).toContain("AGENTOS_API_KEY");
     expect(section).toContain("32-byte");
@@ -33,7 +33,7 @@ describe("README bootstrap quickstart", () => {
     // The line the review found missing: AgentOS must never fabricate a
     // provider credential, only its own bearer token.
     expect(section).toContain("Never");
-    expect(section).toContain("provider credential");
+    expect(section.toLowerCase()).toContain("provider credential");
 
     // doctor must name the cause, not "missing identities".
     expect(section).toContain("agentos doctor");
@@ -44,16 +44,16 @@ describe("README bootstrap quickstart", () => {
   it("documents an in-place write, because appending would break the documented next command", async () => {
     const readme = await Bun.file(new URL("README.md", repository)).text();
     const example = await Bun.file(new URL(".env.example", repository)).text();
-    const devUp = await Bun.file(new URL("scripts/dev-up.sh", repository)).text();
+    const bootstrap = await Bun.file(new URL("crates/cli/src/bootstrap.rs", repository)).text();
 
     // The two facts that make "append" wrong, asserted against the tree rather
     // than trusted: the template already declares the name, and the startup
     // script refuses a file that assigns one name twice.
     expect(/^AGENTOS_API_KEY=\s*$/m.test(example), ".env.example no longer ships an empty AGENTOS_API_KEY=").toBe(true);
-    expect(devUp).toContain("duplicate dotenv variable");
+    expect(bootstrap).toContain("Duplicate dotenv variable");
 
     expect(readme, "README must say the key is written in place, not appended").toContain("in place");
-    expect(readme).toContain("duplicate dotenv variable");
+    expect(readme).toContain("Duplicate dotenv variable");
     expect(readme).not.toContain("append it to that `.env`");
   });
 
@@ -68,17 +68,17 @@ describe("README bootstrap quickstart", () => {
 
     const router = await Bun.file(new URL("workers/llm-router/src/main.rs", repository)).text();
     const table = /const AUTO_ROUTE_PREFERENCE: &\[&str\] = &\[([\s\S]*?)\];/.exec(router)?.[1];
-    if (table === undefined) return; // preference table not landed yet
+    if (table === undefined) throw new Error("llm-router preference table is missing");
 
-    const order = [...table.matchAll(/"([a-z-]+)"|([A-Z_]+_PROVIDER)/g)].map((match) =>
+    const order = [...table.matchAll(/"([a-z-]+)"|\b([A-Z_]+_PROVIDER)\b/g)].map((match) =>
       match[1] ?? (match[2] === "CODEX_PROVIDER" ? "codex" : match[2]!),
     );
     expect(order.length).toBeGreaterThan(1);
     expect(router).toContain("provider_credential_missing");
 
     // README must list exactly that order, in that order.
-    const start = readme.indexOf("walks a fixed");
-    const end = readme.indexOf("Naming a provider");
+    const start = readme.indexOf("The default provider");
+    const end = readme.indexOf("Explicit provider/model selection", start);
     expect(start, "README no longer describes the preference order").toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
     const published = readme.slice(start, end);
@@ -96,10 +96,10 @@ describe("README bootstrap quickstart", () => {
     const hasStart = /^ {4}Start\s*(?:\{|\(|,)/m.test(commands);
 
     if (hasStart) {
-      expect(
-        readme,
-        "crates/cli still declares `start`, so README must state that it loads the same .env as `up`",
-      ).toContain("`agentos start` | Loads the same active `.env` as `agentos up`");
+      expect(readme).toContain("`agentos up`/`agentos start`");
+      expect(readme).toContain("must not be used with this OCI-only config");
+      const bootstrap = await Bun.file(new URL("crates/cli/src/bootstrap.rs", repository)).text();
+      expect(bootstrap).toContain("require_container");
     } else {
       expect(
         readme.includes("agentos start"),
