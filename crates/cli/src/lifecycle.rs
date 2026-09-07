@@ -297,6 +297,12 @@ fn process_state_is_dead(state: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn procfs_entry_gone(error: &std::io::Error) -> bool {
+    // procfs may return ESRCH after lookup when a task exits before the read.
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(3)
+}
+
+#[cfg(target_os = "linux")]
 fn parse_process_stat(stat: &str, stat_path: &Path) -> Result<(u64, bool)> {
     let (_, fields) = stat
         .rsplit_once(") ")
@@ -323,7 +329,7 @@ fn process_identity_at(
     use std::os::unix::fs::MetadataExt;
     let stat = match fs::read_to_string(stat_path) {
         Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if procfs_entry_gone(&error) => return Ok(None),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("Cannot read process identity {}", stat_path.display()));
@@ -341,7 +347,7 @@ fn process_identity_at(
     }
     let executable = match fs::read_link(executable_path) {
         Ok(executable) => executable,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if procfs_entry_gone(&error) => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| format!("Cannot resolve executable for pid {pid}"));
         }
@@ -351,7 +357,7 @@ fn process_identity_at(
         // Exit can remove the executable between read_link and stat. An absent
         // inode is not a live, mismatching identity. Unlinked live images still
         // have kernel metadata through the /proc executable magic link.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if procfs_entry_gone(&error) => return Ok(None),
         Err(error) => return Err(error).context("Cannot inspect executable identity"),
     };
     Ok(Some(ProcessIdentity {
@@ -413,7 +419,7 @@ fn group_has_owned_member(process: &OwnedProcess, witnesses: &[OwnedProcess]) ->
         let path = PathBuf::from(format!("/proc/{}/stat", witness.pid));
         let stat = match fs::read_to_string(&path) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if procfs_entry_gone(&error) => continue,
             Err(error) => return Err(error).context("Cannot inspect owned group witness"),
         };
         let (start_token, dead) = parse_process_stat(&stat, &path)?;
@@ -442,7 +448,7 @@ fn supervisor_cleanup_grace(processes: &[OwnedProcess], requested: Duration) -> 
         }
         let command = match fs::read(format!("/proc/{}/cmdline", process.pid)) {
             Ok(command) => command,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if procfs_entry_gone(&error) => continue,
             Err(error) => return Err(error).context("Cannot inspect engine cleanup mode"),
         };
         if command.split(|byte| *byte == 0).nth(1) == Some(crate::supervisor::MODE.as_bytes()) {
@@ -574,14 +580,19 @@ fn capture_descendant_groups(owned: &mut Vec<OwnedProcess>) -> Result<Vec<OwnedP
         // A pathname, executable match, or stale pid alone never grants ownership.
         let tasks = match fs::read_dir(format!("/proc/{}/task", parent.pid)) {
             Ok(tasks) => tasks,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if procfs_entry_gone(&error) => continue,
             Err(error) => return Err(error).context("Cannot inspect owned process tasks"),
         };
         for task in tasks {
-            let path = task?.path().join("children");
+            let task = match task {
+                Ok(task) => task,
+                Err(error) if procfs_entry_gone(&error) => continue,
+                Err(error) => return Err(error).context("Cannot inspect owned task entry"),
+            };
+            let path = task.path().join("children");
             let children = match fs::read_to_string(&path) {
                 Ok(children) => children,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if procfs_entry_gone(&error) => continue,
                 Err(error) => return Err(error).context("Cannot inspect owned process children"),
             };
             for child in children.split_whitespace() {
@@ -592,7 +603,7 @@ fn capture_descendant_groups(owned: &mut Vec<OwnedProcess>) -> Result<Vec<OwnedP
                 let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
                 let stat = match fs::read_to_string(&stat_path) {
                     Ok(stat) => stat,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) if procfs_entry_gone(&error) => continue,
                     Err(error) => return Err(error).context("Cannot inspect child identity"),
                 };
                 let (start_token, dead) = parse_process_stat(&stat, &stat_path)?;
@@ -861,7 +872,7 @@ fn live_group_members(process_group: u32) -> Result<Vec<u32>> {
     for entry in fs::read_dir("/proc").context("Cannot enumerate /proc for owned descendants")? {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if procfs_entry_gone(&error) => continue,
             Err(error) => {
                 return Err(error).context("Cannot inspect /proc entry for owned descendants");
             }
@@ -875,7 +886,7 @@ fn live_group_members(process_group: u32) -> Result<Vec<u32>> {
         let stat_path = entry.path().join("stat");
         let stat_bytes = match fs::read(&stat_path) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if procfs_entry_gone(&error) => continue,
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!("Cannot inspect process group via {}", stat_path.display())
@@ -1278,6 +1289,14 @@ mod tests {
 
     #[test]
     fn identity_reader_treats_only_confirmed_disappearance_as_gone() {
+        for errno in [2, 3] {
+            assert!(procfs_entry_gone(&std::io::Error::from_raw_os_error(errno)));
+        }
+        for errno in [1, 5, 13, 20, 22] {
+            assert!(!procfs_entry_gone(&std::io::Error::from_raw_os_error(
+                errno
+            )));
+        }
         let root = root("identity-read-races");
         let executable = root.join("exe");
         fs::write(&executable, "fixture").unwrap();

@@ -59,10 +59,14 @@ pub(crate) async fn run() -> Result<()> {
 fn direct_children() -> Result<BTreeSet<i32>> {
     let mut children = BTreeSet::new();
     for task in std::fs::read_dir("/proc/self/task")? {
-        let path = task?.path().join("children");
-        let text = match std::fs::read_to_string(path) {
+        let task = match task {
+            Ok(task) => task,
+            Err(error) if crate::lifecycle::procfs_entry_gone(&error) => continue,
+            Err(error) => return Err(error).context("Cannot inspect supervised task entry"),
+        };
+        let text = match std::fs::read_to_string(task.path().join("children")) {
             Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if crate::lifecycle::procfs_entry_gone(&error) => continue,
             Err(error) => return Err(error).context("Cannot inspect supervised children"),
         };
         for pid in text.split_whitespace() {
