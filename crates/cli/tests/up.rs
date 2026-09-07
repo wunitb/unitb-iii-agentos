@@ -1130,7 +1130,8 @@ fn up_starts_the_bus_auth_daemon_with_the_generated_key() {
 #[test]
 fn up_refuses_a_typoed_gate_even_when_a_daemon_is_already_listening() {
     let fixture = Fixture::new("bus-auth-typo-live");
-    let addr = free_loopback_addr();
+    let held = TcpListener::bind("127.0.0.1:0").expect("hold the daemon port");
+    let addr = held.local_addr().expect("daemon address").to_string();
     let addr = addr.as_str();
     fixture.with_bus_auth(addr);
 
@@ -1144,7 +1145,6 @@ fn up_refuses_a_typoed_gate_even_when_a_daemon_is_already_listening() {
 
     // A daemon is already up: the CLI only probes the port, so a plain listener
     // is indistinguishable from the real thing.
-    let held = TcpListener::bind(addr).expect("hold the daemon port");
 
     // This path is immutable for the duration of the integration test. A copied
     // executable can hit ETXTBSY when cases run in parallel.

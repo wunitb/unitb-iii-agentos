@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const repository = new URL("../", import.meta.url);
 
@@ -12,6 +15,8 @@ async function sourceFiles(pattern: string): Promise<string[]> {
   for await (const path of glob.scan({ cwd: repository.pathname })) {
     if (
       path.startsWith("target/") ||
+      path.startsWith(".tmp/") ||
+      path.startsWith(".worktrees/") ||
       path.startsWith("node_modules/") ||
       path.startsWith("website/node_modules/") ||
       path.startsWith("website/dist/") ||
@@ -114,4 +119,18 @@ describe("iii stable version contract", () => {
       expect(source, path).toContain(`v${version}`);
     }
   });
+});
+
+it("ignores generated fixture manifests without losing the canonical workspace", async () => {
+  await mkdir(new URL(".tmp/", repository), { recursive: true });
+  const fixture = await mkdtemp(fileURLToPath(new URL(".tmp/iii-version-fixture-", repository)));
+  const manifest = join(fixture, "Cargo.toml");
+  try {
+    await writeFile(manifest, '[dependencies]\niii-sdk = "=0.0.0"\n');
+    const sources = await sourceFiles("**/Cargo.toml");
+    expect(sources).toContain("Cargo.toml");
+    expect(sources).not.toContain(relative(fileURLToPath(repository), manifest).split(sep).join("/"));
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
 });
