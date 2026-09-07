@@ -11,6 +11,13 @@ const RECORD_VERSION: u32 = 1;
 const RECORD_RELATIVE_PATH: &str = "run/owned-processes.json";
 const LOCK_RELATIVE_PATH: &str = "run/lifecycle.lock";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExecutableIdentity {
+    device: u64,
+    inode: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct LifecycleLock {
     _file: File,
@@ -215,6 +222,7 @@ impl OwnedCandidate {
             process_group: self.pid,
             start_token: expected_start,
             executable: observed.executable,
+            executable_identity: observed.executable_identity,
         })
     }
 
@@ -232,8 +240,11 @@ pub(crate) struct OwnedProcess {
     pub(crate) pid: u32,
     pub(crate) process_group: u32,
     pub(crate) start_token: u64,
-    /// Kernel executable (`/proc/<pid>/exe`), which is the interpreter for a script.
+    /// Kernel path retained for diagnostics and legacy records. New records pin
+    /// the executable inode so moving or replacing a binary preserves ownership.
     pub(crate) executable: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executable_identity: Option<ExecutableIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,6 +286,8 @@ pub(crate) fn ensure_supported() -> Result<()> {
 struct ProcessIdentity {
     start_token: u64,
     executable: PathBuf,
+    executable_identity: Option<ExecutableIdentity>,
+    executable_deleted: bool,
     zombie: bool,
 }
 
@@ -320,6 +333,8 @@ fn process_identity_at(
         return Ok(Some(ProcessIdentity {
             start_token,
             executable: PathBuf::new(),
+            executable_identity: None,
+            executable_deleted: false,
             zombie: true,
         }));
     }
@@ -330,9 +345,20 @@ fn process_identity_at(
             return Err(error).with_context(|| format!("Cannot resolve executable for pid {pid}"));
         }
     };
+    use std::os::unix::fs::MetadataExt;
+    let metadata = match fs::metadata(executable_path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("Cannot inspect executable identity"),
+    };
     Ok(Some(ProcessIdentity {
         start_token,
         executable,
+        executable_identity: metadata.as_ref().map(|metadata| ExecutableIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }),
+        executable_deleted: metadata.is_some_and(|metadata| metadata.nlink() == 0),
         zombie: false,
     }))
 }
@@ -348,6 +374,81 @@ fn process_identity_if_present(pid: u32) -> Result<Option<ProcessIdentity>> {
 fn process_identity(pid: u32) -> Result<ProcessIdentity> {
     process_identity_if_present(pid)?
         .with_context(|| format!("Process {pid} exited before its identity could be read"))
+}
+
+#[cfg(target_os = "linux")]
+fn recorded_identity_matches(process: &OwnedProcess, identity: &ProcessIdentity) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    if identity.start_token != process.start_token {
+        return false;
+    }
+    if let Some(expected) = process.executable_identity {
+        return identity.executable_identity == Some(expected);
+    }
+    // Version-1 records without an inode remain readable. Only the kernel's
+    // unlinked-file suffix is an alias, not a real filename ending in that text.
+    identity.executable == process.executable
+        || (identity.executable_deleted
+            && identity
+                .executable
+                .as_os_str()
+                .as_bytes()
+                .strip_suffix(b" (deleted)")
+                == Some(process.executable.as_os_str().as_bytes()))
+}
+
+#[cfg(target_os = "linux")]
+fn group_has_owned_member(process: &OwnedProcess, witnesses: &[OwnedProcess]) -> Result<bool> {
+    if verify_identity(process)? {
+        return Ok(true);
+    }
+    for witness in witnesses
+        .iter()
+        .filter(|member| member.process_group == process.process_group)
+    {
+        let path = PathBuf::from(format!("/proc/{}/stat", witness.pid));
+        let stat = match fs::read_to_string(&path) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("Cannot inspect owned group witness"),
+        };
+        let (start_token, dead) = parse_process_stat(&stat, &path)?;
+        let group = stat
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(2)
+            .context("Missing witness process group")?
+            .parse::<u32>()?;
+        // These witnesses were captured through verified ancestry in THIS stop.
+        // PID birth and current group membership preserve ownership across exec.
+        if !dead && start_token == witness.start_token && group == process.process_group {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn supervisor_cleanup_grace(processes: &[OwnedProcess], requested: Duration) -> Result<Duration> {
+    for process in processes.iter().filter(|process| process.role == "engine") {
+        if !verify_identity(process)? {
+            continue;
+        }
+        let command = match fs::read(format!("/proc/{}/cmdline", process.pid)) {
+            Ok(command) => command,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("Cannot inspect engine cleanup mode"),
+        };
+        if command.split(|byte| *byte == 0).nth(1) == Some(crate::supervisor::MODE.as_bytes()) {
+            // The supervisor needs its bounded engine/descendant reap budget even
+            // when the operator requests immediate escalation for ordinary workers.
+            return Ok(requested.max(Duration::from_secs(5)));
+        }
+    }
+    Ok(requested)
 }
 
 fn record_path(agentos_home: &Path) -> PathBuf {
@@ -450,10 +551,178 @@ fn read_record(agentos_home: &Path) -> Result<Option<LoadedRecord>> {
     Ok(Some(LoadedRecord { record, generation }))
 }
 
-/// Persist the processes spawned by one startup transaction.
-///
-/// Production callers must hold the `LifecycleLock` returned by `try_lock` from
-/// before their first startup mutation through this atomic record replacement.
+/// Capture detached groups only through the ancestry of a verified owned process.
+#[cfg(target_os = "linux")]
+fn capture_descendant_groups(owned: &mut Vec<OwnedProcess>) -> Result<Vec<OwnedProcess>> {
+    let mut pending = owned.clone();
+    let mut witnesses = Vec::new();
+    let mut seen = owned
+        .iter()
+        .map(|process| process.pid)
+        .collect::<BTreeSet<_>>();
+    for process in &pending {
+        verify_identity(process)?;
+    }
+    while let Some(parent) = pending.pop() {
+        if !verify_identity(&parent)? {
+            continue;
+        }
+        // /proc task children proves ancestry even when a child called setsid.
+        // A pathname, executable match, or stale pid alone never grants ownership.
+        let tasks = match fs::read_dir(format!("/proc/{}/task", parent.pid)) {
+            Ok(tasks) => tasks,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("Cannot inspect owned process tasks"),
+        };
+        for task in tasks {
+            let path = task?.path().join("children");
+            let children = match fs::read_to_string(&path) {
+                Ok(children) => children,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("Cannot inspect owned process children"),
+            };
+            for child in children.split_whitespace() {
+                let pid = child.parse::<u32>().context("Invalid child pid")?;
+                if seen.contains(&pid) {
+                    continue;
+                }
+                let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
+                let stat = match fs::read_to_string(&stat_path) {
+                    Ok(stat) => stat,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error).context("Cannot inspect child identity"),
+                };
+                let (start_token, dead) = parse_process_stat(&stat, &stat_path)?;
+                let fields = stat
+                    .rsplit_once(") ")
+                    .unwrap()
+                    .1
+                    .split_whitespace()
+                    .collect::<Vec<_>>();
+                let parent_pid = fields
+                    .get(1)
+                    .context("Missing parent pid")?
+                    .parse::<u32>()?;
+                let process_group = fields
+                    .get(2)
+                    .context("Missing process group")?
+                    .parse::<u32>()?;
+                if dead || parent_pid != parent.pid || start_token < parent.start_token {
+                    continue;
+                }
+                let Some(identity) = process_identity_if_present(pid)? else {
+                    continue;
+                };
+                if identity.zombie
+                    || identity.start_token != start_token
+                    || !verify_identity(&parent)?
+                {
+                    continue;
+                }
+                if !seen.insert(pid) {
+                    continue;
+                }
+                if seen.len() > 1024 {
+                    anyhow::bail!("Owned descendant scan exceeds its process limit");
+                }
+                let descendant = OwnedProcess {
+                    role: "worker".to_owned(),
+                    pid,
+                    process_group,
+                    start_token,
+                    executable: identity.executable,
+                    executable_identity: identity.executable_identity,
+                };
+                // Inherited groups are already covered by their original leader;
+                // continue through them to discover nested detached groups.
+                if process_group == pid {
+                    if owned.len() >= 128 {
+                        anyhow::bail!("Lifecycle record contains too many processes");
+                    }
+                    owned.push(descendant.clone());
+                }
+                witnesses.push(descendant.clone());
+                pending.push(descendant);
+            }
+        }
+    }
+    Ok(witnesses)
+}
+
+/// Keep daemonized grandchildren attached to their supervisor for its entire
+/// lifetime. This must run before the engine can fork helpers.
+#[cfg(target_os = "linux")]
+pub(crate) fn enable_child_subreaper() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn prctl(option: i32, ...) -> i32;
+        }
+        const PR_SET_CHILD_SUBREAPER: i32 = 36;
+        if unsafe { prctl(PR_SET_CHILD_SUBREAPER, 1_usize, 0_usize, 0_usize, 0_usize) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("Cannot adopt engine registry daemons");
+        }
+    }
+    Ok(())
+}
+
+/// Capture orphan identities in the isolated subreaper regression fixture.
+#[cfg(all(test, target_os = "linux"))]
+fn capture_adopted_descendants(owned: &mut Vec<OwnedProcess>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let root = OwnedCandidate::spawned("worker", std::process::id()).finalize()?;
+        let mut tree = vec![root];
+        capture_descendant_groups(&mut tree)?;
+        let mut seen = owned
+            .iter()
+            .map(|process| process.pid)
+            .collect::<BTreeSet<_>>();
+        for child in tree.into_iter().skip(1) {
+            if seen.insert(child.pid) {
+                owned.push(child);
+            }
+        }
+        if owned.len() > 128 {
+            anyhow::bail!("Lifecycle record contains too many processes");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = owned;
+    Ok(())
+}
+
+pub(crate) fn terminate_spawned_group(
+    child: &mut std::process::Child,
+    grace: Duration,
+) -> Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let owned = OwnedCandidate::spawned("engine", child.id()).finalize()?;
+        signal_verified_group(&owned, &[], 15)?;
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        signal_verified_group(&owned, &[], 9)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = grace;
+        child.kill()?;
+    }
+    child.wait()?;
+    Ok(())
+}
+
+/// Persist one startup transaction while the caller holds its `LifecycleLock`.
 pub(crate) fn persist_owned(agentos_home: &Path, mut started: Vec<OwnedProcess>) -> Result<()> {
     ensure_supported()?;
     if started.is_empty() {
@@ -465,10 +734,7 @@ pub(crate) fn persist_owned(agentos_home: &Path, mut started: Vec<OwnedProcess>)
             match process_identity_if_present(process.pid)? {
                 None => {} // a fully exited prior process is stale, not authority
                 Some(identity) if identity.zombie => {}
-                Some(identity)
-                    if identity.start_token == process.start_token
-                        && identity.executable == process.executable =>
-                {
+                Some(identity) if recorded_identity_matches(&process, &identity) => {
                     started.push(process);
                 }
                 Some(_) => anyhow::bail!(
@@ -539,7 +805,7 @@ fn verify_identity(process: &OwnedProcess) -> Result<bool> {
     if identity.zombie {
         return Ok(false);
     }
-    if identity.start_token != process.start_token || identity.executable != process.executable {
+    if !recorded_identity_matches(process, &identity) {
         anyhow::bail!(
             "refusing pid {} for role {}: recorded process identity no longer matches",
             process.pid,
@@ -567,13 +833,17 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "linux")]
-fn signal_verified_group(process: &OwnedProcess, signal: i32) -> Result<()> {
-    if !verify_identity(process)? {
+fn signal_verified_group(
+    process: &OwnedProcess,
+    witnesses: &[OwnedProcess],
+    signal: i32,
+) -> Result<()> {
+    if !group_has_owned_member(process, witnesses)? {
         return Ok(());
     }
     let group = i32::try_from(process.process_group).context("process group does not fit i32")?;
     // Linux/POSIX: a negative pid addresses exactly that process group.
-    if unsafe { kill(-group, signal) } != 0 && leader_is_running(process)? {
+    if unsafe { kill(-group, signal) } != 0 && group_has_owned_member(process, witnesses)? {
         return Err(std::io::Error::last_os_error()).context(format!(
             "Cannot signal owned process group {} with signal {signal}",
             process.process_group
@@ -700,8 +970,10 @@ pub(crate) fn stop_owned(agentos_home: &Path, grace: Duration) -> Result<StopOut
     };
     let mut record = loaded.record;
     let generation = loaded.generation;
-    // Validate the complete record before signalling anything. A single stale or
-    // tampered entry makes the whole operation non-destructive.
+    #[cfg(target_os = "linux")]
+    let witnesses = capture_descendant_groups(&mut record.processes)?;
+    // Validate every recorded root before signalling anything. Witnesses only
+    // come from the verified ancestry walk above, never from stale group ids.
     #[cfg(target_os = "linux")]
     for process in &record.processes {
         let _ = verify_identity(process)?;
@@ -717,16 +989,15 @@ pub(crate) fn stop_owned(agentos_home: &Path, grace: Duration) -> Result<StopOut
     let count = record.processes.len();
     #[cfg(target_os = "linux")]
     {
-        // SIGTERM every verified group first, then give all services the same
-        // bounded grace window for state flushes and in-flight work.
+        let grace = supervisor_cleanup_grace(&record.processes, grace)?;
         for process in &record.processes {
-            signal_verified_group(process, 15)?;
+            signal_verified_group(process, &witnesses, 15)?;
         }
         let deadline = Instant::now() + grace;
         loop {
             let mut running = false;
             for process in &record.processes {
-                running |= leader_is_running(process)?;
+                running |= group_has_owned_member(process, &witnesses)?;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if !running || remaining.is_zero() {
@@ -734,19 +1005,16 @@ pub(crate) fn stop_owned(agentos_home: &Path, grace: Duration) -> Result<StopOut
             }
             std::thread::sleep(Duration::from_millis(20).min(remaining));
         }
-
-        // Escalation is authorized only while the original leader identity is
-        // still present. A group whose leader exited is never blind-signalled.
+        // A live, ancestry-captured member pins ownership even if the original
+        // leader handled SIGTERM and exited. Never signal an unwitnessed group.
         for process in &record.processes {
-            if leader_is_running(process)? {
-                signal_verified_group(process, 9)?;
-            }
+            signal_verified_group(process, &witnesses, 9)?;
         }
         let kill_deadline = Instant::now() + Duration::from_secs(1);
         loop {
             let mut running = false;
             for process in &record.processes {
-                running |= leader_is_running(process)?;
+                running |= group_has_owned_member(process, &witnesses)?;
             }
             let remaining = kill_deadline.saturating_duration_since(Instant::now());
             if !running || remaining.is_zero() {
@@ -761,8 +1029,6 @@ pub(crate) fn stop_owned(agentos_home: &Path, grace: Duration) -> Result<StopOut
                     process.pid
                 );
             }
-        }
-        for process in &record.processes {
             let survivors = live_group_members(process.process_group)?;
             if !survivors.is_empty() {
                 anyhow::bail!(
@@ -808,6 +1074,21 @@ mod tests {
         command.spawn().unwrap()
     }
 
+    fn spawn_copied_binary(path: &Path) -> std::process::Child {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match Command::new(path).arg("30").process_group(0).spawn() {
+                Ok(child) => return child,
+                // Parallel tests can briefly inherit the copy's write descriptor
+                // between fork and exec, even after this thread has closed it.
+                Err(error) if error.raw_os_error() == Some(26) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("cannot spawn copied fixture {}: {error}", path.display()),
+            }
+        }
+    }
+
     fn spawn_shell(source: String) -> std::process::Child {
         let mut command = Command::new("/bin/sh");
         command
@@ -821,7 +1102,7 @@ mod tests {
 
     fn await_file(path: &Path) {
         for _ in 0..200 {
-            if path.is_file() {
+            if fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -833,6 +1114,114 @@ mod tests {
         let candidate = OwnedCandidate::spawned(role, child.id());
         std::thread::sleep(Duration::from_millis(10));
         candidate.finalize().unwrap()
+    }
+
+    fn detached_registry_fixture(root: &Path) -> (std::process::Child, OwnedProcess) {
+        let ready = root.join("registry.pid");
+        let engine = spawn_shell(format!(
+            "setsid /bin/sh -c 'echo $$ > {}; trap \"exit 0\" TERM; while :; do sleep 0.1; done' & wait",
+            ready.display()
+        ));
+        await_file(&ready);
+        let pid = fs::read_to_string(&ready).unwrap().trim().parse().unwrap();
+        let registry = OwnedCandidate::spawned("worker", pid).finalize().unwrap();
+        (engine, registry)
+    }
+
+    #[test]
+    fn reparented_registry_is_adopted_and_persisted() {
+        const CHILD: &str = "AGENTOS_SUBREAPER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lifecycle::tests::reparented_registry_is_adopted_and_persisted",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated subreaper fixture failed");
+            return;
+        }
+        enable_child_subreaper().unwrap();
+        let root = root("reparented-registry");
+        let ready = root.join("registry.pid");
+        let mut engine = spawn_shell(format!(
+            "(setsid /bin/sh -c 'echo $$ > {}; trap \"exit 0\" TERM; while :; do sleep 0.1; done' &) ; exec sleep 30",
+            ready.display()
+        ));
+        await_file(&ready);
+        let pid = fs::read_to_string(&ready).unwrap().trim().parse().unwrap();
+        let registry = OwnedCandidate::spawned("worker", pid).finalize().unwrap();
+        let mut owned = vec![capture(&engine, "engine")];
+        capture_adopted_descendants(&mut owned).unwrap();
+        let recorded = owned.iter().any(|process| process.pid == pid);
+        persist_owned(&root, owned).unwrap();
+        engine.kill().unwrap();
+        engine.wait().unwrap();
+        let result = stop_owned(&root, Duration::from_secs(1));
+        let survived = verify_identity(&registry).unwrap();
+        signal_verified_group(&registry, &[], 9).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(recorded, "daemon reparented during boot was not captured");
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!survived, "adopted registry survived stop");
+    }
+
+    #[test]
+    fn detached_registry_is_recorded_and_stopped_after_engine_exit() {
+        let root = root("detached-registry");
+        let (mut engine, registry) = detached_registry_fixture(&root);
+        let mut unrelated = spawn_sleep();
+        let mut owned = vec![capture(&engine, "engine")];
+        capture_descendant_groups(&mut owned).unwrap();
+        persist_owned(&root, owned).unwrap();
+        let recorded = read_record(&root)
+            .unwrap()
+            .unwrap()
+            .record
+            .processes
+            .iter()
+            .any(|process| process.pid == registry.pid);
+        engine.kill().unwrap();
+        engine.wait().unwrap();
+        let result = stop_owned(&root, Duration::from_secs(1));
+        let survived = verify_identity(&registry).unwrap();
+        let untouched = unrelated.try_wait().unwrap().is_none();
+        signal_verified_group(&registry, &[], 9).unwrap();
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(recorded, "detached registry ownership was not persisted");
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!survived, "detached registry survived CLI stop");
+        assert!(untouched, "unrelated process was stopped");
+    }
+
+    #[test]
+    fn detached_registry_started_after_persistence_is_discovered_before_stop() {
+        let root = root("late-detached-registry");
+        let ready = root.join("registry.pid");
+        let launch = root.join("launch");
+        let mut engine = spawn_shell(format!(
+            "while [ ! -f {} ]; do sleep 0.01; done; setsid /bin/sh -c 'echo $$ > {}; trap \"exit 0\" TERM; while :; do sleep 0.1; done' & wait",
+            launch.display(),
+            ready.display()
+        ));
+        persist_owned(&root, vec![capture(&engine, "engine")]).unwrap();
+        fs::write(&launch, "go").unwrap();
+        await_file(&ready);
+        let pid = fs::read_to_string(&ready).unwrap().trim().parse().unwrap();
+        let registry = OwnedCandidate::spawned("worker", pid).finalize().unwrap();
+        let result = stop_owned(&root, Duration::from_secs(1));
+        let survived = verify_identity(&registry).unwrap();
+        signal_verified_group(&registry, &[], 9).unwrap();
+        let _ = engine.kill();
+        engine.wait().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!survived, "late detached registry survived CLI stop");
     }
 
     #[test]
@@ -1116,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn surviving_descendant_after_leader_exit_is_reported_without_blind_signal() {
+    fn captured_descendant_is_stopped_after_its_leader_exits() {
         let root = root("stubborn-descendant");
         let ready = root.join("ready");
         let descendant_path = root.join("descendant.pid");
@@ -1135,22 +1524,131 @@ mod tests {
         let process = capture(&child, "worker");
         let process_group = process.process_group;
         persist_owned(&root, vec![process]).unwrap();
-        let error = stop_owned(&root, Duration::from_millis(200))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("descendant cleanup after leader exit is not guaranteed"),
-            "{error}"
-        );
-        assert!(error.contains(&descendant.to_string()), "{error}");
-        assert!(
-            record_path(&root).is_file(),
-            "refusal removed the authority record"
-        );
-        assert!(process_identity(descendant).is_ok_and(|identity| !identity.zombie));
+        let outcome = stop_owned(&root, Duration::from_millis(100));
+        let still_running = process_identity(descendant).is_ok_and(|identity| !identity.zombie);
+        let record_remains = record_path(&root).exists();
         unsafe { kill(-(process_group as i32), 9) };
         let _ = child.wait();
-        let _ = fs::remove_dir_all(root);
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(outcome.unwrap(), StopOutcome::Stopped(1));
+        assert!(!still_running, "verified descendant survived escalation");
+        assert!(
+            !record_remains,
+            "successful cleanup left an un-retryable record"
+        );
+    }
+
+    fn replaced_binary_fixture(legacy: bool, rename_only: bool) {
+        let root = root("replaced-executable");
+        let binary = root.join("owned-binary");
+        fs::copy("/bin/sleep", &binary).unwrap();
+        let mut child = spawn_copied_binary(&binary);
+        let mut process = capture(&child, "engine");
+        if legacy {
+            process.executable_identity = None;
+        }
+        persist_owned(&root, vec![process.clone()]).unwrap();
+        let replacement = root.join("replacement");
+        if rename_only {
+            fs::rename(&binary, &replacement).unwrap();
+        } else {
+            fs::copy("/bin/sleep", &replacement).unwrap();
+            fs::rename(&replacement, &binary).unwrap();
+        }
+        let matches = verify_identity(&process);
+        let persisted = persist_owned(&root, vec![process]);
+        let outcome = stop_owned(&root, Duration::from_millis(100));
+        let _ = child.kill();
+        let _ = child.wait();
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            matches.unwrap(),
+            "replacing or moving an executable lost ownership"
+        );
+        persisted.unwrap();
+        assert_eq!(outcome.unwrap(), StopOutcome::Stopped(1));
+    }
+
+    #[test]
+    fn replaced_running_executable_remains_stoppable_by_inode() {
+        replaced_binary_fixture(false, false);
+        replaced_binary_fixture(false, true);
+    }
+
+    #[test]
+    fn legacy_record_accepts_the_kernel_unlinked_suffix() {
+        replaced_binary_fixture(true, false);
+    }
+
+    #[test]
+    fn a_real_deleted_suffix_is_not_a_legacy_executable_alias() {
+        let root = root("literal-deleted-suffix");
+        let binary = root.join("owned-binary (deleted)");
+        fs::copy("/bin/sleep", &binary).unwrap();
+        let mut child = spawn_copied_binary(&binary);
+        let mut process = capture(&child, "worker");
+        process.executable_identity = None;
+        process.executable = root.join("owned-binary");
+        persist_owned(&root, vec![process]).unwrap();
+        let outcome = stop_owned(&root, Duration::from_millis(20));
+        let survived = child.try_wait().unwrap().is_none();
+        let record_remains = record_path(&root).exists();
+        let _ = child.kill();
+        let _ = child.wait();
+        fs::remove_dir_all(root).unwrap();
+        assert!(outcome.is_err());
+        assert!(survived && record_remains);
+    }
+
+    #[test]
+    fn a_group_without_a_live_recorded_leader_or_captured_witness_is_refused() {
+        let root = root("unwitnessed-group");
+        let ready = root.join("descendant.pid");
+        let mut child = spawn_shell(format!(
+            r#"/bin/sh -c 'trap "" TERM; echo $$ > "{}"; while :; do sleep 1; done' & wait"#,
+            ready.display()
+        ));
+        await_file(&ready);
+        let descendant: u32 = fs::read_to_string(&ready).unwrap().trim().parse().unwrap();
+        let process = capture(&child, "worker");
+        let group = process.process_group;
+        persist_owned(&root, vec![process]).unwrap();
+        child.kill().unwrap();
+        for _ in 0..200 {
+            if process_identity(child.id()).is_ok_and(|identity| identity.zombie) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let outcome = stop_owned(&root, Duration::from_millis(20));
+        let survived = process_identity(descendant).is_ok_and(|identity| !identity.zombie);
+        let record_remains = record_path(&root).exists();
+        // This fixture still owns the unreaped parent Child; its group cannot be reused.
+        unsafe { kill(-(group as i32), 9) };
+        let _ = child.wait();
+        fs::remove_dir_all(root).unwrap();
+        assert!(outcome.is_err());
+        assert!(survived && record_remains);
+    }
+
+    #[test]
+    fn supervisor_cleanup_keeps_its_budget_when_a_short_grace_is_requested() {
+        let root = root("supervisor-budget");
+        fs::write(root.join(crate::supervisor::MODE), "sleep 30\n").unwrap();
+        let mut child = Command::new("/bin/sh")
+            .arg(crate::supervisor::MODE)
+            .current_dir(&root)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let process = capture(&child, "engine");
+        let short = supervisor_cleanup_grace(std::slice::from_ref(&process), Duration::ZERO);
+        let long = supervisor_cleanup_grace(std::slice::from_ref(&process), Duration::from_secs(9));
+        unsafe { kill(-(process.process_group as i32), 9) };
+        let _ = child.wait();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(short.unwrap(), Duration::from_secs(5));
+        assert_eq!(long.unwrap(), Duration::from_secs(9));
     }
 
     #[test]
@@ -1205,11 +1703,10 @@ mod tests {
     fn tampered_start_token_refuses_without_signalling() {
         let root = root("tamper");
         let mut child = spawn_sleep();
-        let mut process = capture(&child, "engine");
-        process.start_token += 1;
-        persist_owned(&root, vec![process.clone()]).unwrap();
-        // persist filters stale records only when merging; the new record is kept
-        // so stop can prove it refuses the mismatch.
+        persist_owned(&root, vec![capture(&child, "engine")]).unwrap();
+        let mut record = read_record(&root).unwrap().unwrap().record;
+        record.processes[0].start_token += 1;
+        fs::write(record_path(&root), serde_json::to_vec(&record).unwrap()).unwrap();
         let error = stop_owned(&root, Duration::from_millis(100))
             .unwrap_err()
             .to_string();
@@ -1228,24 +1725,45 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let root = root("metadata");
         let mut child = spawn_sleep();
-        let mut process = capture(&child, "engine");
-        process.executable = PathBuf::from("/bin/false");
-        persist_owned(&root, vec![process]).unwrap();
+        persist_owned(&root, vec![capture(&child, "engine")]).unwrap();
+        let mut record = read_record(&root).unwrap().unwrap().record;
+        record.processes[0]
+            .executable_identity
+            .as_mut()
+            .unwrap()
+            .inode ^= 1;
+        fs::write(record_path(&root), serde_json::to_vec(&record).unwrap()).unwrap();
+        let bad_inode = stop_owned(&root, Duration::from_millis(100));
+        let mut legacy = capture(&child, "engine");
+        legacy.executable_identity = None;
+        legacy.executable = PathBuf::from("/bin/false");
+        record.processes[0] = legacy;
+        fs::write(record_path(&root), serde_json::to_vec(&record).unwrap()).unwrap();
+        let bad_legacy_path = stop_owned(&root, Duration::from_millis(100));
+        fs::set_permissions(record_path(&root), fs::Permissions::from_mode(0o644)).unwrap();
+        let bad_permissions = stop_owned(&root, Duration::from_millis(100));
+        let survived = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        fs::remove_dir_all(root).unwrap();
         assert!(
-            stop_owned(&root, Duration::from_millis(100))
+            bad_inode
                 .unwrap_err()
                 .to_string()
                 .contains("identity no longer matches")
         );
-        fs::set_permissions(record_path(&root), fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
-            stop_owned(&root, Duration::from_millis(100))
+            bad_legacy_path
+                .unwrap_err()
+                .to_string()
+                .contains("identity no longer matches")
+        );
+        assert!(
+            bad_permissions
                 .unwrap_err()
                 .to_string()
                 .contains("mode 0600")
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        assert!(survived, "unowned process was signalled");
     }
 }

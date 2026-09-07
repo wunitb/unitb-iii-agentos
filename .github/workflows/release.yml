@@ -169,8 +169,10 @@ jobs:
           [[ -f "$archive" ]]
           [[ -f "$checksum" ]]
           [[ -f "dist/$asset.spdx.json" ]]
+          mkdir -p "$HOME" "$AGENTOS_HOME"
           (cd dist && sha256sum --check "$asset.tar.gz.sha256")
           gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "dist/$asset.spdx.json" --repo "$GITHUB_REPOSITORY"
           tar -tzf "$archive" > "$archive.contents"
           for required in \
             ./bin/agentos \

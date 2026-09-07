@@ -8,20 +8,23 @@
     "test": "bun run test:unit",
     "test:unit": "bun test examples scripts tests/*.test.ts",
     "test:governance": "bun test tests/governance",
+    "audit": "bun audit && npm --prefix website audit",
     "test:e2e": "AGENTOS_E2E=1 vitest --run --config vitest.e2e.config.ts",
     "test:e2e:smoke": "AGENTOS_E2E=1 vitest --run --config vitest.e2e.config.ts --testNamePattern=\"health|chat_completions\"",
     "test:examples": "vitest --run examples/shared.test.ts",
-    "test:scripts": "vitest --run scripts/dev-up.test.ts",
+    "test:scripts": "vitest --run scripts",
     "counts": "bun scripts/counts.ts",
     "counts:check": "bun scripts/counts.ts --check",
     "counts:write": "bun scripts/counts.ts --write",
-    "typecheck": "bun run typecheck:examples && bun run typecheck:scripts && bun run typecheck:counts && bun run typecheck:tests",
-    "typecheck:examples": "tsc --ignoreConfig --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck examples/*.ts",
+    "typecheck": "bun run typecheck:examples && bun run typecheck:scripts && bun run typecheck:counts && bun run typecheck:tests && bun run typecheck:e2e",
+    "typecheck:examples": "tsc --ignoreConfig --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --types node --strict --skipLibCheck examples/*.ts",
     "typecheck:scripts": "tsc --ignoreConfig --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --types node --strict --skipLibCheck scripts/*.test.ts",
     "typecheck:counts": "tsc --ignoreConfig --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --types node --strict --skipLibCheck scripts/counts.ts",
     "typecheck:tests": "tsc --ignoreConfig --noEmit --target ES2022 --module ESNext --moduleResolution bundler --types bun,node --strict --skipLibCheck tests/*.test.ts tests/governance/*.test.ts",
     "build:website": "bash -lc 'cd website && npm run build'",
-    "check": "bun run typecheck && bun run test:unit && bun run test:governance && bun run counts:check && bun run build:website"
+    "check": "bun run typecheck && bun run test:unit && bun run test:governance && bun run test:scripts && bun run counts:check && bun run build:website",
+    "test:otel:native": "node scripts/native-otel.mjs",
+    "typecheck:e2e": "tsc --noEmit"
   },
   "dependencies": {
     "iii-sdk": "0.22.1"
@@ -31,5 +34,19 @@
     "@types/node": "^26.4.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11"
+  },
+  "overrides": {
+    "@opentelemetry/api-logs": "0.222.0",
+    "@opentelemetry/core": "2.11.0",
+    "@opentelemetry/instrumentation": "0.222.0",
+    "@opentelemetry/otlp-transformer": "0.222.0",
+    "@opentelemetry/resources": "2.11.0",
+    "@opentelemetry/sdk-logs": "0.222.0",
+    "@opentelemetry/sdk-metrics": "2.11.0",
+    "@opentelemetry/sdk-trace-base": "2.11.0",
+    "@opentelemetry/sdk-trace-node": "2.11.0"
+  },
+  "patchedDependencies": {
+    "@iii-dev/helpers@0.22.1": "patches/@iii-dev%2Fhelpers@0.22.1.patch"
   }
 }

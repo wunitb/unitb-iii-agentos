@@ -1,14 +1,15 @@
 use agentos_http_adapter::{CHAT_TIMEOUT_MS, TriggerBus, principal};
 use chrono::{DateTime, Timelike, Utc};
-use cron::Schedule;
 use iii_sdk::errors::Error;
 use iii_sdk::{
     IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker, trigger::Trigger,
 };
+use schedule::Schedule;
 use serde_json::{Value, json};
 use std::{collections::HashMap, str::FromStr, sync::Arc};
 use tokio::sync::Mutex;
 
+mod schedule;
 mod types;
 
 use types::{ContextMode, InvokeRequest, PulseConfig, PulseRun, PulseStatus, RegisterPulseRequest};

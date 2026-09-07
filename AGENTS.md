@@ -89,8 +89,15 @@ three supported targets.
 
 ## Delivery path
 
-Repository changes enter as **control-room directives** and are built by the **sweafax** factory; nothing
-in this repository launches an agent session of its own. `main` is protected and accepts pull requests only.
-The managed UNITB OMPAX fleet was withdrawn on 2026-08-22 and no longer governs work here; if you find a
-document that still describes `fleet_handoff`, `fleet_merge`, a managed Planner or a Dispatcher checkout
-layout, that document is stale.
+The user-appointed principal development team owns implementation, integration, and verification directly.
+The 2026-09-06 takeover supersedes the former control-room/sweafax delivery requirement. Do not resume
+old factory jobs, reviewers, background sessions, or work packages from historical ACTIVE labels.
+The managed UNITB OMPAX fleet was withdrawn on 2026-08-22 and remains retired.
+`main` remains protected and accepts pull requests only. Commit, push, merge, tag, and release require
+explicit user authorization; a local green gate is not permission to publish. Preserve existing branches,
+worktrees, archives, credentials, and operator data unless their removal is specifically authorized.
+
+Run live acceptance in a scratch runtime, never in the source tree. The root Vitest configuration limits
+discovery to this checkout's `scripts/` and `examples/`; `.worktrees/` and `.upstream-iii/` are not additional
+test suites. Historical review reports remain evidence, not current execution instructions. Current
+assessment and remaining release blockers are tracked in `docs/TAKEOVER-2026-09-06.md`.

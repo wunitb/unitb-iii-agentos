@@ -2235,13 +2235,13 @@ impl Bootstrap for SystemEffects {
             let _ = worker.child.wait();
         }
         self.workers.clear();
-        if let Some(engine) = self.engine.as_mut() {
-            let _ = engine.kill();
-            let _ = engine.wait();
+        if let Some(engine) = self.engine.as_mut()
+            && let Err(error) =
+                crate::lifecycle::terminate_spawned_group(engine, Duration::from_secs(5))
+        {
+            tracing::warn!(%error, "Engine startup rollback did not complete");
         }
         self.engine = None;
-        // The daemon goes last: it is the gate the rest of the stack talks
-        // through, and killing it first would refuse their shutdown traffic.
         if let Some(daemon) = self.bus_auth.as_mut() {
             let _ = daemon.kill();
             let _ = daemon.wait();

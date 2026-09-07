@@ -7,7 +7,7 @@ The repository pins iii `v0.22.1`; do not assume a newer engine or SDK is wire-c
 
 ## Reporting a vulnerability
 
-Do not publish exploit details in a normal issue. GitHub private vulnerability reporting is the intended confidential path **only when it is enabled** for this repository: open the repository **Security** tab and choose **Report a vulnerability**. The maintainer must verify that this feature is enabled before publishing `v0.2.0`; this document does not claim that the setting has already been checked.
+Do not publish exploit details in a normal issue. GitHub private vulnerability reporting is enabled for `wunitb/unitb-iii-agentos`, verified through the repository API during `v0.2.0` release preparation. Use [Report a vulnerability](https://github.com/wunitb/unitb-iii-agentos/security/advisories/new), or open the repository **Security** tab and choose **Report a vulnerability**.
 
 Use a normal GitHub issue only for non-sensitive hardening requests. This project does not publish a private security email address.
 

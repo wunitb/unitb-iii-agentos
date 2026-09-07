@@ -137,58 +137,50 @@ cleanup() {
   status=$?
   trap - 0 1 2 15
   owned_file="$scratch/owned-pids"
+  teardown_ok=1
 
-  write_owned() {
-    owned_pids > "$owned_file"
-  }
-  signal_owned_file() {
-    signal=$1
-    while IFS= read -r pid; do
-      [ -n "$pid" ] || continue
-      kill "$signal" "$pid" 2>/dev/null || true
-    done < "$owned_file"
-  }
-
-  # Freeze one ownership snapshot before killing it. In particular this stops
-  # the engine and its `iii-worker start` helpers before either can create a new
-  # detached child between the TERM sweep and the final emptiness check.
-  write_owned
-  if [ -s "$owned_file" ]; then
-    signal_owned_file -STOP
-    signal_owned_file -KILL
+  # Only the CLI's kernel-identity record authorizes signalling. Path and HOME
+  # matches below are observations, never authority to kill a process.
+  if [ -x "$runtime/target/release/agentos" ]; then
+    if ! AGENTOS_HOME="$agentos_home" AGENTOS_CONFIG="$runtime/config.yaml" \
+      timeout --signal=TERM --kill-after=5s 20 \
+      "$runtime/target/release/agentos" stop --grace-seconds 5; then
+      printf 'boot smoke: verified CLI stop failed\n' >&2
+      teardown_ok=0
+    fi
   fi
 
-  # An exec already committed by a helper can appear just after the first
-  # sweep. Require three consecutive empty one-second observations, rather than
-  # treating one empty instant as quiescence, and fail closed after 15 probes.
   attempts=0
   quiet_observations=0
   while [ "$attempts" -lt 15 ] && [ "$quiet_observations" -lt 3 ]; do
     sleep 1
-    write_owned
+    owned_pids > "$owned_file"
     if [ -s "$owned_file" ]; then
-      signal_owned_file -STOP
-      signal_owned_file -KILL
       quiet_observations=0
     else
       quiet_observations=$((quiet_observations + 1))
     fi
     attempts=$((attempts + 1))
   done
-  write_owned
-  if [ -s "$owned_file" ] || [ "$quiet_observations" -lt 3 ]; then
+  if [ "$quiet_observations" -lt 3 ]; then
     printf 'boot smoke: teardown could not quiesce owned processes\n' >&2
     cat "$owned_file" >&2
-    status=1
+    teardown_ok=0
   fi
 
   for port in "$BUS_AUTH_PORT" "$ENGINE_PORT"; do
     if port_is_open "$port"; then
       printf 'boot smoke: teardown left boundary port %s occupied\n' "$port" >&2
       status=1
+      teardown_ok=0
     fi
   done
-  rm -rf "$scratch"
+  if [ "$teardown_ok" -eq 1 ]; then
+    rm -rf "$scratch"
+  else
+    printf 'boot smoke: preserving scratch for ownership recovery: %s\n' "$scratch" >&2
+    status=1
+  fi
   exit "$status"
 }
 trap cleanup 0

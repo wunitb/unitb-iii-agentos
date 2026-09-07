@@ -21,7 +21,6 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
-cron = "=0.12.1"
 
 [dev-dependencies]
 agentos-http-adapter = { workspace = true, features = ["fake-bus"] }

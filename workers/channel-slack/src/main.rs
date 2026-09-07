@@ -67,6 +67,9 @@ fn raw_body_source(req: &Value) -> Result<RawBodySource, String> {
         return Ok(RawBodySource::Channel(channel));
     }
     if let Some(raw) = req.get("rawBody").and_then(Value::as_str) {
+        if raw.len() > MAX_RAW_BODY_BYTES {
+            return Err(format!("request body exceeds {MAX_RAW_BODY_BYTES} bytes"));
+        }
         return Ok(RawBodySource::Inline(raw.as_bytes().to_vec()));
     }
     Err("raw request body unavailable (no request_body channel, no rawBody)".into())
@@ -89,20 +92,36 @@ async fn raw_request_body(req: &Value) -> Result<Vec<u8>, String> {
         RawBodySource::Channel(channel) => channel,
     };
     let reader = ChannelReader::new(&engine_ws_url(), &channel);
-    let mut bytes = Vec::new();
-    loop {
-        let chunk = tokio::time::timeout(RAW_BODY_READ_TIMEOUT, reader.next_binary())
-            .await
-            .map_err(|_| "timed out reading the request_body channel".to_string())?
-            .map_err(|e| format!("request_body channel read failed: {e}"))?;
-        let Some(chunk) = chunk else {
-            return Ok(bytes);
-        };
-        bytes.extend_from_slice(&chunk);
-        if bytes.len() > MAX_RAW_BODY_BYTES {
-            return Err(format!("request body exceeds {MAX_RAW_BODY_BYTES} bytes"));
+    collect_request_body(
+        || async {
+            reader
+                .next_binary()
+                .await
+                .map_err(|e| format!("request_body channel read failed: {e}"))
+        },
+        RAW_BODY_READ_TIMEOUT,
+    )
+    .await
+}
+async fn collect_request_body<F, Fut>(mut next: F, timeout: Duration) -> Result<Vec<u8>, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Vec<u8>>, String>>,
+{
+    tokio::time::timeout(timeout, async {
+        let mut bytes = Vec::new();
+        loop {
+            let Some(chunk) = next().await? else {
+                return Ok(bytes);
+            };
+            if chunk.len() > MAX_RAW_BODY_BYTES - bytes.len() {
+                return Err(format!("request body exceeds {MAX_RAW_BODY_BYTES} bytes"));
+            }
+            bytes.extend_from_slice(&chunk);
         }
-    }
+    })
+    .await
+    .map_err(|_| "timed out reading the request_body channel".to_string())?
 }
 
 /// One header by case-insensitive name. The engine lowercases header names;
@@ -598,6 +617,49 @@ mod tests {
         // A channel ref that cannot be used is a refusal, never a fall-through.
         assert!(raw_body_source(&json!({ "request_body": "junk", "rawBody": "{}" })).is_err());
         assert!(raw_body_source(&json!({})).is_err());
+    }
+
+    #[tokio::test]
+    async fn request_body_deadline_does_not_reset_for_each_chunk() {
+        let mut remaining = 10;
+        let result = collect_request_body(
+            || {
+                let chunk = (remaining > 0).then(|| vec![b'x']);
+                remaining -= 1;
+                async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok(chunk)
+                }
+            },
+            Duration::from_millis(35),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn inline_request_body_obeys_byte_limit() {
+        let req = json!({"rawBody": "x".repeat(MAX_RAW_BODY_BYTES + 1)});
+        assert!(raw_request_body(&req).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn request_body_preserves_chunks_and_rejects_overflow() {
+        let mut chunks = vec![None, Some(vec![b'2', b'}']), Some(vec![b'{', b' '])];
+        let bytes = collect_request_body(
+            || std::future::ready(Ok(chunks.pop().unwrap())),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, b"{ 2}");
+        let mut chunks = vec![Some(vec![0]), Some(vec![0; MAX_RAW_BODY_BYTES])];
+        let result = collect_request_body(
+            || std::future::ready(Ok(chunks.pop().unwrap())),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("exceeds"));
     }
 
     const SECRET: &str = "slack-signing-secret";

@@ -118,16 +118,17 @@ async function runSmokeFixture(options: {
   await writeFile(
     agentos,
     "#!/bin/sh\n" +
-      "test \"$1 $2\" = \"up --no-tui\" || exit 64\n" +
+      'if [ "$1" = stop ]; then\n' +
+      '  if [ -f "$SMOKE_CHILD_PID_FILE" ]; then kill "$(cat "$SMOKE_CHILD_PID_FILE")" 2>/dev/null || true; fi\n' +
+      '  printf "fixture: verified CLI stop\\n"; exit 0\nfi\n' +
+      'test "$1 $2" = "up --no-tui" || exit 64\n' +
       templateCopyCheck +
       `printf '%s\n' 'AGENTOS_API_KEY=${generatedApiKey}' > .env\n` +
-      // Model the real iii-worker helper: it is reparented after this stub
-      // exits, its argv contains no scratch path yet, and only its inherited
-      // scratch HOME proves ownership before the delayed exec.
+      // The smoke delegates ownership enforcement to the CLI, not a path-based kill sweep.
       "/bin/sh -c 'sleep 1; mkdir -p \"$HOME/.iii/workers\"; " +
       "cp /bin/sleep \"$HOME/.iii/workers/provider-late\"; " +
       "exec \"$HOME/.iii/workers/provider-late\" 60' &\n" +
-      "printf '%s\\n' $! > \"$SMOKE_CHILD_PID_FILE\"\n" +
+      'printf "%s\\n" $! > "$SMOKE_CHILD_PID_FILE"\n' +
       builtinEnvCheck,
   );
   await chmod(agentos, 0o755);
@@ -398,4 +399,12 @@ describe("boot smoke contract", () => {
     expect(job).toContain("name: worker-binaries");
     expect(job).toContain("bash scripts/boot-smoke.sh");
   });
+});
+
+it("delegates teardown to verified CLI ownership instead of signalling a path-matched PID", async () => {
+  const source = await readFile(new URL("./boot-smoke.sh", import.meta.url), "utf8");
+  expect(source).toContain('stop --grace-seconds 5');
+  expect(source).not.toContain("signal_owned_file");
+  expect(source).not.toContain('kill "$signal" "$pid"');
+  expect(source).toContain("preserving scratch");
 });

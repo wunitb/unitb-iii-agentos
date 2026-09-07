@@ -21,6 +21,77 @@ fn temporary_directory(label: &str) -> PathBuf {
     path
 }
 
+#[test]
+fn init_never_copies_inherited_credentials_to_legacy_config() {
+    let root = temporary_directory("init-secret");
+    let home = root.join("home");
+    let result = Command::new(env!("CARGO_BIN_EXE_agentos"))
+        .current_dir(&root)
+        .env("AGENTOS_HOME", &home)
+        .env("ANTHROPIC_API_KEY", "fixture-provider-secret")
+        .args(["init", "--quick"])
+        .output()
+        .unwrap();
+    let legacy_exists = home.join("config.toml").exists();
+    fs::remove_dir_all(root).unwrap();
+    assert!(result.status.success(), "init failed");
+    assert!(
+        !legacy_exists,
+        "init persisted a provider secret in the unused legacy config"
+    );
+    assert!(!String::from_utf8_lossy(&result.stdout).contains("fixture-provider-secret"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn supervisor_reaps_registry_daemons_created_after_startup() {
+    use std::os::unix::process::CommandExt;
+    let root = temporary_directory("supervised-registry");
+    let engine = root.join("iii");
+    let pid_file = root.join("registry.pid");
+    write_executable(
+        &engine,
+        &format!(
+            "#!/bin/sh\n(sleep 0.2; setsid /bin/sh -c 'echo $$ > {}; trap \"exit 0\" TERM; while :; do sleep 0.1; done' &)\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    );
+    let mut supervisor = Command::new(env!("CARGO_BIN_EXE_agentos"))
+        .arg("__agentos_supervise_engine")
+        .arg(&engine)
+        .arg(root.join("config.yaml"))
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut unrelated = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let mut ready = false;
+    for _ in 0..100 {
+        ready = fs::metadata(&pid_file).is_ok_and(|metadata| metadata.len() > 0);
+        if ready || supervisor.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let status = Command::new("kill")
+        .args(["-TERM", &supervisor.id().to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    let exit = supervisor.wait().unwrap();
+    let untouched = unrelated.try_wait().unwrap().is_none();
+    unrelated.kill().unwrap();
+    unrelated.wait().unwrap();
+    assert!(
+        ready && status.success() && exit.success(),
+        "supervisor did not complete the delayed-daemon lifecycle"
+    );
+    assert_process_gone(&pid_file);
+    assert!(untouched, "supervisor touched an unrelated process");
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn write_executable(path: &Path, body: &str) {
     fs::write(path, body).expect("write executable");
     let mut permissions = fs::metadata(path)

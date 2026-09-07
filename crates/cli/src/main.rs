@@ -14,6 +14,8 @@ use std::time::Duration;
 mod api_client;
 mod bootstrap;
 mod lifecycle;
+#[cfg(target_os = "linux")]
+mod supervisor;
 
 const API_BASE: &str = "http://localhost:3111";
 const TUI_BINARY: &str = "agentos-tui";
@@ -59,7 +61,7 @@ enum Commands {
     Start,
     /// Stop processes started by `up`. Sends SIGTERM, then escalates after a bounded grace.
     Stop {
-        /// Seconds to wait for owned leaders to exit before SIGKILL (maximum 60).
+        /// Seconds before SIGKILL (maximum 60); engine supervisor cleanup gets at least 5.
         #[arg(long, default_value_t = 5)]
         grace_seconds: u64,
     },
@@ -1390,14 +1392,19 @@ pub(crate) fn spawn_engine(
         .with_context(|| format!("Cannot create engine log {}", log_path.display()))?;
     let log_err = log_file.try_clone()?;
     let mut command = Command::new(iii_path);
+    #[cfg(target_os = "linux")]
+    if detached {
+        command = Command::new(std::env::current_exe()?);
+        command.arg(supervisor::MODE).arg(iii_path).arg(config_path);
+    } else {
+        command.arg("--config").arg(config_path);
+    }
+    #[cfg(not(target_os = "linux"))]
+    command.arg("--config").arg(config_path);
     command
-        .arg("--config")
-        .arg(config_path)
         .current_dir(runtime_dir)
         .env_clear()
         .envs(scoped_service_environment(ENGINE_ENV, env))
-        // AgentOS owns this engine lifecycle. The built-in daemon would expose
-        // worker::* mutation functions outside the packaged-worker boundary.
         .env("IIIWORKER_DISABLE_BUILTIN_DAEMONS", "1")
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err));
@@ -1411,6 +1418,10 @@ pub(crate) fn spawn_engine(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(supervisor::MODE)) {
+        return supervisor::run().await;
+    }
     let cli = Cli::parse();
     // Resolve API URL/key only in commands that use the API. Local lifecycle
     // commands such as `stop` must still work when an unrelated dotenv entry is
@@ -1423,19 +1434,6 @@ async fn main() -> Result<()> {
             let config_dir = agentos_home_dir()?;
             initialize_agentos_home(&config_dir)?;
             println!("{} Initialized {}", "✓".green(), config_dir.display());
-
-            if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-                let config_path = config_dir.join("config.toml");
-                let mut config = String::new();
-                if config_path.exists() {
-                    config = std::fs::read_to_string(&config_path).unwrap_or_default();
-                }
-                if !config.contains("anthropic") {
-                    config.push_str(&format!("\n[keys]\nanthropic = \"{}\"\n", key));
-                    std::fs::write(&config_path, config)?;
-                    println!("{} Auto-detected ANTHROPIC_API_KEY", "✓".green());
-                }
-            }
 
             if quick {
                 println!(

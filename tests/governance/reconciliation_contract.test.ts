@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const repository = new URL("../../", import.meta.url);
 
@@ -71,7 +73,7 @@ describe("reconciled Git history and worktree contract", () => {
 
     const failures: string[] = [];
     for (const path of listed.stdout.toString().split("\0").filter(Boolean)) {
-      const file = Bun.file(new URL(path, repository));
+      const file = Bun.file(join(fileURLToPath(repository), path));
         if (!(await file.exists())) continue;
       const markers = conflictMarkerLines(await file.text());
       if (markers.length > 0) failures.push(`${path}: ${markers.join(", ")}`);
