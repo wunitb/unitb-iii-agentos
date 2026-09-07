@@ -1,0 +1,185 @@
+{
+  "checked_at": "2026-09-06T16:52:41.243Z",
+  "subject": "base commit plus complete current uncommitted takeover working tree",
+  "head": "d6a50fa92b6579382af34f18965b1b9628190153",
+  "branch": "fix/takeover-stabilization",
+  "main": "5507c3a0ded026420ee0f56929776b69f2eb343e",
+  "source_sha256": {
+    ".github/workflows/ci.yml": "320bc81b73d66b1a3514d8148f486b3a3040b6deaa60ae8ba6fdc47e0e644991",
+    ".gitignore": "a8c8faea64f3301a6deb8c4c3a91e483e770fc731372e93a052e4a78889cc437",
+    "AGENTS.md": "c262cc1a917894d5e82e9d44526e5fd9886ae538fa0feec022495e272c2220ae",
+    "ARCHITECTURE.md": "95b404f2d4dd4b9d2b71bea80e098fc0686eb4d970614008c3407b1e7a2fb09c",
+    "Cargo.lock": "3f2199ca319135a44c44a4061eb4673b47408d55e078e6f70c9c037c7b20aaf1",
+    "README.md": "d9659423465cb41b53f7777634718e33a7a31060896f6b165df7a6077d43f3e4",
+    "bun.lock": "4d9ab6f982e151aa31966e5f0a9bbc0f15bc695304313c717c0889530245dc0d",
+    "crates/cli/src/bootstrap.rs": "69b65189d5691b0515a076e98722bc4f83bdde0478a918060745245f2ccdbbbb",
+    "crates/cli/src/lifecycle.rs": "bbecb6155feec83ff824696abca1b282c666c57a993c3a5571590e096e18f63c",
+    "crates/cli/src/main.rs": "03d93dba7273a6d938d97a3b9da11f2761dfebc3edd5785d91c2267964a23d0e",
+    "crates/cli/src/supervisor.rs": "c75988684e71a3852dd8d733154ff572c56fc10b4846811075c2ddaca92bac09",
+    "crates/cli/tests/portability.rs": "b028d5e95f817fe7ae0a13addc2832953cf1e7eada3bdcdfff4420a334d39c32",
+    "docs/CONTINUATION-CLOSURE-2026-09-06.md": "cfc62ebfc9305acaaa9ae4a67a4e4209f3cfa5c8541e7175172bb5f2d7b9dd3f",
+    "docs/NODE-OTEL-MIGRATION.md": "0449009de9db6303a95d3452b0b857ce6f8c8aa20376f09e804e1eb015af44ef",
+    "docs/TAKEOVER-2026-09-06.md": "2e69597e8c10f0dc1c608374b15a7cfba496d94e8e50074a58b12a1a40f982a5",
+    "docs/evidence/node-supply-chain-2026-09-06.json": "67438ea2c94372a209b9c661be1d61b9f316d5379607ed311f7e3b82a16e7f05",
+    "docs/evidence/takeover-2026-09-06.json": "85e96c3c9d1bc30ead6ab50f27c68482cecf959565b69fdef7f7901755f0c922",
+    "package.json": "cff7cde861f7cb1ac857f948ff7012bb9ede8de0602aae0370706366a2424e85",
+    "patches/@iii-dev%2Fhelpers@0.22.1.patch": "f1ab5a4ec3f330a2fe422c513d6cfb2ddfc39dff9c8e2990c8078bc99526e0ce",
+    "scripts/boot-smoke.sh": "617facef65ab6dd519077803a46b89c8429a76b94be9d0be5336f380e7cc29ac",
+    "scripts/boot-smoke.test.ts": "ddb97bfc3387736ca74eedcff2e8a91df2f12b8a465c24588183562c2e4e4879",
+    "scripts/fixtures/native-otel-client.mjs": "59f66a524b3774c2636fb5e13ba91afe7fb8a016f5af380d15bc7362b09b98f6",
+    "scripts/fixtures/otel-compatibility.mjs": "66b5929305fbe0b1a074be22bfce3e9ea9583156d00fec12cf101b7c708a3d0a",
+    "scripts/fixtures/otel-support.mjs": "dd0392264ba2a50f9093ed7d162ec433bb3e732ef7a0ded74b0b1237525a1608",
+    "scripts/native-otel.mjs": "3cfa3a768df9bf42390373bb883d256f0aa3d546e48de9a5e571c4aa60d628a6",
+    "scripts/otel-compatibility.test.ts": "9ba83939b55261a225ebe001da60114b3824b8c82efc4f01bca73419a49eaf2c",
+    "tests/governance/reconciliation_contract.test.ts": "4c38ef18aa23094b0ac3164a5a7c20a3c970e797f3a14637ff1e3088090afb1d",
+    "vitest.config.ts": "a866d4d070ec4331fcd873408d5c5d7260a1d64be33f3b640b9f6834da9e253d",
+    "website/components/Hero.tsx": "aafe9821eb90dd72c499df8d01e8e7dac3a1ddde7173fb6907fd57293c81f2db",
+    "workers/channel-slack/src/main.rs": "e6a042e1c7a727d2b965e4f5c8f7f2bb378705ebc4bc55f68a3d54c5746b0a75",
+    "workers/pulse/Cargo.toml": "36a68c966aeb45998fe34faa015f5345115158ba9be080f321c5729b6e3618cf",
+    "workers/pulse/src/main.rs": "f14beb3bfa713be2fa4065d6f16c9374cb3f51c344caa7e7eb1a2fb3559bab10",
+    "workers/pulse/src/schedule.rs": "d1ad510845de22ff4274469cef23d7a8594836259510a76b784ba1bf72d2c850",
+    "workers/pulse/tests/cron-corpus.json": "a78727dca9c789fee6d92aa05f6a3849f8baa87dad407fb7547e7e45904266b5",
+    "workers/security/src/taint.rs": "6afc5eeb02df39c13cf23e6fe49ef8ee4e98def3825306a94644f7e73d6cff68",
+    "workers/vault/src/main.rs": "3193ee9bfaa485f247e03bd1b56c18b2f84ba751ef61362f8fb15367c31448f3"
+  },
+  "pulse_binary_sha256": "9e3d5ea2110c8621f8eb0d417f97949baed6dc7c7f83ea3fd52151111c88ed04",
+  "policy_unchanged": true,
+  "completed_scope": [
+    "cargo-deny without added exceptions",
+    "native iii 0.22.1 OTEL ingestion and teardown"
+  ],
+  "public_ci_claim": false,
+  "published": false,
+  "toolchains": {
+    "rust": "1.90.0",
+    "bun": "1.3.14",
+    "node": "24.18.0",
+    "cargo_deny": "0.20.2"
+  },
+  "checks": {
+    "rust_format": "pass",
+    "rust_clippy_workspace_all_targets_deny_warnings": "pass",
+    "rust_workspace_tests": {
+      "status": "pass",
+      "passed": 2150,
+      "failed": 0,
+      "ignored": 3,
+      "includes_doctests": true
+    },
+    "rust_release_workspace_build": "pass",
+    "rust_source_test_attributes": 2151,
+    "cargo_deny": {
+      "advisories": "pass",
+      "bans": "pass",
+      "licenses": "pass",
+      "sources": "pass"
+    },
+    "rustsec": {
+      "known_vulnerabilities": 0,
+      "database_commit": "5a0ebedfe8bdd2e295b171f4162f8c977bcad9a5",
+      "informational_warning": "RUSTSEC-2025-0057 (fxhash unmaintained)"
+    },
+    "bun_check": "pass",
+    "bun_unit_tests": 214,
+    "bun_governance_tests": 34,
+    "vitest_script_tests": 91,
+    "root_bun_audit": "pass",
+    "website_npm_audit": "pass",
+    "clean_frozen_install_and_compatibility": {
+      "status": "pass",
+      "ignore_scripts": true,
+      "tests": 6
+    }
+  },
+  "pulse": {
+    "removed_dependency": "cron@0.12.1",
+    "replacement": "private UTC due-slot membership only; engine remains scheduler",
+    "corpus_cases": 176,
+    "legacy_accepted_cases": 97,
+    "legacy_exact_ordinal_comparison": "pass",
+    "legacy_calendar_comparisons": 426024,
+    "permanent_pulse_tests": 20,
+    "year_bounds": [
+      1970,
+      2100
+    ],
+    "sunday_ordinal": 1,
+    "day_of_month_and_weekday": "intersection",
+    "policy_exceptions_added": 0
+  },
+  "native_otel": {
+    "engine_version": "0.22.1",
+    "engine_sha256": "44b1dc0c8899c8d30321fdccb149e8c99c316149805b6335daf9042505276cd3",
+    "isolated_runtime": true,
+    "real_engine_ingestion": true,
+    "cases": [
+      {
+        "runtime": "node",
+        "version": "24.18.0",
+        "format": "esm",
+        "traces": true,
+        "correlated_logs": true,
+        "metrics": true,
+        "rpc": true
+      },
+      {
+        "runtime": "node",
+        "version": "24.18.0",
+        "format": "cjs",
+        "traces": true,
+        "correlated_logs": true,
+        "metrics": true,
+        "rpc": true
+      },
+      {
+        "runtime": "bun",
+        "version": "1.3.14",
+        "format": "esm",
+        "traces": true,
+        "correlated_logs": true,
+        "metrics": true,
+        "rpc": true
+      },
+      {
+        "runtime": "bun",
+        "version": "1.3.14",
+        "format": "cjs",
+        "traces": true,
+        "correlated_logs": true,
+        "metrics": true,
+        "rpc": true
+      }
+    ],
+    "engine_exited": true,
+    "listener_closed": true,
+    "scratch_removed": true,
+    "portless_route": "pass",
+    "without_portless_ci_path": "pass",
+    "builtin_daemons_disabled": true,
+    "anonymous_telemetry_disabled": true,
+    "engine_and_sdk_use_allowlisted_env": true,
+    "ci_required_step_added": true
+  },
+  "review": {
+    "initial_background": {
+      "id": "bg-1",
+      "outcome": "timed out without verdict",
+      "stop_requested": true
+    },
+    "bounded_inspector": {
+      "verdict": "APPROVE",
+      "scope": "supplied algorithm and measured evidence only; not an independent source audit"
+    }
+  },
+  "notes": [
+    "The combined Rust runner hit a harness timeout; standalone workspace tests and release build were rerun successfully",
+    "Historical takeover and Node-only evidence remain unchanged",
+    "Rust source attribute count and executed test count are different measurements"
+  ],
+  "limits": [
+    "Native receiver is the real pinned engine in an isolated minimal configuration, not all AgentOS workers",
+    "No new real-provider/channel traffic, public CI, attestation, or release acceptance",
+    "Existing unrelated product/release backlog is outside these two closure items",
+    "No commit, push, merge, tag, repository-security setting changes, or operator-data cleanup"
+  ]
+}

@@ -58,8 +58,7 @@ impl VaultState {
             && key.is_some()
             && last.elapsed() >= Duration::from_millis(self.auto_lock_ms)
         {
-            self.crypto_key = None;
-            self.last_activity = None;
+            self.lock();
         }
     }
 
@@ -67,7 +66,6 @@ impl VaultState {
         self.last_activity = Some(Instant::now());
     }
 
-    #[allow(dead_code)]
     fn lock(&mut self) {
         self.crypto_key = None;
         self.last_activity = None;

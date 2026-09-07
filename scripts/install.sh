@@ -195,6 +195,168 @@ workers_item_indent() {
   '
 }
 
+extract_worker_entry() {
+  local worker="$1"
+  awk -v worker="$worker" '
+    BEGIN { emit = 0; entry_indent = 0 }
+    {
+      match($0, /^[ \t]*/); indent = RLENGTH
+      if (emit && $0 !~ /^[ \t]*$/ && indent <= entry_indent) exit
+      if ($0 ~ "^[ \t]*-[ \t]*name:[ \t]*" worker "[ \t]*$") {
+        emit = 1; entry_indent = indent
+      }
+      if (emit) print
+    }
+  '
+}
+
+normalized_rbac() {
+  awk '
+    function trim(line) { sub(/^[ \t]*/, "", line); sub(/[ \t]*$/, "", line); return line }
+    BEGIN { emit = 0; base = 0 }
+    {
+      line = $0
+      if (line ~ /^[ \t]*#/ || line ~ /^[ \t]*$/) next
+      match(line, /^[ \t]*/); indent = RLENGTH
+      if (!emit && line ~ /^[ \t]*rbac[ \t]*:[ \t]*$/) { emit = 1; base = indent }
+      else if (emit && indent <= base) exit
+      if (emit) print trim(line)
+    }
+  '
+}
+
+normalized_entry() {
+  sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' \
+      -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+EXPECTED_RBAC='rbac:
+auth_function_id: agentos::bus_auth
+on_function_registration_function_id: agentos::bus_on_register
+on_trigger_registration_function_id: agentos::bus_on_trigger
+on_trigger_type_registration_function_id: agentos::bus_on_trigger_type
+expose_functions:
+- match("*")'
+EXPECTED_BRIDGE='- name: iii-bridge
+config:
+url: ws://127.0.0.1:49129
+forward:
+- local_function: agentos::bus_auth
+remote_function: agentos::bus_auth
+timeout_ms: 5000
+- local_function: agentos::bus_on_register
+remote_function: agentos::bus_on_register
+timeout_ms: 5000
+- local_function: agentos::bus_on_trigger
+remote_function: agentos::bus_on_trigger
+timeout_ms: 5000
+- local_function: agentos::bus_on_trigger_type
+remote_function: agentos::bus_on_trigger_type
+timeout_ms: 5000'
+
+# Prints armed, unarmed, or conflict. Only a completely absent topology is
+# migratable; a partial/unknown topology is never overwritten by text surgery.
+security_topology_state() {
+  local config="$1" manager bridge rbac manager_count bridge_count
+  manager_count="$(grep -cE "^[[:space:]]*-[[:space:]]*name:[[:space:]]*${BUS_WORKER}[[:space:]]*$" "$config")"
+  bridge_count="$(grep -cE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*iii-bridge[[:space:]]*$' "$config")"
+  if [ "$manager_count" -gt 1 ] || [ "$bridge_count" -gt 1 ]; then
+    printf 'conflict
+'
+    return
+  fi
+  manager="$(extract_worker_entry "$BUS_WORKER" < "$config")"
+  bridge="$(extract_worker_entry iii-bridge < "$config")"
+  rbac="$(printf '%s\n' "$manager" | normalized_rbac)"
+  if [ -z "$rbac" ] && [ -z "$bridge" ]; then
+    # Inline manager config cannot be extended safely without a YAML parser.
+    if printf '%s\n' "$manager" | grep -Eq '^[[:space:]]*config[[:space:]]*:[[:space:]]*[^[:space:]]'; then
+      printf 'conflict\n'
+    else
+      printf 'unarmed\n'
+    fi
+    return
+  fi
+  if [ "$rbac" = "$EXPECTED_RBAC" ] && \
+      [ "$(printf '%s\n' "$bridge" | normalized_entry)" = "$EXPECTED_BRIDGE" ]; then
+    printf 'armed\n'
+  else
+    printf 'conflict\n'
+  fi
+}
+
+inject_release_rbac() {
+  awk -v worker="$BUS_WORKER" '
+    function pad(width,   out) { out = ""; while (length(out) < width) out = out " "; return out }
+    function add_rbac(   child) {
+      child = config_indent + 2
+      print pad(child) "rbac:"
+      print pad(child + 2) "auth_function_id: agentos::bus_auth"
+      print pad(child + 2) "on_function_registration_function_id: agentos::bus_on_register"
+      print pad(child + 2) "on_trigger_registration_function_id: agentos::bus_on_trigger"
+      print pad(child + 2) "on_trigger_type_registration_function_id: agentos::bus_on_trigger_type"
+      print pad(child + 2) "expose_functions:"
+      print pad(child + 4) "- match(\"*\")"
+    }
+    BEGIN { state = 0 }
+    {
+      line = $0; match(line, /^[ \t]*/); indent = RLENGTH
+      if (state == 2 && line !~ /^[ \t]*$/ && indent <= config_indent) { add_rbac(); state = 1 }
+      if (state > 0 && line !~ /^[ \t]*$/ && indent <= entry_indent) state = 0
+      if (line ~ "^[ \t]*-[ \t]*name:[ \t]*" worker "[ \t]*$") { state = 1; entry_indent = indent }
+      if (state == 1 && line ~ /^[ \t]*config[ \t]*:[ \t]*$/ && indent > entry_indent) {
+        state = 2; config_indent = indent
+      }
+      print line
+    }
+    END { if (state == 2) add_rbac() }
+  '
+}
+
+inject_release_bridge() {
+  local item_indent="$1"
+  awk -v width="$item_indent" '
+    function pad(n,   out) { out = ""; while (length(out) < n) out = out " "; return out }
+    {
+      print
+      if (!done && $0 ~ /^[ \t]*workers[ \t]*:[ \t]*$/) {
+        print pad(width) "- name: iii-bridge"
+        print pad(width + 2) "config:"
+        print pad(width + 4) "url: ws://127.0.0.1:49129"
+        print pad(width + 4) "forward:"
+        add("agentos::bus_auth")
+        add("agentos::bus_on_register")
+        add("agentos::bus_on_trigger")
+        add("agentos::bus_on_trigger_type")
+        done = 1
+      }
+    }
+    function add(id) {
+      print pad(width + 6) "- local_function: " id
+      print pad(width + 8) "remote_function: " id
+      print pad(width + 8) "timeout_ms: 5000"
+    }
+  '
+}
+
+preflight_release_security_defaults() {
+  local release_runtime="$1" installed_runtime="$2" release_config target_config state
+  release_config="$release_runtime/config.yaml"
+  target_config="$installed_runtime/config.yaml"
+  if [ ! -f "$release_config" ] || [ -L "$release_config" ]; then
+    err "release runtime has no regular config.yaml"
+  fi
+  state="$(security_topology_state "$release_config")"
+  [ "$state" = armed ] || err "release config.yaml does not carry the required four-hook bus security topology"
+  [ -e "$target_config" ] || return 0
+  if [ ! -f "$target_config" ] || [ -L "$target_config" ]; then
+    err "installed config.yaml must be a regular file, not a symlink"
+  fi
+  grep -Eq '^[[:space:]]*workers[[:space:]]*:[[:space:]]*$' "$target_config" || return 0
+  state="$(security_topology_state "$target_config")"
+  [ "$state" != conflict ] || err "conflicting bus security topology in ${target_config}; refusing to overwrite operator config"
+}
+
 apply_release_security_defaults() {
     local release_runtime="$1"
     local installed_runtime="$2"
@@ -203,6 +365,7 @@ apply_release_security_defaults() {
     local config="$installed_runtime/config.yaml"
     local removed=""
     local item_indent
+    local topology_state
     local updated
 
     for relative_path in "${RELEASE_GOVERNED_PATHS[@]}"; do
@@ -216,6 +379,8 @@ apply_release_security_defaults() {
     # Only a file that really declares a worker roster is an engine config; an
     # unrelated operator YAML is left byte-for-byte alone.
     grep -Eq '^[[:space:]]*workers[[:space:]]*:[[:space:]]*$' "$config" || return 0
+    topology_state="$(security_topology_state "$config")"
+    [ "$topology_state" != conflict ] || err "conflicting bus security topology in ${config}; refusing to overwrite operator config"
 
     if grep -Eq "^[[:space:]]*-[[:space:]]*name:[[:space:]]*${BUS_WORKER}[[:space:]]*$" "$config" &&
         grep -Eq "^[[:space:]]*config[[:space:]]*:[[:space:]]*[^[:space:]]" "$config"; then
@@ -238,6 +403,10 @@ apply_release_security_defaults() {
     else
         updated="$(printf '%s\n' "$updated" | ensure_bus_binding "$item_indent" 0)"
     fi
+    if [ "$topology_state" = unarmed ]; then
+        updated="$(printf '%s\n' "$updated" | inject_release_rbac)"
+        updated="$(printf '%s\n' "$updated" | inject_release_bridge "$item_indent")"
+    fi
 
     if [ "$updated" = "$(cat "$config")" ]; then
         return 0
@@ -249,9 +418,9 @@ apply_release_security_defaults() {
         warn "Removed release-governed worker entries from ${config}: ${removed}"
         warn "  they expose an arbitrary-command sink and a 0.0.0.0 web console on an unauthenticated bus"
     fi
-    warn "Pinned ${BUS_WORKER} to host ${BUS_HOST} in ${config}"
-    warn "  an undeclared or unpinned bus worker binds 0.0.0.0, which is a remote unauthenticated bus"
-    warn "  your previous file is kept at ${config}.bak; every other entry was left untouched"
+    warn "Applied the release bus security topology and pinned ${BUS_WORKER} to ${BUS_HOST} in ${config}"
+    warn "  the four RBAC hooks fail closed through the loopback iii-bridge/agentos-bus-authd gate"
+    warn "  your previous file is kept at ${config}.bak; safe custom entries were preserved"
 }
 
 download_and_install() {
@@ -290,21 +459,44 @@ download_and_install() {
   fi
 
   tar -xzf "$archive_path" -C "$tmp_dir"
-  [ -x "$tmp_dir/bin/$binary_name" ] \
-    || err "Could not find $binary_name in $asset"
-  [ -d "$tmp_dir/runtime" ] || err "Could not find runtime in $asset"
-
-  mkdir -p "$INSTALL_DIR" "$AGENTOS_HOME"
-  cp "$tmp_dir/bin/$binary_name" "$INSTALL_DIR/$binary_name"
-  chmod +x "$INSTALL_DIR/$binary_name"
-  if [ -x "$tmp_dir/bin/agentos-tui" ]; then
-    cp "$tmp_dir/bin/agentos-tui" "$INSTALL_DIR/agentos-tui"
-    chmod +x "$INSTALL_DIR/agentos-tui"
-  fi
-
   runtime_dir="$AGENTOS_HOME/runtime"
   runtime_stage="$AGENTOS_HOME/runtime.new"
   runtime_retired="$AGENTOS_HOME/runtime.old"
+
+  # Validate every release input consumed below, plus the live topology, before
+  # changing any installed executable or runtime path.
+  local executable relative_path
+  for executable in "$binary_name" agentos-tui agentos-bus-authd; do
+    if [ ! -f "$tmp_dir/bin/$executable" ] || [ -L "$tmp_dir/bin/$executable" ] || [ ! -x "$tmp_dir/bin/$executable" ]; then
+      err "Could not find regular executable $executable in $asset"
+    fi
+  done
+  if [ ! -d "$tmp_dir/runtime" ] || [ -L "$tmp_dir/runtime" ]; then
+    err "Could not find regular runtime directory in $asset"
+  fi
+  if [ ! -f "$tmp_dir/runtime/.iii-version" ] || [ -L "$tmp_dir/runtime/.iii-version" ] || [ ! -s "$tmp_dir/runtime/.iii-version" ]; then
+    err "Release runtime must contain a non-empty regular .iii-version"
+  fi
+  for relative_path in .env.example iii.lock workers/env.allowlist; do
+    if [ ! -f "$tmp_dir/runtime/$relative_path" ] || [ -L "$tmp_dir/runtime/$relative_path" ]; then
+      err "Release runtime input $relative_path must be a regular file"
+    fi
+  done
+  for relative_path in "${RELEASE_GOVERNED_PATHS[@]}"; do
+    if [ -e "$tmp_dir/runtime/$relative_path" ] && { [ ! -f "$tmp_dir/runtime/$relative_path" ] || [ -L "$tmp_dir/runtime/$relative_path" ]; }; then
+      err "Release governance input $relative_path must be a regular file"
+    fi
+  done
+  preflight_release_security_defaults "$tmp_dir/runtime" "$runtime_dir"
+  if [ -d "$runtime_retired" ]; then
+    preflight_release_security_defaults "$tmp_dir/runtime" "$runtime_retired"
+  fi
+
+  mkdir -p "$INSTALL_DIR" "$AGENTOS_HOME"
+  for executable in "$binary_name" agentos-tui agentos-bus-authd; do
+    cp "$tmp_dir/bin/$executable" "$INSTALL_DIR/$executable"
+    chmod +x "$INSTALL_DIR/$executable"
+  done
 
   # Finish an upgrade that was interrupted mid-swap, so operator state is never
   # stranded in the retired tree.

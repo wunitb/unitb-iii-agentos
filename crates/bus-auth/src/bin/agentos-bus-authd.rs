@@ -86,7 +86,8 @@ async fn main() -> anyhow::Result<()> {
 /// The engine accepts an unknown key inside `rbac:` and a hook id nothing
 /// answers, in both cases without an error, so this is the only place the
 /// operator can be told. A config that is not armed at all, or that cannot be
-/// found, is not an error: the shipped default is unarmed.
+/// found, is not an error so the daemon can diagnose legacy or custom configs;
+/// the shipped default is armed.
 fn check_config(explicit: Option<&str>) -> anyhow::Result<()> {
     let Some(source) = config::discover(explicit) else {
         tracing::info!(

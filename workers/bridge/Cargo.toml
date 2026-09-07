@@ -22,3 +22,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
+url.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+
+[dev-dependencies]
+agentos-http-adapter = { workspace = true, features = ["fake-bus"] }

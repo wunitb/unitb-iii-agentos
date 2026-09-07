@@ -147,7 +147,8 @@ async fn handle_webhook(iii: &IIIClient, req: Value) -> Result<Value, Error> {
         .trigger(TriggerRequest {
             function_id: "agent::chat".to_string(),
             payload: json!({
-                "agentId": agent_id,
+                "agentId": &agent_id,
+                "principal": { "agentId": &agent_id },
                 "message": format!("Subject: {subject_display}\n\n{text}"),
                 "sessionId": format!("email:{from}"),
             }),

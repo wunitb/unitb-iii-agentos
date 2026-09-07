@@ -1,0 +1,89 @@
+{
+  "checked_at": "2026-09-06T12:16:08.452Z",
+  "base_commit": "d6a50fa92b6579382af34f18965b1b9628190153",
+  "branch": "fix/takeover-stabilization",
+  "subject": "base plus existing takeover working tree and Node dependency continuation",
+  "public_ci_claim": false,
+  "release_ready": false,
+  "toolchains": {
+    "bun": "1.3.14",
+    "node": "24.18.0",
+    "cargo_deny": "0.20.2"
+  },
+  "dependency_migration": {
+    "iii_sdk": "0.22.1",
+    "iii_helpers": "0.22.1",
+    "opentelemetry_stable": "2.11.0",
+    "opentelemetry_experimental": "0.222.0",
+    "upstream_supported_iii_release": false,
+    "advisory_exceptions_added": false
+  },
+  "checks": {
+    "bun_check": "pass",
+    "node_audits": "pass",
+    "rustsec_audit": "pass",
+    "cargo_deny": "fail",
+    "local_compatibility": {
+      "node_esm": "pass",
+      "node_cjs": "pass",
+      "bun_esm": "pass",
+      "bun_cjs": "pass",
+      "rpc_trace_baggage_and_three_otel_signals": true
+    },
+    "fresh_install": {
+      "status": "pass",
+      "frozen_lockfile": true,
+      "ignore_scripts": true,
+      "compatibility_tests_passed": 5,
+      "fixture_directory_removed": true
+    },
+    "bun_unit_tests_passed": 213,
+    "bun_governance_tests_passed": 34,
+    "vitest_script_tests_passed": 90
+  },
+  "rustsec": {
+    "database": {
+      "advisory-count": 1239,
+      "last-commit": "5a0ebedfe8bdd2e295b171f4162f8c977bcad9a5",
+      "last-updated": "2026-09-02T11:13:32+02:00"
+    },
+    "vulnerability_count": 0,
+    "informational_advisories": [
+      "RUSTSEC-2025-0057"
+    ]
+  },
+  "cargo_deny_failure": {
+    "kind": "duplicate",
+    "crate": "nom",
+    "versions": [
+      "7.1.3",
+      "8.0.0"
+    ],
+    "consumers": [
+      "cron@0.12.1 -> agentos-pulse",
+      "lettre@0.11.23 -> agentos-channel-email"
+    ],
+    "other_checks": "advisories, licenses and sources passed",
+    "policy_unchanged": true
+  },
+  "limits": [
+    "WebSocket receiver is a fixture, not native iii engine ingestion",
+    "No additional real-provider/channel traffic or native artifact acceptance",
+    "No full Rust build/test rerun in this dependency-only continuation",
+    "Other Node/runtime targets not verified",
+    "No publication or repository-security setting changes"
+  ],
+  "source_sha256": {
+    "package.json": "1b07634752ecb961e223b3a26589b87477bbe559129931fdf57100f641d25547",
+    "bun.lock": "4d9ab6f982e151aa31966e5f0a9bbc0f15bc695304313c717c0889530245dc0d",
+    "patches/@iii-dev%2Fhelpers@0.22.1.patch": "f1ab5a4ec3f330a2fe422c513d6cfb2ddfc39dff9c8e2990c8078bc99526e0ce",
+    "scripts/otel-compatibility.test.ts": "8a20a2bd639425cf9912d4e16604d2cbea9ea81dc0c626fd0e35b94705a98939",
+    "scripts/fixtures/otel-compatibility.mjs": "3ea58a1c4a9fbe255a2fda3817a7042a4b35e63a6e4e7453d41dd9dffc1497f0",
+    "tests/governance/reconciliation_contract.test.ts": "4c38ef18aa23094b0ac3164a5a7c20a3c970e797f3a14637ff1e3088090afb1d",
+    "docs/NODE-OTEL-MIGRATION.md": "beab02ccfdba70276c366b794c2973126033b857324717584c8d1306f5a54e67",
+    "docs/TAKEOVER-2026-09-06.md": "0e4bc17123ef227170c7c897cba92765cedf33999a3ec50fb0aec730d880510c",
+    "Cargo.lock": "33777793a18bbce438fffc920cba5db512782dd3065a2d952f88b690d6411f25"
+  },
+  "previous_takeover_evidence": "takeover-2026-09-06.json",
+  "source_sha256_scope": "continuation files, updated handoff, and unchanged Rust lockfile; previous takeover source hashes remain in the prior evidence"
+}

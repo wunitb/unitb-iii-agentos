@@ -31,6 +31,8 @@ async function upgradeFixture(
   const iiiVersion = (
     await Bun.file(new URL(".iii-version", repository)).text()
   ).trim();
+  const releaseVersion = (await Bun.file(new URL("package.json", repository)).json()).version;
+  const releaseConfig = `release: default\n${await Bun.file(new URL("config.yaml", repository)).text()}`;
   sandboxes.push(root);
   const home = join(root, "home");
   const agentosHome = join(home, ".agentos");
@@ -63,7 +65,10 @@ async function upgradeFixture(
     writeFile(join(runtime, ".env"), "ANTHROPIC_API_KEY=preserve-me\n"),
     writeFile(join(runtime, "stale-release-file"), "remove me\n"),
     writeFile(join(payload, "runtime", ".iii-version"), `${iiiVersion}\n`),
-    writeFile(join(payload, "runtime", "config.yaml"), "release: default\n"),
+    writeFile(join(payload, "runtime", "config.yaml"), releaseConfig),
+    ...[".env.example", "iii.lock", "workers/env.allowlist"].map(async (relative) =>
+      writeFile(join(payload, "runtime", relative), await Bun.file(new URL(relative, repository)).text()),
+    ),
     writeFile(join(payload, "runtime", "config", "state.yaml"), "release default\n"),
     writeFile(
       join(payload, "runtime", "config", "shell.yaml"),
@@ -72,13 +77,15 @@ async function upgradeFixture(
     writeFile(join(payload, "runtime", "data", "default.db"), "release default\n"),
     writeFile(join(payload, "runtime", "workers", "fresh", "iii.worker.yaml"), "name: fresh\n"),
   ]);
-  await executable(join(payload, "bin", "agentos"), "#!/bin/sh\nexit 0\n");
+  for (const binary of ["agentos", "agentos-tui", "agentos-bus-authd"]) {
+    await executable(join(payload, "bin", binary), "#!/bin/sh\nexit 0\n");
+  }
   await executable(
     join(stubs, "iii"),
     `#!/bin/sh\nprintf '${iiiVersion}\\n'\n`,
   );
   await executable(join(stubs, "iii-worker"), "#!/bin/sh\nexit 0\n");
-    await executable(
+  await executable(
     join(stubs, "curl"),
     `#!/bin/sh
 set -eu
@@ -118,7 +125,7 @@ esac
       HOME: home,
       AGENTOS_HOME: agentosHome,
       BIN_DIR: bin,
-      AGENTOS_VERSION: "v0.1.0",
+      AGENTOS_VERSION: `v${releaseVersion}`,
       AGENTOS_TEST_ARCHIVE: archive,
       PATH: `${stubs}:${bin}:${Bun.env.PATH ?? ""}`,
       SHELL: "/bin/sh",
@@ -132,7 +139,7 @@ esac
     process.exited,
   ]);
   expect(exitCode, `${stdout}\n${stderr}`).toBe(0);
-  return { runtime };
+  return { runtime, releaseConfig };
 }
 
 afterEach(async () => {
@@ -197,12 +204,12 @@ describe("installer upgrade portability", () => {
   });
 
   it("uses release defaults when no previous runtime exists", async () => {
-    const { runtime } = await upgradeFixture(async ({ runtime }) => {
+    const { runtime, releaseConfig } = await upgradeFixture(async ({ runtime }) => {
       await rm(runtime, { recursive: true, force: true });
     });
 
     expect(await readFile(join(runtime, "config.yaml"), "utf8")).toBe(
-      "release: default\n",
+      releaseConfig,
     );
     expect(await readFile(join(runtime, "config", "state.yaml"), "utf8")).toBe(
       "release default\n",

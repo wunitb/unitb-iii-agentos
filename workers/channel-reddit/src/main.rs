@@ -200,7 +200,8 @@ async fn webhook_handler(
         .trigger(TriggerRequest {
             function_id: "agent::chat".to_string(),
             payload: json!({
-                "agentId": agent_id,
+                "agentId": &agent_id,
+                "principal": { "agentId": &agent_id },
                 "message": text,
                 "sessionId": format!("reddit:{session_anchor}"),
             }),

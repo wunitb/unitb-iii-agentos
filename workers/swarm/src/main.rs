@@ -1,4 +1,4 @@
-use agentos_http_adapter::principal;
+use agentos_http_adapter::{TriggerBus, principal};
 use iii_sdk::errors::Error;
 use iii_sdk::{IIIClient, RegisterFunction, protocol::TriggerRequest, register_worker};
 use serde_json::{Value, json};
@@ -115,6 +115,34 @@ fn normalize_swarm_input(input: Value) -> Value {
     body
 }
 
+fn expected_bearer() -> Option<String> {
+    agentos_bus_auth::policy::expected_api_key()
+}
+
+async fn authorize_principal_for_agents(
+    iii: &dyn TriggerBus,
+    caller: &principal::Principal,
+    agent_ids: &[String],
+) -> Result<Vec<String>, Error> {
+    let mut authorized = Vec::with_capacity(agent_ids.len());
+    for agent_id in agent_ids {
+        authorized.push(
+            principal::acting_agent(iii, caller, &json!({ "agentId": agent_id }), agent_id).await?,
+        );
+    }
+    Ok(authorized)
+}
+
+async fn authorize_named_agents(
+    iii: &dyn TriggerBus,
+    input: &Value,
+    agent_ids: &[String],
+    expected_bearer: Option<&str>,
+) -> Result<Vec<String>, Error> {
+    let caller = principal::resolve(input, expected_bearer)?;
+    authorize_principal_for_agents(iii, &caller, agent_ids).await
+}
+
 fn swarm_prompt(swarm: &SwarmConfig, agent_id: &str) -> String {
     format!(
         "You are member {agent_id} of swarm {}. The shared goal is:\n{}\n\nInvestigate independently. Return one concrete, actionable proposal with supporting evidence, assumptions, and risks. Do not claim evidence you did not observe.",
@@ -143,6 +171,7 @@ async fn call_swarm_agent(
             function_id: "agent::chat".to_string(),
             payload: json!({
                 "agentId": agent_id,
+                "principal": { "agentId": agent_id },
                 "message": message,
                 "sessionId": format!("swarm:{}:{agent_id}", swarm.id),
             }),
@@ -257,7 +286,7 @@ async fn run_swarm(iii: IIIClient, swarm: SwarmConfig) -> Result<(), Error> {
     while let Some(result) = tasks.join_next().await {
         match result {
             Ok((agent_id, Ok(content))) => {
-                broadcast(
+                record_broadcast(
                     &iii,
                     BroadcastRequest {
                         swarm_id: swarm.id.clone(),
@@ -273,7 +302,7 @@ async fn run_swarm(iii: IIIClient, swarm: SwarmConfig) -> Result<(), Error> {
             Ok((agent_id, Err(error))) => {
                 let detail = format!("{agent_id}: {error}");
                 errors.push(detail.clone());
-                broadcast(
+                record_broadcast(
                     &iii,
                     BroadcastRequest {
                         swarm_id: swarm.id.clone(),
@@ -309,7 +338,7 @@ async fn run_swarm(iii: IIIClient, swarm: SwarmConfig) -> Result<(), Error> {
             );
             match call_swarm_agent(&iii, &swarm, coordinator, message, remaining).await {
                 Ok(content) => {
-                    broadcast(
+                    record_broadcast(
                         &iii,
                         BroadcastRequest {
                             swarm_id: swarm.id.clone(),
@@ -339,6 +368,9 @@ async fn run_swarm(iii: IIIClient, swarm: SwarmConfig) -> Result<(), Error> {
     .await
 }
 
+/// Resume only swarms whose members were authorized before the config was
+/// persisted. Direct mutation of the shared state scope can still forge a
+/// replay until the bus policy protects state mutation functions.
 async fn rehydrate_swarms(iii: &IIIClient) -> Result<(), Error> {
     let mut last_error = None;
     let mut entries = None;
@@ -396,7 +428,12 @@ async fn rehydrate_swarms(iii: &IIIClient) -> Result<(), Error> {
     Ok(())
 }
 
-async fn create_swarm(iii: &IIIClient, req: CreateSwarmRequest) -> Result<Value, Error> {
+async fn create_swarm(
+    iii: &IIIClient,
+    req: CreateSwarmRequest,
+    caller_input: &Value,
+    expected_bearer: Option<&str>,
+) -> Result<Value, Error> {
     let goal = req
         .goal
         .map(|goal| goal.trim().to_string())
@@ -422,6 +459,7 @@ async fn create_swarm(iii: &IIIClient, req: CreateSwarmRequest) -> Result<Value,
     if unique_agents.len() != agent_ids.len() {
         return Err(Error::Handler("agentIds must be unique".to_string()));
     }
+    let agent_ids = authorize_named_agents(iii, caller_input, &agent_ids, expected_bearer).await?;
     let mut missing_agents = Vec::new();
     for agent_id in &agent_ids {
         if state_get(iii, "agents", agent_id).await?.is_none() {
@@ -505,7 +543,7 @@ async fn create_swarm(iii: &IIIClient, req: CreateSwarmRequest) -> Result<Value,
     }))
 }
 
-async fn broadcast(iii: &IIIClient, req: BroadcastRequest) -> Result<Value, Error> {
+async fn record_broadcast(iii: &IIIClient, req: BroadcastRequest) -> Result<Value, Error> {
     let safe_swarm_id = sanitize_id(&req.swarm_id).map_err(Error::Handler)?;
     let safe_agent_id = sanitize_id(&req.agent_id).map_err(Error::Handler)?;
 
@@ -692,7 +730,13 @@ fn findings_memory_payload(swarm_id: &str, agent_id: &str, summary: &str) -> Val
     })
 }
 
-async fn dissolve(iii: &IIIClient, req: DissolveRequest) -> Result<Value, Error> {
+async fn dissolve(
+    iii: &IIIClient,
+    req: DissolveRequest,
+    caller_input: &Value,
+    expected_bearer: Option<&str>,
+) -> Result<Value, Error> {
+    let caller = principal::resolve(caller_input, expected_bearer)?;
     let safe_swarm_id = sanitize_id(&req.swarm_id).map_err(Error::Handler)?;
 
     let swarm_val = state_get(iii, "swarms", &safe_swarm_id)
@@ -700,6 +744,7 @@ async fn dissolve(iii: &IIIClient, req: DissolveRequest) -> Result<Value, Error>
         .ok_or_else(|| Error::Handler(format!("Swarm {safe_swarm_id} not found")))?;
     let mut swarm: SwarmConfig =
         serde_json::from_value(swarm_val).map_err(|e| Error::Handler(e.to_string()))?;
+    authorize_principal_for_agents(iii, &caller, &swarm.agent_ids).await?;
 
     let findings = collect(
         iii,
@@ -771,9 +816,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_clone.clone();
             async move {
-                let req: CreateSwarmRequest = serde_json::from_value(normalize_swarm_input(input))
-                    .map_err(|error| Error::Handler(error.to_string()))?;
-                create_swarm(&iii, req).await
+                let req: CreateSwarmRequest =
+                    serde_json::from_value(normalize_swarm_input(input.clone()))
+                        .map_err(|error| Error::Handler(error.to_string()))?;
+                create_swarm(&iii, req, &input, expected_bearer().as_deref()).await
             }
         })
         .description("Create a new decentralized agent swarm"),
@@ -785,9 +831,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_clone.clone();
             async move {
-                let req: BroadcastRequest = serde_json::from_value(normalize_swarm_input(input))
-                    .map_err(|error| Error::Handler(error.to_string()))?;
-                broadcast(&iii, req).await
+                let req: BroadcastRequest =
+                    serde_json::from_value(normalize_swarm_input(input.clone()))
+                        .map_err(|error| Error::Handler(error.to_string()))?;
+                authorize_named_agents(
+                    &iii,
+                    &input,
+                    std::slice::from_ref(&req.agent_id),
+                    expected_bearer().as_deref(),
+                )
+                .await?;
+                record_broadcast(&iii, req).await
             }
         })
         .description("Broadcast a message to all agents in a swarm"),
@@ -827,9 +881,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RegisterFunction::new_async(move |input: Value| {
             let iii = iii_clone.clone();
             async move {
-                let req: DissolveRequest = serde_json::from_value(normalize_swarm_input(input))
-                    .map_err(|error| Error::Handler(error.to_string()))?;
-                dissolve(&iii, req).await
+                let req: DissolveRequest =
+                    serde_json::from_value(normalize_swarm_input(input.clone()))
+                        .map_err(|error| Error::Handler(error.to_string()))?;
+                dissolve(&iii, req, &input, expected_bearer().as_deref()).await
             }
         })
         .description("Dissolve a swarm and archive its findings"),
@@ -877,6 +932,92 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn named_swarm_agents_are_bound_to_the_caller_before_state_or_chat() {
+        use agentos_http_adapter::fake::FakeBus;
+        let targets = vec!["victim".to_string()];
+        for input in [json!({}), json!({ "principal": {} })] {
+            let bus = FakeBus::new();
+            assert!(
+                authorize_named_agents(&bus, &input, &targets, Some("key"))
+                    .await
+                    .is_err()
+            );
+            assert!(bus.calls().is_empty());
+        }
+
+        let self_bus = FakeBus::new();
+        assert_eq!(
+            authorize_named_agents(
+                &self_bus,
+                &json!({ "principal": principal::as_agent("caller") }),
+                &["caller".into()],
+                None
+            )
+            .await
+            .unwrap(),
+            vec!["caller"]
+        );
+        assert!(self_bus.calls().is_empty());
+
+        let denied = FakeBus::new();
+        assert!(
+            authorize_named_agents(
+                &denied,
+                &json!({ "principal": principal::as_agent("caller") }),
+                &targets,
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(denied.call_count("security::check_capability"), 1);
+        assert_eq!(denied.call_count("state::get"), 0);
+        assert_eq!(denied.call_count("agent::chat"), 0);
+
+        let granted = FakeBus::new();
+        granted.on("security::check_capability", |input| Ok(json!({
+            "allowed": input["agentId"] == "caller" && input["resource"] == "grant::act_as::victim"
+        })));
+        assert_eq!(
+            authorize_named_agents(
+                &granted,
+                &json!({ "principal": principal::as_agent("caller") }),
+                &targets,
+                None
+            )
+            .await
+            .unwrap(),
+            targets
+        );
+
+        let operator = FakeBus::new();
+        assert_eq!(
+            authorize_named_agents(
+                &operator,
+                &json!({ "headers": { "authorization": "Bearer key" } }),
+                &["victim".into()],
+                Some("key")
+            )
+            .await
+            .unwrap(),
+            vec!["victim"]
+        );
+
+        let forged = principal::attach_agent(
+            "swarm::create",
+            json!({ "agentIds": ["victim"], "principal": principal::as_agent("victim"), "headers": { "authorization": "Bearer key" } }),
+            "caller",
+        );
+        let forged_bus = FakeBus::new();
+        assert!(
+            authorize_named_agents(&forged_bus, &forged, &["victim".into()], Some("key"))
+                .await
+                .is_err()
+        );
+        assert_eq!(forged_bus.call_count("security::check_capability"), 1);
+    }
 
     #[test]
     fn findings_are_stored_on_behalf_of_the_member_that_owns_them() {

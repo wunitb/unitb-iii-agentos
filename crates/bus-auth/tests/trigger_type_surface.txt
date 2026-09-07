@@ -15,7 +15,7 @@
 # Regenerate (iii 0.22.1, ~40 s):
 #   1. cargo +1.90 build -p agentos-bus-auth
 #   2. AGENTOS_API_KEY=<key> RUST_LOG=debug agentos-bus-authd --listen=127.0.0.1:49129
-#   3. boot `iii` with config.yaml + bus-rbac.overlay.yaml merged in
+#   3. boot `iii` with the default-armed config.yaml after the daemon is listening
 #   4. sed -n 's/.*allowed trigger type registration trigger_type_id=\([^ ]*\).*/\1/p' \
 #        authd.log | sort -u      # and confirm `refused trigger type` never appears
 #

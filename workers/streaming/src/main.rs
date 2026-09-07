@@ -131,7 +131,20 @@ fn chat_message(body: &Value) -> Result<String, Error> {
         .ok_or_else(|| Error::Handler("a non-empty message is required".into()))
 }
 
-fn agent_chat_payload(body: &Value, message: &str) -> Value {
+fn agent_chat_payload(input: &Value, body: &Value, message: &str) -> Value {
+    let mut headers = serde_json::Map::new();
+    if let Some((name, value)) =
+        input
+            .get("headers")
+            .and_then(Value::as_object)
+            .and_then(|headers| {
+                headers.iter().find(|(name, value)| {
+                    name.eq_ignore_ascii_case("authorization") && value.is_string()
+                })
+            })
+    {
+        headers.insert(name.clone(), value.clone());
+    }
     json!({
         "agentId": body["agentId"].as_str().unwrap_or("default"),
         "message": message,
@@ -139,6 +152,7 @@ fn agent_chat_payload(body: &Value, message: &str) -> Value {
         "systemPrompt": body.get("systemPrompt").cloned().unwrap_or(Value::Null),
         "provider": body.get("provider").cloned().unwrap_or(Value::Null),
         "model": body.get("model").cloned().unwrap_or(Value::Null),
+        "headers": headers,
     })
 }
 
@@ -166,10 +180,15 @@ fn stream_chat_response(response: &Value) -> Value {
     body
 }
 
-async fn agent_chat(iii: &IIIClient, body: &Value, message: &str) -> Result<Value, Error> {
+async fn agent_chat(
+    iii: &IIIClient,
+    input: &Value,
+    body: &Value,
+    message: &str,
+) -> Result<Value, Error> {
     iii.trigger(chat_trigger(
         "agent::chat",
-        agent_chat_payload(body, message),
+        agent_chat_payload(input, body, message),
     ))
     .await
     .map_err(|error| Error::Handler(error.to_string()))
@@ -180,7 +199,7 @@ async fn agent_chat(iii: &IIIClient, body: &Value, message: &str) -> Result<Valu
 async fn stream_chat(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let body = payload_body(&input);
     let message = chat_message(&body)?;
-    let response = agent_chat(iii, &body, &message).await?;
+    let response = agent_chat(iii, &input, &body, &message).await?;
     Ok(stream_chat_response(&response))
 }
 
@@ -204,7 +223,7 @@ async fn chat_completion(iii: &IIIClient, input: Value) -> Result<Value, Error> 
     let message = latest_user_message(&body)?;
     let requested_model = body["model"].as_str().unwrap_or("agentos-default");
 
-    let response = agent_chat(iii, &body, &message).await?;
+    let response = agent_chat(iii, &input, &body, &message).await?;
 
     let content = response.get("content").cloned().unwrap_or(Value::Null);
     let model = response["model"].as_str().unwrap_or(requested_model);
@@ -286,7 +305,7 @@ fn sse_envelope(sse_body: String) -> Value {
 async fn stream_sse(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let body = payload_body(&input);
     let message = chat_message(&body)?;
-    let response = agent_chat(iii, &body, &message).await?;
+    let response = agent_chat(iii, &input, &body, &message).await?;
 
     let content = response["content"].as_str().unwrap_or("");
     let model = response["model"].as_str().unwrap_or("agentos-default");
@@ -395,8 +414,27 @@ mod tests {
     }
 
     #[test]
+    fn agent_chat_payload_forwards_operator_authorization_headers() {
+        let input = json!({
+            "body": { "agentId": "agent-1", "message": "hello" },
+            "headers": { "authorization": "Bearer operator-key", "x-untrusted": "drop" },
+        });
+        let payload = agent_chat_payload(&input, &payload_body(&input), "hello");
+        assert_eq!(
+            payload["headers"],
+            json!({ "authorization": "Bearer operator-key" })
+        );
+        assert!(payload.get("principal").is_none());
+    }
+
+    #[test]
     fn agent_chat_payload_forwards_route_preferences() {
         let payload = agent_chat_payload(
+            &json!({
+                "agentId": "agent-1",
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+            }),
             &json!({
                 "agentId": "agent-1",
                 "provider": "codex",
@@ -414,12 +452,13 @@ mod tests {
     fn agent_chat_payload_carries_the_session_and_defaults_the_agent() {
         let with_session = agent_chat_payload(
             &json!({ "agentId": "agent-1", "sessionId": "tui-1", "systemPrompt": "be brief" }),
+            &json!({ "agentId": "agent-1", "sessionId": "tui-1", "systemPrompt": "be brief" }),
             "hello",
         );
         assert_eq!(with_session["sessionId"], "tui-1");
         assert_eq!(with_session["systemPrompt"], "be brief");
 
-        let without_session = agent_chat_payload(&json!({}), "hello");
+        let without_session = agent_chat_payload(&json!({}), &json!({}), "hello");
         assert_eq!(without_session["agentId"], "default");
         assert_eq!(without_session["sessionId"], Value::Null);
         assert_eq!(without_session["provider"], Value::Null);

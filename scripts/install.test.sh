@@ -223,9 +223,40 @@ make_release() {
 
   printf '#!/bin/sh\necho "agentos %s"\n' "$tag" > "$stage/bin/agentos"
   printf '#!/bin/sh\necho "agentos-tui %s"\n' "$tag" > "$stage/bin/agentos-tui"
-  chmod +x "$stage/bin/agentos" "$stage/bin/agentos-tui"
+  printf '#!/bin/sh\necho "agentos-bus-authd %s"\n' "$tag" > "$stage/bin/agentos-bus-authd"
+  chmod +x "$stage/bin/agentos" "$stage/bin/agentos-tui" "$stage/bin/agentos-bus-authd"
 
-  printf 'release: "%s"\n' "$tag" > "$stage/runtime/config.yaml"
+  cat > "$stage/runtime/config.yaml" <<EOF
+# release: "$tag"
+workers:
+  - name: iii-worker-manager
+    config:
+      host: 127.0.0.1
+      rbac:
+        auth_function_id: agentos::bus_auth
+        on_function_registration_function_id: agentos::bus_on_register
+        on_trigger_registration_function_id: agentos::bus_on_trigger
+        on_trigger_type_registration_function_id: agentos::bus_on_trigger_type
+        expose_functions:
+          - match("*")
+  - name: iii-bridge
+    config:
+      url: ws://127.0.0.1:49129
+      forward:
+        - local_function: agentos::bus_auth
+          remote_function: agentos::bus_auth
+          timeout_ms: 5000
+        - local_function: agentos::bus_on_register
+          remote_function: agentos::bus_on_register
+          timeout_ms: 5000
+        - local_function: agentos::bus_on_trigger
+          remote_function: agentos::bus_on_trigger
+          timeout_ms: 5000
+        - local_function: agentos::bus_on_trigger_type
+          remote_function: agentos::bus_on_trigger_type
+          timeout_ms: 5000
+  - name: state
+EOF
   printf 'release = "%s"\n' "$tag" > "$stage/runtime/config/default.toml"
   printf 'name: echo\nruntime: rust\n' > "$stage/runtime/workers/echo/iii.worker.yaml"
   printf '%s\n' "$tag" > "$stage/runtime/RELEASE"
@@ -233,6 +264,9 @@ make_release() {
   # to continue without it, so the release fixture must ship it like the real
   # bundle does (.iii-version at the repository root).
   printf '%s\n' "$III_PINNED_VERSION" > "$stage/runtime/.iii-version"
+  printf 'AGENTOS_API_KEY=\nAUDIT_HMAC_KEY=\n' > "$stage/runtime/.env.example"
+  printf 'version = 1\n' > "$stage/runtime/iii.lock"
+  printf 'echo=III_URL,AGENTOS_API_KEY\n' > "$stage/runtime/workers/env.allowlist"
 
   for extra in "$@"; do
     mkdir -p "$stage/runtime/$(dirname "$extra")"
@@ -279,11 +313,51 @@ test_fresh_install_places_binaries_and_runtime() {
 
   assert_exists "$BIN_DIR/agentos" fresh_install
   assert_exists "$BIN_DIR/agentos-tui" fresh_install
+  assert_exists "$BIN_DIR/agentos-bus-authd" fresh_install
   [ -x "$BIN_DIR/agentos" ] || fail "fresh_install: agentos is not executable"
+  [ -x "$BIN_DIR/agentos-bus-authd" ] || fail "fresh_install: agentos-bus-authd is not executable"
   assert_file_content "$AGENTOS_HOME/runtime/RELEASE" "1.0.0" fresh_install
   assert_exists "$AGENTOS_HOME/runtime/workers/echo/iii.worker.yaml" fresh_install
   assert_absent "$AGENTOS_HOME/runtime.new" fresh_install
   assert_absent "$AGENTOS_HOME/runtime.old" fresh_install
+}
+
+test_fresh_install_authd_is_discovered_by_real_cli() {
+  make_release v1.0.0
+  local stage="$SANDBOX/stage-v1.0.0"
+  local real_cli="$REPO_ROOT/target/debug/agentos"
+  local marker="$SANDBOX/authd.discovered"
+  local log="$SANDBOX/authd-discovery.log"
+  local auth_addr
+  auth_addr="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+  if [ ! -x "$real_cli" ]; then
+    fail "authd_discovery: native copied CLI fixture is missing: $real_cli"
+    return
+  fi
+  cp "$real_cli" "$stage/bin/agentos"
+  cat > "$stage/bin/agentos-bus-authd" <<EOF
+#!/bin/sh
+echo discovered > "$marker"
+exec sleep 30
+EOF
+  chmod +x "$stage/bin/agentos" "$stage/bin/agentos-bus-authd"
+  tar -czf "$AGENTOS_TEST_FIXTURE_DIR/release.tar.gz" -C "$stage" bin runtime
+
+  run_installer v1.0.0 || return
+  [ -x "$BIN_DIR/agentos-bus-authd" ] \
+    || fail "authd_discovery: installed authd is missing or not executable"
+
+  AGENTOS_CONFIG="$AGENTOS_HOME/runtime/config.yaml" \
+    AGENTOS_BUS_AUTH_ADDR="127.0.0.1:$auth_addr" \
+    AGENTOS_VERSION=v1.0.0 \
+    "$BIN_DIR/agentos" up --no-tui --timeout 1 > "$log" 2>&1
+  if [ ! -f "$marker" ]; then
+    fail "authd_discovery: real installed CLI did not discover/start its sibling authd"
+    sed 's/^/       | /' "$log" >&2
+  fi
+  if grep -q 'agentos-bus-authd was not found' "$log"; then
+    fail "authd_discovery: real installed CLI reported its sibling authd missing"
+  fi
 }
 
 test_fresh_install_resolves_latest_release() {
@@ -376,7 +450,7 @@ OPERATOR
 
 # A config that already satisfies every release-governed rule is not rewritten:
 # no backup, no reformatting, no gratuitous churn on upgrade.
-test_upgrade_keeps_a_clean_config_untouched() {
+test_upgrade_migrates_unarmed_config_to_secure_topology() {
   make_release v1.0.0
   run_installer v1.0.0 || return
 
@@ -385,17 +459,37 @@ workers:
   - name: iii-worker-manager
     config:
       host: 127.0.0.1
+      port: 49134
+      handshake_timeout_ms: 7000
   - name: state
+  - name: operator-worker
 user: true
 OPERATOR
-  local before
-  before="$(cat "$AGENTOS_HOME/runtime/config.yaml")"
 
   make_release v2.0.0
   run_installer v2.0.0 || return
 
-  assert_file_content "$AGENTOS_HOME/runtime/config.yaml" "$before" clean_config
-  assert_absent "$AGENTOS_HOME/runtime/config.yaml.bak" clean_config
+  local config="$AGENTOS_HOME/runtime/config.yaml"
+  for expected in \
+    "auth_function_id: agentos::bus_auth" \
+    "on_function_registration_function_id: agentos::bus_on_register" \
+    "on_trigger_registration_function_id: agentos::bus_on_trigger" \
+    "on_trigger_type_registration_function_id: agentos::bus_on_trigger_type" \
+    "- name: iii-bridge" \
+    "url: ws://127.0.0.1:49129"; do
+    assert_file_contains "$config" "$expected" secure_migration
+  done
+  assert_file_contains "$config" "port: 49134" secure_migration
+  assert_file_contains "$config" "handshake_timeout_ms: 7000" secure_migration
+  assert_file_contains "$config" "operator-worker" secure_migration
+  assert_file_contains "$config" "user: true" secure_migration
+  assert_exists "$config.bak" secure_migration
+
+  # A second upgrade is idempotent and does not add duplicate topology.
+  make_release v3.0.0
+  run_installer v3.0.0 || return
+  assert_equal "$(grep -c 'auth_function_id: agentos::bus_auth' "$config")" "1" secure_idempotent
+  assert_equal "$(grep -cE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*iii-bridge[[:space:]]*$' "$config")" "1" secure_idempotent
 }
 
 # Regression: the engine bus worker is mandatory. If config.yaml does not
@@ -455,6 +549,111 @@ OPERATOR
   assert_file_contains "$config" "port: 49134" bus_host
   assert_file_contains "$config" "handshake_timeout_ms: 5000" bus_host
   assert_file_contains "$config.bak" "host: 0.0.0.0" bus_host
+}
+
+test_upgrade_refuses_missing_required_runtime_inputs_before_mutation() {
+  make_release v1.0.0
+  run_installer v1.0.0 || return
+
+  local runtime_before binaries_before required stage status log label
+  runtime_before="$(tree_manifest "$AGENTOS_HOME/runtime")"
+  binaries_before="$(tree_manifest "$BIN_DIR")"
+  for required in .env.example iii.lock workers/env.allowlist; do
+    make_release v2.0.0
+    stage="$SANDBOX/stage-v2.0.0"
+    rm "$stage/runtime/$required"
+    tar -czf "$AGENTOS_TEST_FIXTURE_DIR/release.tar.gz" -C "$stage" bin runtime
+    label="missing_${required//\//_}"
+    log="$SANDBOX/$label.log"
+    AGENTOS_VERSION=v2.0.0 bash "$INSTALLER" > "$log" 2>&1
+    status=$?
+    if [ "$status" -eq 0 ]; then
+      fail "$label: installer accepted a release without $required"
+    fi
+    assert_equal "$(tree_manifest "$AGENTOS_HOME/runtime")" "$runtime_before" "${label}_runtime"
+    assert_equal "$(tree_manifest "$BIN_DIR")" "$binaries_before" "${label}_binaries"
+    assert_absent "$AGENTOS_HOME/runtime.new" "$label"
+    assert_absent "$AGENTOS_HOME/runtime.old" "$label"
+  done
+}
+
+test_upgrade_refuses_directory_iii_version_before_mutation() {
+  make_release v1.0.0
+  run_installer v1.0.0 || return
+
+  local runtime_before binaries_before stage status log
+  runtime_before="$(tree_manifest "$AGENTOS_HOME/runtime")"
+  binaries_before="$(tree_manifest "$BIN_DIR")"
+  make_release v2.0.0
+  stage="$SANDBOX/stage-v2.0.0"
+  rm "$stage/runtime/.iii-version"
+  mkdir "$stage/runtime/.iii-version"
+  printf 'not-a-file\n' > "$stage/runtime/.iii-version/payload"
+  tar -czf "$AGENTOS_TEST_FIXTURE_DIR/release.tar.gz" -C "$stage" bin runtime
+  log="$SANDBOX/directory-iii-version.log"
+  AGENTOS_VERSION=v2.0.0 bash "$INSTALLER" > "$log" 2>&1
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    fail "directory_iii_version: installer accepted a directory as .iii-version"
+  fi
+  assert_equal "$(tree_manifest "$AGENTOS_HOME/runtime")" "$runtime_before" directory_iii_version_runtime
+  assert_equal "$(tree_manifest "$BIN_DIR")" "$binaries_before" directory_iii_version_binaries
+  assert_absent "$AGENTOS_HOME/runtime.new" directory_iii_version
+  assert_absent "$AGENTOS_HOME/runtime.old" directory_iii_version
+}
+
+test_upgrade_refuses_missing_authd_before_mutation() {
+  make_release v1.0.0
+  run_installer v1.0.0 || return
+
+  local runtime_before binaries_before status log stage
+  runtime_before="$(tree_manifest "$AGENTOS_HOME/runtime")"
+  binaries_before="$(tree_manifest "$BIN_DIR")"
+  make_release v2.0.0
+  stage="$SANDBOX/stage-v2.0.0"
+  rm "$stage/bin/agentos-bus-authd"
+  tar -czf "$AGENTOS_TEST_FIXTURE_DIR/release.tar.gz" -C "$stage" bin runtime
+  log="$SANDBOX/missing-authd.log"
+  AGENTOS_VERSION=v2.0.0 bash "$INSTALLER" > "$log" 2>&1
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    fail "missing_authd: installer accepted a release without agentos-bus-authd"
+  fi
+  assert_file_contains "$log" "regular executable agentos-bus-authd" missing_authd
+  assert_equal "$(tree_manifest "$AGENTOS_HOME/runtime")" "$runtime_before" missing_authd_runtime
+  assert_equal "$(tree_manifest "$BIN_DIR")" "$binaries_before" missing_authd_binaries
+  assert_absent "$AGENTOS_HOME/runtime.new" missing_authd
+  assert_absent "$AGENTOS_HOME/runtime.old" missing_authd
+}
+
+test_upgrade_refuses_conflicting_security_topology_before_swap() {
+  make_release v1.0.0
+  run_installer v1.0.0 || return
+
+  cat > "$AGENTOS_HOME/runtime/config.yaml" <<'OPERATOR'
+workers:
+  - name: iii-worker-manager
+    config:
+      host: 127.0.0.1
+      rbac:
+        auth_function_id: attacker::allow_all
+  - name: state
+OPERATOR
+  local before binaries_before status log
+  before="$(tree_manifest "$AGENTOS_HOME/runtime")"
+  binaries_before="$(tree_manifest "$BIN_DIR")"
+  make_release v2.0.0
+  log="$SANDBOX/conflict.log"
+  AGENTOS_VERSION=v2.0.0 bash "$INSTALLER" > "$log" 2>&1
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    fail "security_conflict: installer accepted a conflicting RBAC topology"
+  fi
+  assert_file_contains "$log" "conflicting bus security topology" security_conflict
+  assert_equal "$(tree_manifest "$AGENTOS_HOME/runtime")" "$before" security_conflict
+  assert_equal "$(tree_manifest "$BIN_DIR")" "$binaries_before" security_conflict_binaries
+  assert_absent "$AGENTOS_HOME/runtime.new" security_conflict
+  assert_absent "$AGENTOS_HOME/runtime.old" security_conflict
 }
 
 test_upgrade_leaves_a_config_without_a_worker_roster_alone() {
@@ -592,11 +791,16 @@ test_published_installer_is_identical() {
 
 ALL_TESTS=(
   test_fresh_install_places_binaries_and_runtime
+  test_fresh_install_authd_is_discovered_by_real_cli
   test_fresh_install_resolves_latest_release
   test_upgrade_preserves_user_config
   test_upgrade_applies_release_security_defaults
   test_upgrade_removes_unsafe_worker_entries_from_adopted_config
-  test_upgrade_keeps_a_clean_config_untouched
+  test_upgrade_migrates_unarmed_config_to_secure_topology
+  test_upgrade_refuses_missing_required_runtime_inputs_before_mutation
+  test_upgrade_refuses_directory_iii_version_before_mutation
+  test_upgrade_refuses_missing_authd_before_mutation
+  test_upgrade_refuses_conflicting_security_topology_before_swap
   test_upgrade_pins_the_bus_worker_to_loopback
   test_upgrade_forces_the_bus_host_and_keeps_other_keys
   test_upgrade_leaves_a_config_without_a_worker_roster_alone

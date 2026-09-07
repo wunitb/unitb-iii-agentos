@@ -1,16 +1,21 @@
 use anyhow::{Context, Result};
+use api_client::AgentosApiClient;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+mod api_client;
 mod bootstrap;
+mod lifecycle;
+#[cfg(target_os = "linux")]
+mod supervisor;
 
 const API_BASE: &str = "http://localhost:3111";
 const TUI_BINARY: &str = "agentos-tui";
@@ -54,8 +59,12 @@ enum Commands {
     /// active `.env` exactly like `up`; `up` is the one-command path and also
     /// launches the TUI.
     Start,
-    /// Stop an engine and workers started by `up`.
-    Stop,
+    /// Stop processes started by `up`. Sends SIGTERM, then escalates after a bounded grace.
+    Stop {
+        /// Seconds before SIGKILL (maximum 60); engine supervisor cleanup gets at least 5.
+        #[arg(long, default_value_t = 5)]
+        grace_seconds: u64,
+    },
     Status {
         #[arg(long)]
         json: bool,
@@ -344,6 +353,9 @@ pub(crate) struct WorkerSpec {
     pub(crate) name: String,
     pub(crate) runtime: WorkerRuntime,
     pub(crate) binary: Option<PathBuf>,
+    /// Exact dotenv/shell keys this worker may receive. The process baseline is
+    /// added separately and is intentionally non-secret.
+    pub(crate) env: Vec<String>,
 }
 
 pub(crate) struct RunningWorker {
@@ -664,6 +676,307 @@ fn parse_inline_runtime(value: &str) -> Result<WorkerRuntime> {
     parse_runtime_kind(kind.ok_or_else(|| anyhow::anyhow!("Missing direct runtime.kind"))?)
 }
 
+const WORKER_ENV_POLICY: &str = "workers/env.allowlist";
+const DOTENV_TEMPLATE: &str = ".env.example";
+const UNIVERSAL_WORKER_ENV: [&str; 2] = ["III_URL", "AGENTOS_API_KEY"];
+const DISABLED_WORKERS_VARIABLE: &str = "AGENTOS_DISABLED_WORKERS";
+
+fn valid_worker_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+}
+
+fn valid_env_name(name: &str) -> bool {
+    let Some(first) = name.bytes().next() else {
+        return false;
+    };
+    (first.is_ascii_uppercase() || first == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn dotenv_template_names(source: &str) -> BTreeSet<String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (name, _) = line.split_once('=')?;
+            valid_env_name(name).then(|| name.to_string())
+        })
+        .collect()
+}
+
+fn integration_env_names(runtime_dir: &Path) -> Result<BTreeSet<String>> {
+    let directory = runtime_dir.join("integrations");
+    let entries = std::fs::read_dir(&directory).with_context(|| {
+        format!(
+            "Worker env policy requires integration manifests in {}",
+            directory.display()
+        )
+    })?;
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("Cannot read {}", directory.display()))?
+            .path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)
+            .with_context(|| format!("Cannot read integration manifest {}", path.display()))?;
+        let document = source
+            .parse::<toml::Value>()
+            .with_context(|| format!("Invalid integration manifest {}", path.display()))?;
+        let Some(environment) = document
+            .get("integration")
+            .and_then(|integration| integration.get("env"))
+            .and_then(toml::Value::as_table)
+        else {
+            continue;
+        };
+        for name in environment.keys() {
+            if !valid_env_name(name) {
+                anyhow::bail!(
+                    "Invalid env key {name:?} in integration manifest {}",
+                    path.display()
+                );
+            }
+            names.insert(name.clone());
+        }
+    }
+    Ok(names)
+}
+
+/// Parses the shared Rust/Bash policy format: one `worker=KEY,KEY` line per
+/// shipped Rust worker. Exact set equality makes an unknown new worker fail
+/// closed until its least-privilege declaration is reviewed.
+fn parse_worker_env_policy(
+    source: &str,
+    rust_workers: &BTreeSet<String>,
+    allowed_env: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut policy = BTreeMap::new();
+    for (index, raw) in source.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line != raw {
+            anyhow::bail!(
+                "Malformed worker env policy at line {}: surrounding whitespace is forbidden",
+                index + 1
+            );
+        }
+        let Some((worker, raw_keys)) = line.split_once('=') else {
+            anyhow::bail!("Malformed worker env policy at line {}", index + 1);
+        };
+        if !valid_worker_name(worker) || raw_keys.is_empty() || raw_keys.contains('=') {
+            anyhow::bail!("Malformed worker env policy at line {}", index + 1);
+        }
+        if !rust_workers.contains(worker) {
+            anyhow::bail!(
+                "Unknown worker {worker:?} in worker env policy at line {}",
+                index + 1
+            );
+        }
+        if policy.contains_key(worker) {
+            anyhow::bail!(
+                "Duplicate worker {worker:?} in worker env policy at line {}",
+                index + 1
+            );
+        }
+        let mut seen = BTreeSet::new();
+        let keys = raw_keys
+            .split(',')
+            .map(|key| {
+                if !valid_env_name(key) {
+                    anyhow::bail!(
+                        "Invalid env key {key:?} for worker {worker:?} at line {}",
+                        index + 1
+                    );
+                }
+                if !allowed_env.contains(key) {
+                    anyhow::bail!(
+                        "Unknown env key {key:?} for worker {worker:?} at line {}",
+                        index + 1
+                    );
+                }
+                if !seen.insert(key) {
+                    anyhow::bail!(
+                        "Duplicate env key {key:?} for worker {worker:?} at line {}",
+                        index + 1
+                    );
+                }
+                Ok(key.to_string())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if keys.first().map(String::as_str) != Some(UNIVERSAL_WORKER_ENV[0])
+            || keys.get(1).map(String::as_str) != Some(UNIVERSAL_WORKER_ENV[1])
+        {
+            anyhow::bail!(
+                "Worker {worker:?} must declare III_URL,AGENTOS_API_KEY first and exactly once"
+            );
+        }
+        policy.insert(worker.to_string(), keys);
+    }
+    let missing = rust_workers
+        .iter()
+        .filter(|worker| !policy.contains_key(*worker))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Worker env policy has no declaration for: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(policy)
+}
+
+fn parse_disabled_workers(
+    raw: Option<&str>,
+    available: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(BTreeSet::new());
+    };
+    let mut disabled = BTreeSet::new();
+    for name in raw.split(',') {
+        if name.is_empty() || name.trim() != name || !valid_worker_name(name) {
+            anyhow::bail!(
+                "Invalid {DISABLED_WORKERS_VARIABLE} entry {name:?}; use comma-separated shipped Rust worker names"
+            );
+        }
+        if !available.contains(name) {
+            anyhow::bail!("Unknown {DISABLED_WORKERS_VARIABLE} worker {name:?}");
+        }
+        if !disabled.insert(name.to_string()) {
+            anyhow::bail!("Duplicate {DISABLED_WORKERS_VARIABLE} worker {name:?}");
+        }
+    }
+    Ok(disabled)
+}
+
+const PROCESS_BASELINE_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "AGENTOS_HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LANGUAGE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NIX_SSL_CERT_FILE",
+    "RUST_BACKTRACE",
+    "RUST_LOG",
+];
+
+fn is_process_baseline(name: &str) -> bool {
+    PROCESS_BASELINE_ENV.contains(&name) || name.starts_with("LC_")
+}
+
+fn unicode_environment(
+    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> BTreeMap<String, String> {
+    environment
+        .into_iter()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
+}
+
+// The iii registry launches these native provider workers inside the engine
+// process tree. Keep only their documented credential/runtime knobs plus the
+// common process baseline; AgentOS worker/channel/integration secrets stay out.
+const ENGINE_ENV: &[&str] = &[
+    "III_URL",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "CODEX_HOME",
+    "PROVIDER_ANTHROPIC_CACHE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "III_DISABLE_TRACE_PAYLOADS",
+    "III_TRACE_PAYLOAD_MAX_BYTES",
+    "TOKIO_WORKER_THREADS",
+];
+const BUS_AUTH_ENV: &[&str] = &["AGENTOS_API_KEY"];
+
+fn scoped_service_environment(
+    allowed: &[&str],
+    dotenv: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let parent = unicode_environment(std::env::vars_os());
+    let mut scoped = parent
+        .iter()
+        .filter(|(name, _)| is_process_baseline(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for name in allowed {
+        if let Some(value) = dotenv.get(*name).filter(|value| !value.is_empty()) {
+            scoped.insert((*name).to_string(), value.clone());
+        } else if let Some(value) = parent.get(*name) {
+            scoped.insert((*name).to_string(), value.clone());
+        }
+    }
+    scoped
+}
+
+fn scoped_tui_environment(
+    dotenv: &BTreeMap<String, String>,
+    parent: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut scoped = parent
+        .iter()
+        .filter(|(name, _)| is_process_baseline(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(bearer) = api_client::selected_api_bearer(dotenv, parent) {
+        scoped.insert("AGENTOS_API_KEY".to_string(), bearer);
+    }
+    scoped
+}
+
+fn scoped_worker_environment(
+    declared: &[String],
+    dotenv: &BTreeMap<String, String>,
+    parent: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut scoped = parent
+        .iter()
+        .filter(|(name, _)| is_process_baseline(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for name in declared {
+        if let Some(value) = dotenv.get(name).filter(|value| !value.is_empty()) {
+            scoped.insert(name.clone(), value.clone());
+        } else if let Some(value) = parent.get(name) {
+            scoped.insert(name.clone(), value.clone());
+        }
+    }
+    scoped
+}
+
 fn parse_worker_runtime(manifest: &str) -> Result<WorkerRuntime> {
     let lines = manifest.lines().collect::<Vec<_>>();
     for (line_number, line) in lines.iter().enumerate() {
@@ -826,6 +1139,7 @@ pub(crate) fn collect_worker_specs(runtime_dir: &Path) -> Result<Vec<WorkerSpec>
             name: worker_name,
             runtime,
             binary,
+            env: Vec::new(),
         });
     }
 
@@ -834,11 +1148,59 @@ pub(crate) fn collect_worker_specs(runtime_dir: &Path) -> Result<Vec<WorkerSpec>
     }
 
     workers.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let rust_workers = workers
+        .iter()
+        .filter(|worker| worker.runtime == WorkerRuntime::Rust)
+        .map(|worker| worker.name.clone())
+        .collect::<BTreeSet<_>>();
+    let template_path = runtime_dir.join(DOTENV_TEMPLATE);
+    let template = std::fs::read_to_string(&template_path)
+        .with_context(|| format!("Worker env policy requires {}", template_path.display()))?;
+    let policy_path = runtime_dir.join(WORKER_ENV_POLICY);
+    let policy_source = std::fs::read_to_string(&policy_path).with_context(|| {
+        format!(
+            "Worker env policy is missing or unreadable: {}",
+            policy_path.display()
+        )
+    })?;
+    let mut allowed_env = dotenv_template_names(&template);
+    allowed_env.extend(integration_env_names(runtime_dir)?);
+    let mut policy = parse_worker_env_policy(&policy_source, &rust_workers, &allowed_env)
+        .with_context(|| format!("Invalid worker env policy {}", policy_path.display()))?;
+    for worker in &mut workers {
+        if worker.runtime == WorkerRuntime::Rust {
+            worker.env = policy
+                .remove(&worker.name)
+                .expect("complete policy checked above");
+        }
+    }
     Ok(workers)
 }
 
-fn discover_workers(runtime_dir: &Path) -> Result<Vec<WorkerSpec>> {
-    let workers = collect_worker_specs(runtime_dir)?;
+fn filter_disabled_workers(workers: Vec<WorkerSpec>, raw: Option<&str>) -> Result<Vec<WorkerSpec>> {
+    let available = workers
+        .iter()
+        .filter(|worker| worker.runtime == WorkerRuntime::Rust)
+        .map(|worker| worker.name.clone())
+        .collect::<BTreeSet<_>>();
+    let disabled = parse_disabled_workers(raw, &available)?;
+    Ok(workers
+        .into_iter()
+        .filter(|worker| !disabled.contains(&worker.name))
+        .collect())
+}
+
+fn discover_workers(
+    runtime_dir: &Path,
+    launch_env: &BTreeMap<String, String>,
+) -> Result<Vec<WorkerSpec>> {
+    let inherited_disabled = std::env::var(DISABLED_WORKERS_VARIABLE).ok();
+    let disabled = launch_env
+        .get(DISABLED_WORKERS_VARIABLE)
+        .map(String::as_str)
+        .or(inherited_disabled.as_deref());
+    let workers = filter_disabled_workers(collect_worker_specs(runtime_dir)?, disabled)?;
     let missing = missing_worker_binaries(&workers);
     if !missing.is_empty() {
         anyhow::bail!(
@@ -927,8 +1289,8 @@ fn detach_process(command: &mut Command) {
 pub(crate) struct WorkerLaunch<'a> {
     pub(crate) runtime_dir: &'a Path,
     pub(crate) log_path: &'a Path,
-    /// Values loaded from the runtime `.env`. Explicit shell exports are not
-    /// included here and continue to be inherited normally.
+    /// Values loaded from the runtime `.env`. After `env_clear`, only declared
+    /// non-empty dotenv values or declared shell fallbacks are restored.
     pub(crate) env: &'a BTreeMap<String, String>,
     /// Keep the workers running after this process exits.
     pub(crate) detached: bool,
@@ -948,10 +1310,13 @@ pub(crate) fn launch_workers(
         let Some(binary) = worker.binary.as_ref() else {
             continue;
         };
+        let parent_env = unicode_environment(std::env::vars_os());
+        let scoped_env = scoped_worker_environment(&worker.env, launch.env, &parent_env);
         let mut command = Command::new(binary);
         command
             .current_dir(launch.runtime_dir)
-            .envs(launch.env)
+            .env_clear()
+            .envs(scoped_env)
             // iii-sdk 0.22.1 otherwise falls back to hostname:pid, which is
             // not stable enough for readiness or duplicate suppression. The
             // value is namespaced so it cannot collide with an engine worker
@@ -1002,7 +1367,8 @@ pub(crate) fn spawn_bus_auth(
         // the check follows `--config`, not the working directory.
         .arg(format!("--config={}", config_path.display()))
         .current_dir(runtime_dir)
-        .envs(env)
+        .env_clear()
+        .envs(scoped_service_environment(BUS_AUTH_ENV, env))
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err));
     if detached {
@@ -1026,11 +1392,20 @@ pub(crate) fn spawn_engine(
         .with_context(|| format!("Cannot create engine log {}", log_path.display()))?;
     let log_err = log_file.try_clone()?;
     let mut command = Command::new(iii_path);
+    #[cfg(target_os = "linux")]
+    if detached {
+        command = Command::new(std::env::current_exe()?);
+        command.arg(supervisor::MODE).arg(iii_path).arg(config_path);
+    } else {
+        command.arg("--config").arg(config_path);
+    }
+    #[cfg(not(target_os = "linux"))]
+    command.arg("--config").arg(config_path);
     command
-        .arg("--config")
-        .arg(config_path)
         .current_dir(runtime_dir)
-        .envs(env)
+        .env_clear()
+        .envs(scoped_service_environment(ENGINE_ENV, env))
+        .env("IIIWORKER_DISABLE_BUILTIN_DAEMONS", "1")
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err));
     if detached {
@@ -1043,28 +1418,22 @@ pub(crate) fn spawn_engine(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(supervisor::MODE)) {
+        return supervisor::run().await;
+    }
     let cli = Cli::parse();
-    let client = reqwest::Client::new();
-    let api_base = get_api_url();
+    // Resolve API URL/key only in commands that use the API. Local lifecycle
+    // commands such as `stop` must still work when an unrelated dotenv entry is
+    // malformed or the API configuration is invalid.
+    let client = || AgentosApiClient::from_runtime();
+    let api_base = || client().map(|value| value.base_url());
 
     match cli.command {
         Commands::Init { quick } => {
             let config_dir = agentos_home_dir()?;
             initialize_agentos_home(&config_dir)?;
             println!("{} Initialized {}", "✓".green(), config_dir.display());
-
-            if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-                let config_path = config_dir.join("config.toml");
-                let mut config = String::new();
-                if config_path.exists() {
-                    config = std::fs::read_to_string(&config_path).unwrap_or_default();
-                }
-                if !config.contains("anthropic") {
-                    config.push_str(&format!("\n[keys]\nanthropic = \"{}\"\n", key));
-                    std::fs::write(&config_path, config)?;
-                    println!("{} Auto-detected ANTHROPIC_API_KEY", "✓".green());
-                }
-            }
 
             if quick {
                 println!(
@@ -1096,6 +1465,7 @@ async fn main() -> Result<()> {
                 ..
             } = runtime_paths()?;
             let first_run = !agentos_home.exists();
+            let lifecycle_lock = lifecycle::try_lock_foreground(&agentos_home)?;
             initialize_agentos_home(&agentos_home)?;
             if first_run {
                 println!("{} First run detected. Initializing...", "→".blue());
@@ -1108,7 +1478,6 @@ async fn main() -> Result<()> {
                     config_yaml.display()
                 );
             }
-            let worker_specs = discover_workers(&runtime_dir)?;
             let iii_path = find_iii_binary(&agentos_home)?;
             let engine_log = engine_log_path(&agentos_home);
             let worker_log = worker_log_path(&agentos_home);
@@ -1116,10 +1485,13 @@ async fn main() -> Result<()> {
             // the active `.env` has none, then hand that `.env` to the engine,
             // the workers, and the TUI.
             let key_outcome = bootstrap::ensure_api_key(&runtime_dir)?;
+            let audit_outcome = bootstrap::ensure_audit_key(&runtime_dir)?;
             let launch_env = bootstrap::load_dotenv(&runtime_dir)?;
+            let worker_specs = discover_workers(&runtime_dir, &launch_env)?;
 
             println!("\n{}", "AgentOS".bold().cyan());
             println!("{} {}", "✓".green(), key_outcome.describe());
+            println!("{} {}", "✓".green(), audit_outcome.describe());
             println!("{}", "─".repeat(40).dimmed());
 
             // Same order as `up`: the bus RBAC gate must answer before the
@@ -1196,6 +1568,10 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // Foreground ownership stays with this process. Release the lock
+            // once its key/bootstrap/spawn transaction is complete.
+            drop(lifecycle_lock);
+
             let rust_worker_count = worker_specs
                 .iter()
                 .filter(|worker| worker.runtime == WorkerRuntime::Rust)
@@ -1227,18 +1603,27 @@ async fn main() -> Result<()> {
             println!("{} Stopped.", "✓".green());
         }
 
-        Commands::Stop => {
-            println!("{} Stopping agentos engine...", "→".blue());
-            println!("{} Engine stopped.", "✓".green());
+        Commands::Stop { grace_seconds } => {
+            if grace_seconds > 60 {
+                anyhow::bail!("--grace-seconds must be between 0 and 60");
+            }
+            let paths = runtime_paths()?;
+            println!("{} Stopping AgentOS-owned processes...", "→".blue());
+            match lifecycle::stop_owned(&paths.agentos_home, Duration::from_secs(grace_seconds))? {
+                lifecycle::StopOutcome::NothingRecorded => {
+                    println!(
+                        "{} No owned process record; nothing was signalled.",
+                        "✓".green()
+                    );
+                }
+                lifecycle::StopOutcome::Stopped(count) => {
+                    println!("{} Stopped {count} owned process groups.", "✓".green());
+                }
+            }
         }
 
         Commands::Status { json: is_json } => {
-            let resp: Value = client
-                .get(format!("{}/api/health", api_base))
-                .send()
-                .await?
-                .json()
-                .await?;
+            let resp: Value = client()?.get("/api/health").send().await?.json().await?;
             if is_json {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
@@ -1255,12 +1640,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Health { json: is_json } => {
-            let resp: Value = client
-                .get(format!("{}/api/health", api_base))
-                .send()
-                .await?
-                .json()
-                .await?;
+            let resp: Value = client()?.get("/api/health").send().await?.json().await?;
             if is_json {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
@@ -1276,12 +1656,7 @@ async fn main() -> Result<()> {
 
         Commands::Agent(cmd) => match cmd {
             AgentCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/agents", api_base))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/agents").send().await?.json().await?;
                 if let Some(agents) = resp.as_array() {
                     println!(
                         "{:<20} {:<15} {:<30}",
@@ -1301,8 +1676,8 @@ async fn main() -> Result<()> {
             }
             AgentCmd::New { template } => {
                 let tmpl = template.unwrap_or_else(|| "assistant".into());
-                let resp: Value = client
-                    .post(format!("{}/api/agents", api_base))
+                let resp: Value = client()?
+                    .post("/api/agents")
                     .json(&json!({ "name": tmpl, "tags": ["template"] }))
                     .send()
                     .await?
@@ -1339,8 +1714,8 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    let resp: Value = client
-                        .post(format!("{}/api/agents/{}/message", api_base, agent))
+                    let resp: Value = client()?
+                        .post(format!("/api/agents/{}/message", agent))
                         .json(&json!({ "message": input }))
                         .send()
                         .await?
@@ -1355,15 +1730,15 @@ async fn main() -> Result<()> {
             }
             AgentCmd::Kill { agent } => {
                 let agent = validate_id(&agent)?;
-                client
-                    .delete(format!("{}/api/agents/{}", api_base, agent))
+                client()?
+                    .delete(format!("/api/agents/{}", agent))
                     .send()
                     .await?;
                 println!("{} Agent {} terminated", "✓".green(), agent);
             }
             AgentCmd::Spawn { template } => {
-                let resp: Value = client
-                    .post(format!("{}/api/agents", api_base))
+                let resp: Value = client()?
+                    .post("/api/agents")
                     .json(&json!({ "name": template, "tags": ["spawned"] }))
                     .send()
                     .await?
@@ -1379,8 +1754,8 @@ async fn main() -> Result<()> {
 
         Commands::Workflow(cmd) => match cmd {
             WorkflowCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/workflows", api_base))
+                let resp: Value = client()?
+                    .get("/api/workflows")
                     .send()
                     .await?
                     .error_for_status()?
@@ -1390,8 +1765,8 @@ async fn main() -> Result<()> {
             }
             WorkflowCmd::Show { id } => {
                 let id = validate_id(&id)?;
-                let resp: Value = client
-                    .get(format!("{}/api/workflows/{}", api_base, id))
+                let resp: Value = client()?
+                    .get(format!("/api/workflows/{}", id))
                     .send()
                     .await?
                     .error_for_status()?
@@ -1402,8 +1777,8 @@ async fn main() -> Result<()> {
             WorkflowCmd::Create { file } => {
                 let content = std::fs::read_to_string(&file)?;
                 let workflow = parse_workflow_document(&content)?;
-                let resp: Value = client
-                    .post(format!("{}/api/workflows", api_base))
+                let resp: Value = client()?
+                    .post("/api/workflows")
                     .json(&workflow)
                     .send()
                     .await?
@@ -1435,8 +1810,8 @@ async fn main() -> Result<()> {
                     let agent = validate_id(&agent)?;
                     body["agentId"] = Value::String(agent.to_string());
                 }
-                let resp: Value = client
-                    .post(format!("{}/api/workflows/{}/run", api_base, id))
+                let resp: Value = client()?
+                    .post(format!("/api/workflows/{}/run", id))
                     .json(&body)
                     .send()
                     .await?
@@ -1447,10 +1822,10 @@ async fn main() -> Result<()> {
             }
             WorkflowCmd::Runs { id, limit, offset } => {
                 let id = validate_id(&id)?;
-                let resp: Value = client
+                let resp: Value = client()?
                     .get(format!(
-                        "{}/api/workflows/{}/runs?limit={}&offset={}",
-                        api_base, id, limit, offset
+                        "/api/workflows/{}/runs?limit={}&offset={}",
+                        id, limit, offset
                     ))
                     .send()
                     .await?
@@ -1461,8 +1836,8 @@ async fn main() -> Result<()> {
             }
             WorkflowCmd::Status { run_id } => {
                 let run_id = validate_id(&run_id)?;
-                let resp: Value = client
-                    .get(format!("{}/api/workflow-runs/{}", api_base, run_id))
+                let resp: Value = client()?
+                    .get(format!("/api/workflow-runs/{}", run_id))
                     .send()
                     .await?
                     .error_for_status()?
@@ -1474,8 +1849,8 @@ async fn main() -> Result<()> {
 
         Commands::Skill(cmd) => match cmd {
             SkillCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/skillkit/list", api_base))
+                let resp: Value = client()?
+                    .get("/api/skillkit/list")
                     .send()
                     .await?
                     .json()
@@ -1499,8 +1874,8 @@ async fn main() -> Result<()> {
                 }
             }
             SkillCmd::Install { id } => {
-                let resp: Value = client
-                    .post(format!("{}/api/skillkit/install", api_base))
+                let resp: Value = client()?
+                    .post("/api/skillkit/install")
                     .json(&json!({ "id": id }))
                     .send()
                     .await?
@@ -1516,8 +1891,8 @@ async fn main() -> Result<()> {
             }
             SkillCmd::Remove { id } => {
                 let id = validate_id(&id)?;
-                let resp: Value = client
-                    .post(format!("{}/api/skillkit/uninstall", api_base))
+                let resp: Value = client()?
+                    .post("/api/skillkit/uninstall")
                     .json(&json!({ "id": id }))
                     .send()
                     .await?
@@ -1532,10 +1907,9 @@ async fn main() -> Result<()> {
                 println!("{} Removed skill: {}", "✓".green(), id);
             }
             SkillCmd::Search { query } => {
-                let resp: Value = client
+                let resp: Value = client()?
                     .get(format!(
-                        "{}/api/skillkit/search?query={}",
-                        api_base,
+                        "/api/skillkit/search?query={}",
                         urlencoding::encode(&query)
                     ))
                     .send()
@@ -1555,12 +1929,7 @@ async fn main() -> Result<()> {
 
         Commands::Models(cmd) => match cmd {
             ModelsCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/models", api_base))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/models").send().await?.json().await?;
                 if let Some(models) = resp.as_array() {
                     println!(
                         "{:<25} {:<15} {:<12} {:<10} {}",
@@ -1584,8 +1953,8 @@ async fn main() -> Result<()> {
                 }
             }
             ModelsCmd::Aliases => {
-                let resp: Value = client
-                    .get(format!("{}/api/models/aliases", api_base))
+                let resp: Value = client()?
+                    .get("/api/models/aliases")
                     .send()
                     .await?
                     .json()
@@ -1597,12 +1966,7 @@ async fn main() -> Result<()> {
                 }
             }
             ModelsCmd::Providers => {
-                let resp: Value = client
-                    .get(format!("{}/api/providers", api_base))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/providers").send().await?.json().await?;
                 if let Some(providers) = resp.as_array() {
                     for p in providers {
                         let available = p["available"].as_bool().unwrap_or(false);
@@ -1621,12 +1985,7 @@ async fn main() -> Result<()> {
                 }
             }
             ModelsCmd::Describe { model } => {
-                let resp: Value = client
-                    .get(format!("{}/api/models", api_base))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/models").send().await?.json().await?;
                 if let Some(models) = resp.as_array() {
                     if let Some(m) = models.iter().find(|m| m["id"].as_str() == Some(&model)) {
                         println!("{}", serde_json::to_string_pretty(m)?);
@@ -1640,8 +1999,8 @@ async fn main() -> Result<()> {
         Commands::Security(cmd) => match cmd {
             SecurityCmd::Audit => {
                 println!("{} Fetching audit trail...", "→".blue());
-                let resp: Value = client
-                    .get(format!("{}/api/security/audit/verify", api_base))
+                let resp: Value = client()?
+                    .get("/api/security/audit/verify")
                     .send()
                     .await?
                     .json()
@@ -1656,8 +2015,8 @@ async fn main() -> Result<()> {
                 );
             }
             SecurityCmd::Verify => {
-                let resp: Value = client
-                    .get(format!("{}/api/security/audit/verify", api_base))
+                let resp: Value = client()?
+                    .get("/api/security/audit/verify")
                     .send()
                     .await?
                     .json()
@@ -1665,8 +2024,8 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             }
             SecurityCmd::Scan { text } => {
-                let resp: Value = client
-                    .post(format!("{}/api/security/scan", api_base))
+                let resp: Value = client()?
+                    .post("/api/security/scan")
                     .json(&json!({ "text": text }))
                     .send()
                     .await?
@@ -1685,17 +2044,12 @@ async fn main() -> Result<()> {
 
         Commands::Approvals(cmd) => match cmd {
             ApprovalsCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/approvals", api_base))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/approvals").send().await?.json().await?;
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             }
             ApprovalsCmd::Approve { id } => {
-                let resp: Value = client
-                    .post(format!("{}/api/approvals/decide", api_base))
+                let resp: Value = client()?
+                    .post("/api/approvals/decide")
                     .json(&json!({ "requestId": id, "decision": "approve" }))
                     .send()
                     .await?
@@ -1710,8 +2064,8 @@ async fn main() -> Result<()> {
                 );
             }
             ApprovalsCmd::Reject { id } => {
-                let resp: Value = client
-                    .post(format!("{}/api/approvals/decide", api_base))
+                let resp: Value = client()?
+                    .post("/api/approvals/decide")
                     .json(&json!({ "requestId": id, "decision": "deny" }))
                     .send()
                     .await?
@@ -1753,8 +2107,8 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let resp: Value = client
-                    .post(format!("{}/api/agents/{}/message", api_base, agent_id))
+                let resp: Value = client()?
+                    .post(format!("/api/agents/{}/message", agent_id))
                     .json(&json!({ "message": input }))
                     .send()
                     .await?
@@ -1774,8 +2128,8 @@ async fn main() -> Result<()> {
             json: is_json,
         } => {
             let agent = validate_id(&agent)?;
-            let resp: Value = client
-                .post(format!("{}/api/agents/{}/message", api_base, agent))
+            let resp: Value = client()?
+                .post(format!("/api/agents/{}/message", agent))
                 .json(&json!({ "message": text }))
                 .send()
                 .await?
@@ -1789,6 +2143,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Dashboard => {
+            let api_base = api_base()?;
             println!("{} Opening dashboard at {}/dashboard", "→".blue(), api_base);
             let _ = std::process::Command::new("open")
                 .arg(format!("{}/dashboard", api_base))
@@ -1798,7 +2153,9 @@ async fn main() -> Result<()> {
         Commands::Up { no_tui, timeout } => {
             use std::io::Write as _;
 
+            lifecycle::ensure_supported()?;
             let paths = runtime_paths()?;
+            let lifecycle_lock = lifecycle::try_lock(&paths.agentos_home)?;
             initialize_agentos_home(&paths.agentos_home)?;
             // A clean machine has no AGENTOS_API_KEY, and without it almost
             // every worker exits while registering its HTTP routes. Only touch
@@ -1806,6 +2163,8 @@ async fn main() -> Result<()> {
             if paths.config_path.is_file() {
                 let outcome = bootstrap::ensure_api_key(&paths.runtime_dir)?;
                 println!("{} {}", "✓".green(), outcome.describe());
+                let audit = bootstrap::ensure_audit_key(&paths.runtime_dir)?;
+                println!("{} {}", "✓".green(), audit.describe());
             }
             let launch_env = bootstrap::load_dotenv(&paths.runtime_dir)?;
             let mut effects = bootstrap::SystemEffects::new(&paths, launch_env);
@@ -1814,14 +2173,19 @@ async fn main() -> Result<()> {
                 stage_timeout: Duration::from_secs(timeout),
                 poll_interval: Duration::from_millis(250),
             };
-            let outcome = tokio::task::spawn_blocking(move || {
+            let (outcome, mut effects) = tokio::task::spawn_blocking(move || {
                 let mut out = std::io::stdout();
                 let outcome = bootstrap::run_up(&mut effects, &paths, &options, &mut out);
                 let _ = out.flush();
-                outcome
+                (outcome, effects)
             })
-            .await??;
-            if let bootstrap::UpOutcome::Tui(code) = outcome {
+            .await?;
+            let outcome = outcome?;
+            effects.persist_started()?;
+            drop(lifecycle_lock);
+            if let bootstrap::UpOutcome::Tui(tui_path) = outcome {
+                println!("{} Starting agentos-tui...", "→".blue());
+                let code = bootstrap::Bootstrap::run_tui(&mut effects, &tui_path)?;
                 std::process::exit(code);
             }
         }
@@ -1854,12 +2218,7 @@ async fn main() -> Result<()> {
 
         Commands::Trigger(cmd) => match cmd {
             TriggerCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/triggers", get_api_url()))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/triggers").send().await?.json().await?;
                 if let Some(triggers) = resp.as_array() {
                     println!(
                         "{:<20} {:<15} {:<20} {:<30}",
@@ -1885,8 +2244,8 @@ async fn main() -> Result<()> {
                 function_id,
                 trigger_type,
             } => {
-                let resp: Value = client
-                    .post(format!("{}/api/triggers", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/triggers")
                     .json(&json!({ "functionId": function_id, "type": trigger_type }))
                     .send()
                     .await?
@@ -1900,8 +2259,8 @@ async fn main() -> Result<()> {
             }
             TriggerCmd::Delete { id } => {
                 let id = validate_id(&id)?;
-                client
-                    .delete(format!("{}/api/triggers/{}", get_api_url(), id))
+                client()?
+                    .delete(format!("/api/triggers/{}", id))
                     .send()
                     .await?;
                 println!("{} Deleted trigger: {}", "✓".green(), id);
@@ -1910,12 +2269,7 @@ async fn main() -> Result<()> {
 
         Commands::Channel(cmd) => match cmd {
             ChannelCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/channels", get_api_url()))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/channels").send().await?.json().await?;
                 if let Some(channels) = resp.as_array() {
                     println!(
                         "{:<20} {:<15} {:<15} {:<30}",
@@ -1944,8 +2298,8 @@ async fn main() -> Result<()> {
                 }
             }
             ChannelCmd::Setup { channel } => {
-                let resp: Value = client
-                    .post(format!("{}/api/channels", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/channels")
                     .json(&json!({ "channel": channel }))
                     .send()
                     .await?
@@ -1962,8 +2316,8 @@ async fn main() -> Result<()> {
             }
             ChannelCmd::Test { channel } => {
                 let channel = validate_id(&channel)?;
-                let resp: Value = client
-                    .post(format!("{}/api/channels/{}/test", get_api_url(), channel))
+                let resp: Value = client()?
+                    .post(format!("/api/channels/{}/test", channel))
                     .send()
                     .await?
                     .json()
@@ -2105,10 +2459,9 @@ async fn main() -> Result<()> {
         Commands::Memory(cmd) => match cmd {
             MemoryCmd::Get { agent, key } => {
                 let agent = validate_id(&agent)?;
-                let resp: Value = client
+                let resp: Value = client()?
                     .get(format!(
-                        "{}/api/memory/{}?agent={}",
-                        get_api_url(),
+                        "/api/memory/{}?agent={}",
                         urlencoding::encode(&key),
                         urlencoding::encode(agent)
                     ))
@@ -2120,8 +2473,8 @@ async fn main() -> Result<()> {
             }
             MemoryCmd::Set { agent, key, value } => {
                 let agent = validate_id(&agent)?;
-                let resp: Value = client
-                    .post(format!("{}/api/memory", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/memory")
                     .json(&json!({ "agent": agent, "key": key, "value": value }))
                     .send()
                     .await?
@@ -2138,10 +2491,9 @@ async fn main() -> Result<()> {
             }
             MemoryCmd::Delete { agent, key } => {
                 let agent = validate_id(&agent)?;
-                client
+                client()?
                     .delete(format!(
-                        "{}/api/memory/{}?agent={}",
-                        get_api_url(),
+                        "/api/memory/{}?agent={}",
                         urlencoding::encode(&key),
                         urlencoding::encode(agent)
                     ))
@@ -2151,12 +2503,8 @@ async fn main() -> Result<()> {
             }
             MemoryCmd::List { agent } => {
                 let agent = validate_id(&agent)?;
-                let resp: Value = client
-                    .get(format!(
-                        "{}/api/memory?agent={}",
-                        get_api_url(),
-                        urlencoding::encode(agent)
-                    ))
+                let resp: Value = client()?
+                    .get(format!("/api/memory?agent={}", urlencoding::encode(agent)))
                     .send()
                     .await?
                     .json()
@@ -2189,10 +2537,7 @@ async fn main() -> Result<()> {
         Commands::Logs { lines, follow } => {
             if follow {
                 println!("{} Streaming logs (Ctrl+C to stop)...\n", "→".blue());
-                let resp = client
-                    .get(format!("{}/api/dashboard/logs/stream", get_api_url()))
-                    .send()
-                    .await?;
+                let resp = client()?.get("/api/dashboard/logs/stream").send().await?;
                 let mut stream = resp.bytes_stream();
                 use futures_util::StreamExt;
                 while let Some(chunk) = stream.next().await {
@@ -2216,12 +2561,8 @@ async fn main() -> Result<()> {
                     }
                 }
             } else {
-                let resp: Value = client
-                    .get(format!(
-                        "{}/api/dashboard/logs?lines={}",
-                        get_api_url(),
-                        lines
-                    ))
+                let resp: Value = client()?
+                    .get(format!("/api/dashboard/logs?lines={}", lines))
                     .send()
                     .await?
                     .json()
@@ -2238,8 +2579,8 @@ async fn main() -> Result<()> {
 
         Commands::Vault(cmd) => match cmd {
             VaultCmd::Init => {
-                let resp: Value = client
-                    .post(format!("{}/api/vault/init", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/vault/init")
                     .send()
                     .await?
                     .json()
@@ -2251,24 +2592,15 @@ async fn main() -> Result<()> {
                 );
             }
             VaultCmd::Set { key, value } => {
-                client
-                    .post(format!(
-                        "{}/api/vault/{}",
-                        get_api_url(),
-                        urlencoding::encode(&key)
-                    ))
+                client()?
+                    .post(format!("/api/vault/{}", urlencoding::encode(&key)))
                     .json(&json!({ "value": value }))
                     .send()
                     .await?;
                 println!("{} Vault secret set: {}", "✓".green(), key.cyan());
             }
             VaultCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/vault", get_api_url()))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/vault").send().await?.json().await?;
                 if let Some(secrets) = resp.as_array() {
                     println!("{:<30} {:<20}", "KEY".bold(), "CREATED".bold());
                     for s in secrets {
@@ -2283,12 +2615,8 @@ async fn main() -> Result<()> {
                 }
             }
             VaultCmd::Remove { key } => {
-                client
-                    .delete(format!(
-                        "{}/api/vault/{}",
-                        get_api_url(),
-                        urlencoding::encode(&key)
-                    ))
+                client()?
+                    .delete(format!("/api/vault/{}", urlencoding::encode(&key)))
                     .send()
                     .await?;
                 println!("{} Vault secret removed: {}", "✓".green(), key);
@@ -2298,8 +2626,8 @@ async fn main() -> Result<()> {
         Commands::Migrate(cmd) => match cmd {
             MigrateCmd::Scan => {
                 println!("{} Scanning for migratable resources...", "→".blue());
-                let resp: Value = client
-                    .post(format!("{}/api/migrate/scan", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/migrate/scan")
                     .send()
                     .await?
                     .json()
@@ -2329,8 +2657,8 @@ async fn main() -> Result<()> {
                     "→".blue(),
                     if dry_run { " (dry run)" } else { "" }
                 );
-                let resp: Value = client
-                    .post(format!("{}/api/migrate/openclaw", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/migrate/openclaw")
                     .json(&json!({ "dryRun": dry_run }))
                     .send()
                     .await?
@@ -2349,8 +2677,8 @@ async fn main() -> Result<()> {
                     "→".blue(),
                     if dry_run { " (dry run)" } else { "" }
                 );
-                let resp: Value = client
-                    .post(format!("{}/api/migrate/langchain", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/migrate/langchain")
                     .json(&json!({ "dryRun": dry_run }))
                     .send()
                     .await?
@@ -2364,8 +2692,8 @@ async fn main() -> Result<()> {
                 );
             }
             MigrateCmd::Report => {
-                let resp: Value = client
-                    .get(format!("{}/api/migrate/report", get_api_url()))
+                let resp: Value = client()?
+                    .get("/api/migrate/report")
                     .send()
                     .await?
                     .json()
@@ -2377,8 +2705,8 @@ async fn main() -> Result<()> {
         Commands::Replay(cmd) => match cmd {
             ReplayCmd::Get { session_id } => {
                 let session_id = validate_id(&session_id)?;
-                let resp: Value = client
-                    .get(format!("{}/api/replay/{}", get_api_url(), session_id))
+                let resp: Value = client()?
+                    .get(format!("/api/replay/{}", session_id))
                     .send()
                     .await?
                     .json()
@@ -2423,15 +2751,11 @@ async fn main() -> Result<()> {
             }
             ReplayCmd::List { agent } => {
                 let url = if let Some(ref agent) = agent {
-                    format!(
-                        "{}/api/replay/search?agentId={}",
-                        get_api_url(),
-                        urlencoding::encode(agent)
-                    )
+                    format!("/api/replay/search?agentId={}", urlencoding::encode(agent))
                 } else {
-                    format!("{}/api/replay/search", get_api_url())
+                    "/api/replay/search".to_string()
                 };
-                let resp: Value = client.get(&url).send().await?.json().await?;
+                let resp: Value = client()?.get(&url).send().await?.json().await?;
                 if let Some(sessions) = resp.as_array() {
                     println!(
                         "{:<36} {:<20} {:<10} {:<25}",
@@ -2457,12 +2781,8 @@ async fn main() -> Result<()> {
             }
             ReplayCmd::Summary { session_id } => {
                 let session_id = validate_id(&session_id)?;
-                let resp: Value = client
-                    .get(format!(
-                        "{}/api/replay/{}/summary",
-                        get_api_url(),
-                        session_id
-                    ))
+                let resp: Value = client()?
+                    .get(format!("/api/replay/{}/summary", session_id))
                     .send()
                     .await?
                     .json()
@@ -2491,15 +2811,11 @@ async fn main() -> Result<()> {
         Commands::Sessions(cmd) => match cmd {
             SessionsCmd::List { agent } => {
                 let url = if let Some(ref agent) = agent {
-                    format!(
-                        "{}/api/sessions?agent={}",
-                        get_api_url(),
-                        urlencoding::encode(agent)
-                    )
+                    format!("/api/sessions?agent={}", urlencoding::encode(agent))
                 } else {
-                    format!("{}/api/sessions", get_api_url())
+                    "/api/sessions".to_string()
                 };
-                let resp: Value = client.get(&url).send().await?.json().await?;
+                let resp: Value = client()?.get(&url).send().await?.json().await?;
                 if let Some(sessions) = resp.as_array() {
                     println!(
                         "{:<36} {:<20} {:<15} {:<20}",
@@ -2523,8 +2839,8 @@ async fn main() -> Result<()> {
             }
             SessionsCmd::Delete { id } => {
                 let id = validate_id(&id)?;
-                client
-                    .delete(format!("{}/api/sessions/{}", get_api_url(), id))
+                client()?
+                    .delete(format!("/api/sessions/{}", id))
                     .send()
                     .await?;
                 println!("{} Session deleted: {}", "✓".green(), id);
@@ -2533,12 +2849,7 @@ async fn main() -> Result<()> {
 
         Commands::Cron(cmd) => match cmd {
             CronCmd::List => {
-                let resp: Value = client
-                    .get(format!("{}/api/cron", get_api_url()))
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let resp: Value = client()?.get("/api/cron").send().await?.json().await?;
                 if let Some(jobs) = resp.as_array() {
                     println!(
                         "{:<20} {:<20} {:<20} {:<10}",
@@ -2570,8 +2881,8 @@ async fn main() -> Result<()> {
                 expression,
                 function_id,
             } => {
-                let resp: Value = client
-                    .post(format!("{}/api/cron", get_api_url()))
+                let resp: Value = client()?
+                    .post("/api/cron")
                     .json(&json!({ "expression": expression, "functionId": function_id }))
                     .send()
                     .await?
@@ -2585,16 +2896,13 @@ async fn main() -> Result<()> {
             }
             CronCmd::Delete { id } => {
                 let id = validate_id(&id)?;
-                client
-                    .delete(format!("{}/api/cron/{}", get_api_url(), id))
-                    .send()
-                    .await?;
+                client()?.delete(format!("/api/cron/{}", id)).send().await?;
                 println!("{} Deleted cron job: {}", "✓".green(), id);
             }
             CronCmd::Enable { id } => {
                 let id = validate_id(&id)?;
-                client
-                    .patch(format!("{}/api/cron/{}", get_api_url(), id))
+                client()?
+                    .patch(format!("/api/cron/{}", id))
                     .json(&json!({ "enabled": true }))
                     .send()
                     .await?;
@@ -2602,8 +2910,8 @@ async fn main() -> Result<()> {
             }
             CronCmd::Disable { id } => {
                 let id = validate_id(&id)?;
-                client
-                    .patch(format!("{}/api/cron/{}", get_api_url(), id))
+                client()?
+                    .patch(format!("/api/cron/{}", id))
                     .json(&json!({ "enabled": false }))
                     .send()
                     .await?;
@@ -2613,15 +2921,11 @@ async fn main() -> Result<()> {
 
         Commands::Integrations { query } => {
             let url = if let Some(ref q) = query {
-                format!(
-                    "{}/api/integrations?query={}",
-                    get_api_url(),
-                    urlencoding::encode(q)
-                )
+                format!("/api/integrations?query={}", urlencoding::encode(q))
             } else {
-                format!("{}/api/integrations", get_api_url())
+                "/api/integrations".to_string()
             };
-            let resp: Value = client.get(&url).send().await?.json().await?;
+            let resp: Value = client()?.get(&url).send().await?.json().await?;
             if let Some(integrations) = resp.as_array() {
                 println!(
                     "{:<25} {:<15} {:<15} {:<30}",
@@ -2668,6 +2972,8 @@ async fn main() -> Result<()> {
             let paths = runtime_paths()?;
             let key_outcome = bootstrap::ensure_api_key(&paths.runtime_dir)?;
             println!("  {} {}", "✓".green(), key_outcome.describe());
+            let audit_outcome = bootstrap::ensure_audit_key(&paths.runtime_dir)?;
+            println!("  {} {}", "✓".green(), audit_outcome.describe());
 
             // The provider credential is a different thing entirely: workers
             // read it from the environment, so it goes into the active `.env`.
@@ -2714,7 +3020,7 @@ async fn main() -> Result<()> {
                 "default_model".into(),
                 toml::Value::String(default_model.clone()),
             );
-            config.insert("api_url".into(), toml::Value::String(get_api_url()));
+            config.insert("api_url".into(), toml::Value::String(api_base()?));
 
             let config_path = config_dir.join("config.toml");
             std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
@@ -2741,11 +3047,7 @@ async fn main() -> Result<()> {
 
             println!("{} Resetting AgentOS...", "→".blue());
 
-            match client
-                .delete(format!("{}/api/state/reset", get_api_url()))
-                .send()
-                .await
-            {
+            match client()?.delete("/api/state/reset").send().await {
                 Ok(_) => println!("  {} Server state cleared", "✓".green()),
                 Err(_) => println!(
                     "  {} Server not reachable (skipping remote reset)",
@@ -2769,8 +3071,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Add { name, key } => {
-            let resp: Value = client
-                .post(format!("{}/api/integrations", get_api_url()))
+            let resp: Value = client()?
+                .post("/api/integrations")
                 .json(&json!({ "name": name, "key": key }))
                 .send()
                 .await?
@@ -2784,12 +3086,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Remove { name } => {
-            client
-                .delete(format!(
-                    "{}/api/integrations/{}",
-                    get_api_url(),
-                    urlencoding::encode(&name)
-                ))
+            client()?
+                .delete(format!("/api/integrations/{}", urlencoding::encode(&name)))
                 .send()
                 .await?;
             println!("{} Removed: {}", "✓".green(), name);
@@ -2797,10 +3095,16 @@ async fn main() -> Result<()> {
 
         Commands::Tui => {
             println!("{} Starting TUI...", "→".blue());
-            let runtime_dir = runtime_paths().ok().map(|paths| paths.runtime_dir);
-            match find_tui_binary(runtime_dir.as_deref()) {
+            let paths = runtime_paths()?;
+            let dotenv = bootstrap::load_dotenv(&paths.runtime_dir)?;
+            let parent = unicode_environment(std::env::vars_os());
+            let environment = scoped_tui_environment(&dotenv, &parent);
+            match find_tui_binary(Some(&paths.runtime_dir)) {
                 Some(tui_path) => {
-                    let status = Command::new(&tui_path).status()?;
+                    let status = Command::new(&tui_path)
+                        .env_clear()
+                        .envs(environment)
+                        .status()?;
                     std::process::exit(status.code().unwrap_or(1));
                 }
                 None => {
@@ -2841,10 +3145,6 @@ fn agentos_config_path() -> Result<PathBuf> {
     Ok(agentos_home_dir()?.join("config.toml"))
 }
 
-fn get_api_url() -> String {
-    std::env::var("AGENTOS_API_URL").unwrap_or_else(|_| API_BASE.to_string())
-}
-
 fn format_epoch_ms(ms: u64) -> String {
     if ms == 0 {
         return "-".into();
@@ -2879,9 +3179,12 @@ fn print_log_entry(entry: &Value) {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use std::io::Write as _;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn test_validate_id_valid_alphanumeric() {
@@ -2954,34 +3257,6 @@ mod tests {
     #[test]
     fn test_api_base_constant() {
         assert_eq!(API_BASE, "http://localhost:3111");
-    }
-
-    #[test]
-    fn test_get_api_url_default() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var_os("AGENTOS_API_URL");
-        unsafe {
-            std::env::remove_var("AGENTOS_API_URL");
-        }
-        let result = get_api_url();
-        restore_test_env("AGENTOS_API_URL", previous);
-        assert_eq!(result, "http://localhost:3111");
-    }
-
-    #[test]
-    fn test_get_api_url_custom() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var_os("AGENTOS_API_URL");
-        unsafe {
-            std::env::set_var("AGENTOS_API_URL", "http://custom:8080");
-        }
-        let url = get_api_url();
-        restore_test_env("AGENTOS_API_URL", previous);
-        assert_eq!(url, "http://custom:8080");
     }
 
     #[test]
@@ -3693,13 +3968,50 @@ mod tests {
             .permissions();
         permissions.set_mode(0o0);
         std::fs::set_permissions(&workers_dir, permissions).expect("make workers unreadable");
-        assert!(discover_workers(&root).is_err());
+        assert!(discover_workers(&root, &BTreeMap::new()).is_err());
         let mut permissions = std::fs::metadata(&workers_dir)
             .expect("read workers directory metadata")
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&workers_dir, permissions).expect("restore workers permissions");
         std::fs::remove_dir_all(root).expect("remove temporary workers directory");
+    }
+
+    fn isolated_fixture_root(label: &str) -> PathBuf {
+        let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "agentos-{label}-{}-{sequence}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).expect("create unique fixture root");
+        root
+    }
+
+    #[cfg(unix)]
+    fn install_executable_fixture(path: &Path, source: &str) {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // The executable pathname never names an inode that is still open for
+        // writing. This prevents ETXTBSY when tests spawn fixtures in parallel.
+        let pending = path.with_extension(format!(
+            "pending-{}",
+            FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&pending)
+            .expect("create pending executable fixture");
+        file.write_all(source.as_bytes())
+            .expect("write executable fixture");
+        file.sync_all().expect("sync executable fixture");
+        drop(file);
+        std::fs::rename(&pending, path).expect("publish closed executable fixture");
     }
 
     fn restore_test_env(name: &str, previous: Option<std::ffi::OsString>) {
@@ -3711,11 +4023,234 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agentos_engine_spawn_rebuilds_a_bounded_environment() {
+        let root = isolated_fixture_root("engine-env");
+        let engine = root.join("iii");
+        let capture = root.join("captured");
+        install_executable_fixture(
+            &engine,
+            &format!("#!/bin/sh\nenv | sort > '{}'\n", capture.display()),
+        );
+        let log = root.join("engine.log");
+        let mut child = spawn_engine(
+            &engine,
+            Path::new("config.yaml"),
+            &root,
+            &log,
+            &BTreeMap::from([
+                (
+                    "IIIWORKER_DISABLE_BUILTIN_DAEMONS".to_string(),
+                    "0".to_string(),
+                ),
+                (
+                    "ANTHROPIC_API_KEY".to_string(),
+                    "native-anthropic".to_string(),
+                ),
+                ("OPENAI_API_KEY".to_string(), "native-openai".to_string()),
+                (
+                    "HTTPS_PROXY".to_string(),
+                    "http://proxy.invalid".to_string(),
+                ),
+                ("AUDIT_HMAC_KEY".to_string(), "must-not-leak".to_string()),
+                ("SLACK_BOT_TOKEN".to_string(), "must-not-leak".to_string()),
+                ("MONGODB_URI".to_string(), "must-not-leak".to_string()),
+                ("PARENT_CANARY".to_string(), "must-not-leak".to_string()),
+            ]),
+            false,
+        )
+        .expect("spawn fake engine");
+        assert!(child.wait().unwrap().success());
+        let captured = std::fs::read_to_string(capture).unwrap();
+        assert!(captured.contains("IIIWORKER_DISABLE_BUILTIN_DAEMONS=1\n"));
+        assert!(captured.contains("ANTHROPIC_API_KEY=native-anthropic\n"));
+        assert!(captured.contains("OPENAI_API_KEY=native-openai\n"));
+        assert!(captured.contains("HTTPS_PROXY=http://proxy.invalid\n"));
+        for forbidden in [
+            "AUDIT_HMAC_KEY",
+            "SLACK_BOT_TOKEN",
+            "MONGODB_URI",
+            "PARENT_CANARY",
+        ] {
+            assert!(
+                !captured.contains(forbidden),
+                "engine leaked {forbidden}: {captured}"
+            );
+        }
+        std::fs::remove_dir_all(root).expect("clean up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bus_auth_spawn_receives_only_its_api_key_and_process_baseline() {
+        let root = isolated_fixture_root("auth-env");
+        let daemon = root.join("agentos-bus-authd");
+        let capture = root.join("captured");
+        install_executable_fixture(
+            &daemon,
+            &format!("#!/bin/sh\nenv | sort > '{}'\n", capture.display()),
+        );
+        let env = BTreeMap::from([
+            ("AGENTOS_API_KEY".to_string(), "machine-key".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "must-not-leak".to_string()),
+            ("AUDIT_HMAC_KEY".to_string(), "must-not-leak".to_string()),
+            ("PARENT_CANARY".to_string(), "must-not-leak".to_string()),
+        ]);
+        let mut child = spawn_bus_auth(
+            &daemon,
+            "127.0.0.1:49129".parse().unwrap(),
+            &root.join("config.yaml"),
+            &root,
+            &root.join("auth.log"),
+            &env,
+            false,
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+        let captured = std::fs::read_to_string(capture).unwrap();
+        assert!(captured.contains("AGENTOS_API_KEY=machine-key\n"));
+        for forbidden in ["ANTHROPIC_API_KEY", "AUDIT_HMAC_KEY", "PARENT_CANARY"] {
+            assert!(
+                !captured.contains(forbidden),
+                "authd leaked {forbidden}: {captured}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_env_policy_is_strict_and_complete() {
+        let workers = ["alpha", "beta"].into_iter().map(str::to_string).collect();
+        let allowed = ["III_URL", "AGENTOS_API_KEY", "ONLY_ALPHA"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let parsed = parse_worker_env_policy(
+            "alpha=III_URL,AGENTOS_API_KEY,ONLY_ALPHA\nbeta=III_URL,AGENTOS_API_KEY\n",
+            &workers,
+            &allowed,
+        )
+        .expect("strict policy");
+        assert_eq!(parsed["alpha"][2], "ONLY_ALPHA");
+
+        for source in [
+            "alpha=III_URL,AGENTOS_API_KEY\nalpha=III_URL,AGENTOS_API_KEY\nbeta=III_URL,AGENTOS_API_KEY\n",
+            "alpha=III_URL,AGENTOS_API_KEY,ONLY_ALPHA,ONLY_ALPHA\nbeta=III_URL,AGENTOS_API_KEY\n",
+            "alpha=III_URL,AGENTOS_API_KEY,UNKNOWN\nbeta=III_URL,AGENTOS_API_KEY\n",
+            "alpha=III_URL,AGENTOS_API_KEY\nunknown=III_URL,AGENTOS_API_KEY\nbeta=III_URL,AGENTOS_API_KEY\n",
+            "alpha=III_URL,AGENTOS_API_KEY\n",
+            "alpha=AGENTOS_API_KEY,III_URL\nbeta=III_URL,AGENTOS_API_KEY\n",
+        ] {
+            assert!(
+                parse_worker_env_policy(source, &workers, &allowed).is_err(),
+                "{source}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_environment_skips_non_utf8_entries_instead_of_panicking() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let values = unicode_environment([
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from_vec(vec![0xff]), OsString::from("secret")),
+            (OsString::from("BROKEN"), OsString::from_vec(vec![0xff])),
+        ]);
+        assert_eq!(
+            values,
+            BTreeMap::from([("PATH".to_string(), "/bin".to_string())])
+        );
+    }
+
+    #[test]
+    fn scoped_worker_environment_clears_parent_secrets_and_dotenv_wins() {
+        let parent = BTreeMap::from([
+            ("PATH".to_string(), "/bin".to_string()),
+            ("HOME".to_string(), "/home/test".to_string()),
+            ("USER".to_string(), "tester".to_string()),
+            ("LOGNAME".to_string(), "tester".to_string()),
+            ("SHELL".to_string(), "/bin/sh".to_string()),
+            ("TERM".to_string(), "xterm".to_string()),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("RUST_BACKTRACE".to_string(), "1".to_string()),
+            ("PARENT_CANARY".to_string(), "must-not-leak".to_string()),
+            ("ONLY_ALPHA".to_string(), "from-shell".to_string()),
+            ("OTHER_SECRET".to_string(), "must-not-cross".to_string()),
+        ]);
+        let dotenv = BTreeMap::from([
+            ("ONLY_ALPHA".to_string(), "from-dotenv".to_string()),
+            ("OTHER_SECRET".to_string(), "other-dotenv".to_string()),
+        ]);
+        let env = scoped_worker_environment(&["ONLY_ALPHA".to_string()], &dotenv, &parent);
+        assert_eq!(
+            env.get("ONLY_ALPHA").map(String::as_str),
+            Some("from-dotenv")
+        );
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/test"));
+        assert_eq!(env.get("LANG").map(String::as_str), Some("C.UTF-8"));
+        assert_eq!(env.get("RUST_BACKTRACE").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "HOME",
+                "LANG",
+                "LOGNAME",
+                "ONLY_ALPHA",
+                "PATH",
+                "RUST_BACKTRACE",
+                "SHELL",
+                "TERM",
+                "USER",
+            ]
+        );
+        assert!(!env.contains_key("PARENT_CANARY"));
+        assert!(!env.contains_key("OTHER_SECRET"));
+    }
+
+    #[test]
+    fn disabled_workers_are_strict_and_default_to_none() {
+        let available = ["alpha", "beta"].into_iter().map(str::to_string).collect();
+        assert!(parse_disabled_workers(None, &available).unwrap().is_empty());
+        assert_eq!(
+            parse_disabled_workers(Some("beta"), &available).unwrap(),
+            ["beta".to_string()].into_iter().collect()
+        );
+        assert!(parse_disabled_workers(Some("unknown"), &available).is_err());
+        assert!(parse_disabled_workers(Some("alpha,alpha"), &available).is_err());
+        assert!(parse_disabled_workers(Some("alpha,,beta"), &available).is_err());
+
+        let workers = ["alpha", "beta"]
+            .into_iter()
+            .map(|name| WorkerSpec {
+                name: name.to_string(),
+                runtime: WorkerRuntime::Rust,
+                binary: Some(PathBuf::from(format!("agentos-{name}"))),
+                env: UNIVERSAL_WORKER_ENV
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect(),
+            })
+            .collect();
+        let enabled = filter_disabled_workers(workers, Some("beta")).unwrap();
+        assert_eq!(
+            enabled
+                .iter()
+                .map(|worker| worker.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha"]
+        );
+    }
+
     #[test]
     fn test_repository_worker_manifests_parse_fail_closed() {
         let workers_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workers");
         let mut count = 0;
-        for entry in std::fs::read_dir(workers_dir).expect("read repository workers") {
+        for entry in std::fs::read_dir(&workers_dir).expect("read repository workers") {
             let entry = entry.expect("read worker entry");
             if !entry.path().is_dir() {
                 continue;
@@ -3733,5 +4268,17 @@ mod tests {
             count += 1;
         }
         assert!(count > 0);
+
+        let runtime = workers_dir.parent().expect("repository root");
+        let specs = collect_worker_specs(runtime).expect("collect governed repository workers");
+        let mcp = specs
+            .iter()
+            .find(|worker| worker.name == "mcp-client")
+            .unwrap();
+        assert!(
+            mcp.env
+                .contains(&"GITHUB_PERSONAL_ACCESS_TOKEN".to_string())
+        );
+        assert!(mcp.env.contains(&"AWS_SECRET_ACCESS_KEY".to_string()));
     }
 }

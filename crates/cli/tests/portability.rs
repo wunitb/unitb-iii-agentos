@@ -21,6 +21,77 @@ fn temporary_directory(label: &str) -> PathBuf {
     path
 }
 
+#[test]
+fn init_never_copies_inherited_credentials_to_legacy_config() {
+    let root = temporary_directory("init-secret");
+    let home = root.join("home");
+    let result = Command::new(env!("CARGO_BIN_EXE_agentos"))
+        .current_dir(&root)
+        .env("AGENTOS_HOME", &home)
+        .env("ANTHROPIC_API_KEY", "fixture-provider-secret")
+        .args(["init", "--quick"])
+        .output()
+        .unwrap();
+    let legacy_exists = home.join("config.toml").exists();
+    fs::remove_dir_all(root).unwrap();
+    assert!(result.status.success(), "init failed");
+    assert!(
+        !legacy_exists,
+        "init persisted a provider secret in the unused legacy config"
+    );
+    assert!(!String::from_utf8_lossy(&result.stdout).contains("fixture-provider-secret"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn supervisor_reaps_registry_daemons_created_after_startup() {
+    use std::os::unix::process::CommandExt;
+    let root = temporary_directory("supervised-registry");
+    let engine = root.join("iii");
+    let pid_file = root.join("registry.pid");
+    write_executable(
+        &engine,
+        &format!(
+            "#!/bin/sh\n(sleep 0.2; setsid /bin/sh -c 'echo $$ > {}; trap \"exit 0\" TERM; while :; do sleep 0.1; done' &)\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    );
+    let mut supervisor = Command::new(env!("CARGO_BIN_EXE_agentos"))
+        .arg("__agentos_supervise_engine")
+        .arg(&engine)
+        .arg(root.join("config.yaml"))
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut unrelated = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let mut ready = false;
+    for _ in 0..100 {
+        ready = fs::metadata(&pid_file).is_ok_and(|metadata| metadata.len() > 0);
+        if ready || supervisor.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let status = Command::new("kill")
+        .args(["-TERM", &supervisor.id().to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    let exit = supervisor.wait().unwrap();
+    let untouched = unrelated.try_wait().unwrap().is_none();
+    unrelated.kill().unwrap();
+    unrelated.wait().unwrap();
+    assert!(
+        ready && status.success() && exit.success(),
+        "supervisor did not complete the delayed-daemon lifecycle"
+    );
+    assert_process_gone(&pid_file);
+    assert!(untouched, "supervisor touched an unrelated process");
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn write_executable(path: &Path, body: &str) {
     fs::write(path, body).expect("write executable");
     let mut permissions = fs::metadata(path)
@@ -28,6 +99,20 @@ fn write_executable(path: &Path, body: &str) {
         .permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).expect("make executable");
+}
+
+fn write_env_policy(runtime: &Path) {
+    fs::create_dir_all(runtime.join("integrations")).expect("create integrations directory");
+    fs::write(
+        runtime.join(".env.example"),
+        "III_URL=\nAGENTOS_API_KEY=\nAGENTOS_DISABLED_WORKERS=\n",
+    )
+    .expect("write dotenv template");
+    fs::write(
+        runtime.join("workers/env.allowlist"),
+        "echo=III_URL,AGENTOS_API_KEY\n",
+    )
+    .expect("write worker env policy");
 }
 
 fn wait_for_file(path: &Path) {
@@ -91,6 +176,7 @@ fn run_start_with_relative_config(config_override: &str) {
         "iii: v1\nname: echo\nruntime: rust\nscripts:\n  start: echo\n",
     )
     .expect("write worker manifest");
+    write_env_policy(&runtime);
 
     let engine_pid = caller.join("engine.pid");
     let engine_cwd = caller.join("engine.cwd");
@@ -177,6 +263,7 @@ fn start_uses_relative_home_for_installed_runtime() {
         "iii: v1\nname: echo\nruntime: rust\nscripts:\n  start: echo\n",
     )
     .expect("write worker manifest");
+    write_env_policy(&runtime);
 
     let engine_cwd = caller.join("engine.cwd");
     let engine_pid = caller.join("engine.pid");
@@ -253,6 +340,7 @@ fn start_fails_closed_when_engine_exits_before_workers() {
         "iii: v1\nname: echo\nruntime: rust\nscripts:\n  start: echo\n",
     )
     .expect("write worker manifest");
+    write_env_policy(&runtime);
     write_executable(&bin.join("iii"), "#!/bin/sh\nexit 0\n");
 
     let old_path = std::env::var_os("PATH").unwrap_or_default();
@@ -285,6 +373,7 @@ fn start_fails_closed_when_worker_launch_fails() {
         "iii: v1\nname: echo\nruntime: rust\nscripts:\n  start: echo\n",
     )
     .expect("write worker manifest");
+    write_env_policy(&runtime);
     let engine_pid = root.join("engine.pid");
     write_executable(
         &bin.join("iii"),
@@ -445,4 +534,118 @@ fn doctor_does_not_create_state_or_start_processes() {
     assert_eq!(state["hint"], "create it with `agentos init`");
 
     fs::remove_dir_all(root).expect("remove temporary doctor directory");
+}
+
+fn run_copied_cli_tui(
+    label: &str,
+    dotenv_key: &str,
+    shell_key: Option<&str>,
+    expected_key: &str,
+) -> std::process::Output {
+    let root = temporary_directory(label);
+    let runtime = root.join("runtime");
+    let bin = root.join("bin");
+    let home = root.join("home");
+    fs::create_dir_all(&runtime).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(runtime.join("config.yaml"), "workers: []\n").unwrap();
+    let file_secret = "dotenv-provider-secret-must-not-leak";
+    let audit_secret = "dotenv-audit-secret-must-not-leak";
+    fs::write(
+        runtime.join(".env"),
+        format!(
+            "AGENTOS_API_KEY={dotenv_key}\nANTHROPIC_API_KEY={file_secret}\nAUDIT_HMAC_KEY={audit_secret}\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(runtime.join(".env"), fs::Permissions::from_mode(0o600)).unwrap();
+
+    let copied_cli = bin.join("agentos");
+    fs::copy(env!("CARGO_BIN_EXE_agentos"), &copied_cli).unwrap();
+    let tui = bin.join("agentos-tui");
+    write_executable(
+        &tui,
+        &format!(
+            "#!/bin/sh\n[ \"${{AGENTOS_API_KEY-}}\" = '{expected_key}' ] && selected=true || selected=false\n[ -n \"${{ANTHROPIC_API_KEY+x}}\" ] || [ -n \"${{AUDIT_HMAC_KEY+x}}\" ] && unrelated=true || unrelated=false\n[ -n \"${{HOME-}}\" ] && [ -n \"${{PATH-}}\" ] && [ -n \"${{TERM-}}\" ] && baseline=true || baseline=false\nprintf 'selected:%s\\nunrelated:%s\\nbaseline:%s\\n' \"$selected\" \"$unrelated\" \"$baseline\"\n"
+        ),
+    );
+    let mut command = Command::new(&copied_cli);
+    command
+        .arg("tui")
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-test")
+        .env("AGENTOS_HOME", &root)
+        .env("AGENTOS_CONFIG", runtime.join("config.yaml"));
+    if let Some(key) = shell_key {
+        command.env("AGENTOS_API_KEY", key);
+    }
+    let output = command.output().unwrap();
+    fs::remove_dir_all(root).unwrap();
+    output
+}
+
+#[test]
+fn standalone_tui_receives_selected_dotenv_bearer_and_no_unrelated_secrets() {
+    let output = run_copied_cli_tui(
+        "tui-dotenv-bearer",
+        "dotenv-selected-key",
+        Some("shell-key-must-lose"),
+        "dotenv-selected-key",
+    );
+    assert!(output.status.success(), "copied CLI failed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("selected:true"),
+        "TUI did not receive selected bearer"
+    );
+    assert!(
+        stdout.contains("unrelated:false"),
+        "TUI received an unrelated secret"
+    );
+    assert!(
+        stdout.contains("baseline:true"),
+        "TUI lost its process baseline"
+    );
+    for secret in [
+        "dotenv-selected-key",
+        "shell-key-must-lose",
+        "dotenv-provider-secret-must-not-leak",
+        "dotenv-audit-secret-must-not-leak",
+    ] {
+        assert!(
+            !stdout.contains(secret),
+            "TUI output disclosed supplied secret material"
+        );
+    }
+}
+
+#[test]
+fn standalone_tui_uses_inherited_bearer_when_dotenv_is_blank() {
+    let output = run_copied_cli_tui(
+        "tui-shell-bearer",
+        "\"   \"",
+        Some("inherited-selected-key"),
+        "inherited-selected-key",
+    );
+    assert!(output.status.success(), "copied CLI failed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("selected:true"),
+        "TUI did not use inherited fallback bearer"
+    );
+    assert!(
+        stdout.contains("unrelated:false"),
+        "TUI received an unrelated dotenv secret"
+    );
+    assert!(
+        stdout.contains("baseline:true"),
+        "TUI lost its process baseline"
+    );
+    assert!(
+        !stdout.contains("inherited-selected-key"),
+        "TUI output disclosed supplied secret material"
+    );
 }

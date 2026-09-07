@@ -704,7 +704,8 @@ async fn handle_webhook(
         .trigger(TriggerRequest {
             function_id: "agent::chat".to_string(),
             payload: json!({
-                "agentId": agent_id,
+                "agentId": &agent_id,
+                "principal": { "agentId": &agent_id },
                 "message": text,
                 "sessionId": format!("teams:{conversation_id}"),
             }),
@@ -1039,6 +1040,10 @@ mod tests {
         let chats = bus.calls_to("agent::chat");
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].payload["message"], "<at>AgentOS</at> hello");
+        assert_eq!(
+            chats[0].payload["principal"],
+            json!({ "agentId": "default" })
+        );
     }
 
     #[tokio::test]

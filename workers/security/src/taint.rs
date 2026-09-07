@@ -18,8 +18,8 @@ pub struct TaintSet {
     labels: HashSet<TaintLabel>,
 }
 
-#[allow(dead_code)]
 impl TaintSet {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             labels: HashSet::new(),
@@ -32,10 +32,12 @@ impl TaintSet {
         }
     }
 
+    #[cfg(test)]
     pub fn add(&mut self, label: TaintLabel) {
         self.labels.insert(label);
     }
 
+    #[cfg(test)]
     pub fn merge(&mut self, other: &TaintSet) {
         for label in &other.labels {
             self.labels.insert(*label);
@@ -50,6 +52,7 @@ impl TaintSet {
         self.labels.remove(label);
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.labels.is_empty()
     }

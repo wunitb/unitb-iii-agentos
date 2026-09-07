@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:net";
 import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
@@ -6,6 +6,19 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+
+
+interface DotenvCorpusCase {
+  name: string;
+  source: string;
+  inherited: Record<string, string>;
+  expected?: Record<string, string>;
+  error?: string;
+}
+
+const dotenvCorpus = JSON.parse(
+  await readFile(new URL("../crates/cli/tests/fixtures/dotenv-corpus.json", import.meta.url), "utf8"),
+) as DotenvCorpusCase[];
 
 const execFileAsync = promisify(execFile);
 const fixtureRoots: string[] = [];
@@ -35,6 +48,10 @@ interface FixtureOptions {
   /// "present": ship a fake daemon; "armed-missing": arm config.yaml with no
   /// daemon binary at all.
   busAuth?: "present" | "armed-missing";
+  /// Hold the configured engine port before dev-up starts.
+  existingEngine?: boolean;
+  workerPolicy?: string;
+  initialPidFile?: string;
 }
 
 interface BusAuthCapture {
@@ -43,7 +60,15 @@ interface BusAuthCapture {
   starts: number;
 }
 
+interface WorkerSecurityCapture {
+  apiKey: string | null;
+  identity: string | null;
+  parentCanary: string | null;
+  slackSecret: string | null;
+}
+
 interface FixtureResult {
+  root: string;
   captured: CapturedEnvironment | null;
   stderr: string;
   stdout: string;
@@ -54,6 +79,13 @@ interface FixtureResult {
   busAuth: BusAuthCapture | null;
   /// The address this fixture told dev-up.sh to use for the daemon.
   busAuthAddr: string;
+  workerSecurity: WorkerSecurityCapture | null;
+  startOrder: string[];
+  engineBuiltinDaemons: string | null;
+  engineCwd: string | null;
+  engineEnvironment: string | null;
+  authEnvironment: string | null;
+  pidFile: string | null;
 }
 
 /// A loopback address nothing is listening on right now. dev-up.sh defaults the
@@ -97,6 +129,16 @@ async function runDevUpFixture(
   await mkdir(dirname(workerPath), { recursive: true });
   await copyFile(new URL("./dev-up.sh", import.meta.url), scriptPath);
   await copyFile(new URL("../.env.example", import.meta.url), join(root, ".env.example"));
+  await mkdir(join(root, "workers", "env-probe"), { recursive: true });
+  await writeFile(
+    join(root, "workers", "env-probe", "iii.worker.yaml"),
+    "iii: v1\nname: env-probe\nruntime: rust\n",
+  );
+  await writeFile(
+    join(root, "workers", "env.allowlist"),
+    options.workerPolicy ??
+      "env-probe=III_URL,AGENTOS_API_KEY,CODEX_PROXY_API_KEY,ANTHROPIC_API_KEY,OPENAI_API_KEY,AGENTOS_DEFAULT_MODEL\n",
+  );
   if (options.dotenvSymlink) {
     await writeFile(join(root, ".env.target"), dotenv, { mode: 0o600 });
     await symlink(".env.target", envPath);
@@ -106,18 +148,31 @@ async function runDevUpFixture(
   }
   const busAuthAddr = await freeLoopbackAddr();
   const busAuthLog = join(root, "bus-auth.argv");
+  const startOrderPath = join(root, "start.order");
+  const engineEnvPath = join(root, "engine.builtin");
+  const engineCwdPath = join(root, "engine.cwd");
+  const engineEnvironmentPath = join(root, "engine.env");
+  const authEnvironmentPath = join(root, "auth.env");
+  await writeFile(join(root, "config.yaml"), "workers: []\n");
+  if (options.initialPidFile !== undefined) {
+    await writeFile(join(root, ".agentos-dev.pids"), options.initialPidFile);
+  }
   if (options.busAuth === "present") {
     const daemonPath = join(root, "target", "release", "agentos-bus-authd");
     // Holds the port the way the real daemon does, so the readiness probe in
     // dev-up.sh has something to connect to.
     await writeFile(
       daemonPath,
-      `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${JSON.stringify(busAuthLog)}\n` +
+      `#!/usr/bin/env bash\nprintf '%s\\n' auth >> ${JSON.stringify(startOrderPath)}\nenv | sort > ${JSON.stringify(authEnvironmentPath)}\nprintf '%s\\n' "$*" >> ${JSON.stringify(busAuthLog)}\n` +
         `port="\${1##*:}"\nexec python3 -c "import socket,time\n` +
         `s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n` +
         `s.bind(('127.0.0.1',int('$port')));s.listen();time.sleep(30)"\n`,
     );
     await chmod(daemonPath, 0o755);
+    await writeFile(
+      join(root, "config.yaml"),
+      "workers:\n  - name: iii-worker-manager\n    config:\n      rbac:\n        auth_function_id: agentos::bus_auth\n",
+    );
   }
   if (options.busAuth === "armed-missing") {
     await writeFile(
@@ -128,12 +183,12 @@ async function runDevUpFixture(
 
   const memworkrMarker = join(root, "memworkr.started");
   const stubDir = join(root, "stub");
+  await mkdir(stubDir, { recursive: true });
   if (options.memworkr) {
     const version = options.memworkr.version ?? "0".repeat(39) + "1";
     const versionDir = join(root, ".agentos-runtime", "memworkr", "versions", version);
     const memworkrPath = join(versionDir, "memworkr");
     await mkdir(versionDir, { recursive: true });
-    await mkdir(stubDir, { recursive: true });
     await writeFile(join(root, ".agentos-runtime", "memworkr", "current"), `${version}\n`);
     await writeFile(
       memworkrPath,
@@ -176,6 +231,53 @@ async function runDevUpFixture(
     await chmod(iiiStub, 0o755);
   }
 
+  const engineAddr = await freeLoopbackAddr();
+  const existingEngine = options.existingEngine ? createServer() : null;
+  if (existingEngine) {
+    const [host, port] = engineAddr.split(":");
+    await new Promise<void>((resolve) => existingEngine.listen(Number(port), host, resolve));
+  }
+  const health = options.memworkr?.healthy ?? true
+    ? '{"status":"ok","schemaVersion":6,"callerEnforced":true,"instanceClaimed":true}'
+    : '{"status":"degraded","schemaVersion":6}';
+  const iiiStub = join(stubDir, "iii");
+  await writeFile(
+    iiiStub,
+    `#!/usr/bin/env bash
+` +
+      `if [[ "\${1:-}" == "trigger" ]]; then
+` +
+      `  for ((attempt=0; attempt<200; attempt++)); do
+` +
+      `    [[ -f ${JSON.stringify(memworkrMarker)} ]] && break
+` +
+      `    sleep 0.01
+` +
+      `  done
+` +
+      `  [[ -f ${JSON.stringify(memworkrMarker)} ]] || exit 1
+` +
+      `  printf '%s\n' ${JSON.stringify(health)}
+` +
+      `  exit 0
+` +
+      `fi
+` +
+      `printf '%s\n' engine >> ${JSON.stringify(startOrderPath)}
+` +
+      `printf '%s' "\${IIIWORKER_DISABLE_BUILTIN_DAEMONS-}" > ${JSON.stringify(engineEnvPath)}
+` +
+      `pwd > ${JSON.stringify(engineCwdPath)}
+` +
+      `env | sort > ${JSON.stringify(engineEnvironmentPath)}
+` +
+      `port="\${III_URL##*:}"
+` +
+      `exec python3 -c "import socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int('$port')));s.listen();time.sleep(30)"
+`,
+  );
+  await chmod(iiiStub, 0o755);
+
   for (const [id, keys] of Object.entries(options.integrations ?? {})) {
     await mkdir(join(root, "integrations"), { recursive: true });
     const declarations = keys
@@ -198,6 +300,10 @@ if [[ \${CODEX_PROXY_API_KEY+x} ]]; then printf '%s' "$CODEX_PROXY_API_KEY" > "$
 if [[ \${ANTHROPIC_API_KEY+x} ]]; then printf '%s' "$ANTHROPIC_API_KEY" > "$capture_tmp/anthropic"; fi
 if [[ \${OPENAI_API_KEY+x} ]]; then printf '%s' "$OPENAI_API_KEY" > "$capture_tmp/openai"; fi
 if [[ \${AGENTOS_DEFAULT_MODEL+x} ]]; then printf '%s' "$AGENTOS_DEFAULT_MODEL" > "$capture_tmp/defaultModel"; fi
+if [[ \${AGENTOS_API_KEY+x} ]]; then printf '%s' "$AGENTOS_API_KEY" > "$capture_tmp/apiKey"; fi
+if [[ \${III_WORKER_NAME+x} ]]; then printf '%s' "$III_WORKER_NAME" > "$capture_tmp/identity"; fi
+if [[ \${PARENT_CANARY+x} ]]; then printf '%s' "$PARENT_CANARY" > "$capture_tmp/parentCanary"; fi
+if [[ \${SLACK_BOT_TOKEN+x} ]]; then printf '%s' "$SLACK_BOT_TOKEN" > "$capture_tmp/slackSecret"; fi
 mv "$capture_tmp" "$capture_path"
 `,
   );
@@ -206,17 +312,28 @@ mv "$capture_tmp" "$capture_path"
   let stderr = "";
   let stdout = "";
   let exitCode = 0;
+  const commandEnv = {
+    PATH: `${stubDir}:${process.env.PATH}`,
+    HOME: process.env.HOME,
+    TMPDIR: process.env.TMPDIR,
+    III_URL: `ws://${engineAddr}`,
+    AGENTOS_API_KEY: "fixture-api-key",
+    // Never the fixed default: that port is shared machine state.
+    AGENTOS_BUS_AUTH_ADDR: busAuthAddr,
+    ...inherited,
+  };
+  const stopOwned = async () => {
+    try {
+      await execFileAsync("bash", [scriptPath, "stop"], { encoding: "utf8", env: commandEnv });
+    } catch {
+      // The assertion reports the primary launch failure; best-effort cleanup
+      // must not replace it with a second error.
+    }
+  };
   try {
     const result = await execFileAsync("bash", [scriptPath], {
       encoding: "utf8",
-      env: {
-        PATH: options.memworkr ? `${stubDir}:${process.env.PATH}` : process.env.PATH,
-        HOME: process.env.HOME,
-        TMPDIR: process.env.TMPDIR,
-        // Never the fixed default: that port is shared machine state.
-        AGENTOS_BUS_AUTH_ADDR: busAuthAddr,
-        ...inherited,
-      },
+      env: commandEnv,
     });
     stderr = result.stderr;
     stdout = result.stdout;
@@ -231,6 +348,11 @@ mv "$capture_tmp" "$capture_path"
     stderr = commandError.stderr ?? "";
     stdout = commandError.stdout ?? "";
   }
+  if (existingEngine) {
+    await new Promise<void>((resolve, reject) =>
+      existingEngine.close((error) => error ? reject(error) : resolve())
+    );
+  }
   const memworkrStarted = await readCapturedValue(root, "memworkr.started").then(
     (value) => value !== null,
   );
@@ -239,8 +361,31 @@ mv "$capture_tmp" "$capture_path"
   const busAuth: BusAuthCapture | null = busAuthRaw === null
     ? null
     : { argv: busAuthLines[0]?.split(" ") ?? [], starts: busAuthLines.length };
+  const startOrder = ((await readCapturedValue(root, "start.order")) ?? "").split("\n").filter(Boolean);
+  const engineBuiltinDaemons = await readCapturedValue(root, "engine.builtin");
+  const engineCwd = await readCapturedValue(root, "engine.cwd").then((value) => value?.trim() ?? null);
+  const engineEnvironment = await readCapturedValue(root, "engine.env");
+  const authEnvironment = await readCapturedValue(root, "auth.env");
+  const pidFile = await readCapturedValue(root, ".agentos-dev.pids");
   if (exitCode !== 0) {
-    return { captured: null, stderr, stdout, exitCode, memworkrStarted, busAuth, busAuthAddr };
+    await stopOwned();
+    return {
+      root,
+      captured: null,
+      stderr,
+      stdout,
+      exitCode,
+      memworkrStarted,
+      busAuth,
+      busAuthAddr,
+      workerSecurity: null,
+      startOrder,
+      engineBuiltinDaemons,
+      engineCwd,
+      engineEnvironment,
+      authEnvironment,
+      pidFile,
+    };
   }
 
   for (let attempt = 0; attempt < 200; attempt += 1) {
@@ -252,13 +397,19 @@ mv "$capture_tmp" "$capture_path"
     }
   }
   await access(capturePath);
-  const [codex, anthropic, openai, defaultModel] = await Promise.all([
+  const [codex, anthropic, openai, defaultModel, apiKey, identity, parentCanary, slackSecret] = await Promise.all([
     readCapturedValue(capturePath, "codex"),
     readCapturedValue(capturePath, "anthropic"),
     readCapturedValue(capturePath, "openai"),
     readCapturedValue(capturePath, "defaultModel"),
+    readCapturedValue(capturePath, "apiKey"),
+    readCapturedValue(capturePath, "identity"),
+    readCapturedValue(capturePath, "parentCanary"),
+    readCapturedValue(capturePath, "slackSecret"),
   ]);
+  await stopOwned();
   return {
+    root,
     captured: { codex, anthropic, openai, defaultModel },
     stderr,
     stdout,
@@ -266,6 +417,13 @@ mv "$capture_tmp" "$capture_path"
     memworkrStarted,
     busAuth,
     busAuthAddr,
+    workerSecurity: { apiKey, identity, parentCanary, slackSecret },
+    startOrder,
+    engineBuiltinDaemons,
+    engineCwd,
+    engineEnvironment,
+    authEnvironment,
+    pidFile,
   };
 }
 
@@ -288,6 +446,51 @@ afterEach(async () => {
   const roots = fixtureRoots.splice(0);
   await Promise.all(roots.map(stopFixtureProcesses));
   await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
+});
+
+async function runStopVerb(argument: string): Promise<{ exitCode: number; stderr: string; alive: boolean }> {
+  const root = await mkdtemp(join(tmpdir(), "agentos-dev-stop-"));
+  fixtureRoots.push(root);
+  await mkdir(join(root, "scripts"), { recursive: true });
+  const script = join(root, "scripts", "dev-up.sh");
+  await copyFile(new URL("./dev-up.sh", import.meta.url), script);
+  const child = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+  child.unref();
+  await writeFile(join(root, ".agentos-dev.pids"), `${child.pid}\n`);
+  let exitCode = 0;
+  let stderr = "";
+  try {
+    await execFileAsync("bash", [script, argument], { encoding: "utf8" });
+  } catch (error) {
+    const failure = error as { code?: number; stderr?: string };
+    exitCode = typeof failure.code === "number" ? failure.code : 1;
+    stderr = failure.stderr ?? "";
+  }
+  let alive = true;
+  try { process.kill(child.pid!, 0); } catch { alive = false; }
+  if (alive) { try { process.kill(-child.pid!, "SIGKILL"); } catch {} }
+  return { exitCode, stderr, alive };
+}
+
+describe("dev-up command verbs", () => {
+  it("the documented stop verb actually terminates recorded processes", async () => {
+    const result = await runStopVerb("stop");
+    expect(result.exitCode).toBe(0);
+    expect(result.alive).toBe(false);
+  });
+
+  it("accepts --stop as a compatibility alias instead of booting", async () => {
+    const result = await runStopVerb("--stop");
+    expect(result.exitCode).toBe(0);
+    expect(result.alive).toBe(false);
+  });
+
+  it("rejects unknown arguments before any boot work", async () => {
+    const result = await runStopVerb("--bogus");
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("unknown argument: --bogus");
+    expect(result.alive).toBe(true);
+  });
 });
 
 describe("dev-up dotenv loading", () => {
@@ -326,23 +529,26 @@ OPENAI_API_KEY='open secret'
     });
   });
 
-  it("keeps shell syntax, unmatched quotes, and inline comments inert", async () => {
-    const { captured, exitCode } = await runDevUpFixture(
-      `CODEX_PROXY_API_KEY=$(printf exploited)
-ANTHROPIC_API_KEY=$HOME
-OPENAI_API_KEY="unmatched
-AGENTOS_DEFAULT_MODEL=value # literal
-`,
-    );
-    expect(exitCode).toBe(0);
-
-    expect(captured).toEqual({
-      codex: "$(printf exploited)",
-      anthropic: "$HOME",
-      openai: '"unmatched',
-      defaultModel: "value # literal",
+  for (const testCase of dotenvCorpus) {
+    it(`matches shared dotenv corpus: ${testCase.name}`, async () => {
+      const result = await runDevUpFixture(testCase.source, testCase.inherited);
+      if (testCase.error !== undefined) {
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.toLowerCase()).toContain(testCase.error.toLowerCase());
+        return;
+      }
+      expect(result.exitCode).toBe(0);
+      const names: Record<string, keyof NonNullable<FixtureResult["captured"]>> = {
+        CODEX_PROXY_API_KEY: "codex",
+        ANTHROPIC_API_KEY: "anthropic",
+        OPENAI_API_KEY: "openai",
+        AGENTOS_DEFAULT_MODEL: "defaultModel",
+      };
+      for (const [name, expected] of Object.entries(testCase.expected ?? {})) {
+        expect(result.captured![names[name]!], name).toBe(expected);
+      }
     });
-  });
+  }
 
   it("rejects a dotenv file with mode 0644 before starting workers", async () => {
     const { exitCode, stderr } = await runDevUpFixture("", {}, { dotenvMode: 0o644 });
@@ -444,6 +650,43 @@ describe("dev-up dotenv allowlist", () => {
     expect(stderr).toContain("error: unknown dotenv variable 'NOT_DECLARED_ANYWHERE' on line 1");
   });
 
+  it("clears parent and cross-worker secrets while preserving exact identity", async () => {
+    const { exitCode, workerSecurity } = await runDevUpFixture(
+      "SLACK_BOT_TOKEN=channel-secret\n",
+      { PARENT_CANARY: "must-not-leak" },
+    );
+    expect(exitCode).toBe(0);
+    expect(workerSecurity).toEqual({
+      apiKey: "fixture-api-key",
+      identity: "agentos-env-probe",
+      parentCanary: null,
+      slackSecret: null,
+    });
+  });
+
+  it("rejects unknown or duplicate worker-policy entries", async () => {
+    for (const workerPolicy of [
+      "unknown=III_URL,AGENTOS_API_KEY\n",
+      "env-probe=III_URL,AGENTOS_API_KEY\nenv-probe=III_URL,AGENTOS_API_KEY\n",
+      "env-probe=III_URL,AGENTOS_API_KEY,OPENAI_API_KEY,OPENAI_API_KEY\n",
+      "env-probe=III_URL,AGENTOS_API_KEY,NOT_DECLARED\n",
+    ]) {
+      const { exitCode, stderr } = await runDevUpFixture("", {}, { workerPolicy });
+      expect(exitCode, workerPolicy).toBe(1);
+      expect(stderr, workerPolicy).toMatch(/unknown|duplicate/);
+    }
+  });
+
+  it("rejects unknown and duplicate disabled-worker names", async () => {
+    for (const disabled of ["unknown", "env-probe,env-probe", "env-probe,", ",env-probe"]) {
+      const { exitCode, stderr } = await runDevUpFixture("", {
+        AGENTOS_DISABLED_WORKERS: disabled,
+      });
+      expect(exitCode, disabled).toBe(1);
+      expect(stderr, disabled).toContain("AGENTOS_DISABLED_WORKERS");
+    }
+  });
+
   it("reads integration manifest keys only from the env section", async () => {
     // `id = "example"` sits under [integration], not [integration.env]: a
     // parser that scanned the whole manifest would allow `id` as a variable.
@@ -515,8 +758,37 @@ describe("dev-up memworkr runtime", () => {
 });
 
 describe("dev-up bus RBAC gate", () => {
+  it("passes the exact config to authd and starts the engine from the runtime root", async () => {
+    const { exitCode, busAuth, engineCwd, root } = await runDevUpFixture("", {}, { busAuth: "present" });
+    expect(exitCode).toBe(0);
+    expect(busAuth?.argv).toContain(`--config=${join(root, "config.yaml")}`);
+    expect(engineCwd).toBe(root);
+  });
+
+  it("rebuilds bounded engine and authd environments", async () => {
+    const result = await runDevUpFixture("", {
+      ANTHROPIC_API_KEY: "native-anthropic",
+      OPENAI_API_KEY: "native-openai",
+      HTTPS_PROXY: "http://proxy.invalid",
+      AUDIT_HMAC_KEY: "must-not-leak",
+      SLACK_BOT_TOKEN: "must-not-leak",
+      MONGODB_URI: "must-not-leak",
+      PARENT_CANARY: "must-not-leak",
+    }, { busAuth: "present" });
+    expect(result.exitCode).toBe(0);
+    expect(result.engineEnvironment).toContain("ANTHROPIC_API_KEY=native-anthropic\n");
+    expect(result.engineEnvironment).toContain("OPENAI_API_KEY=native-openai\n");
+    expect(result.engineEnvironment).toContain("HTTPS_PROXY=http://proxy.invalid\n");
+    expect(result.authEnvironment).toContain("AGENTOS_API_KEY=fixture-api-key\n");
+    for (const forbidden of ["AUDIT_HMAC_KEY", "SLACK_BOT_TOKEN", "MONGODB_URI", "PARENT_CANARY"]) {
+      expect(result.engineEnvironment, forbidden).not.toContain(forbidden);
+      expect(result.authEnvironment, forbidden).not.toContain(forbidden);
+    }
+    expect(result.authEnvironment).not.toContain("ANTHROPIC_API_KEY");
+  });
+
   it("starts the bus-auth daemon and does not treat it as a worker", async () => {
-    const { exitCode, stdout, busAuth, busAuthAddr } = await runDevUpFixture("", {}, {
+    const { exitCode, stdout, busAuth, busAuthAddr, startOrder, engineBuiltinDaemons } = await runDevUpFixture("", {}, {
       busAuth: "present",
     });
 
@@ -528,12 +800,28 @@ describe("dev-up bus RBAC gate", () => {
     expect(stdout).toContain(`bus-auth daemon listening on ${busAuthAddr}`);
     // It is not a worker: the worker loop must not have started a second copy.
     expect(busAuth?.starts).toBe(1);
+    expect(startOrder.slice(0, 2)).toEqual(["auth", "engine"]);
+    expect(engineBuiltinDaemons).toBe("1");
   }, 30_000);
 
-  it("warns when the config arms bus RBAC and the daemon is not built", async () => {
+  it("refuses an already-open engine when armed RBAC cannot be verified", async () => {
+    const { exitCode, stderr, busAuth, startOrder, pidFile } = await runDevUpFixture("", {}, {
+      busAuth: "present",
+      existingEngine: true,
+      initialPidFile: "999999999\n",
+    });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("live bus RBAC cannot be verified");
+    expect(stderr).toContain("stop that stack yourself");
+    expect(busAuth).toBeNull();
+    expect(startOrder).toEqual([]);
+    expect(pidFile).toBe("999999999\n");
+  });
+
+  it("refuses when the config arms bus RBAC and the daemon is not built", async () => {
     const { exitCode, stderr } = await runDevUpFixture("", {}, { busAuth: "armed-missing" });
 
-    expect(exitCode).toBe(0);
+    expect(exitCode).toBe(1);
     expect(stderr).toContain("arms bus RBAC");
     expect(stderr).toContain("cargo build --workspace --release");
   });

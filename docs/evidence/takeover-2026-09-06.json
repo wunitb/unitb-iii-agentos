@@ -1,0 +1,121 @@
+{
+  "date": "2026-09-06",
+  "base_commit": "d6a50fa92b6579382af34f18965b1b9628190153",
+  "main_unchanged": "5507c3a0ded026420ee0f56929776b69f2eb343e",
+  "branch": "fix/takeover-stabilization",
+  "subject": "base commit plus uncommitted takeover working-tree changes",
+  "public_ci_claim": false,
+  "release_ready": false,
+  "toolchains": {
+    "rust": "1.90.0",
+    "bun": "1.3.14",
+    "python_embedding_test": "3.14.3"
+  },
+  "checks": {
+    "rust_format": "pass",
+    "rust_clippy_workspace_all_targets_deny_warnings": "pass",
+    "rust_workspace_tests": "pass",
+    "rust_ignored_test_attributes": 3,
+    "rust_source_test_attributes": 2147,
+    "rust_locked_metadata": "pass",
+    "rust_locked_release_build": "pass",
+    "bun_unit_passed": 208,
+    "bun_governance_passed": 34,
+    "vitest_root_script_tests_passed": 85,
+    "typescript": "pass",
+    "published_counts": "pass",
+    "website_build": "pass",
+    "python_embedding_tests_passed": 161,
+    "shellcheck_dash_installer_fixtures": "pass",
+    "native_default_armed_smoke": "pass",
+    "root_node_audit": "fail",
+    "website_npm_audit": "pass",
+    "fresh_rust_advisory_database": "not run"
+  },
+  "artifact": {
+    "version": "0.2.0",
+    "target": "aarch64-linux",
+    "elf_machine": 183,
+    "sha256": "eab9233308cb531010544e909d3c3dce2735e9a35f94dffddda605595c799060",
+    "exact_release_workflow_staging_step": true,
+    "required_runtime_files_byte_identical": true,
+    "runtime_symlinks_to_checkout": false,
+    "outside_checkout_cwd": true
+  },
+  "runtime": {
+    "fixture_credentials_only": true,
+    "actual_fake_chat_leaf_passed": true,
+    "fake_lane_tests_passed": 8,
+    "required_agentos_workers": 62,
+    "registered_functions": 608,
+    "recorded_stable_root_groups": 64,
+    "observed_runtime_processes": 74,
+    "sampling_seconds": [
+      0.52,
+      20.57,
+      40.52,
+      60.52
+    ],
+    "all_samples_ready": true,
+    "untrusted_sensitive_calls_denied": 15,
+    "builtin_worker_mutations_absent": true,
+    "remaining_owned_live_after_stop": 0,
+    "remaining_observable_runtime_processes_after_stop": 0,
+    "ownership_record_retired": true,
+    "remaining_boundary_ports_open": 0,
+    "restart_and_second_teardown": "pass",
+    "final_artifact_manual_kill_required": false,
+    "real_provider_acceptance": false,
+    "macos_runtime_acceptance": false
+  },
+  "node_advisories": [
+    {
+      "package": "@opentelemetry/core",
+      "locked_version": "1.30.1",
+      "id": "GHSA-8988-4f7v-96qf",
+      "severity": "moderate",
+      "status": "unresolved"
+    },
+    {
+      "package": "@opentelemetry/propagator-jaeger",
+      "locked_version": "1.30.1",
+      "id": "GHSA-45rx-2jwx-cxfr",
+      "severity": "high",
+      "status": "unresolved"
+    }
+  ],
+  "github_read_only_checks": {
+    "private_vulnerability_reporting": false,
+    "branch_strict": false,
+    "enforce_admins": true,
+    "required_status_checks": 10,
+    "open_pull_requests": 0,
+    "latest_release": "v0.1.0",
+    "latest_release_published_at": "2026-08-31T13:40:54Z"
+  },
+  "limits": [
+    "Single-operator trusted-host boundary, not a hostile same-UID sandbox",
+    "One-minute readiness sampling, not endurance or SLA proof",
+    "No public CI, attestation, tag, or release acceptance for this working tree",
+    "No implicit deletion of branches, archives, operator data, or credential files"
+  ],
+  "source_sha256": {
+    ".github/workflows/ci.yml": "75e88135d5f3348130eddb6fb73dc7242569e84cdd670693a1c87a5b84db8f39",
+    "AGENTS.md": "c262cc1a917894d5e82e9d44526e5fd9886ae538fa0feec022495e272c2220ae",
+    "ARCHITECTURE.md": "2506f655c709d96f67fcdc2a35600274e36a37944101336264be795e6383ce2c",
+    "README.md": "44003dddc4b92412b13203dcea7c06dd66746dc5f2ad21aa82ecb1d3e5c6ee59",
+    "package.json": "ca7be66fef2204a062a8b7b1418db17016a247578b0110a642d77b5fe8335acb",
+    "crates/cli/src/bootstrap.rs": "69b65189d5691b0515a076e98722bc4f83bdde0478a918060745245f2ccdbbbb",
+    "crates/cli/src/lifecycle.rs": "bbecb6155feec83ff824696abca1b282c666c57a993c3a5571590e096e18f63c",
+    "crates/cli/src/main.rs": "03d93dba7273a6d938d97a3b9da11f2761dfebc3edd5785d91c2267964a23d0e",
+    "crates/cli/src/supervisor.rs": "c75988684e71a3852dd8d733154ff572c56fc10b4846811075c2ddaca92bac09",
+    "crates/cli/tests/portability.rs": "b028d5e95f817fe7ae0a13addc2832953cf1e7eada3bdcdfff4420a334d39c32",
+    "scripts/boot-smoke.sh": "617facef65ab6dd519077803a46b89c8429a76b94be9d0be5336f380e7cc29ac",
+    "scripts/boot-smoke.test.ts": "ddb97bfc3387736ca74eedcff2e8a91df2f12b8a465c24588183562c2e4e4879",
+    "vitest.config.ts": "a866d4d070ec4331fcd873408d5c5d7260a1d64be33f3b640b9f6834da9e253d",
+    "website/components/Hero.tsx": "984f639d375c8021bb578011b592f483f1ba071a23fcdfd7c2f887ee7aa276fb",
+    "workers/channel-slack/src/main.rs": "e6a042e1c7a727d2b965e4f5c8f7f2bb378705ebc4bc55f68a3d54c5746b0a75",
+    "workers/security/src/taint.rs": "6afc5eeb02df39c13cf23e6fe49ef8ee4e98def3825306a94644f7e73d6cff68",
+    "workers/vault/src/main.rs": "3193ee9bfaa485f247e03bd1b56c18b2f84ba751ef61362f8fb15367c31448f3"
+  }
+}
