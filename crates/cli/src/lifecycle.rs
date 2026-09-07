@@ -320,6 +320,7 @@ fn process_identity_at(
     stat_path: &Path,
     executable_path: &Path,
 ) -> Result<Option<ProcessIdentity>> {
+    use std::os::unix::fs::MetadataExt;
     let stat = match fs::read_to_string(stat_path) {
         Ok(stat) => stat,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -345,20 +346,22 @@ fn process_identity_at(
             return Err(error).with_context(|| format!("Cannot resolve executable for pid {pid}"));
         }
     };
-    use std::os::unix::fs::MetadataExt;
     let metadata = match fs::metadata(executable_path) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(metadata) => metadata,
+        // Exit can remove the executable between read_link and stat. An absent
+        // inode is not a live, mismatching identity. Unlinked live images still
+        // have kernel metadata through the /proc executable magic link.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("Cannot inspect executable identity"),
     };
     Ok(Some(ProcessIdentity {
         start_token,
         executable,
-        executable_identity: metadata.as_ref().map(|metadata| ExecutableIdentity {
+        executable_identity: Some(ExecutableIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
         }),
-        executable_deleted: metadata.is_some_and(|metadata| metadata.nlink() == 0),
+        executable_deleted: metadata.nlink() == 0,
         zombie: false,
     }))
 }
@@ -1100,6 +1103,14 @@ mod tests {
         command.spawn().unwrap()
     }
 
+    fn spawn_stubborn_descendant(pid_file: &Path) -> std::process::Child {
+        // Readiness precedes a blocking builtin, with no further fork/exec races.
+        Command::new("/bin/sh")
+        .args(["-c", &format!(r#"exec 3<&0; trap 'exit 0' TERM; /bin/sh -c 'trap "" TERM; echo $$ > "{}"; read blocked <&3' & wait"#, pid_file.display())])
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null())
+        .process_group(0).spawn().unwrap()
+    }
+
     fn await_file(path: &Path) {
         for _ in 0..200 {
             if fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0) {
@@ -1301,10 +1312,12 @@ mod tests {
         let deleted_target = root.join("deleted-target");
         let deleted_link = root.join("deleted-executable-link");
         std::os::unix::fs::symlink(&deleted_target, &deleted_link).unwrap();
-        let identity = process_identity_at(42, &stat_path, &deleted_link)
-            .unwrap()
-            .expect("a readable link to a deleted executable is still identity evidence");
-        assert_eq!(identity.executable, deleted_target);
+        assert!(
+            process_identity_at(42, &stat_path, &deleted_link)
+                .unwrap()
+                .is_none(),
+            "a link without executable metadata must not fabricate a live identity"
+        );
 
         fs::remove_file(&stat_path).unwrap();
         fs::write(&stat_path, "malformed").unwrap();
@@ -1507,14 +1520,8 @@ mod tests {
     #[test]
     fn captured_descendant_is_stopped_after_its_leader_exits() {
         let root = root("stubborn-descendant");
-        let ready = root.join("ready");
         let descendant_path = root.join("descendant.pid");
-        let mut child = spawn_shell(format!(
-            r#"trap 'exit 0' TERM; /bin/sh -c 'trap "" TERM; echo $$ > "{}"; while :; do sleep 1; done' & printf ready > "{}"; wait"#,
-            descendant_path.display(),
-            ready.display()
-        ));
-        await_file(&ready);
+        let mut child = spawn_stubborn_descendant(&descendant_path);
         await_file(&descendant_path);
         let descendant: u32 = fs::read_to_string(&descendant_path)
             .unwrap()
@@ -1522,12 +1529,12 @@ mod tests {
             .parse()
             .unwrap();
         let process = capture(&child, "worker");
-        let process_group = process.process_group;
+        let group = process.process_group;
         persist_owned(&root, vec![process]).unwrap();
         let outcome = stop_owned(&root, Duration::from_millis(100));
         let still_running = process_identity(descendant).is_ok_and(|identity| !identity.zombie);
         let record_remains = record_path(&root).exists();
-        unsafe { kill(-(process_group as i32), 9) };
+        unsafe { kill(-(group as i32), 9) };
         let _ = child.wait();
         fs::remove_dir_all(root).unwrap();
         assert_eq!(outcome.unwrap(), StopOutcome::Stopped(1));
@@ -1604,10 +1611,7 @@ mod tests {
     fn a_group_without_a_live_recorded_leader_or_captured_witness_is_refused() {
         let root = root("unwitnessed-group");
         let ready = root.join("descendant.pid");
-        let mut child = spawn_shell(format!(
-            r#"/bin/sh -c 'trap "" TERM; echo $$ > "{}"; while :; do sleep 1; done' & wait"#,
-            ready.display()
-        ));
+        let mut child = spawn_stubborn_descendant(&ready);
         await_file(&ready);
         let descendant: u32 = fs::read_to_string(&ready).unwrap().trim().parse().unwrap();
         let process = capture(&child, "worker");
@@ -1623,7 +1627,7 @@ mod tests {
         let outcome = stop_owned(&root, Duration::from_millis(20));
         let survived = process_identity(descendant).is_ok_and(|identity| !identity.zombie);
         let record_remains = record_path(&root).exists();
-        // This fixture still owns the unreaped parent Child; its group cannot be reused.
+        // The unreaped fixture Child still reserves the original group id.
         unsafe { kill(-(group as i32), 9) };
         let _ = child.wait();
         fs::remove_dir_all(root).unwrap();
