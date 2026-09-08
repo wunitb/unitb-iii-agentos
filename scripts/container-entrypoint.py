@@ -104,7 +104,9 @@ def main() -> int:
     signal.signal(signal.SIGINT, lambda *_: STOP.set())
     prepare()
     try:
-        child = subprocess.Popen(["agentos", "up", "--no-tui"])
+        # Compose installs registry primitives across dependent startup layers.
+        # Keep this below the launcher's 300s whole-startup readiness deadline.
+        child = subprocess.Popen(["agentos", "up", "--no-tui", "--timeout", "240"])
         while child.poll() is None:
             if STOP.wait(0.2):
                 child.terminate()

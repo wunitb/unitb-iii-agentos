@@ -174,15 +174,24 @@ class ContainerRuntimeTests(unittest.TestCase):
             self.assertEqual(kwargs["timeout"], 40)
             return subprocess.CompletedProcess(args, 0)
         with patch.object(self.entry, "prepare"), patch.object(self.entry.signal, "signal"), \
-                patch.object(self.entry.subprocess, "Popen", return_value=child), \
+                patch.object(self.entry.subprocess, "Popen", return_value=child) as start, \
                 patch.object(self.entry.subprocess, "run", side_effect=run) as command, \
                 patch.object(self.entry.STOP, "wait", side_effect=lambda _seconds: next(waits)), \
                 contextlib.redirect_stderr(io.StringIO()) as output:
             result = self.entry.main()
+        self.startup_args = start.call_args.args[0]
         self.assertFalse(self.entry.READY.exists())
         self.assertEqual(command.call_args.args[0], ["agentos", "stop"])
         self.assertNotIn("SECRET", output.getvalue())
         return result, output.getvalue(), command
+
+    def test_container_startup_budget_covers_compose_and_fits_outer_deadline(self):
+        self.run_health([0])
+        self.assertIn("--no-tui", self.startup_args)
+        self.assertIn("--timeout", self.startup_args)
+        budget = int(self.startup_args[self.startup_args.index("--timeout") + 1])
+        self.assertGreaterEqual(budget, 4 * 60)  # Four dependent Compose startup layers.
+        self.assertLess(budget, 300)  # Launcher retains its whole-startup deadline.
 
     def test_health_requires_three_consecutive_bounded_failures(self):
         result, output, command = self.run_health([1, "timeout", 1])
