@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Iterator
+import contextlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -274,6 +276,31 @@ def validate_status(value: dict, engine: str) -> str:
     return endpoints['api']
 
 
+@contextlib.contextmanager
+def fixture_base_reference(oci: str, identity: str, reference: str,
+                           env: dict[str, str]) -> Iterator[str]:
+    # BuildKit treats a bare image ID in FROM as a registry repository name.
+    # Give the inspected image a private, temporary name without replacing its tags.
+    existing = run([oci, 'image', 'ls', '--quiet', '--no-trunc',
+                    '--filter', f'reference={reference}'], env, timeout=30)
+    require(not existing.strip(), 'fixture base reference already exists')
+    source = json.loads(run([oci, 'image', 'inspect', identity], env, timeout=30))[0]
+    require(any(tag and tag != '<none>:<none>' for tag in source.get('RepoTags') or []),
+            'fixture requires a retained production image tag')
+    run([oci, 'image', 'tag', identity, reference], env, timeout=30)
+    try:
+        pinned = json.loads(run([oci, 'image', 'inspect', reference], env, timeout=30))[0]
+        require(pinned['Id'] == identity, 'fixture base identity changed')
+        yield reference
+    finally:
+        pinned = json.loads(run([oci, 'image', 'inspect', reference], env, timeout=30))[0]
+        require(pinned['Id'] == identity, 'fixture base identity changed; reference retained')
+        require(any(tag and tag not in (reference, '<none>:<none>')
+                    for tag in pinned.get('RepoTags') or []),
+                'refusing to remove the last production image tag; reference retained')
+        run([oci, 'image', 'rm', reference], env, timeout=30)
+
+
 def host_acceptance(*, build: bool = True, live: bool = False, report: Path | None = None) -> None:
     launcher = ROOT / 'scripts/oci-stack.sh'
     require(launcher.is_file(), 'complete OCI checkout required (scripts/oci-stack.sh missing)')
@@ -334,11 +361,12 @@ def host_acceptance(*, build: bool = True, live: bool = False, report: Path | No
             context = scratch / 'image'
             context.mkdir(mode=0o700)
             shutil.copyfile(Path(__file__), context / 'oci-smoke.py')
-            private_write(context / 'Containerfile', f'FROM {identity}\nCOPY --chmod=0644 oci-smoke.py {SCRIPT}\n'
-                f'ENTRYPOINT ["/usr/bin/tini", "--", "python3", "{SCRIPT}", "--fixture-entrypoint"]\n')
-            run([str(oci), 'build', '--file', str(context / 'Containerfile'), '--tag', image,
-                 '--label', f'{ENGINE_LABEL}={engine}', str(context)], env, timeout=300)
-            image_created = True
+            with fixture_base_reference(str(oci), identity, image + '-base', env) as base_reference:
+                private_write(context / 'Containerfile', f'FROM {base_reference}\nCOPY --chmod=0644 oci-smoke.py {SCRIPT}\n'
+                    f'ENTRYPOINT ["/usr/bin/tini", "--", "python3", "{SCRIPT}", "--fixture-entrypoint"]\n')
+                run([str(oci), 'build', '--file', str(context / 'Containerfile'), '--tag', image,
+                     '--label', f'{ENGINE_LABEL}={engine}', str(context)], env, timeout=300)
+                image_created = True
             env['AGENTOS_OCI_IMAGE'] = image
             private_write(home / 'oci-smoke.marker', 'fixture-only\n')
         start_attempted = True
