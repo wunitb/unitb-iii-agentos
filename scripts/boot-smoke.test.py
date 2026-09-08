@@ -69,6 +69,21 @@ class OciSmokeTests(unittest.TestCase):
         with self.assertRaisesRegex(SMOKE.SmokeError, "exited 7"):
             SMOKE.run(["python3", "-c", "raise SystemExit(7)"], {"PATH": os.environ["PATH"]}, timeout=5)
 
+    def test_fixture_diagnostics_redact_dotenv_values_and_bound_output(self):
+        (self.home / "runtime").mkdir()
+        (self.home / "runtime/.env").write_text('AGENTOS_API_KEY="private-api-value"\nAUDIT_HMAC_KEY=private-audit-value\n')
+        (self.home / "logs").mkdir()
+        (self.home / "last-boot.log").write_text("startup failed: private-api-value")
+        (self.home / "logs/engine.log").write_text("x" * 20000 + " engine error: private-audit-value")
+        with patch.object(SMOKE.sys, "stderr", io.StringIO()) as output:
+            SMOKE.fixture_diagnostics(self.home)
+        result = output.getvalue()
+        self.assertIn("startup failed", result)
+        self.assertIn("engine error", result)
+        self.assertNotIn("private-api-value", result)
+        self.assertNotIn("private-audit-value", result)
+        self.assertLess(len(result), 17000)
+
     def test_access_views_require_real_targets_and_hide_denied_functions(self):
         authenticated = {"functions": [{"function_id": name} for name in SMOKE.UNTRUSTED_DENIED_FUNCTION_IDS]}
         public = {"functions": [{"function_id": "state::get"}]}

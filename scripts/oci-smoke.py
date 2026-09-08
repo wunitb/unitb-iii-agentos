@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -66,6 +67,27 @@ def private_write(path: Path, text: str) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, 'w') as stream:
         stream.write(text)
+
+
+def fixture_diagnostics(home: Path) -> None:
+    # Only the hermetic fixture calls this; live-provider logs remain private.
+    try:
+        secrets = {FAKE_KEY}
+        dotenv = home / 'runtime/.env'
+        for line in dotenv.read_text().splitlines() if dotenv.exists() else []:
+            if not line.strip() or line.lstrip().startswith('#'):
+                continue
+            key, separator, value = line.partition('=')
+            require(bool(separator) and bool(key.strip()), 'invalid fixture dotenv')
+            secrets.update(shlex.split(value, comments=True))
+        for path in [home / 'last-boot.log', *sorted((home / 'logs').glob('*.log'))]:
+            if path.is_file():
+                content = path.read_text(errors='replace')
+                for secret in sorted(filter(None, secrets), key=len, reverse=True):
+                    content = content.replace(secret, '[REDACTED]')
+                print(f'OCI fixture diagnostic: {path.name}\n{content[-16000:]}', file=sys.stderr)
+    except (OSError, ValueError, SmokeError):
+        print('OCI fixture diagnostics unavailable; private logs retained', file=sys.stderr)
 
 
 def run(args: list[str], env: dict[str, str], *, timeout: int = 600) -> str:
@@ -413,6 +435,8 @@ def host_acceptance(*, build: bool = True, live: bool = False, report: Path | No
                 private_write(report, json.dumps(receipt, indent=2) + '\n')
             shutil.rmtree(scratch)
         else:
+            if not live:
+                fixture_diagnostics(home)
             print(f'OCI smoke: failed; private scratch evidence retained: {scratch}', file=sys.stderr)
     print(json.dumps(receipt))
     print('OCI smoke: real OCI readiness, acceptance and owned teardown passed')
