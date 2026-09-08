@@ -14,6 +14,7 @@ agentos-bus-auth.workspace = true
 agentos-http-adapter.workspace = true
 iii-sdk.workspace = true
 tokio.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

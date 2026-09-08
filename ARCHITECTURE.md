@@ -1,6 +1,17 @@
 # UnitB AgentOS architecture
 
-This codebase is an independent continuation of `iii-experimental/agentos`, migrated to the stable iii version pinned in `.iii-version` (v0.22.1). AgentOS is an agent operating system built on the [iii engine](https://github.com/iii-hq/iii). The repo ships **63 narrow workers** (62 Rust workers and one Python worker), declarative config (hands, integrations, agents), and two surfaces (`crates/cli`, `crates/tui`). Everything coordinates through iii primitives — `register_function`, `register_trigger`, `iii.trigger` — over the engine's WebSocket on port 49134.
+This codebase is an independent continuation of `iii-experimental/agentos`, migrated to the stable iii version pinned in `.iii-version` (v0.23.0). AgentOS is an agent operating system built on the [iii engine](https://github.com/iii-hq/iii). The repo ships **63 narrow workers** (62 Rust workers and one Python worker), declarative config (hands, integrations, agents), and two surfaces (`crates/cli`, `crates/tui`). Everything coordinates through iii primitives — `register_function`, `register_trigger`, `iii.trigger` — over the engine's WebSocket on port 49134.
+
+## Runtime boundary
+
+The migrated source runs in a non-root OCI container. A private loopback engine
+manager handles policy bootstrap and Compose infrastructure; a second manager
+retains the native deny-by-default authentication/registration hooks for product
+workers and external clients. Only the authenticated edge and API are published
+on host loopback, using runtime-assigned ports. Compose controls and the raw bus
+are not host-facing. `worker-compose.yaml` pins infrastructure; the CLI owns
+ordered readiness and shutdown. The container marker is an operator-configuration
+guard, not a sandbox against hostile processes sharing the same user identity.
 
 ## Repository layout
 
@@ -57,18 +68,35 @@ CI's `validate iii.worker.yaml` job enforces this on every PR.
 
 ## Engine boot
 
-`config.yaml` uses the `.iii-version` stable pin, currently iii v0.22.1, and its configuration-worker layout. It declares seventeen engine workers — the file-backed `configuration` store, the loopback `iii-worker-manager` bus, `iii-bridge`, plus `iii-http`, `iii-pubsub`, `state`, `llm-router`, `context-manager`, `cron`, `iii-directory`, `iii-observability`, `iii-stream`, `provider-anthropic`, `provider-openai`, `provider-openai-codex`, `queue`, and `session-manager`. These are upstream registry binaries resolved through `iii.lock`; `iii-bridge` forwards the four RBAC hooks to the loopback `agentos-bus-authd`. The engine's `llm-router` and `context-manager` are *not* the AgentOS workers of the same folder name. The state, queue, and cron workers use the canonical 0.22.1 names; declaring their deprecated `iii-*` aliases alongside canonical workers makes the engine reject the config. Their committed values live in matching files under `config/`. AgentOS workers spawn alongside as separate processes and connect through `register_worker`.
+`config.yaml` uses the `.iii-version` stable pin, currently iii v0.23.0. It declares four engine workers — the file-backed `configuration` store, the private `iii-worker-manager#raw`, the authenticated `iii-worker-manager` edge, and `iii-stream`.
 
-Bus RBAC is armed by default and fails closed when `agentos-bus-authd` cannot answer. Linux `agentos up`, foreground `agentos start`, and the Linux development helper start authd before an engine they own, force builtin mutation daemons off, and refuse an already-listening engine whose live RBAC gate cannot be verified. The gate assigns an untrusted tier to callers without the shared bearer and broader tiers to trusted workers/operator calls. It denies exact sensitive calls and registration families, but intentionally leaves generic registry and state compatibility; it is not a hostile same-host sandbox.
+`worker-compose.yaml` separately pins registry infrastructure, including HTTP,
+pubsub, state, queue, cron, provider adapters and session/context services. Their
+explicit configuration IDs read the committed records under `config/`, and their
+working directories preserve relative data paths. The registry LLM/context
+services are not the AgentOS Rust workers with similarly named source folders.
+The legacy `iii.lock` belongs to the archived native installation path; it no
+longer declares the migrated Compose topology.
 
-Only Linux has runtime proof for the owned detached `up`/`stop` lifecycle. On
-macOS `aarch64`, use foreground `agentos start` and run `agentos tui` separately;
-a successfully built macOS archive proves compilation/package shape, not detached
-ownership or stop semantics.
+Inside OCI, the CLI starts its owned engine, attaches the policy worker on the
+private manager, verifies all native RBAC hooks, then starts Compose. Readiness
+requires both primitive identities and their critical registered functions before
+product workers are started with authenticated, scoped environments. There is no
+legacy bridge in this configuration and no raw host listener. The mandatory bare
+manager name is retained so upstream does not inject an extra ungated default.
 
-The `shell`, `console` and `harness` registry workers are configured under `config/` but deliberately **not** booted by default: `shell` exposes host command execution on the unauthenticated bus, and console v1.9.16 has no host key — it listens on `0.0.0.0` and proxies `/ws` to the bus — so both are opt-in.
+The host launcher publishes only the API and gated bus on loopback using dynamic
+ports; `scripts/oci-stack.sh status` reports their endpoints. The raw manager,
+Compose controls and internal telemetry/stream services are not host-published.
+An untrusted caller cannot invoke Compose lifecycle controls. Native host
+`agentos up`/`agentos start` refuses this topology before modifying operator files.
 
-The engine WebSocket endpoint is configurable via `III_URL` (default `ws://localhost:49134`).
+Podman/Docker run the Linux runtime on supported hosts. Native macOS archive
+behavior is historical release evidence, not proof for the new OCI installation.
+The gate remains a shared-operator boundary, not protection from hostile code
+sharing the operator identity. `shell`, `console` and `harness` are not booted
+by default. Internal workers use the authenticated `III_URL`; external clients
+use the dynamically published bus endpoint and an authorized bearer.
 
 ## Calling a function from another worker
 
@@ -115,16 +143,16 @@ guarantee teardown of descendants.
 
 | namespace | worker | semantics |
 |---|---|---|
-| `sandbox::create` / `sandbox::exec` / `sandbox::list` / `sandbox::stop` | **builtin** iii-sandbox (v0.22.1) | Ephemeral microVMs from OCI rootfs (Python, Node presets). Full Linux. |
+| `sandbox::create` / `sandbox::exec` / `sandbox::list` / `sandbox::stop` | upstream iii-sandbox namespace | Reserved for upstream infrastructure; not enabled in the shipped OCI composition. |
 | `wasm::execute` / `wasm::validate` / `wasm::list_modules` | agentos `wasm-sandbox` | wasmtime, fuel-metered, sub-millisecond cold start. |
 
 CI's `no sandbox::* clash with builtin` job greps the workspace to ensure no agentos worker registers `sandbox::*`.
 
 ## Atomic state ops
 
-iii v0.22.1 exposes `state::update` / `stream::update` with `set`, `increment`, `append` and `merge` operations. Workers prefer these over `state::list + state::set` race patterns when mutating lists or counters.
+The state and stream primitives expose `state::update` / `stream::update` with `set`, `increment`, `append` and `merge` operations. Workers prefer these over `state::list + state::set` race patterns when mutating lists or counters.
 
-The wire shape is exact, and three of its fields are easy to get wrong. Verified against the pinned engine on 2026-09-02:
+The wire shape is exact, and three of its fields are easy to get wrong. This contract was characterized on 2026-09-02 and is guarded by the state-protocol tests:
 
 ```jsonc
 {
@@ -166,7 +194,7 @@ The transport is **buffered, not token streaming**. `stream::sse` frames an answ
 
 Two limits, stated rather than papered over:
 
-- **The engine fails open around it.** In iii 0.22.1 a failing `auth_function` is only logged and the socket is upgraded anyway with `context: None`, and an `Err` from the `stream:join` trigger call is likewise logged while the join proceeds. A slow, crashed or unregistered `streaming` worker therefore means joins are **allowed**, not denied.
+- **The legacy engine review found it fails open around the gate.** In iii 0.22.1, when authentication or join handlers fail, joins are **allowed**, not denied. OCI therefore keeps the stream listener private rather than treating the migration as evidence of a stronger stream-authentication guarantee.
 - **So the loopback bind is load-bearing.** `config/iii-stream.yaml` sets `host: 127.0.0.1`; this gate is defence in depth behind that bind, not a replacement for it. Widening the bind re-exposes the socket to anything that can reach the host, fail-open and all.
 
 ## Surfaces (cli, tui)
@@ -202,15 +230,16 @@ Development is coordinated outside this repository. Work is split into packages 
 
 ## Versioning
 
-- iii engine: **v0.22.1**, pinned and checksum-verified by `scripts/install-iii.sh`
-- iii-sdk (Rust): **=0.22.1** in workspace `Cargo.toml`
-- iii-sdk (Node): **0.22.1** in root `package.json` (e2e tests only)
-- iii-sdk (Python): **=0.22.1** in `workers/embedding/pyproject.toml`
+- iii engine: **v0.23.0**, pinned and checksum-verified by `scripts/install-iii.sh`
+- iii-sdk (Rust): **=0.23.0** in workspace `Cargo.toml`
+- iii-sdk (Node): **0.23.0** in root `package.json` (examples and E2E clients)
+- iii-sdk (Python): **=0.23.0** in `workers/embedding/pyproject.toml`
 - agentos workspace: **0.2.0**, inherited by every Rust crate from `[workspace.package]`
 
-iii `v0.23` is the latest stable upstream line. This release defers it until
-RBAC hooks, SDK wire contracts, locked registry assets, supported-platform binaries,
-boot behavior, and the full matrix pass together. The current pin is deliberate.
+The source uses the OCI installation contract in `docs/III-023-MIGRATION.md`.
+The published native AgentOS `v0.2.0` bundles remain historical iii `v0.22.1`
+artifacts; this migration does not republish them. Cross-platform and real-provider
+acceptance require their own evidence, not inference from a local fixture.
 
 ## CI
 
@@ -222,18 +251,18 @@ push with `AGENTOS_FULL_E2E_ENABLED`. The workflow starts from
 
 | job | gate |
 |---|---|
-| `rust` | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` (dev profile, 2,156 test attributes; 3 live-engine checks ignored by default) + `cargo build --workspace --release` + `cargo audit` + `cargo deny check` (advisories, bans, licences, sources — policy in `deny.toml`) |
-| `boot-smoke` | downloads the release binaries built by `rust`, boots a scratch runtime through `agentos up --no-tui`, and requires every local worker identity plus the six functions that make the AgentOS layer usable; no provider credential or model call |
+| `rust` | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` (dev profile, 2,178 test attributes; 3 live-engine checks ignored by default) + `cargo build --workspace --release` + `cargo audit` + `cargo deny check` (advisories, bans, licences, sources — policy in `deny.toml`) |
+| `boot-smoke` | `scripts/boot-smoke.sh` builds the OCI image and runs scratch fixture acceptance: registry, product identities, access views, a deterministic chat/protocol, worker calls, restart preservation and owned teardown; no real provider credential |
 | `node-unit` | `bun run typecheck`, `bun run test:unit` (tests of the software), `bun run test:governance` (build-evidence and documentation contracts), `bun run counts:check` (every published number recomputed from the tree) |
 | `dependency-review` | `actions/dependency-review-action` with `fail-on-severity: moderate`, pull requests only |
 | `portable-bundle` | stages the release payload from the `rust` artifacts and asserts the extracted bundle needs no checkout-relative path |
-| `python` | `pytest workers/embedding/test_main.py` |
+| `python` | installs pytest and the pinned iii SDK, then `python -m pytest workers/embedding -q`, including the real SDK contract tests |
 | `website` | `npm ci` + `npm run build` in `website/` |
 | `scripts` | `shellcheck --severity=warning` over the seven shipped shell scripts |
 | `worker-yaml` | every `workers/<name>/iii.worker.yaml` parses, matches its folder, declares `runtime.kind` of `rust` or `python`, and carries a `scripts.start` string |
 | `namespace-clash` | grep ensures no agentos worker registers `sandbox::*` |
-| `e2e-smoke` | typechecks and tests the Node examples and startup configuration, then starts engine + workers, asserts ports listen, the required functions register, and no namespace clash |
-| `e2e-full` | runs the vitest e2e suite against the live stack — needs `AGENTOS_API_KEY` and `ANTHROPIC_API_KEY` secrets and the `AGENTOS_FULL_E2E_ENABLED` variable |
+| `e2e-smoke` | typechecks/tests Node examples and startup configuration, checks native OpenTelemetry ingestion, then reuses the OCI image built by `boot-smoke` for fixture acceptance and validates its exact JSON report with `scripts/assert-oci-results.ts` |
+| `e2e-full` | `scripts/oci-smoke.py --live-e2e` runs the Vitest suite against an isolated OCI stack — needs `AGENTOS_API_KEY` and `ANTHROPIC_API_KEY` secrets and the `AGENTOS_FULL_E2E_ENABLED` variable |
 
 The toolchain is pinned in one place, `rust-toolchain.toml` (`channel = "1.90"`),
 which `ci.yml`, `release.yml` and `Cargo.toml`'s `rust-version` must all match;

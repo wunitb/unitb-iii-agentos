@@ -81,6 +81,9 @@ pub fn register_http_trigger(
         function_id: adapter_id,
         config,
         metadata,
+        // Inherit the worker's function namespace and engine provider fallback.
+        namespace: None,
+        trigger_namespace: None,
     })
 }
 

@@ -1,0 +1,145 @@
+# Private infrastructure only. CLI owns the engine and runs:
+# iii compose --engine ws://127.0.0.1:49129 --up --file worker-compose.yaml
+# Names match upstream identities/config ids; default namespace also matches
+# authenticated product workers. Existing pins are from iii.lock; HTTP/pubsub
+# pins are verified binary releases from the registry (2026-09-07).
+# Explicit working_dir preserves relative ./data paths at the runtime root.
+namespace: default
+startup_timeout: 60s
+stop_timeout: 5s
+containers:
+  http:
+    worker: package://api.workers.iii.dev/http
+    version: "0.21.9"
+    config_name: iii-http
+    working_dir: .
+    environment: &primitive_env
+      TOKIO_WORKER_THREADS: "${TOKIO_WORKER_THREADS:-2}"
+      III_DISABLE_TRACE_PAYLOADS: "${III_DISABLE_TRACE_PAYLOADS:-false}"
+      III_TRACE_PAYLOAD_MAX_BYTES: "${III_TRACE_PAYLOAD_MAX_BYTES:-}"
+      HTTP_PROXY: "${HTTP_PROXY:-}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-}"
+      ALL_PROXY: "${ALL_PROXY:-}"
+      NO_PROXY: "${NO_PROXY:-}"
+      http_proxy: "${http_proxy:-}"
+      https_proxy: "${https_proxy:-}"
+      all_proxy: "${all_proxy:-}"
+      no_proxy: "${no_proxy:-}"
+  pubsub:
+    worker: package://api.workers.iii.dev/pubsub
+    version: "0.21.5"
+    config_name: iii-pubsub
+    working_dir: .
+    environment: *primitive_env
+  state:
+    worker: package://api.workers.iii.dev/state
+    version: "0.22.2"
+    config_name: state
+    working_dir: .
+    environment: *primitive_env
+  queue:
+    worker: package://api.workers.iii.dev/queue
+    version: "0.21.9"
+    config_name: queue
+    working_dir: .
+    environment: *primitive_env
+    start_after: [state]
+  cron:
+    worker: package://api.workers.iii.dev/cron
+    version: "0.21.10"
+    config_name: cron
+    working_dir: .
+    environment: *primitive_env
+    start_after: [state]
+  llm-router:
+    worker: package://api.workers.iii.dev/llm-router
+    version: "1.4.14"
+    config_name: llm-router
+    working_dir: .
+    environment:
+      TOKIO_WORKER_THREADS: "${TOKIO_WORKER_THREADS:-2}"
+      III_DISABLE_TRACE_PAYLOADS: "${III_DISABLE_TRACE_PAYLOADS:-false}"
+      III_TRACE_PAYLOAD_MAX_BYTES: "${III_TRACE_PAYLOAD_MAX_BYTES:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    start_after: [state]
+  context-manager:
+    worker: package://api.workers.iii.dev/context-manager
+    version: "1.1.4"
+    config_name: context-manager
+    working_dir: .
+    environment: *primitive_env
+    start_after: [llm-router]
+  iii-directory:
+    worker: package://api.workers.iii.dev/iii-directory
+    version: "1.2.6"
+    config_name: iii-directory
+    working_dir: .
+    environment: *primitive_env
+  provider-anthropic:
+    worker: package://api.workers.iii.dev/provider-anthropic
+    version: "1.2.10"
+    config_name: provider-anthropic
+    working_dir: .
+    environment:
+      TOKIO_WORKER_THREADS: "${TOKIO_WORKER_THREADS:-2}"
+      III_DISABLE_TRACE_PAYLOADS: "${III_DISABLE_TRACE_PAYLOADS:-false}"
+      III_TRACE_PAYLOAD_MAX_BYTES: "${III_TRACE_PAYLOAD_MAX_BYTES:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      PROVIDER_ANTHROPIC_CACHE: "${PROVIDER_ANTHROPIC_CACHE:-}"
+      HTTP_PROXY: "${HTTP_PROXY:-}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-}"
+      ALL_PROXY: "${ALL_PROXY:-}"
+      NO_PROXY: "${NO_PROXY:-}"
+      http_proxy: "${http_proxy:-}"
+      https_proxy: "${https_proxy:-}"
+      all_proxy: "${all_proxy:-}"
+      no_proxy: "${no_proxy:-}"
+    start_after: [llm-router]
+  provider-openai:
+    worker: package://api.workers.iii.dev/provider-openai
+    version: "1.2.8"
+    config_name: provider-openai
+    working_dir: .
+    environment:
+      TOKIO_WORKER_THREADS: "${TOKIO_WORKER_THREADS:-2}"
+      III_DISABLE_TRACE_PAYLOADS: "${III_DISABLE_TRACE_PAYLOADS:-false}"
+      III_TRACE_PAYLOAD_MAX_BYTES: "${III_TRACE_PAYLOAD_MAX_BYTES:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      HTTP_PROXY: "${HTTP_PROXY:-}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-}"
+      ALL_PROXY: "${ALL_PROXY:-}"
+      NO_PROXY: "${NO_PROXY:-}"
+      http_proxy: "${http_proxy:-}"
+      https_proxy: "${https_proxy:-}"
+      all_proxy: "${all_proxy:-}"
+      no_proxy: "${no_proxy:-}"
+    start_after: [llm-router]
+  provider-openai-codex:
+    worker: package://api.workers.iii.dev/provider-openai-codex
+    version: "0.4.7"
+    config_name: provider-openai-codex
+    working_dir: .
+    environment:
+      TOKIO_WORKER_THREADS: "${TOKIO_WORKER_THREADS:-2}"
+      III_DISABLE_TRACE_PAYLOADS: "${III_DISABLE_TRACE_PAYLOADS:-false}"
+      III_TRACE_PAYLOAD_MAX_BYTES: "${III_TRACE_PAYLOAD_MAX_BYTES:-}"
+      CODEX_HOME: "${CODEX_HOME:-}"
+      HTTP_PROXY: "${HTTP_PROXY:-}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-}"
+      ALL_PROXY: "${ALL_PROXY:-}"
+      NO_PROXY: "${NO_PROXY:-}"
+      http_proxy: "${http_proxy:-}"
+      https_proxy: "${https_proxy:-}"
+      all_proxy: "${all_proxy:-}"
+      no_proxy: "${no_proxy:-}"
+    start_after: [llm-router]
+  session-manager:
+    worker: package://api.workers.iii.dev/session-manager
+    version: "1.0.13"
+    config_name: session-manager
+    working_dir: .
+    environment: *primitive_env
+    start_after: [context-manager, state]
+# No engine block: Compose must not start another engine. No product workers,
+# shell, harness, console, or bridge; no auth headers are supported by Compose.

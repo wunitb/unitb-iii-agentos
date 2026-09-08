@@ -1,10 +1,8 @@
-//! The bus-auth daemon: the engine side of the iii-sdk protocol.
+//! Pure policy handlers with an OCI worker transport for iii 0.23.
 //!
-//! The engine's builtin `iii-bridge` worker connects here as a client and
-//! forwards three function ids (see [`crate::policy`]). Everything else on this
-//! socket is answered with `function_not_found`, so the daemon is a policy
-//! oracle and nothing more: it registers nothing, it stores nothing, and it
-//! cannot be used to reach the bus.
+//! Worker mode connects to the container-private raw manager after engine boot,
+//! registers exactly the four existing policy handlers, then answers invocations.
+//! The legacy listener remains available for older bridge configurations only.
 //!
 //! # Threat notes
 //!
@@ -16,7 +14,7 @@
 //!   engine and must never behave like one.
 //! * If the daemon is down, the engine's forward call errors and the RBAC gate
 //!   refuses every new bus connection. That is the intended direction (fail
-//!   closed) and it is why `agentos up` has to start this before the engine.
+//!   closed). OCI startup waits for policy registration before Compose/product workers.
 
 use std::net::SocketAddr;
 
@@ -226,8 +224,135 @@ pub async fn serve(listener: TcpListener, expected_key: String) -> anyhow::Resul
     }
 }
 
+/// Attach a policy-only worker to the fixed private manager. No proxy or SDK
+/// bootstrap dependency: the wire spelling is iii 0.23's `registerfunction`.
+/// Disconnects/errors terminate the worker; callers must treat it as unhealthy.
+pub async fn serve_worker(url: &str, expected_key: String) -> anyhow::Result<()> {
+    crate::config::require_container()?;
+    anyhow::ensure!(
+        url == crate::config::RAW_WORKER_URL,
+        "policy worker must use the fixed private raw manager"
+    );
+    run_worker(url, expected_key).await
+}
+
+async fn run_worker(url: &str, expected_key: String) -> anyhow::Result<()> {
+    let (mut socket, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .context("connect policy worker to private raw manager")?;
+    let hello = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match socket.next().await.transpose()? {
+                Some(WsMessage::Text(text)) => {
+                    let frame: Value = serde_json::from_str(&text)?;
+                    anyhow::ensure!(
+                        frame["type"] != "error",
+                        "engine refused policy worker: {frame}"
+                    );
+                    if frame["type"] == "workerregistered" {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                }
+                Some(WsMessage::Ping(payload)) => socket.send(WsMessage::Pong(payload)).await?,
+                None | Some(WsMessage::Close(_)) => anyhow::bail!("engine closed policy handshake"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("policy handshake timed out")?;
+    hello?;
+    // Metadata registration precedes handler registration on the same socket.
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "type": "invokefunction", "invocation_id": uuid::Uuid::new_v4().to_string(),
+                "function_id": WORKER_REGISTER_FUNCTION_ID,
+                "data": { "name": "agentos-bus-auth", "namespace": "default" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    for (_, id) in crate::policy::ARMED_HOOKS {
+        socket
+            .send(WsMessage::Text(
+                json!({ "type": "registerfunction", "id": id })
+                    .to_string()
+                    .into(),
+            ))
+            .await?;
+    }
+    tracing::info!(%url, "policy worker attached; four hooks submitted");
+    while let Some(frame) = socket.next().await {
+        match frame? {
+            WsMessage::Text(text) => {
+                let frame: Value = serde_json::from_str(&text)?;
+                anyhow::ensure!(
+                    frame["type"] != "error" && frame.get("error").is_none_or(Value::is_null),
+                    "policy worker registration/connection error: {frame}"
+                );
+                if let Some(reply) = handle_frame(&text, Some(&expected_key)) {
+                    socket.send(WsMessage::Text(reply.into())).await?;
+                }
+            }
+            WsMessage::Ping(payload) => socket.send(WsMessage::Pong(payload)).await?,
+            WsMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+    anyhow::bail!("private raw manager disconnected the policy worker")
+}
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn policy_worker_registers_only_four_handlers_and_fails_on_disconnect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let worker = tokio::spawn(async move { super::run_worker(&url, "secret".into()).await });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        socket
+            .send(WsMessage::Text(
+                json!({"type": "workerregistered", "worker_id": "fixture"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let metadata: Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(metadata["function_id"], WORKER_REGISTER_FUNCTION_ID);
+        assert_eq!(metadata["data"]["namespace"], "default");
+        for (_, id) in crate::policy::ARMED_HOOKS {
+            let registration: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(registration, json!({"type": "registerfunction", "id": id}));
+        }
+        socket
+            .send(WsMessage::Text(
+                invoke_frame(AUTH_FUNCTION_ID, json!({"headers": {}})).into(),
+            ))
+            .await
+            .unwrap();
+        let result: Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(
+            result["result"]["context"][TIER_CONTEXT_KEY],
+            TIER_UNTRUSTED
+        );
+        socket.close(None).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), worker)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+    }
+
     use super::*;
     use crate::policy::{TIER_CONTEXT_KEY, TIER_TRUSTED, TIER_UNTRUSTED};
 

@@ -1,10 +1,7 @@
 import { registerWorker } from "iii-sdk";
-import { ENGINE_URL, OTEL_CONFIG, registerHttpTrigger, registerShutdown } from "./shared.js";
+import { ENGINE_URL, workerOptions, registerHttpTrigger, registerShutdown } from "./shared.js";
 
-const sdk = registerWorker(ENGINE_URL, {
-  workerName: "crew-swarm-debate",
-  otel: OTEL_CONFIG,
-});
+const sdk = registerWorker(ENGINE_URL, workerOptions("crew-swarm-debate"));
 registerShutdown(sdk);
 const { trigger: rawTrigger, registerFunction } = sdk;
 const trigger = (id: string, payload: unknown, timeoutMs?: number) =>

@@ -3,7 +3,9 @@
 ## Supported version
 
 AgentOS `0.2.x` receives security fixes. Older releases are not supported.
-The repository pins iii `v0.22.1`; do not assume a newer engine or SDK is wire-compatible.
+The current source pins iii `v0.23.0` and uses the non-root OCI runtime.
+Published native `v0.2.0` archives remain on iii `v0.22.1`; they are not migration
+artifacts. Do not assume a different engine or SDK is wire-compatible.
 
 ## Reporting a vulnerability
 
@@ -15,12 +17,14 @@ Include the affected commit or release, a minimal reproduction, impact, and any 
 
 ## Supported threat model
 
-AgentOS is a single-operator product on a trusted host. The engine bus is bound to loopback. The default configuration arms tiered bus RBAC through `agentos-bus-authd`: callers without the shared bearer are the untrusted tier; callers with `AGENTOS_API_KEY` and registered AgentOS workers receive broader policy tiers. Exact sensitive calls and registration families are denied to the untrusted tier.
+AgentOS is a single-operator product on a trusted host. The OCI launcher publishes
+only the API and authenticated edge bus on dynamically assigned host-loopback
+ports. The raw bootstrap bus remains on private container loopback, never published. The default configuration arms tiered bus RBAC through `agentos-bus-authd`: callers without the shared bearer are the untrusted tier; callers with `AGENTOS_API_KEY` and registered AgentOS workers receive broader policy tiers. Exact sensitive calls and registration families are denied to the untrusted tier.
 
 This is **not** a hostile local multi-user boundary:
 
 - `AGENTOS_API_KEY` is one shared operator credential. Shipped Rust workers receive it through the worker environment policy. It identifies operator-trusted processes; it does not give each worker a separate identity or isolate processes running as the same OS user.
-- The untrusted tier deliberately retains some generic registry and state access for iii compatibility. In particular, RBAC is not a complete state-mutation boundary. Do not expose port 49134 to a LAN, tailnet, container peer, or another untrusted user.
+- The untrusted tier deliberately retains some generic registry and state access for iii compatibility. In particular, RBAC is not a complete state-mutation boundary. Do not widen the launcher's host-loopback publications or expose the container-private listeners to a LAN, tailnet, container peer, or another untrusted user.
 - HTTP bearer checks, principal propagation, and the bus gate narrow remote and deputy authority. They are defence in depth inside the single-operator boundary, not a replacement for OS accounts, file permissions, or network isolation.
 
 ## Execution and supply-chain boundaries
@@ -33,6 +37,13 @@ The `shell`, `console`, and `harness` registry workers remain opt-in because the
 
 ## Provider and engine evidence
 
-Credential-free tests use the in-tree fake Anthropic endpoint. They prove request shape and multi-turn history without network egress. They do not prove a real provider account, billing path, rate limits, or production egress.
+Credential-free OCI tests execute a real single chat turn against an in-tree fake
+Anthropic endpoint on container loopback. They check provider request shape,
+registry/access views, worker calls, restart preservation and owned teardown.
+Artifact setup requires network access. These tests do not prove multi-turn
+history, real provider accounts, billing, rate limits, or production egress.
 
-iii `v0.23` is the latest stable upstream line, but AgentOS `0.2.0` stays on `v0.22.1`. Compatibility is deferred until the RBAC hook protocol, SDK wire shapes, registry lock, worker assets on every supported platform, boot lifecycle, and full test matrix are validated together. Do not change `.iii-version` alone.
+Engine and SDK changes require wire-contract, RBAC, registry, lifecycle and
+platform evidence. Do not change `.iii-version` alone or rewrite an existing
+runtime's stored pin to bypass the separate-home migration guard. See
+[the current migration boundary](docs/III-023-MIGRATION.md).

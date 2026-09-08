@@ -1,93 +1,8 @@
-# iii v0.22.1 configuration-worker layout.
-#
-# The `configuration` worker is the source of truth for every other worker's
-# settings: each `- name: X` entry below reads its value from ./config/X.yaml.
-# Inline `config:` blocks on those entries are no longer read — change a value
-# by editing ./config/X.yaml. Runtime `configuration::set` is restricted to an
-# authenticated bus client; the bare `iii config set X` CLI is untrusted.
-
+# iii 0.23 engine-only configuration. Run via scripts/oci-stack.sh.
+# Raw bootstrap and Compose stay inside one OCI network boundary; only the
+# RBAC-gated edge may be published, to host loopback. The marker is an operator
+# misconfiguration guard, not a sandbox against hostile same-UID processes.
 workers:
-  # The engine's own WebSocket bus (the socket every worker connects to). It is
-  # mandatory and is auto-added when absent, with WorkerManagerConfig::default()
-  # -> host "0.0.0.0". Declared here so the bind host is pinned to loopback
-  # instead of inherited: the bus carries every AgentOS function and has no
-  # authentication of its own, so an all-interfaces bind is a remote, unauthed
-  # gateway to the whole stack. Verified live: with host 127.0.0.1 the socket is
-  # refused from this machine's LAN and tailnet addresses; with 0.0.0.0 it is
-  # reachable from both. Valid keys are port, host, middleware_function_id,
-  # rbac, handshake_timeout_ms — THIS struct is deny_unknown_fields, so a typo
-  # here fails the boot instead of being ignored. The nested `rbac:` mapping is
-  # NOT: the engine ignores any key it does not know, so a typo inside it
-  # silently disarms the gate. `agentos-bus-authd` checks that file for you and
-  # refuses to start on a mismatch (crates/bus-auth/src/config.rs).
-  - name: iii-worker-manager
-    config:
-      host: 127.0.0.1
-      # `rbac.auth_function_id` fails closed. Every supported boot path must
-      # start `agentos-bus-authd` on 127.0.0.1:49129 before starting iii.
-      # The four hooks below gate connections, function registrations, trigger
-      # registrations, and trigger-type claims respectively.
-      rbac:
-        auth_function_id: agentos::bus_auth
-        on_function_registration_function_id: agentos::bus_on_register
-        on_trigger_registration_function_id: agentos::bus_on_trigger
-        on_trigger_type_registration_function_id: agentos::bus_on_trigger_type
-        # `forbidden_functions` returned by bus-authd narrows the untrusted tier
-        # by exact id; the engine requires this global wildcard first.
-        expose_functions:
-          - match("*")
-  # Bootstrap bridge for the four RBAC hooks. The bridge registers its forward
-  # handlers before the engine bus listener starts, so the gate can authenticate
-  # the first registry-worker connection. Never point this at the engine bus.
-  - name: iii-bridge
-    config:
-      url: ws://127.0.0.1:49129
-      forward:
-        - local_function: agentos::bus_auth
-          remote_function: agentos::bus_auth
-          timeout_ms: 5000
-        - local_function: agentos::bus_on_register
-          remote_function: agentos::bus_on_register
-          timeout_ms: 5000
-        - local_function: agentos::bus_on_trigger
-          remote_function: agentos::bus_on_trigger
-          timeout_ms: 5000
-        - local_function: agentos::bus_on_trigger_type
-          remote_function: agentos::bus_on_trigger_type
-          timeout_ms: 5000
-  - name: iii-http
-  - name: iii-pubsub
-  - name: state
-  - name: llm-router
-  - name: context-manager
-  - name: cron
-  - name: iii-directory
-  - name: iii-observability
-  - name: iii-stream
-  - name: provider-anthropic
-  - name: provider-openai
-  - name: provider-openai-codex
-  - name: queue
-  - name: session-manager
-  # `shell` is deliberately NOT booted by default. Its function surface
-  # (shell::exec, shell::exec_bg, shell::pty::open, shell::fs::write,
-  # shell::fs::rm, coder::*) lands on the engine bus, which has no
-  # authentication, and `fs.host_roots` jails only the shell::fs::* half — it
-  # does not constrain the program shell::exec runs. Opt in by adding
-  # `- name: shell` here; ./config/shell.yaml holds the hardened settings that
-  # then apply. See config/shell.yaml for what that does and does not buy you.
-  # `harness` is deliberately NOT booted by default, for the same reason as
-  # `shell`. Read out of the shipped v1.8.8-rc.3 binary's own function
-  # descriptions: harness::send and harness::spawn start autonomous agent turns,
-  # harness::function::trigger invokes arbitrary iii functions under the harness
-  # dispatch policy, and harness::filesystem::grant / ::revoke are upstream's own
-  # "Internal control-plane" functions that widen a session's filesystem roots.
-  # It also drives coder::* and shell::* for file writes. All of it sits on the
-  # unauthenticated bus, and upstream's approval-gate spec pairs
-  # `harness::spawn` with `shell::*`. Nothing in this repo calls harness::*, and
-  # its only in-stack consumer was the console worker, which is also opt-in now.
-  # Opt in by adding `- name: harness` here; ./config/harness.yaml holds the
-  # bounded settings that then apply, and says what you still have to decide.
   - name: configuration
     config:
       adapter:
@@ -95,12 +10,23 @@ workers:
         config:
           directory: ./config
       ttl_seconds: 0
-  # `console` is deliberately NOT booted by default. Its worker configuration
-  # (v1.9.16, pinned in iii.lock) exposes exactly one server key, `http_port` —
-  # there is no bind-host key — and the shipped binary listens on 0.0.0.0, so
-  # the console (which also proxies /ws to the unauthenticated engine bus)
-  # cannot be confined to loopback from this repo. It was observed live as
-  # `LISTEN 0 128 0.0.0.0:3113 users:(("console",...))` on a tailnet-attached
-  # host. Opt in by adding `- name: console` here AND blocking 3113 at the
-  # firewall, or reach it through an SSH tunnel. ./config/console.yaml pins the
-  # port so the value is declared in-tree rather than inherited.
+  - name: iii-worker-manager#raw
+    config:
+      host: 127.0.0.1
+      port: 49129
+  # Mandatory manager must retain the bare name; upstream otherwise injects
+  # a third, ungated default listener. This bare instance is our gated edge.
+  - name: iii-worker-manager
+    config:
+      host: 0.0.0.0
+      port: 49134
+      rbac:
+        auth_function_id: agentos::bus_auth
+        on_function_registration_function_id: agentos::bus_on_register
+        on_trigger_registration_function_id: agentos::bus_on_trigger
+        on_trigger_type_registration_function_id: agentos::bus_on_trigger_type
+        expose_functions:
+          - match("*")
+  - name: iii-stream
+# Registry primitives are pinned in worker-compose.yaml, not engine workers.
+# shell, harness, console, and the legacy iii-bridge are not started.

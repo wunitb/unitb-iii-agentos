@@ -1307,11 +1307,15 @@ fn parse_chat_response(body: &str) -> String {
             .or_else(|| json["response"].as_str())
             .or_else(|| json["message"].as_str())
     {
-        return match tool_call_summary(&json) {
+        let mut content = match tool_call_summary(&json) {
             Some(summary) if s.trim().is_empty() => summary,
             Some(summary) => format!("{s}\n\n{summary}"),
             None => s.to_string(),
         };
+        if json["sessionPersisted"] == false {
+            content.push_str("\n\nWarning: this turn was not saved completely to session history.");
+        }
+        return content;
     }
     let mut out = String::new();
     for line in body.split('\n') {
@@ -4456,6 +4460,15 @@ mod tests {
     fn test_parse_chat_response_json_object() {
         let s = parse_chat_response(r#"{"content":"hello world"}"#);
         assert_eq!(s, "hello world");
+    }
+
+    #[test]
+    fn chat_response_displays_a_failed_history_write_without_losing_the_answer() {
+        let text = parse_chat_response(
+            r#"{"content":"answer","sessionPersisted":false,"persistenceWarnings":["memory unavailable"]}"#,
+        );
+        assert!(text.starts_with("answer"));
+        assert!(text.contains("not saved"));
     }
 
     #[test]

@@ -106,13 +106,13 @@ idna==3.18 \
     # via
     #   anyio
     #   httpx
-iii-helpers==0.22.1 \
-    --hash=sha256:334448658ee4a60097f554f091b9c21b05da2f05ea22e95be4d2872c0c9dc998 \
-    --hash=sha256:8c66e97d9e232af699399380eb7e3de4329c5f4ac5b9405c8ba82b80624cc584
+iii-helpers==0.23.0 \
+    --hash=sha256:035332804bb8f585905a223057f63528000b1cce1ebe7a8bd319b6e9cbf9ccf1 \
+    --hash=sha256:6035086d8dbf7cecb9f92b7dc6cb9e9793c73d6eebdc286394f171fb71abe5f5
     # via iii-sdk
-iii-sdk==0.22.1 \
-    --hash=sha256:7201092b0c49cb0ad4f76e29e5d719b6b17fb234e09d257225fd2991cce0e50b \
-    --hash=sha256:e8bdc668be4186566555b865f2e5e06748b86a1f9b22eb217b1a8622cbd7b76a
+iii-sdk==0.23.0 \
+    --hash=sha256:382df8108c7f642768c8956dacba5cbbd9bb2db0b21c74ef3174c620011b717c \
+    --hash=sha256:40ec1de1193a8b5f1d7df2a42acb8084cfcbd8627863f8a412281918cd0d6d38
     # via agentos-embedding (pyproject.toml)
 iniconfig==2.3.0 \
     --hash=sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730 \

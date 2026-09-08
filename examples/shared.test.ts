@@ -1,6 +1,26 @@
 import type { IIIClient, JsonValue } from "iii-sdk";
 import { describe, expect, it, vi } from "vitest";
-import { agentStateWrites, registerHttpTrigger } from "./shared.js";
+import { agentStateWrites, registerHttpTrigger, OTEL_CONFIG, workerOptions } from "./shared.js";
+
+describe("workerOptions", () => {
+  it("keeps identity and OTEL while forwarding only the bus credential", () => {
+    expect(workerOptions("crew-fixture", {
+      AGENTOS_API_KEY: "fixture-key",
+      UNRELATED_SECRET: "must-not-cross",
+    })).toEqual({
+      workerName: "crew-fixture",
+      otel: OTEL_CONFIG,
+      headers: { Authorization: "Bearer fixture-key" },
+    });
+  });
+
+  it.each([{}, { AGENTOS_API_KEY: "" }])("does not fabricate a credential for %j", (env) => {
+    expect(workerOptions("crew-fixture", env)).toEqual({
+      workerName: "crew-fixture",
+      otel: OTEL_CONFIG,
+    });
+  });
+});
 
 type Handler = (input: JsonValue) => Promise<JsonValue>;
 

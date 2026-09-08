@@ -165,6 +165,22 @@ pub const TIER_UNTRUSTED: &str = "untrusted";
 /// `step.function_id` verbatim from its OWN trusted session, so an untrusted
 /// `workflow::create` + an allowed `workflow::run` reaches every id on this list.
 pub const UNTRUSTED_FORBIDDEN_FUNCTIONS: &[&str] = &[
+    // Compose is private infrastructure: its process/configuration control and
+    // log surfaces are never available to an untrusted edge session. (A)(B)(C)
+    "compose::up",
+    "compose::down",
+    "compose::list",
+    "compose::status",
+    "compose::logs",
+    "compose::stop",
+    "compose::validate",
+    "compose::add",
+    "compose::remove",
+    "compose::restart",
+    "compose::update",
+    "compose::schema",
+    "compose::operation",
+    "compose::cancel",
     // configuration — mutation is not required by the credential-less registry
     // workers. Reads and the in-process registration path stay available. (B)
     "configuration::set",
@@ -923,6 +939,7 @@ mod tests {
             "approval",      // (B) an approval a caller grants itself is not a gate
             "control",       // (D) rehydrate replays the trigger factory
             "coder",         // (A) the second surface of the shell binary
+            "compose",       // (A)(B)(C) private worker lifecycle, config, and logs
             "configuration", // (B) set mutates engine-wide worker configuration
             "council",       // (B) override rewrites a decision
             "hand",          // (A) trigger runs an automation on demand

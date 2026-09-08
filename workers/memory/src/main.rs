@@ -15,6 +15,33 @@ use std::collections::HashMap;
 /// does not ask for a specific number.
 const DEFAULT_HISTORY_LIMIT: usize = 50;
 
+async fn lock_session(agent: &str, session: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    type Locks = HashMap<(String, String), Weak<tokio::sync::Mutex<()>>>;
+    // One memory worker owns these handlers. Multiple writers would require a
+    // storage-level compare-and-swap instead of this process-local lock.
+    static LOCKS: OnceLock<Mutex<Locks>> = OnceLock::new();
+    let lock = {
+        let mut locks = LOCKS
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let entry = locks
+            .entry((agent.to_owned(), session.to_owned()))
+            .or_default();
+        match entry.upgrade() {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                *entry = Arc::downgrade(&lock);
+                lock
+            }
+        }
+    };
+    lock.lock_owned().await
+}
+
 /// One stored memory.
 ///
 /// The wire shape is camelCase because that is what `store_memory` writes; the
@@ -28,6 +55,8 @@ struct MemoryEntry {
     content: String,
     role: String,
     embedding: Option<Vec<f64>>,
+    #[serde(default)]
+    embedding_model: Option<String>,
     timestamp: u64,
     session_id: Option<String>,
     importance: f64,
@@ -446,6 +475,7 @@ async fn delete_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Err
     for agent in session_agents(iii, &input).await? {
         // `state::list` returns no keys, so existence is checked by reading the
         // key directly; a miss reads back as null.
+        let _guard = lock_session(&agent, id).await;
         let existing = call_state(
             iii,
             "state::get",
@@ -524,7 +554,7 @@ async fn store_memory(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ms();
 
-    let embedding: Option<Vec<f64>> = iii
+    let embedding_response = iii
         .trigger(TriggerRequest {
             function_id: "embedding::generate".to_string(),
             payload: json!({ "text": content }),
@@ -532,11 +562,9 @@ async fn store_memory(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error
             timeout_ms: None,
         })
         .await
-        .ok()
-        .and_then(|v| {
-            v.get("embedding")
-                .and_then(|e| serde_json::from_value(e.clone()).ok())
-        });
+        .unwrap_or(Value::Null);
+    let embedding: Option<Vec<f64>> =
+        serde_json::from_value(embedding_response["embedding"].clone()).ok();
 
     let importance = estimate_importance(content, role);
 
@@ -546,6 +574,7 @@ async fn store_memory(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error
         "content": content,
         "role": role,
         "embedding": embedding,
+        "embeddingModel": embedding_response["model"],
         "timestamp": now,
         "sessionId": session_id,
         "importance": importance,
@@ -602,6 +631,7 @@ async fn append_session_message(
     role: &str,
     now: u64,
 ) -> bool {
+    let _guard = lock_session(agent_id, session_id).await;
     let result = iii
         .trigger(TriggerRequest {
             function_id: "state::update".to_string(),
@@ -679,7 +709,7 @@ async fn session_history(iii: &dyn TriggerBus, input: Value) -> Result<Value, Er
     .await
     .unwrap_or(Value::Null);
 
-    let mut refs: Vec<(u64, &str)> = session
+    let mut refs: Vec<(u64, &str, Option<&str>)> = session
         .get("messages")
         .and_then(Value::as_array)
         .into_iter()
@@ -695,11 +725,12 @@ async fn session_history(iii: &dyn TriggerBus, input: Value) -> Result<Value, Er
                     .and_then(Value::as_u64)
                     .unwrap_or_default(),
                 id,
+                message.get("role").and_then(Value::as_str),
             ))
         })
         .collect();
     // Stable: equal timestamps keep the order they were appended in.
-    refs.sort_by_key(|(timestamp, _)| *timestamp);
+    refs.sort_by_key(|(timestamp, _, _)| *timestamp);
     if refs.len() > limit {
         refs.drain(..refs.len() - limit);
     }
@@ -708,37 +739,28 @@ async fn session_history(iii: &dyn TriggerBus, input: Value) -> Result<Value, Er
         return Ok(json!({ "sessionId": session_id, "agentId": agent_id, "messages": [] }));
     }
 
-    let entries = call_state(
-        iii,
-        "state::list",
-        json!({ "scope": format!("memory:{agent_id}") }),
-    )
-    .await
-    .unwrap_or(json!([]));
-    // Only entries with content: the dedup records stored under the content
-    // hash carry the same `id` and would otherwise shadow the real entry.
-    let by_id: HashMap<&str, &Value> = state_values(&entries)
-        .into_iter()
-        .filter_map(|value| {
-            value.get("content")?;
-            Some((value.get("id")?.as_str()?, value))
-        })
-        .collect();
-
-    let messages = refs
-        .into_iter()
-        .filter_map(|(timestamp, id)| {
-            let entry = by_id.get(id)?;
-            let content = entry.get("content").and_then(Value::as_str)?;
-            let role = entry.get("role").and_then(Value::as_str)?;
-            Some(json!({
+    let mut messages = Vec::with_capacity(refs.len());
+    for (timestamp, id, role) in refs {
+        let entry = call_state(
+            iii,
+            "state::get",
+            json!({
+                "scope": format!("memory:{agent_id}"), "key": id
+            }),
+        )
+        .await?;
+        if let (Some(content), Some(role)) = (
+            entry.get("content").and_then(Value::as_str),
+            role.or_else(|| entry.get("role").and_then(Value::as_str)),
+        ) {
+            messages.push(json!({
                 "id": id,
                 "role": role,
                 "content": content,
                 "timestamp": timestamp,
-            }))
-        })
-        .collect::<Vec<_>>();
+            }));
+        }
+    }
 
     Ok(json!({
         "sessionId": session_id,
@@ -776,7 +798,7 @@ async fn recall_memory(iii: &dyn TriggerBus, input: Value) -> Result<Value, Erro
         return Ok(json!([]));
     }
 
-    let query_embedding: Option<Vec<f64>> = iii
+    let query_response = iii
         .trigger(TriggerRequest {
             function_id: "embedding::generate".to_string(),
             payload: json!({ "text": query }),
@@ -784,11 +806,12 @@ async fn recall_memory(iii: &dyn TriggerBus, input: Value) -> Result<Value, Erro
             timeout_ms: None,
         })
         .await
-        .ok()
-        .and_then(|v| {
-            v.get("embedding")
-                .and_then(|e| serde_json::from_value(e.clone()).ok())
-        });
+        .unwrap_or(Value::Null);
+    let query_embedding: Option<Vec<f64>> =
+        serde_json::from_value(query_response["embedding"].clone()).ok();
+    let query_model = query_response["model"]
+        .as_str()
+        .filter(|model| !model.is_empty());
 
     let keywords: Vec<String> = query
         .to_lowercase()
@@ -802,7 +825,11 @@ async fn recall_memory(iii: &dyn TriggerBus, input: Value) -> Result<Value, Erro
         .map(|m| {
             let mut score = 0.0_f64;
 
-            if let (Some(qe), Some(me)) = (&query_embedding, &m.embedding) {
+            if query_model.is_some()
+                && query_model == m.embedding_model.as_deref()
+                && let (Some(qe), Some(me)) = (&query_embedding, &m.embedding)
+                && qe.len() == me.len()
+            {
                 score += cosine_similarity(qe, me) * 0.5;
             }
 
@@ -1170,6 +1197,7 @@ async fn compact_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Er
     let session_id = input["sessionId"].as_str().unwrap_or("default");
     let threshold = input["threshold"].as_u64().unwrap_or(30) as usize;
     let keep_recent = input["keepRecent"].as_u64().unwrap_or(10) as usize;
+    let _guard = lock_session(&agent_id, session_id).await;
 
     let session: Value = iii
         .trigger(TriggerRequest {
@@ -1181,12 +1209,11 @@ async fn compact_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Er
             action: None,
             timeout_ms: None,
         })
-        .await
-        .unwrap_or(json!({}));
+        .await?;
 
     let messages = session["messages"].as_array().cloned().unwrap_or_default();
 
-    if messages.len() < threshold {
+    if messages.len() < threshold || messages.len() <= keep_recent {
         return Ok(json!({ "compacted": false, "reason": "below_threshold" }));
     }
 
@@ -1196,7 +1223,7 @@ async fn compact_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Er
     let mut full_messages = Vec::new();
     for msg_ref in to_summarize {
         let msg_id = msg_ref["id"].as_str().unwrap_or("");
-        if let Ok(entry) = iii
+        let entry = iii
             .trigger(TriggerRequest {
                 function_id: "state::get".to_string(),
                 payload: json!({
@@ -1206,14 +1233,15 @@ async fn compact_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Er
                 action: None,
                 timeout_ms: None,
             })
-            .await
-        {
-            full_messages.push(format!(
-                "{}: {}",
-                entry["role"].as_str().unwrap_or("unknown"),
-                entry["content"].as_str().unwrap_or("")
-            ));
-        }
+            .await?;
+        let content = entry["content"]
+            .as_str()
+            .ok_or_else(|| Error::Handler(format!("missing memory content: {msg_id}")))?;
+        let role = msg_ref["role"]
+            .as_str()
+            .or_else(|| entry["role"].as_str())
+            .ok_or_else(|| Error::Handler(format!("missing memory role: {msg_id}")))?;
+        full_messages.push(format!("{role}: {content}"));
     }
 
     let conversation_text = full_messages.join("\n\n");
@@ -1228,11 +1256,12 @@ async fn compact_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Er
                 action: None,
                 timeout_ms: None,
             })
-            .await;
-
-        if let Ok(resp) = summary {
-            summaries.push(resp["content"].as_str().unwrap_or("").to_string());
-        }
+            .await?;
+        let content = summary["content"]
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::Handler("compaction returned an empty summary".into()))?;
+        summaries.push(content.to_string());
     }
 
     let final_summary = summaries.join("\n\n");
@@ -1265,24 +1294,35 @@ async fn compact_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Er
     .await
     .map_err(|e| Error::Handler(e.to_string()))?;
 
-    let mut new_messages = vec![json!({ "id": summary_id, "role": "system", "timestamp": now })];
+    let summary_timestamp = to_summarize
+        .last()
+        .and_then(|message| message["timestamp"].as_u64())
+        .unwrap_or(0);
+    let mut new_messages =
+        vec![json!({ "id": summary_id, "role": "system", "timestamp": summary_timestamp })];
     new_messages.extend(to_keep.iter().cloned());
 
-    iii.trigger(TriggerRequest {
-        function_id: "state::update".to_string(),
-        payload: state_update_payload(
-            format!("sessions:{agent_id}"),
-            session_id,
-            vec![
-                set_op("messages", json!(new_messages)),
-                set_op("compactedAt", json!(now)),
-            ],
-        ),
-        action: None,
-        timeout_ms: None,
-    })
-    .await
-    .map_err(|e| Error::Handler(e.to_string()))?;
+    let updated = iii
+        .trigger(TriggerRequest {
+            function_id: "state::update".to_string(),
+            payload: state_update_payload(
+                format!("sessions:{agent_id}"),
+                session_id,
+                vec![
+                    set_op("messages", json!(new_messages)),
+                    set_op("compactedAt", json!(now)),
+                ],
+            ),
+            action: None,
+            timeout_ms: None,
+        })
+        .await
+        .map_err(|e| Error::Handler(e.to_string()))?;
+    if let Some(errors) = update_errors(&updated) {
+        return Err(Error::Handler(format!(
+            "session compaction rejected: {errors}"
+        )));
+    }
 
     Ok(json!({
         "compacted": true,
@@ -1295,6 +1335,7 @@ async fn compact_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Er
 async fn repair_session(iii: &dyn TriggerBus, input: Value) -> Result<Value, Error> {
     let agent_id = acting_agent(iii, &input).await?;
     let session_id = input["sessionId"].as_str().unwrap_or("default");
+    let _guard = lock_session(&agent_id, session_id).await;
 
     let session: Value = iii
         .trigger(TriggerRequest {
@@ -1774,6 +1815,7 @@ mod tests {
             content: "test content".to_string(),
             role: "user".to_string(),
             embedding: Some(vec![0.1, 0.2, 0.3]),
+            embedding_model: None,
             timestamp: 1000,
             session_id: Some("sess-1".to_string()),
             importance: 0.75,
@@ -1830,6 +1872,7 @@ mod tests {
             content: "roundtrip test".to_string(),
             role: "system".to_string(),
             embedding: Some(vec![1.0, 2.0]),
+            embedding_model: None,
             timestamp: 42,
             session_id: Some("s-1".to_string()),
             importance: 0.8,
@@ -2093,6 +2136,7 @@ mod tests {
             content: "".to_string(),
             role: "".to_string(),
             embedding: None,
+            embedding_model: None,
             timestamp: 0,
             session_id: None,
             importance: 0.0,
@@ -2117,6 +2161,7 @@ mod tests {
             content: long_content.clone(),
             role: "user".to_string(),
             embedding: None,
+            embedding_model: None,
             timestamp: 1000,
             session_id: None,
             importance: 0.5,
@@ -2139,6 +2184,7 @@ mod tests {
             content: "test".to_string(),
             role: "user".to_string(),
             embedding: Some(vec![]),
+            embedding_model: None,
             timestamp: 100,
             session_id: None,
             importance: 0.5,
@@ -2161,6 +2207,7 @@ mod tests {
             content: "test".to_string(),
             role: "user".to_string(),
             embedding: Some(embedding.clone()),
+            embedding_model: None,
             timestamp: 100,
             session_id: None,
             importance: 0.5,
@@ -2575,6 +2622,7 @@ mod tests {
             content: "\u{4f60}\u{597d}\u{4e16}\u{754c} \u{1f600}".to_string(),
             role: "user".to_string(),
             embedding: None,
+            embedding_model: None,
             timestamp: 100,
             session_id: None,
             importance: 0.5,
@@ -2597,6 +2645,7 @@ mod tests {
             content: "test".to_string(),
             role: "user".to_string(),
             embedding: None,
+            embedding_model: None,
             timestamp: 100,
             session_id: None,
             importance: 1.0,
@@ -2856,6 +2905,196 @@ mod tests {
     }
 
     // ---- round-trip tests through the real handlers -------------------------
+    #[tokio::test]
+    async fn recall_compares_only_embeddings_from_the_same_model() {
+        for stored_model in [Value::Null, json!("old-hash"), json!("hash-sha256-v1")] {
+            let (bus, _) = state_bus();
+            bus.on_value(
+                "embedding::generate",
+                json!({"embedding": [1.0, 0.0], "model": stored_model}),
+            );
+            store(&bus, "models", "s", "user", "unrelated content").await;
+            bus.on_value(
+                "embedding::generate",
+                json!({"embedding": [1.0, 0.0], "model": "hash-sha256-v1"}),
+            );
+            let recalled = recall(&bus, "models", "different").await;
+            let score = recalled[0]["score"].as_f64().unwrap();
+            assert_eq!(
+                score > 0.5,
+                stored_model == "hash-sha256-v1",
+                "incompatible vectors received semantic credit"
+            );
+        }
+    }
+
+    struct PausedSummaryBus {
+        inner: FakeBus,
+        started: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    impl TriggerBus for PausedSummaryBus {
+        fn trigger(&self, request: TriggerRequest) -> agentos_http_adapter::bus::BusFuture<'_> {
+            Box::pin(async move {
+                if request.function_id == "agentos::llm::complete" {
+                    self.started.notify_one();
+                    self.resume.notified().await;
+                    Ok(json!({"content": "earlier conversation"}))
+                } else {
+                    self.inner.trigger(request).await
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_preserves_messages_appended_while_summarizing() {
+        let (inner, state) = state_bus();
+        store(&inner, "race", "s", "user", "first").await;
+        store(&inner, "race", "s", "assistant", "second").await;
+        let key = json!({"scope": "sessions:race", "key": "s"});
+        let mut session = state.get(&key);
+        session["messages"][0]["timestamp"] = json!(1);
+        session["messages"][1]["timestamp"] = json!(2);
+        state.set(&json!({"scope": "sessions:race", "key": "s", "value": session}));
+        let bus = PausedSummaryBus {
+            inner,
+            started: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        };
+        let compact = compact_session(
+            &bus,
+            as_agent(
+                "race",
+                json!({
+                    "sessionId": "s", "threshold": 2, "keepRecent": 1
+                }),
+            ),
+        );
+        let append = async {
+            bus.started.notified().await;
+            let append = store_memory(
+                &bus,
+                as_agent(
+                    "race",
+                    json!({
+                        "sessionId": "s", "role": "user", "content": "arrived during summary"
+                    }),
+                ),
+            );
+            tokio::pin!(append);
+            tokio::select! {
+                biased;
+                result = &mut append => { bus.resume.notify_one(); result.unwrap(); }
+                _ = tokio::task::yield_now() => { bus.resume.notify_one(); append.await.unwrap(); }
+            }
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(compact, append)
+        })
+        .await
+        .expect("compaction and append must finish");
+        result.unwrap();
+        let history = session_history(&bus, as_agent("race", json!({"sessionId": "s"})))
+            .await
+            .unwrap();
+        assert_eq!(history["messages"][0]["content"], "earlier conversation");
+        assert!(
+            history["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["content"] == "arrived during summary")
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_preserves_the_session() {
+        let (bus, state) = state_bus();
+        store(&bus, "compact-fail", "s", "user", "keep this question").await;
+        store(&bus, "compact-fail", "s", "assistant", "keep this answer").await;
+        let key = json!({"scope": "sessions:compact-fail", "key": "s"});
+        let before = state.get(&key);
+        for response in [None, Some(json!({"content": "   "}))] {
+            match response {
+                None => {
+                    bus.on_error("agentos::llm::complete", "provider unavailable");
+                }
+                Some(value) => {
+                    bus.on_value("agentos::llm::complete", value);
+                }
+            }
+            assert!(
+                compact_session(
+                    &bus,
+                    as_agent(
+                        "compact-fail",
+                        json!({
+                            "sessionId": "s", "threshold": 2, "keepRecent": 1
+                        })
+                    )
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(state.get(&key), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_storage_failures_do_not_replace_history() {
+        for failure in ["read", "update"] {
+            let (bus, state) = state_bus();
+            store(&bus, "storage", "s", "user", "keep question").await;
+            store(&bus, "storage", "s", "assistant", "keep answer").await;
+            let key = json!({"scope": "sessions:storage", "key": "s"});
+            let before = state.get(&key);
+            bus.on_value("agentos::llm::complete", json!({"content": "summary"}));
+            if failure == "read" {
+                let state = state.clone();
+                bus.on("state::get", move |input| {
+                    if input["scope"] == "memory:storage" {
+                        Err(Error::Handler("storage unavailable".into()))
+                    } else {
+                        Ok(state.get(&input))
+                    }
+                });
+            } else {
+                bus.on_value(
+                    "state::update",
+                    json!({"errors": [{"code": "set.rejected"}]}),
+                );
+            }
+            assert!(
+                compact_session(
+                    &bus,
+                    as_agent(
+                        "storage",
+                        json!({
+                            "sessionId": "s", "threshold": 2, "keepRecent": 1
+                        })
+                    )
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(state.get(&key), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn history_preserves_roles_when_content_is_deduplicated() {
+        let (bus, _) = state_bus();
+        store(&bus, "roles", "s", "user", "ok").await;
+        store(&bus, "roles", "s", "assistant", "ok").await;
+        let history = session_history(&bus, as_agent("roles", json!({"sessionId": "s"})))
+            .await
+            .unwrap();
+        assert_eq!(history["messages"][0]["role"], "user");
+        assert_eq!(history["messages"][1]["role"], "assistant");
+    }
+
     //
     // These drive `store_memory`, `recall_memory`, `evict_memories` and
     // `session_history` against an in-memory `state::*` implementation, so a

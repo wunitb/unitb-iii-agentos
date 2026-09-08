@@ -536,7 +536,10 @@ fn read_record(agentos_home: &Path) -> Result<Option<LoadedRecord>> {
     for process in &record.processes {
         if process.pid == 0
             || process.process_group != process.pid
-            || !matches!(process.role.as_str(), "worker" | "engine" | "bus-auth")
+            || !matches!(
+                process.role.as_str(),
+                "worker" | "compose" | "engine" | "bus-auth"
+            )
             || !pids.insert(process.pid)
         {
             anyhow::bail!("Invalid role, process group, or duplicate pid in lifecycle record");
@@ -996,14 +999,40 @@ pub(crate) fn stop_owned(agentos_home: &Path, grace: Duration) -> Result<StopOut
         .processes
         .sort_by_key(|process| match process.role.as_str() {
             "worker" => 0,
-            "engine" => 1,
-            "bus-auth" => 2,
-            _ => 3,
+            "compose" => 1,
+            "engine" => 2,
+            "bus-auth" => 3,
+            _ => 4,
         });
     let count = record.processes.len();
     #[cfg(target_os = "linux")]
     {
         let grace = supervisor_cleanup_grace(&record.processes, grace)?;
+        // Compose needs the engine and policy alive during its own bounded
+        // teardown. Verify ownership above, then let it stop its children before
+        // the general process-group shutdown (which also catches stragglers).
+        let compose: Vec<_> = record
+            .processes
+            .iter()
+            .filter(|process| process.role == "compose")
+            .collect();
+        for process in &compose {
+            signal_verified_group(process, &witnesses, 15)?;
+        }
+        if !compose.is_empty() {
+            let deadline = Instant::now() + grace;
+            loop {
+                let mut running = false;
+                for process in &compose {
+                    running |= group_has_owned_member(process, &witnesses)?;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !running || remaining.is_zero() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20).min(remaining));
+            }
+        }
         for process in &record.processes {
             signal_verified_group(process, &witnesses, 15)?;
         }
@@ -1148,6 +1177,51 @@ mod tests {
         let pid = fs::read_to_string(&ready).unwrap().trim().parse().unwrap();
         let registry = OwnedCandidate::spawned("worker", pid).finalize().unwrap();
         (engine, registry)
+    }
+
+    #[test]
+    fn owned_compose_gets_grace_before_engine_shutdown_without_touching_foreign_processes() {
+        let root = root("compose-order");
+        let composed = root.join("compose.stopped");
+        let ordered = root.join("engine.ordered");
+        let compose_ready = root.join("compose.ready");
+        let engine_ready = root.join("engine.ready");
+        let mut compose = spawn_shell(format!(
+            "trap 'sleep 0.05; echo stopped > {}; exit 0' TERM; echo ready > {}; while :; do sleep 0.1; done",
+            composed.display(),
+            compose_ready.display()
+        ));
+        let mut engine = spawn_shell(format!(
+            "trap 'if test -f {}; then echo ordered > {}; else echo early > {}; fi; exit 0' TERM; echo ready > {}; while :; do sleep 0.1; done",
+            composed.display(),
+            ordered.display(),
+            ordered.display(),
+            engine_ready.display()
+        ));
+        let mut foreign = spawn_sleep();
+        await_file(&compose_ready);
+        await_file(&engine_ready);
+        persist_owned(
+            &root,
+            vec![capture(&engine, "engine"), capture(&compose, "compose")],
+        )
+        .unwrap();
+        let result = stop_owned(&root, Duration::from_secs(1));
+        let order = fs::read_to_string(&ordered).unwrap_or_default();
+        let untouched = foreign.try_wait().unwrap().is_none();
+        // Only handles created by this fixture are ever cleaned up.
+        let _ = compose.kill();
+        let _ = engine.kill();
+        let _ = foreign.kill();
+        let _ = compose.wait();
+        let _ = engine.wait();
+        let _ = foreign.wait();
+        let record_removed = read_record(&root).is_ok_and(|record| record.is_none());
+        fs::remove_dir_all(root).unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(order.trim(), "ordered");
+        assert!(untouched, "unowned process was signalled");
+        assert!(record_removed, "successful stop must clear ownership");
     }
 
     #[test]

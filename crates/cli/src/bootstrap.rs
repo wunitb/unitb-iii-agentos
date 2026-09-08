@@ -671,6 +671,17 @@ fn write_private_file(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse host-native startup before any process or operator data is changed.
+pub(crate) fn guard_runtime(path: &Path) -> Result<bool> {
+    let yaml = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let oci = agentos_bus_auth::config::requires_container(&yaml);
+    if oci {
+        agentos_bus_auth::config::require_container()?;
+    }
+    check_armed_config(Some(&yaml), path)?;
+    Ok(oci)
+}
+
 fn engine_endpoint() -> SocketAddr {
     SocketAddr::from((ENGINE_HOST, ENGINE_PORT))
 }
@@ -756,6 +767,9 @@ pub(crate) trait Bootstrap: Diagnostics {
     fn bus_auth_stopped(&mut self) -> Option<String>;
     /// Starts the engine detached and returns its pid.
     fn start_engine(&mut self, binary: &Path) -> Result<u32>;
+    fn start_compose(&mut self, _binary: &Path) -> Result<u32> {
+        anyhow::bail!("Compose startup is unsupported by this runtime")
+    }
     /// The exit status of an engine started by this process, if it died.
     fn engine_stopped(&mut self) -> Option<String>;
     /// Workers started by this process that have already exited, named with
@@ -1181,6 +1195,23 @@ fn bus_auth_item(probes: &dyn Diagnostics) -> ReadinessItem {
     let armed = config
         .as_deref()
         .is_some_and(|config| config.contains(BUS_RBAC_MARKER));
+    if config
+        .as_deref()
+        .is_some_and(agentos_bus_auth::config::requires_container)
+    {
+        return if probes.bus_auth_healthy() {
+            ReadinessItem::ok(
+                "Bus auth",
+                "private policy worker registered all four hooks".to_string(),
+            )
+        } else {
+            ReadinessItem::failed(
+                "Bus auth",
+                "policy worker hooks unavailable".to_string(),
+                "start with scripts/oci-stack.sh".to_string(),
+            )
+        };
+    }
     let bridge = config.as_deref().and_then(bridge_url_endpoint);
     let mismatch = match &bridge {
         Some(bridge) if *bridge != addr.to_string() => {
@@ -1295,6 +1326,32 @@ const REQUIRED_ENGINE_FUNCTIONS: [&str; 5] = [
     "state::delete",
     "state::update",
 ];
+
+// Standalone HTTP registers this reload handler only after binding its listener;
+// pubsub registers `publish` after constructing its adapter. Worker counts alone
+// can become visible before either boot sequence has finished.
+const REQUIRED_OCI_FUNCTIONS: [&str; 2] = ["http::on-config-change", "publish"];
+const REQUIRED_COMPOSE_IDS: [&str; 12] = [
+    "http",
+    "pubsub",
+    "state",
+    "queue",
+    "cron",
+    "llm-router",
+    "context-manager",
+    "iii-directory",
+    "provider-anthropic",
+    "provider-openai",
+    "provider-openai-codex",
+    "session-manager",
+];
+
+fn oci_functions_ready(functions: &BTreeSet<String>) -> bool {
+    REQUIRED_OCI_FUNCTIONS
+        .iter()
+        .all(|id| functions.contains(*id))
+        && missing_engine_functions(functions).is_empty()
+}
 
 fn required_engine_functions() -> BTreeSet<String> {
     REQUIRED_ENGINE_FUNCTIONS
@@ -1443,7 +1500,16 @@ fn up_stages(
     // 4. bus-auth daemon, before the engine: iii 0.22.1 calls the RBAC auth
     //    function for every bus connection, so a daemon that is not listening
     //    when the engine starts refuses every worker (fail-closed by design).
-    bus_auth_stage(effects, options, paths, out)?;
+    let config = effects.engine_config();
+    let oci = config
+        .as_deref()
+        .is_some_and(agentos_bus_auth::config::requires_container);
+    check_armed_config(config.as_deref(), &paths.config_path)?;
+    if oci {
+        agentos_bus_auth::config::require_container()?;
+    } else {
+        bus_auth_stage(effects, options, paths, out)?;
+    }
 
     // 5. engine: reuse a healthy one, otherwise start it detached and wait.
     let endpoint = engine_endpoint();
@@ -1464,6 +1530,23 @@ fn up_stages(
         let pid = effects.start_engine(&engine_binary)?;
         await_engine(effects, options)?;
         stage_ok(out, "Bus", &format!("healthy on {endpoint} (pid {pid})"))?;
+    }
+
+    if oci {
+        // The raw manager is engine-owned; policy attaches before any Compose
+        // infrastructure or authenticated product worker is started.
+        bus_auth_stage(effects, options, paths, out)?;
+        let pid = effects.start_compose(&engine_binary)?;
+        await_compose(
+            effects,
+            options,
+            &paths.runtime_dir.join("worker-compose.yaml"),
+        )?;
+        stage_ok(
+            out,
+            "Compose",
+            &format!("private daemon started (pid {pid})"),
+        )?;
     }
 
     // 6. worker binaries
@@ -1748,6 +1831,68 @@ fn await_engine(effects: &mut dyn Bootstrap, options: &UpOptions) -> Result<()> 
     )
 }
 
+fn required_compose_ids(path: &Path) -> Result<BTreeSet<String>> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(path)?)?;
+    anyhow::ensure!(
+        yaml.get("engine").is_none(),
+        "private Compose must not own an engine"
+    );
+    anyhow::ensure!(
+        yaml.get("namespace").and_then(serde_yaml::Value::as_str) == Some("default"),
+        "private primitives must share the default product namespace"
+    );
+    let containers = yaml
+        .get("containers")
+        .and_then(serde_yaml::Value::as_mapping)
+        .context("Compose containers must be a mapping")?;
+    let ids = containers
+        .keys()
+        .map(|name| {
+            name.as_str()
+                .map(str::to_string)
+                .context("Compose identity must be a string")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    anyhow::ensure!(
+        REQUIRED_COMPOSE_IDS.iter().all(|id| ids.contains(*id)),
+        "Compose must declare all twelve required registry primitives, including http and pubsub"
+    );
+    Ok(ids)
+}
+
+fn await_compose(effects: &mut dyn Bootstrap, options: &UpOptions, manifest: &Path) -> Result<()> {
+    let required = required_compose_ids(manifest)?;
+    let (poll, deadline) = poll_plan(options);
+    loop {
+        if let Some(status) = effects.engine_stopped() {
+            anyhow::bail!("engine exited while starting Compose: {status}");
+        }
+        let stopped = effects.stopped_workers();
+        anyhow::ensure!(
+            stopped.is_empty(),
+            "infrastructure exited during Compose readiness: {}",
+            stopped.join(", ")
+        );
+        let control_ready = effects
+            .registered_function_ids()
+            .is_some_and(|ids| ids.contains("compose::status") && oci_functions_ready(&ids));
+        if control_ready
+            && effects
+                .connected_worker_ids()
+                .is_some_and(|ids| required.is_subset(&ids))
+        {
+            return Ok(());
+        }
+        let now = effects.now();
+        anyhow::ensure!(
+            now < deadline,
+            "Compose control, state functions, HTTP listener, pubsub publish, and required primitive identities did not become ready: {}",
+            required.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+        effects.sleep(poll.min(deadline.saturating_duration_since(now)));
+    }
+}
+
 fn await_engine_functions(effects: &mut dyn Bootstrap, options: &UpOptions) -> Result<()> {
     let (poll, deadline) = poll_plan(options);
     let mut reported = None;
@@ -1882,6 +2027,7 @@ pub(crate) struct SystemEffects {
     probe_timeout: Duration,
     engine: Option<std::process::Child>,
     bus_auth: Option<std::process::Child>,
+    compose: Option<std::process::Child>,
     workers: Vec<RunningWorker>,
     owned: Vec<crate::lifecycle::OwnedCandidate>,
 }
@@ -1897,9 +2043,50 @@ impl SystemEffects {
             probe_timeout: Duration::from_secs(1),
             engine: None,
             bus_auth: None,
+            compose: None,
             workers: Vec::new(),
             owned: Vec::new(),
         }
+    }
+
+    pub(crate) fn container_status(&self) -> Result<()> {
+        let config = self.engine_config().context("engine config unavailable")?;
+        anyhow::ensure!(
+            agentos_bus_auth::config::inspect(&config)
+                == agentos_bus_auth::config::GateStatus::Armed,
+            "OCI gate configuration is inconsistent"
+        );
+        let functions = self
+            .registered_function_ids()
+            .context("authenticated edge inventory unavailable")?;
+        anyhow::ensure!(
+            agentos_bus_auth::policy::ARMED_HOOKS
+                .iter()
+                .all(|(_, id)| functions.contains(*id)),
+            "policy worker is unavailable"
+        );
+        anyhow::ensure!(
+            functions.contains("compose::status"),
+            "Compose daemon is unavailable"
+        );
+        anyhow::ensure!(
+            oci_functions_ready(&functions),
+            "required state/HTTP/pubsub primitive functions are unavailable"
+        );
+        let workers = self
+            .connected_worker_ids()
+            .context("worker identity inventory unavailable")?;
+        let mut required = required_worker_ids(&self.worker_specs()?);
+        required.extend(required_compose_ids(
+            &self.runtime_dir.join("worker-compose.yaml"),
+        )?);
+        let missing = missing_worker_ids(&required, &workers);
+        anyhow::ensure!(
+            missing.is_empty(),
+            "required product/primitive workers unavailable: {}",
+            missing.join(", ")
+        );
+        Ok(())
     }
 
     pub(crate) fn persist_started(&mut self) -> Result<()> {
@@ -1972,7 +2159,11 @@ impl SystemEffects {
     }
 
     fn engine_inventory(&self) -> Option<Value> {
-        self.trigger_engine("engine::functions::list", json!({}))
+        // Readiness needs post-bind internal handlers hidden by iii 0.23 discovery.
+        self.trigger_engine(
+            "engine::functions::list",
+            json!({ "include_internal": true }),
+        )
     }
 
     fn shutdown_inventory_client(&self, timeout: Duration) {
@@ -2118,6 +2309,17 @@ impl Diagnostics for SystemEffects {
     }
 
     fn bus_auth_healthy(&self) -> bool {
+        if self
+            .engine_config()
+            .as_deref()
+            .is_some_and(agentos_bus_auth::config::requires_container)
+        {
+            return self.registered_function_ids().is_some_and(|functions| {
+                agentos_bus_auth::policy::ARMED_HOOKS
+                    .iter()
+                    .all(|(_, id)| functions.contains(*id))
+            });
+        }
         self.bus_auth_addr()
             .is_ok_and(|addr| TcpStream::connect_timeout(&addr, HEALTH_PROBE_TIMEOUT).is_ok())
     }
@@ -2191,6 +2393,20 @@ impl Bootstrap for SystemEffects {
         Ok(pid)
     }
 
+    fn start_compose(&mut self, binary: &Path) -> Result<u32> {
+        let child = crate::spawn_compose(
+            binary,
+            &self.runtime_dir,
+            &self.worker_log(),
+            &self.launch_env,
+        )?;
+        let pid = child.id();
+        self.owned
+            .push(crate::lifecycle::OwnedCandidate::spawned("compose", pid));
+        self.compose = Some(child);
+        Ok(pid)
+    }
+
     fn engine_stopped(&mut self) -> Option<String> {
         let engine = self.engine.as_mut()?;
         engine
@@ -2201,13 +2417,20 @@ impl Bootstrap for SystemEffects {
     }
 
     fn stopped_workers(&mut self) -> Vec<String> {
-        self.workers
-            .iter_mut()
-            .filter_map(|worker| {
-                let status = worker.child.try_wait().ok().flatten()?;
-                Some(format!("{} ({status})", worker.name))
-            })
-            .collect()
+        let mut stopped = Vec::new();
+        if let Some(child) = self.compose.as_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            stopped.push(format!("compose ({status})"));
+        }
+        if let Some(status) = self.bus_auth_stopped() {
+            stopped.push(format!("bus-auth ({status})"));
+        }
+        stopped.extend(self.workers.iter_mut().filter_map(|worker| {
+            let status = worker.child.try_wait().ok().flatten()?;
+            Some(format!("{} ({status})", worker.name))
+        }));
+        stopped
     }
 
     fn start_workers(&mut self, workers: &[WorkerSpec]) -> Result<usize> {
@@ -2235,6 +2458,14 @@ impl Bootstrap for SystemEffects {
             let _ = worker.child.wait();
         }
         self.workers.clear();
+        // Give Compose its signal-driven shutdown while engine and policy live.
+        if let Some(compose) = self.compose.as_mut()
+            && let Err(error) =
+                crate::lifecycle::terminate_spawned_group(compose, Duration::from_secs(5))
+        {
+            tracing::warn!(%error, "Compose startup rollback did not complete");
+        }
+        self.compose = None;
         if let Some(engine) = self.engine.as_mut()
             && let Err(error) =
                 crate::lifecycle::terminate_spawned_group(engine, Duration::from_secs(5))
@@ -2661,6 +2892,77 @@ mod tests {
             vec!["start_engine".to_string(), "shutdown_started".to_string()]
         );
         assert!(!fake.events().contains(&"start_workers".to_string()));
+    }
+
+    #[test]
+    fn compose_readiness_requires_native_http_pubsub_and_state_functions() {
+        let runtime = temporary_runtime("compose-ready");
+        let manifest = runtime.join("worker-compose.yaml");
+        std::fs::write(&manifest, include_str!("../../../worker-compose.yaml")).unwrap();
+        let required = required_compose_ids(&manifest).unwrap();
+        assert_eq!(required, ids(&REQUIRED_COMPOSE_IDS));
+        let mut ready_functions = required_engine_functions();
+        ready_functions.extend(ids(&[
+            "compose::status",
+            "http::on-config-change",
+            "publish",
+        ]));
+        for absent in [
+            "compose::status",
+            "http::on-config-change",
+            "publish",
+            "state::set",
+        ] {
+            let mut functions = ready_functions.clone();
+            functions.remove(absent);
+            let mut fake = Fake {
+                connected: RefCell::new(Some(required.clone())),
+                registered_functions: RefCell::new(Some(functions)),
+                ..Fake::default()
+            };
+            assert!(
+                await_compose(&mut fake, &options(false), &manifest).is_err(),
+                "{absent}"
+            );
+        }
+        let mut fake = Fake {
+            connected: RefCell::new(Some(required)),
+            registered_functions: RefCell::new(Some(ready_functions)),
+            ..Fake::default()
+        };
+        assert!(await_compose(&mut fake, &options(false), &manifest).is_ok());
+        assert_eq!(fake.sleeps.get(), 0);
+        std::fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn compose_readiness_refuses_missing_primitives_and_early_process_exit() {
+        let runtime = temporary_runtime("compose-failed");
+        let manifest = runtime.join("worker-compose.yaml");
+        std::fs::write(&manifest, "namespace: default\ncontainers:\n  state: {}\n").unwrap();
+        assert!(required_compose_ids(&manifest).is_err());
+        std::fs::write(&manifest, include_str!("../../../worker-compose.yaml")).unwrap();
+        let mut fake = Fake {
+            worker_exits: vec!["compose (exit status: 1)".into()],
+            started_workers: Cell::new(true),
+            ..Fake::default()
+        };
+        let error = await_compose(&mut fake, &options(false), &manifest)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("infrastructure exited"), "{error}");
+        assert_eq!(fake.sleeps.get(), 0);
+        let mut fake = Fake {
+            engine_exits_after: Some(0),
+            ..Fake::default()
+        };
+        assert!(
+            await_compose(&mut fake, &options(false), &manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("engine exited")
+        );
+        std::fs::remove_dir_all(runtime).unwrap();
     }
 
     #[test]

@@ -156,6 +156,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "topic": "audit",
         }),
         metadata: None,
+        namespace: None,
+        trigger_namespace: None,
     })?;
 
     agentos_http_adapter::register_http_trigger(
@@ -1736,9 +1738,7 @@ mod tests {
 mod config_tree_guards {
     use agentos_bus_auth::policy::ARMED_HOOKS;
 
-    /// Engine bus default port. `iii-bridge` must never point at it: the bridge
-    /// serves the auth function that gates this very listener, so aiming it here
-    /// makes the gate depend on the connection it is gating.
+    /// The gated edge cannot also be the private policy bootstrap endpoint.
     const ENGINE_BUS_PORT: &str = "49134";
 
     fn config_yaml() -> String {
@@ -1780,30 +1780,36 @@ mod config_tree_guards {
     /// The opt-in bus RBAC overlay, which is NOT part of the default stack.
 
     #[test]
-    fn the_bus_is_pinned_to_loopback() {
+    fn the_private_bus_is_pinned_to_container_loopback() {
         let source = config_yaml();
-        let entry = worker_entry(&source, "iii-worker-manager");
-
+        let raw = worker_entry(&source, agentos_bus_auth::config::RAW_MANAGER);
+        let edge = worker_entry(&source, agentos_bus_auth::config::EDGE_MANAGER);
+        assert!(raw.contains("host: 127.0.0.1"));
+        assert!(raw.contains("port: 49129"));
         assert!(
-            entry.contains("host: 127.0.0.1"),
-            "the bus must be pinned to loopback; without this entry the engine \
-             appends iii-worker-manager with WorkerManagerConfig::default() -> 0.0.0.0"
+            !raw.contains("rbac:"),
+            "policy bootstrap must not depend on its own gate"
         );
-        assert!(
-            !entry.contains("0.0.0.0"),
-            "the bus must not bind all interfaces"
+        assert!(edge.contains("host: 0.0.0.0"));
+        assert!(edge.contains(&format!("port: {ENGINE_BUS_PORT}")));
+        assert!(agentos_bus_auth::config::requires_container(&source));
+        assert_eq!(
+            agentos_bus_auth::config::inspect(&source),
+            agentos_bus_auth::config::GateStatus::Armed
         );
     }
 
     #[test]
     fn the_default_stack_arms_the_gate_served_by_the_owned_launcher() {
-        // `agentos up` / `agentos start` and dev-up start the off-bus daemon
-        // before the engine. Bare `iii --config` is not the supported launcher.
-        let source = without_comments(&config_yaml());
-        assert!(source.contains("rbac:"), "default bus RBAC is not armed");
+        let source = config_yaml();
+        assert_eq!(
+            agentos_bus_auth::config::inspect(&source),
+            agentos_bus_auth::config::GateStatus::Armed
+        );
+        assert!(agentos_bus_auth::config::requires_container(&source));
         assert!(
-            source.contains("- name: iii-bridge\n"),
-            "default RBAC has no off-bus hook bridge"
+            !source.contains("- name: iii-bridge\n"),
+            "legacy bridge must not return to the migrated engine"
         );
         assert!(
             !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1831,48 +1837,37 @@ mod config_tree_guards {
     }
 
     #[test]
-    fn the_default_arms_every_hook_and_serves_them_from_off_the_bus() {
+    fn the_default_arms_every_hook_and_bootstraps_them_on_the_private_manager() {
         let source = config_yaml();
-        let manager = worker_entry(&source, "iii-worker-manager");
-        let bridge = worker_entry(&source, "iii-bridge");
-
+        let manager = worker_entry(&source, agentos_bus_auth::config::EDGE_MANAGER);
+        let raw = worker_entry(&source, agentos_bus_auth::config::RAW_MANAGER);
+        assert!(manager.contains("rbac:"));
+        assert!(raw.contains("host: 127.0.0.1"));
         assert!(
-            manager.contains("rbac:"),
-            "the default manager must carry the rbac block"
+            !raw.contains(ENGINE_BUS_PORT),
+            "policy bootstrap must not target the gated edge"
         );
-        assert!(
-            manager.contains("host: 127.0.0.1"),
-            "the default iii-worker-manager must keep the loopback pin"
+        assert_eq!(
+            agentos_bus_auth::config::RAW_WORKER_URL,
+            "ws://127.0.0.1:49129"
         );
-        assert!(
-            bridge.contains("url: ws://127.0.0.1:"),
-            "iii-bridge must reach the bus-auth daemon over loopback"
-        );
-        assert!(
-            !bridge.contains(ENGINE_BUS_PORT),
-            "iii-bridge.url must not be the engine's own bus ({ENGINE_BUS_PORT}); that deadlocks by construction"
-        );
-
-        // Every hook the daemon serves, from its own table: adding a hook there
-        // and forgetting the default config is how the trigger-TYPE surface
-        // stayed ungated.
         for (key, id) in ARMED_HOOKS {
             assert!(
                 manager.contains(&format!("{key}: {id}")),
-                "the default config does not set `{key}: {id}`; that hook is unarmed and the \
-                 engine will not say so - the nested rbac struct ignores what it does \
-                 not know"
-            );
-            assert!(
-                bridge.contains(&format!("local_function: {id}")),
-                "iii-bridge does not forward {id}; the engine would answer \
-                 `Function not found` and refuse every bus connection"
-            );
-            assert!(
-                bridge.contains(&format!("remote_function: {id}")),
-                "iii-bridge does not map {id} to the daemon"
+                "the gated edge must arm {key}: {id}"
             );
         }
+        let launcher = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/oci-stack.py"
+        ))
+        .expect("OCI launcher is present");
+        assert!(launcher.contains("127.0.0.1::3111"));
+        assert!(launcher.contains("127.0.0.1::49134"));
+        assert!(
+            !launcher.contains("::49129"),
+            "raw bootstrap must never be host-published"
+        );
     }
 
     #[test]

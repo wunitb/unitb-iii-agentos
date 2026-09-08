@@ -3,6 +3,7 @@ import inspect
 import math
 import sys
 import os
+import subprocess
 from unittest.mock import patch, MagicMock
 
 
@@ -13,9 +14,25 @@ mock_iii_module.InitOptions.return_value = mock_init_options
 mock_iii_module.register_worker.return_value = mock_iii_instance
 sys.modules["iii"] = mock_iii_module
 
-import main as mod
+with patch.dict(os.environ, {}, clear=True):
+    import main as mod
 
 import pytest
+
+
+def test_hash_embedding_is_stable_across_process_seeds():
+    code = inspect.getsource(mod._hash_embed) + '\nprint(_hash_embed("สรุป release date"))'
+    outputs = [subprocess.check_output(
+        [sys.executable, "-c", code], env={**os.environ, "PYTHONHASHSEED": seed}
+    ) for seed in ("1", "2")]
+    assert outputs[0] == outputs[1]
+
+
+def test_fallback_embeddings_identify_the_algorithm_for_persisted_vectors():
+    with patch.dict(sys.modules, {"sentence_transformers": None}):
+        single = asyncio.run(mod.generate_embedding({"text": "hello"}))
+        batch = asyncio.run(mod.generate_embedding({"batch": ["hello"]}))
+    assert single["model"] == batch["model"] == "hash-sha256-v1"
 
 
 # ---------------------------------------------------------------------------
@@ -390,9 +407,23 @@ class TestIntegration:
         assert inspect.iscoroutinefunction(mod.main)
 
     def test_worker_registration_uses_embedding_name(self):
-        mock_iii_module.InitOptions.assert_called_once_with(worker_name="embedding")
+        assert mock_iii_module.InitOptions.call_args_list[0].kwargs == {
+            "worker_name": "embedding", "headers": None,
+        }
         mock_iii_module.register_worker.assert_called_once_with(
             "ws://localhost:49134", mock_init_options
+        )
+
+    @pytest.mark.parametrize("key", [None, "", "fixture-bus-key"])
+    def test_worker_handshake_carries_only_configured_credential(self, key):
+        env = {"UNRELATED_SECRET": "must-not-cross"}
+        if key is not None:
+            env["AGENTOS_API_KEY"] = key
+        with patch.dict(os.environ, env, clear=True):
+            mod.init_options()
+        mock_iii_module.InitOptions.assert_called_with(
+            worker_name="embedding",
+            headers={"Authorization": f"Bearer {key}"} if key else None,
         )
 
     def test_generate_then_similarity_identical(self):

@@ -2,9 +2,17 @@ import asyncio
 import os
 from iii import InitOptions, register_worker
 
+def init_options():
+    key = os.getenv("AGENTOS_API_KEY")
+    return InitOptions(
+        worker_name="embedding",
+        headers={"Authorization": f"Bearer {key}"} if key else None,
+    )
+
+
 iii = register_worker(
     os.getenv("III_URL", "ws://localhost:49134"),
-    InitOptions(worker_name="embedding"),
+    init_options(),
 )
 
 model = None
@@ -31,18 +39,20 @@ async def generate_embedding(input):
 
     if m == "fallback":
         if batch:
-            return {"embeddings": [_hash_embed(t) for t in batch], "dim": 128}
-        return {"embedding": _hash_embed(text), "dim": 128}
+            return {"embeddings": [_hash_embed(t) for t in batch], "dim": 128, "model": "hash-sha256-v1"}
+        return {"embedding": _hash_embed(text), "dim": 128, "model": "hash-sha256-v1"}
 
     if batch:
         embeddings = m.encode(batch, normalize_embeddings=True)
         return {
             "embeddings": [e.tolist() for e in embeddings],
             "dim": embeddings.shape[1],
+            "model": os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
         }
 
     embedding = m.encode([text], normalize_embeddings=True)[0]
-    return {"embedding": embedding.tolist(), "dim": len(embedding)}
+    return {"embedding": embedding.tolist(), "dim": len(embedding),
+            "model": os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")}
 
 
 async def compute_similarity(input):
@@ -61,12 +71,13 @@ async def compute_similarity(input):
 
 
 def _hash_embed(text: str, dim: int = 128) -> list:
+    import hashlib
     import math
 
     words = text.lower().split()
     vec = [0.0] * dim
     for word in words:
-        h = hash(word) & 0xFFFFFFFF
+        h = int.from_bytes(hashlib.sha256(word.encode("utf-8")).digest()[:4], "big")
         for i in range(dim):
             vec[i] += math.sin(h * (i + 1)) / max(len(words), 1)
 

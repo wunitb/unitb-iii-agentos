@@ -477,6 +477,22 @@ download_and_install() {
   if [ ! -f "$tmp_dir/runtime/.iii-version" ] || [ -L "$tmp_dir/runtime/.iii-version" ] || [ ! -s "$tmp_dir/runtime/.iii-version" ]; then
     err "Release runtime must contain a non-empty regular .iii-version"
   fi
+  # The release archive, not a caller override, selects its compatible engine.
+  # Refuse OCI payloads before touching binaries, config, or interrupted state.
+  require_native_pin "$(tr -d '[:space:]' < "$tmp_dir/runtime/.iii-version")"
+  if [ -n "$III_VERSION_OVERRIDE" ] && [ "$III_VERSION_OVERRIDE" != "$III_VERSION" ]; then
+    err "III_VERSION must match the explicitly selected native release ($III_VERSION)"
+  fi
+  local existing
+  for existing in "$runtime_dir" "$runtime_retired"; do
+    if [ -e "$existing/.iii-version" ] || [ -L "$existing/.iii-version" ]; then
+      if [ ! -f "$existing/.iii-version" ] || [ -L "$existing/.iii-version" ]; then
+        err "Existing native runtime pin must be a regular file"
+      fi
+      require_native_pin "$(tr -d '[:space:]' < "$existing/.iii-version")"
+    fi
+  done
+  III_VERSION="$(tr -d '[:space:]' < "$tmp_dir/runtime/.iii-version")"
   for relative_path in .env.example iii.lock workers/env.allowlist; do
     if [ ! -f "$tmp_dir/runtime/$relative_path" ] || [ -L "$tmp_dir/runtime/$relative_path" ]; then
       err "Release runtime input $relative_path must be a regular file"
@@ -565,6 +581,14 @@ ensure_path() {
   fi
 }
 
+require_native_pin() {
+  local pin="$1"
+  if [[ ! "$pin" =~ ^0\.22\.[0-9]+$ ]]; then
+    err "Native installation supports archived iii 0.22.x releases only (found ${pin:-empty}); iii 0.23+ requires scripts/oci-stack.sh. Existing data was not migrated."
+  fi
+  III_VERSION="$pin"
+}
+
 resolve_iii_version() {
   local version_file="$AGENTOS_HOME/runtime/.iii-version"
   if [ -n "$III_VERSION_OVERRIDE" ]; then
@@ -575,10 +599,7 @@ resolve_iii_version() {
     err "Installed AgentOS runtime is missing .iii-version"
   fi
 
-  case "$III_VERSION" in
-    ''|*[!0-9.]*) err "Invalid stable iii version: ${III_VERSION:-empty}" ;;
-    *-*) err "Refusing prerelease iii version: $III_VERSION" ;;
-  esac
+  require_native_pin "$III_VERSION"
 }
 
 install_iii() {
@@ -675,7 +696,40 @@ install_agentos() {
   download_and_install "$AGENTOS_REPO" "$version" "$os" "$arch" "agentos"
 }
 
+install_oci() {
+  local root
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [ ! -f "$root/scripts/oci-stack.sh" ] || [ ! -f "$root/Containerfile" ]; then
+    err "iii 0.23+ is installed from a fresh source clone: git clone https://github.com/$AGENTOS_REPO.git; then bash scripts/install.sh --oci inside that clone. No native files were changed."
+  fi
+  if [ -n "${AGENTOS_VERSION:-}" ] || [ -n "$III_VERSION_OVERRIDE" ]; then
+    err "OCI uses the checkout and its .iii-version pin, not AGENTOS_VERSION/III_VERSION overrides"
+  fi
+  check_cmd python3 || err "python3 and a running Podman or Docker runtime are required"
+  info "Building the supported OCI runtime; existing native ~/.agentos and installed binaries are not migrated"
+  bash "$root/scripts/oci-stack.sh" build
+  ok "OCI image built. Start with: bash scripts/oci-stack.sh up"
+  info "Use scripts/oci-stack.sh status|logs|doctor|exec|stop; OCI data lives in AGENTOS_OCI_HOME (default ~/.agentos-oci)"
+}
+
 main() {
+  case "${1:-}" in
+    --help|-h)
+      printf '%s\n' 'Usage: bash scripts/install.sh [--oci]' \
+        'Default: install a native release ONLY if its bundled iii pin is 0.22.x.' \
+        'AGENTOS_VERSION=vX.Y.Z selects an archived native release explicitly.' \
+        '--oci: build the fresh checkout OCI image, without starting it or migrating native data.'
+      return ;;
+    --oci)
+      [ "$#" -eq 1 ] || err "Unexpected installer arguments; see --help"
+      install_oci; return ;;
+    '')
+      [ "$#" -eq 0 ] || err "Unexpected installer arguments; see --help"
+      if [ -n "$III_VERSION_OVERRIDE" ]; then require_native_pin "$III_VERSION_OVERRIDE"; fi
+      info "Native release installer (iii 0.22.x only). For iii 0.23+ use scripts/install.sh --oci in a fresh clone."
+      ;;
+    *) err "Unknown installer argument: $1; see --help" ;;
+  esac
   printf "\n"
   printf "${BOLD}  AgentOS Installer${RESET}\n"
   printf "${DIM}  Agent Operating System on iii-engine${RESET}\n"

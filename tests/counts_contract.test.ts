@@ -8,8 +8,7 @@ import {
   publishedNumbers,
   rustRegistrationIds,
   rustStringConstants,
-  workerTableSites,
-} from "../scripts/counts";
+  workerTableSites, publishedEngineWorkers } from "../scripts/counts";
 
 /**
  * On 2026-09-02 the repository advertised 267 functions (really 293), 1,413 /
@@ -190,5 +189,23 @@ describe("registration extractor", () => {
       "crates/http-adapter/src/lib.rs: adapter_id.clone()",
       'workers/hand-runner/src/main.rs: format!("hand::run::{hand_id}")',
     ]);
+  });
+});
+
+describe("engine worker prose", () => {
+  it("separates native managers from the following Compose paragraph", () => {
+    const document = "It declares four engine workers — `configuration`, `iii-worker-manager#raw`, `iii-worker-manager`, and `iii-stream`.\n\nCompose separately starts `http` and `state`.";
+    expect(publishedEngineWorkers(document)).toEqual([
+      "configuration", "iii-worker-manager#raw", "iii-worker-manager", "iii-stream",
+    ]);
+  });
+
+  it("keeps missing enumerations an error rather than an empty success", () => {
+    expect(() => publishedEngineWorkers("No engine enumeration.")).toThrow("no longer enumerates");
+    expect(() => publishedEngineWorkers("It declares workers without names.")).toThrow("no longer enumerates");
+  });
+
+  it("enumerates the integrated engine config exactly", () => {
+    expect(publishedEngineWorkers().sort()).toEqual([...counts.engineWorkers].sort());
   });
 });

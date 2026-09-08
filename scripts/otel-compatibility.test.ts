@@ -30,7 +30,7 @@ describe("pinned iii SDK with maintained OpenTelemetry", () => {
     const gate = lane.indexOf("run: bun run test:otel:native");
     expect(install).toBeGreaterThanOrEqual(0);
     expect(gate).toBeGreaterThan(install);
-    expect(gate).toBeLessThan(lane.indexOf("- name: start engine + workers"));
+    expect(gate).toBeLessThan(lane.indexOf("- name: credential-free worker integration tests"));
     expect(lane).not.toContain("continue-on-error");
   });
 

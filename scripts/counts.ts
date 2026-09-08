@@ -661,17 +661,14 @@ export interface WorkerTableSite {
   readonly parse: () => string[];
 }
 
-/**
- * The engine workers ARCHITECTURE.md enumerates in prose. The count beside them
- * is a published number, but the *names* are free text, so they would otherwise
- * rot silently when config.yaml gains or loses an entry.
- */
-export function publishedEngineWorkers(): string[] {
-  const text = read("ARCHITECTURE.md");
+export function publishedEngineWorkers(text = read("ARCHITECTURE.md")): string[] {
   const start = text.indexOf("It declares");
-  const end = text.indexOf("These are upstream registry binaries", start);
-  if (start < 0 || end < 0) throw new Error("ARCHITECTURE.md no longer enumerates the engine workers");
-  return [...text.slice(start, end).matchAll(/`([^`]+)`/g)].map((match) => match[1]!);
+  if (start < 0) throw new Error("ARCHITECTURE.md no longer enumerates the engine workers");
+  const end = text.indexOf("\n\n", start);
+  const paragraph = text.slice(start, end < 0 ? undefined : end);
+  const names = [...paragraph.matchAll(/`([^`]+)`/g)].map((match) => match[1]!);
+  if (names.length === 0) throw new Error("ARCHITECTURE.md no longer enumerates the engine workers");
+  return names;
 }
 
 export function workerTableSites(): WorkerTableSite[] {

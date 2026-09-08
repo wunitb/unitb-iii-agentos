@@ -51,7 +51,8 @@ async function main() {
       }
     }));
     await bounded("native telemetry flush", otel.flushOtel());
-    const trace = await queryUntil(client, "engine::traces::list",
+    // iii 0.23 lists compact trace summaries; full attributes and IDs live in spans.
+    const trace = await queryUntil(client, "engine::traces::spans",
       { trace_id: spanContext.traceId, include_internal: true, limit: 100 },
       (result) => result.spans?.some((span) => span.name === marker));
     const storedSpan = trace.spans.find((span) => span.name === marker);

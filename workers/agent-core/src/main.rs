@@ -688,8 +688,57 @@ async fn chat(bus: &Bus, input: Value) -> Result<Value, Error> {
     agent_chat(bus, ChatRequest { agent_id, ..req }).await
 }
 
-async fn agent_chat(iii: &Bus, req: ChatRequest) -> Result<Value, Error> {
+fn client_transcript(req: &mut ChatRequest) -> Result<Option<Vec<Value>>, Error> {
+    let Some(messages) = req.messages.take() else {
+        return Ok(None);
+    };
+    if messages.is_empty() || messages.len() > MAX_SESSION_HISTORY {
+        return Err(Error::Handler(format!(
+            "messages must contain 1..={MAX_SESSION_HISTORY} text messages"
+        )));
+    }
+    let mut transcript = Vec::new();
+    let mut system = Vec::new();
+    for message in messages {
+        let role = message["role"].as_str().unwrap_or("");
+        let content = message["content"]
+            .as_str()
+            .ok_or_else(|| Error::Handler("messages support text content only".into()))?;
+        if message.get("tool_calls").is_some() || message.get("tool_call_id").is_some() {
+            return Err(Error::Handler(
+                "client tool transcripts are unsupported".into(),
+            ));
+        }
+        match role {
+            "system" => system.push(content.to_owned()),
+            "user" | "assistant" => transcript.push(json!({"role": role, "content": content})),
+            _ => {
+                return Err(Error::Handler(
+                    "messages support system, user and assistant roles only".into(),
+                ));
+            }
+        }
+    }
+    if !transcript
+        .last()
+        .is_some_and(|message| message["role"] == "user" && message["content"] == req.message)
+    {
+        return Err(Error::Handler(
+            "messages must end with the current user message".into(),
+        ));
+    }
+    if !system.is_empty() {
+        if let Some(prompt) = req.system_prompt.take() {
+            system.insert(0, prompt);
+        }
+        req.system_prompt = Some(system.join("\n\n"));
+    }
+    Ok(Some(transcript))
+}
+
+async fn agent_chat(iii: &Bus, mut req: ChatRequest) -> Result<Value, Error> {
     let start = Instant::now();
+    let supplied_messages = client_transcript(&mut req)?;
     let session_id = session_id_or_default(req.session_id.clone(), &req.agent_id);
 
     let config_result = iii
@@ -724,31 +773,41 @@ async fn agent_chat(iii: &Bus, req: ChatRequest) -> Result<Value, Error> {
     };
     let configured_agent = config.is_some();
 
-    let history = match iii
-        .trigger(TriggerRequest {
-            function_id: "memory::session::history".to_string(),
-            payload: session_history_payload(&req.agent_id, &session_id),
-            action: None,
-            timeout_ms: Some(CHAT_TIMEOUT_MS),
-        })
-        .await
-    {
-        Ok(value) => normalize_session_history(&value, &req.agent_id, &session_id)?,
-        Err(_) => SessionContext {
+    let history = if supplied_messages.is_some() {
+        SessionContext {
             chronological: Vec::new(),
             seen_ids: HashSet::new(),
-        },
+        }
+    } else {
+        match iii
+            .trigger(TriggerRequest {
+                function_id: "memory::session::history".to_string(),
+                payload: session_history_payload(&req.agent_id, &session_id),
+                action: None,
+                timeout_ms: Some(CHAT_TIMEOUT_MS),
+            })
+            .await
+        {
+            Ok(value) => normalize_session_history(&value, &req.agent_id, &session_id)?,
+            Err(_) => SessionContext {
+                chronological: Vec::new(),
+                seen_ids: HashSet::new(),
+            },
+        }
     };
 
-    let memories: Value = iii
-        .trigger(TriggerRequest {
+    let memories: Value = if supplied_messages.is_some() {
+        json!([])
+    } else {
+        iii.trigger(TriggerRequest {
             function_id: "memory::recall".to_string(),
             payload: memory_recall_payload(&req.agent_id, &req.message),
             action: None,
             timeout_ms: Some(CHAT_TIMEOUT_MS),
         })
         .await
-        .unwrap_or(json!([]));
+        .unwrap_or(json!([]))
+    };
 
     let functions: Value = iii
         .trigger(TriggerRequest {
@@ -805,7 +864,8 @@ async fn agent_chat(iii: &Bus, req: ChatRequest) -> Result<Value, Error> {
         )));
     }
 
-    let mut messages = messages_with_session_context(history, &memories, &req.message);
+    let mut messages = supplied_messages
+        .unwrap_or_else(|| messages_with_session_context(history, &memories, &req.message));
 
     let mut response: Value = iii
         .trigger(TriggerRequest {
@@ -816,6 +876,9 @@ async fn agent_chat(iii: &Bus, req: ChatRequest) -> Result<Value, Error> {
         })
         .await
         .map_err(|e| Error::Handler(e.to_string()))?;
+
+    let mut usage = json!({"input": 0_u64, "output": 0_u64, "total": 0_u64});
+    meter_completion(iii, &req.agent_id, &response, true, &mut usage).await;
 
     let mut iterations: u32 = 0;
 
@@ -938,7 +1001,10 @@ async fn agent_chat(iii: &Bus, req: ChatRequest) -> Result<Value, Error> {
             })
             .await
             .map_err(|e| Error::Handler(e.to_string()))?;
+        meter_completion(iii, &req.agent_id, &response, false, &mut usage).await;
     }
+
+    response["usage"] = usage;
 
     let mut persistence_warnings = Vec::new();
     if let Some(warning) =
@@ -962,22 +1028,6 @@ async fn agent_chat(iii: &Bus, req: ChatRequest) -> Result<Value, Error> {
         persistence_warnings.push(warning);
     }
 
-    // The engine's `state::update` takes `ops`, and an increment carries `by`, not
-    // `value` (verified against iii 0.22.1). It also REJECTS an increment over a
-    // stored null, so the amount is resolved to a number here: a missing usage
-    // total meters zero instead of poisoning the counter for good.
-    if let Err(e) = iii
-        .trigger(TriggerRequest {
-            function_id: "state::update".to_string(),
-            payload: metering_update_payload(&req.agent_id, &response),
-            action: None,
-            timeout_ms: Some(CHAT_TIMEOUT_MS),
-        })
-        .await
-    {
-        tracing::warn!(agent_id = %req.agent_id, error = %e, "metering update failed");
-    }
-
     Ok(json!({
         "content": response.get("content").and_then(|v| v.as_str()).unwrap_or(""),
         "model": response.get("model"),
@@ -987,6 +1037,41 @@ async fn agent_chat(iii: &Bus, req: ChatRequest) -> Result<Value, Error> {
         "sessionPersisted": persistence_warnings.is_empty(),
         "persistenceWarnings": persistence_warnings,
     }))
+}
+
+async fn meter_completion(
+    iii: &Bus,
+    agent_id: &str,
+    response: &Value,
+    first: bool,
+    usage: &mut Value,
+) {
+    for field in ["input", "output", "total"] {
+        usage[field] = json!(
+            usage[field]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_add(response["usage"][field].as_u64().unwrap_or(0))
+        );
+    }
+    // Persist each consumed completion, even if a later tool/provider call fails.
+    let mut payload = metering_update_payload(agent_id, response);
+    payload["ops"][1]["by"] = json!(u64::from(first));
+    let result = iii
+        .trigger(TriggerRequest {
+            function_id: "state::update".to_string(),
+            payload,
+            action: None,
+            timeout_ms: Some(CHAT_TIMEOUT_MS),
+        })
+        .await;
+    let error = match result {
+        Ok(value) => agentos_http_adapter::state::update_errors(&value),
+        Err(error) => Some(error.to_string()),
+    };
+    if let Some(error) = error {
+        tracing::warn!(agent_id, %error, "metering update failed");
+    }
 }
 
 /// Build the metering `state::update` payload for one completed turn.
@@ -1300,6 +1385,122 @@ async fn delete_agent_authorized(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn client_transcript_preserves_history_and_system_without_server_context() {
+        let fake = turn_bus(vec![json!({"content": "answer"})]);
+        let bus: Bus = fake.clone();
+        chat(
+            &bus,
+            json!({"agentId": "a-1", "message": "second question",
+            "principal": principal::as_agent("a-1"), "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": "second question"}
+            ]}),
+        )
+        .await
+        .unwrap();
+        let request = &payloads(&fake, "agentos::llm::complete")[0];
+        assert_eq!(request["systemPrompt"], "be brief");
+        assert_eq!(
+            request["messages"],
+            json!([
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": "second question"}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_client_transcript_is_rejected_before_completion() {
+        for messages in [
+            json!([]),
+            json!([{"role": "tool", "content": "x"}]),
+            json!([{"role": "user", "content": [{"type": "image_url"}]}]),
+            json!([{"role": "user", "content": "different"}]),
+        ] {
+            let fake = turn_bus(vec![json!({"content": "answer"})]);
+            let bus: Bus = fake.clone();
+            assert!(
+                chat(
+                    &bus,
+                    json!({"agentId": "a-1", "message": "current",
+                "principal": principal::as_agent("a-1"), "messages": messages})
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(fake.call_count("agentos::llm::complete"), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn metering_counts_every_completion_in_a_tool_turn() {
+        let fake = turn_bus(vec![
+            json!({"content": "", "usage": {"input": 10, "output": 2, "total": 12},
+                "toolCalls": [{"callId": "c", "id": "memory::recall", "arguments": {"query": "test"}}]}),
+            json!({"content": "answer", "usage": {"input": 20, "output": 3, "total": 23}}),
+        ]);
+        let bus: Bus = fake.clone();
+        let answer = chat(
+            &bus,
+            json!({
+                "agentId": "a-1", "message": "test", "principal": principal::as_agent("a-1")
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            answer["usage"],
+            json!({"input": 30, "output": 5, "total": 35})
+        );
+        let updates = payloads(&fake, "state::update");
+        let tokens: u64 = updates
+            .iter()
+            .filter(|p| p["scope"] == "metering")
+            .map(|p| p["ops"][0]["by"].as_u64().unwrap())
+            .sum();
+        assert_eq!(tokens, 35);
+        let invocations: u64 = updates
+            .iter()
+            .filter(|p| p["scope"] == "metering")
+            .map(|p| p["ops"][1]["by"].as_u64().unwrap())
+            .sum();
+        assert_eq!(invocations, 1);
+    }
+
+    #[tokio::test]
+    async fn metering_keeps_consumed_tokens_when_a_later_completion_fails() {
+        let fake = turn_bus(vec![]);
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        fake.on("agentos::llm::complete", move |_| {
+            if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(json!({"content": "", "usage": {"total": 12},
+                    "toolCalls": [{"callId": "c", "id": "memory::recall", "arguments": {}}]}))
+            } else {
+                Err(Error::Handler("provider unavailable".into()))
+            }
+        });
+        let bus: Bus = fake.clone();
+        assert!(
+            chat(
+                &bus,
+                json!({"agentId": "a-1", "message": "test",
+            "principal": principal::as_agent("a-1")})
+            )
+            .await
+            .is_err()
+        );
+        let tokens: u64 = payloads(&fake, "state::update")
+            .iter()
+            .filter(|p| p["scope"] == "metering")
+            .map(|p| p["ops"][0]["by"].as_u64().unwrap())
+            .sum();
+        assert_eq!(tokens, 12);
+    }
+
     #[test]
     fn metering_speaks_the_engines_update_protocol() {
         let payload = metering_update_payload(

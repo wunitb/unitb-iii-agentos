@@ -91,7 +91,9 @@ jobs:
   boot-smoke:
     name: boot smoke (no provider credentials)
     needs: rust
-    timeout-minutes: 10
+    timeout-minutes: 65
+    env:
+      AGENTOS_OCI_RUNTIME: docker
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -105,23 +107,22 @@ jobs:
       - name: install pinned registry probe dependencies
         run: bun install --frozen-lockfile
 
-      - name: download release binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: worker-binaries
-          path: target/release/
-
-      - name: chmod release binaries
-        run: chmod +x target/release/agentos target/release/agentos-*
-
-      - name: install pinned iii runtime
-        run: |
-          set -euo pipefail
-          bash scripts/install-iii.sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
+      # The smoke runner builds a scratch-only fixture child of the immutable
+      # product image; no product engine/worker is started on the host.
       - name: boot through the product entry point and inspect the registry
         run: bash scripts/boot-smoke.sh
+
+      - name: export the tested OCI image
+        run: docker image save --output "$RUNNER_TEMP/agentos-oci-image.tar" localhost/unitb-agentos:local
+
+      - name: share the tested OCI image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: agentos-oci-image
+          path: ${{ runner.temp }}/agentos-oci-image.tar
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
 
   node-unit:
     name: Node unit + governance + config boot
@@ -131,6 +132,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
@@ -148,7 +153,7 @@ jobs:
       - name: verify iii runtime
         run: |
           iii --version
-          test -x "$(command -v iii-worker)"
+          iii compose --help >/dev/null
 
       - name: audit locked Node dependencies
         run: bun audit
@@ -223,6 +228,7 @@ jobs:
           cp .env.example "$stage/runtime/.env.example"
           cp .iii-version "$stage/runtime/.iii-version"
           cp config.yaml "$stage/runtime/config.yaml"
+          cp worker-compose.yaml "$stage/runtime/worker-compose.yaml"
           cp iii.lock "$stage/runtime/iii.lock"
           cp workers/env.allowlist "$stage/runtime/workers/env.allowlist"
           cp -R config agents hands identity integrations plugin workflows "$stage/runtime/"
@@ -252,6 +258,7 @@ jobs:
             ./runtime/.env.example \
             ./runtime/.iii-version \
             ./runtime/config.yaml \
+            ./runtime/worker-compose.yaml \
             ./runtime/iii.lock \
             ./runtime/workers/env.allowlist \
             ./runtime/workers/agent-core/iii.worker.yaml \
@@ -283,7 +290,9 @@ jobs:
             || { echo "::error::packaged config.yaml missing"; exit 1; }
           [[ ! -e "$extract/workers" ]] \
             || { echo "::error::checkout-relative workers directory leaked into bundle"; exit 1; }
-          echo "validated native linux-x86_64 bundle without checkout-relative runtime paths"
+          cmp -s worker-compose.yaml "$extract/runtime/worker-compose.yaml" \
+            || { echo "::error::packaged worker-compose.yaml mismatch"; exit 1; }
+          echo "validated linux-x86_64 OCI runtime payload without checkout-relative runtime paths"
 
   python:
     name: python worker tests
@@ -296,8 +305,8 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
-      - run: python -m pip install --disable-pip-version-check pytest
-      - run: python -m pytest workers/embedding/test_main.py -q
+      - run: python -m pip install --disable-pip-version-check pytest "iii-sdk==$(cat .iii-version)"
+      - run: python -m pytest workers/embedding -q
 
   website:
     name: website build
@@ -327,7 +336,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - run: shellcheck --severity=warning scripts/install.sh scripts/dev-up.sh scripts/desktop-up.sh scripts/memworkr-sync.sh website/public/install.sh scripts/install-iii.sh scripts/boot-smoke.sh
+      - run: shellcheck --severity=warning scripts/install.sh scripts/dev-up.sh scripts/desktop-up.sh scripts/memworkr-sync.sh website/public/install.sh scripts/install-iii.sh scripts/boot-smoke.sh scripts/oci-stack.sh
 
   worker-yaml:
     name: validate iii.worker.yaml
@@ -403,16 +412,16 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    needs: rust
+    timeout-minutes: 65
+    needs: [rust, boot-smoke]
     env:
-      AGENTOS_API_KEY: ci-smoke-key
-      AUDIT_HMAC_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-      AGENTOS_E2E_FAKE_PROVIDER: "1"
-      ANTHROPIC_API_KEY: agentos-e2e-fake-anthropic-key
-      AGENTOS_ANTHROPIC_BASE_URL: http://127.0.0.1:39091
+      AGENTOS_OCI_RUNTIME: docker
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
@@ -433,14 +442,14 @@ jobs:
       - name: test startup configuration
         run: bun run test:scripts
 
-      - name: download worker binaries
+      - name: download the tested OCI image
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: worker-binaries
-          path: target/release/
+          name: agentos-oci-image
+          path: ${{ runner.temp }}/agentos-oci-image
 
-      - name: chmod binaries
-        run: chmod +x target/release/agentos-*
+      - name: load the tested OCI image
+        run: docker image load --input "$RUNNER_TEMP/agentos-oci-image/agentos-oci-image.tar"
 
       - name: install pinned iii runtime
         run: |
@@ -451,139 +460,35 @@ jobs:
       - name: verify iii runtime
         run: |
           iii --version
-          test -x "$(command -v iii-worker)"
+          iii compose --help >/dev/null
 
       - name: verify native OpenTelemetry ingestion
         timeout-minutes: 3
         run: bun run test:otel:native
 
-      - name: start engine + workers
-        run: |
-          set -euo pipefail
-          mkdir -p data
-          export IIIWORKER_DISABLE_BUILTIN_DAEMONS=1
-          ./target/release/agentos-bus-authd --config=config.yaml > bus-auth.log 2>&1 &
-          BUS_AUTH_PID=$!
-          echo "BUS_AUTH_PID=$BUS_AUTH_PID" >> "$GITHUB_ENV"
-          for _ in {1..60}; do
-            timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/49129" 2>/dev/null && break
-            kill -0 "$BUS_AUTH_PID" 2>/dev/null || { cat bus-auth.log; exit 1; }
-            sleep 0.25
-          done
-          timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/49129" 2>/dev/null \
-            || { echo "::error::bus-auth daemon never opened before iii"; cat bus-auth.log; exit 1; }
-          iii --config config.yaml > engine.log 2>&1 &
-          ENGINE_PID=$!
-          echo "ENGINE_PID=$ENGINE_PID" >> "$GITHUB_ENV"
-          for _ in {1..60}; do
-            timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/3111" 2>/dev/null && break
-            kill -0 "$ENGINE_PID" 2>/dev/null || { cat engine.log; exit 1; }
-            sleep 0.5
-          done
-          timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/3111" 2>/dev/null \
-            || { echo "::error::engine HTTP port never opened"; cat engine.log; exit 1; }
-          # The registry chat console is opt-in: it has no bind-host key and
-          # listens on 0.0.0.0, so config.yaml does not boot it by default.
-          # Assert whichever state config.yaml declares, so this step is correct
-          # regardless of which branch lands first.
-          if grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*console[[:space:]]*$' config.yaml; then
-            for _ in {1..120}; do
-              console_probe="$(curl -sS --max-redirs 0 -o /dev/null -w '%{http_code} %{redirect_url}' http://127.0.0.1:3113/ 2>/dev/null || true)"
-              [[ "$console_probe" == 200\ * ]] && break
-              kill -0 "$ENGINE_PID" 2>/dev/null || { cat engine.log; exit 1; }
-              sleep 1
-            done
-            [[ "$console_probe" == 200\ * ]] \
-              || { echo "::error::config.yaml boots the console but it never opened"; cat engine.log; exit 1; }
-          else
-            sleep 5
-            if timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/3113" 2>/dev/null; then
-              echo "::error::config.yaml does not boot the console, but something is listening on 3113"
-              cat engine.log
-              exit 1
-            fi
-            echo "ok: console is not booted and port 3113 is closed"
-          fi
-          for w in agentos-core agentos-llm-router agentos-memory agentos-security agentos-realm agentos-mission agentos-directive agentos-hierarchy agentos-council agentos-ledger agentos-pulse agentos-bridge agentos-wasm-sandbox; do
-            ./target/release/$w > "$w.log" 2>&1 &
-          done
-          required_functions=(state::set state::get state::list health::check agentos::llm::providers memory::store security::scan_injection realm::create mission::create council::submit ledger::set_budget wasm::execute)
-          for _ in {1..60}; do
-            missing=0
-            for function_id in "${required_functions[@]}"; do
-              grep -q "Function $function_id" engine.log || missing=1
-            done
-            [[ "$missing" -eq 0 ]] && break
-            sleep 0.5
-          done
-          for function_id in "${required_functions[@]}"; do
-            grep -q "Function $function_id" engine.log \
-              || { echo "::error::missing registered function $function_id"; cat engine.log; exit 1; }
-          done
-          curl -fsS http://127.0.0.1:3111/api/health >/dev/null
-
-      - name: engine WS port + HTTP port listening
-        run: |
-          set -e
-          for port in 49134 3111; do
-            timeout 5 bash -c "until echo > /dev/tcp/127.0.0.1/$port 2>/dev/null; do sleep 0.5; done" \
-              || (echo "::error::port $port never opened"; cat engine.log; exit 1)
-            echo "ok: port $port listening"
-          done
-
       - name: credential-free worker integration tests
-        env:
-          AGENTOS_E2E: "1"
-          III_URL: ws://localhost:49134
+        # Actual OCI readiness, registry, fake-chat/protocol, worker calls,
+        # persistence and owned teardown are mandatory, not skipped evidence.
         run: |
           set -euo pipefail
-          report="$RUNNER_TEMP/agentos-fake-provider-results.json"
-          rm -f -- "$report"
-          bunx vitest --run --config vitest.e2e.config.ts e2e/full-stack.test.ts \
-            --testNamePattern="local fake Anthropic provider|realm::create|mission::create|security::scan_injection|wasm::list_modules" \
-            --reporter=json --outputFile="$report"
-          bun scripts/assert-e2e-results.ts "$report"
-
-      - name: "assert wasm:: + sandbox:: coexist (no namespace clash)"
-        run: |
-          set -e
-          # wasm-sandbox worker must register wasm::* not sandbox::*
-          grep -q 'Function wasm::execute' engine.log \
-            || (echo "::error::wasm::execute not registered"; exit 1)
-          # The builtin sandbox::* worker is opt-in (commented in config.yaml);
-          # if iii-sandbox were enabled, sandbox::create would also appear without
-          # colliding with our wasm::* names.
-          if grep -q 'Function sandbox::execute' engine.log; then
-            echo "::error::sandbox::execute is reserved for builtin iii-sandbox (iii v0.22.1)"
-            exit 1
-          fi
-          echo "ok: wasm:: registered, no agentos worker shadows sandbox::*"
-
-      - name: dump worker logs on failure
-        if: failure()
-        run: |
-          for f in *.log; do
-            echo "=== $f ==="
-            tail -100 "$f" || true
-          done
-
-      - name: stop
-        if: always()
-        run: |
-          pkill -f 'agentos-' || true
-          if [ -n "${ENGINE_PID:-}" ]; then kill "$ENGINE_PID" || true; fi
-          if [ -n "${BUS_AUTH_PID:-}" ]; then kill "$BUS_AUTH_PID" || true; fi
+          report="$RUNNER_TEMP/agentos-oci-results.json"
+          python3 scripts/oci-smoke.py --report "$report" --no-build
+          bun scripts/assert-oci-results.ts "$report"
 
   e2e-full:
     name: e2e full (main branch, credentials required)
     permissions:
       contents: read
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 80
     needs: e2e-smoke
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'wunitb/unitb-iii-agentos' && vars.AGENTOS_FULL_E2E_ENABLED == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
@@ -615,73 +520,10 @@ jobs:
           test -n "$AGENTOS_API_KEY" || { echo "::error::AGENTOS_API_KEY is required"; exit 1; }
           test -n "$ANTHROPIC_API_KEY" || { echo "::error::ANTHROPIC_API_KEY is required"; exit 1; }
 
-      - name: start engine + workers
-        env:
-          AGENTOS_API_KEY: ${{ secrets.AGENTOS_API_KEY }}
-          AUDIT_HMAC_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          set -euo pipefail
-          mkdir -p data
-          export IIIWORKER_DISABLE_BUILTIN_DAEMONS=1
-          ./target/release/agentos-bus-authd --config=config.yaml > bus-auth.log 2>&1 &
-          BUS_AUTH_PID=$!
-          echo "BUS_AUTH_PID=$BUS_AUTH_PID" >> "$GITHUB_ENV"
-          for _ in {1..60}; do
-            timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/49129" 2>/dev/null && break
-            kill -0 "$BUS_AUTH_PID" 2>/dev/null || { cat bus-auth.log; exit 1; }
-            sleep 0.25
-          done
-          timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/49129" 2>/dev/null \
-            || { echo "::error::bus-auth daemon never opened before iii"; cat bus-auth.log; exit 1; }
-          iii --config config.yaml > engine.log 2>&1 &
-          ENGINE_PID=$!
-          echo "ENGINE_PID=$ENGINE_PID" >> "$GITHUB_ENV"
-          for _ in {1..30}; do
-            timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/3111" 2>/dev/null && break
-            sleep 1
-          done
-          for w in agentos-core agentos-llm-router agentos-memory agentos-security \
-                   agentos-realm agentos-mission agentos-directive agentos-hierarchy \
-                   agentos-council agentos-ledger agentos-pulse agentos-bridge \
-                   agentos-wasm-sandbox; do
-            ./target/release/$w > "$w.log" 2>&1 &
-          done
-          required_functions=(state::set state::get state::list realm::create realm::list mission::create council::submit ledger::set_budget hierarchy::set security::scan_injection memory::store agentos::llm::providers agentos::llm::route agentos::llm::complete agent::chat wasm::list_modules)
-            for _ in {1..60}; do
-            missing=0
-              for function_id in "${required_functions[@]}"; do
-                grep -q "Function $function_id" engine.log || missing=1
-            done
-            [ "$missing" -eq 0 ] && break
-            sleep 0.5
-          done
-          for function_id in "${required_functions[@]}"; do
-            grep -q "Function $function_id" engine.log
-          done
-          curl -fsS http://127.0.0.1:3111/api/health >/dev/null
-
       - name: vitest e2e
         env:
-          AGENTOS_E2E: "1"
-          AGENTOS_BASE_URL: http://127.0.0.1:3111
-          AGENTOS_E2E_MODEL: claude-sonnet-4-20250514
-          III_URL: ws://localhost:49134
           AGENTOS_API_KEY: ${{ secrets.AGENTOS_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: bun run test:e2e
-
-      - name: dump logs on failure
-        if: failure()
-        run: |
-          for f in *.log; do
-            echo "=== $f ==="
-            tail -200 "$f" || true
-          done
-
-      - name: stop
-        if: always()
-        run: |
-          pkill -f 'agentos-' || true
-          if [ -n "${ENGINE_PID:-}" ]; then kill "$ENGINE_PID" || true; fi
-          if [ -n "${BUS_AUTH_PID:-}" ]; then kill "$BUS_AUTH_PID" || true; fi
+        # Explicit credential-gated full tests use dynamic loopback OCI endpoints.
+        # The runner preserves test exit status and verifies owned cleanup.
+        run: python3 scripts/oci-smoke.py --live-e2e

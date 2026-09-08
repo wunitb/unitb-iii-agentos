@@ -71,6 +71,7 @@ function fixtureRoot(): string {
   writeFileSync(join(directory, "Cargo.toml"), `[workspace.package]\nversion = "${version}"\n`);
   writeFileSync(join(directory, ".iii-version"), "0.22.1\n");
   writeFileSync(join(directory, "config.yaml"), "workers: []\n");
+  writeFileSync(join(directory, "worker-compose.yaml"), "workers: []\n");
   writeFileSync(join(directory, "iii.lock"), "version: 1\n");
   writeFileSync(join(directory, ".env.example"), "AGENTOS_API_KEY=\n");
   writeFileSync(join(directory, "workers/env.allowlist"), "agent-core=III_URL,AGENTOS_API_KEY\n");
@@ -213,29 +214,29 @@ describe("release artifact contract", () => {
 describe("public setup documentation", () => {
   test("website uses the guarded launcher and never starts a worker wildcard", () => {
     const install = read("website/components/Install.tsx");
-    expect(install).toContain("agentos up");
-    expect(install).toContain(".env.example");
+    expect(install).toContain("scripts/oci-stack.sh up");
+    expect(install).toContain("scripts/oci-stack.sh exec agentos onboard");
+    expect(install).toContain("AGENTOS_OCI_HOME");
     expect(install).not.toMatch(/for w in|agentos-\*/);
     expect(install).not.toContain("iii --config config.yaml");
   });
 
-  test("documents Linux detached lifecycle separately from macOS foreground lifecycle", () => {
+  test("documents OCI startup separately from archived native releases", () => {
     const readme = read("README.md");
     const installGuide = read("INSTALL_STACK.md");
     const website = read("website/components/Install.tsx");
     for (const document of [readme, installGuide, website]) {
       expect(document).toContain("Linux");
       expect(document).toContain("macOS");
-      expect(document).toContain("agentos up");
-      expect(document).toContain("agentos start");
-      expect(document).toContain("agentos tui");
-      expect(document).toContain("runtime proof");
+      expect(document).toContain("Podman");
+      expect(document).toContain("Docker");
+      expect(document).toContain("scripts/oci-stack.sh");
+      expect(document).toContain("AGENTOS_OCI_HOME");
     }
-    expect(website).toContain("--grace-seconds");
-    expect(readme).toContain("--grace-seconds");
-    expect(readme).toContain("0..60");
-    expect(readme).toContain("default 5");
-    expect(readme).toContain("runtime proof");
+    expect(readme).toContain("Archived native v0.2.0");
+    expect(readme).toContain("not automatic data migrations");
+    expect(website).toContain("runtime proof");
+    expect(website).not.toContain("./target/release/agentos up");
   });
 
   test("documents configured UTC pulse slots instead of a one-minute throttle", () => {

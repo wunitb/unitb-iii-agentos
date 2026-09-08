@@ -597,6 +597,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         function_id: "council::activity".to_string(),
         config: json!({ "topic": "council.audit" }),
         metadata: None,
+        namespace: None,
+        trigger_namespace: None,
     })?;
 
     tracing::info!("council worker started");

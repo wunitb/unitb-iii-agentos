@@ -5,21 +5,19 @@
 //! * [`policy`] — the tier decision and what each tier may call and register.
 //! * [`client`] — the handshake credential every in-tree worker presents.
 //! * [`daemon`] — the engine-protocol server that answers the engine's RBAC
-//!   hooks, reached through the engine's builtin `iii-bridge` worker.
+//!   hooks through a private bootstrap connection in the OCI runtime.
 //!
-//! # Why the daemon is not a worker
+//! # Bootstrap without a circular authentication dependency
 //!
-//! `rbac.auth_function_id` names a function the engine calls for EVERY bus
-//! connection, including the connection of the worker that would provide it.
-//! Measured on iii 0.22.1: a worker that connects to provide `probe::auth` is
-//! itself refused with `AUTH_ERROR: Function probe::auth not found`, so an
-//! AgentOS bus worker can never bootstrap the gate, and enabling RBAC by editing
-//! `config.yaml` at runtime kills the engine (`address … already in use` while
-//! the old listener is still bound). The one place a function can exist before
-//! the listener accepts anything is an in-process registration, and the only
-//! config-driven in-process registration in 0.22.1 is the `iii-bridge` worker's
-//! `forward:` list. So the daemon speaks the ENGINE side of the iii-sdk
-//! protocol and `iii-bridge` forwards `agentos::bus_auth` to it.
+//! The iii 0.23 topology has two managers inside one OCI network boundary.
+//! The daemon registers policy handlers over the private loopback manager before
+//! Compose infrastructure or product workers start. The public-facing edge keeps
+//! all four native RBAC hooks; product workers authenticate there. Neither the
+//! bootstrap manager nor Compose controls are published to the host.
+//!
+//! The legacy engine-side server remains for archived iii 0.22 configurations
+//! using `iii-bridge`. It is not the migrated default. A policy worker cannot
+//! bootstrap through the same authenticated listener whose hook it provides.
 
 pub mod client;
 pub mod config;

@@ -6,6 +6,7 @@ pub struct ChatRequest {
     #[serde(rename = "agentId")]
     pub agent_id: String,
     pub message: String,
+    pub messages: Option<Vec<Value>>,
     #[serde(rename = "sessionId")]
     pub session_id: Option<String>,
     #[serde(rename = "systemPrompt")]
@@ -117,6 +118,7 @@ mod tests {
         let req = ChatRequest {
             agent_id: "a-1".to_string(),
             message: "test".to_string(),
+            messages: None,
             session_id: Some("s-1".to_string()),
             system_prompt: None,
             provider: None,
@@ -277,6 +279,7 @@ mod tests {
         let req = ChatRequest {
             agent_id: "a1".to_string(),
             message: "hello".to_string(),
+            messages: None,
             session_id: Some("s1".to_string()),
             system_prompt: Some("prompt".to_string()),
             provider: None,
@@ -516,6 +519,7 @@ mod tests {
         let req = ChatRequest {
             agent_id: "".to_string(),
             message: "".to_string(),
+            messages: None,
             session_id: Some("".to_string()),
             system_prompt: Some("".to_string()),
             provider: None,
