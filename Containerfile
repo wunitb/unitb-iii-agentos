@@ -21,7 +21,8 @@ RUN python3 /tmp/stage-runtime.py /source /bundle
 FROM docker.io/library/debian:trixie-slim
 RUN apt-get update && apt-get install --no-install-recommends -y ca-certificates curl file python3 python3-venv tini \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --uid 1000 agentos
+    && useradd --create-home --uid 1000 agentos \
+    && chmod 0755 /home/agentos
 COPY --from=build /bundle/bin/ /usr/local/bin/
 COPY --from=build /bundle/runtime/ /opt/agentos/runtime/
 # Private checkout modes must not hide immutable templates from the runtime user.
