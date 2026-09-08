@@ -42,7 +42,7 @@ def safe_error(error: Exception) -> str:
     return type(error).__name__
 
 
-def command(arguments: list[str], *, timeout: int = 30, capture: bool = True) -> str:
+def command(arguments: list[str], *, timeout: int | None = 30, capture: bool = True) -> str:
     phase = arguments[1]
     if phase in {"container", "image"}:
         phase += f" {arguments[2]}"
@@ -407,7 +407,7 @@ def main(arguments: list[str]) -> None:
                 if sys.stdin.isatty():
                     args.append("--tty")
                 args.extend([value["Id"], *(extra if action == "exec" else ["agentos", "doctor"])])
-                command(args, timeout=600, capture=False)
+                command(args, timeout=None if action == "exec" else 600, capture=False)
 
 
 if __name__ == "__main__":

@@ -150,6 +150,7 @@ fn agent_chat_payload(input: &Value, body: &Value, message: &str) -> Value {
     json!({
         "agentId": body["agentId"].as_str().unwrap_or("default"),
         "message": message,
+        "messages": body.get("messages").cloned().unwrap_or(Value::Null),
         "sessionId": body.get("sessionId").cloned().unwrap_or(Value::Null),
         "systemPrompt": body.get("systemPrompt").cloned().unwrap_or(Value::Null),
         "provider": body.get("provider").cloned().unwrap_or(Value::Null),
@@ -174,7 +175,14 @@ fn stream_chat_response(response: &Value) -> Value {
         "model": response.get("model").cloned().unwrap_or(Value::Null),
         "usage": response.get("usage").cloned().unwrap_or(Value::Null),
     });
-    for field in ["toolCalls", "iterations", "durationMs", "sessionId"] {
+    for field in [
+        "toolCalls",
+        "iterations",
+        "durationMs",
+        "sessionId",
+        "sessionPersisted",
+        "persistenceWarnings",
+    ] {
         if let Some(value) = response.get(field) {
             body[field] = value.clone();
         }
@@ -223,15 +231,26 @@ fn latest_user_message(body: &Value) -> Result<String, Error> {
 async fn chat_completion(iii: &IIIClient, input: Value) -> Result<Value, Error> {
     let body = payload_body(&input);
     let message = latest_user_message(&body)?;
-    let requested_model = body["model"].as_str().unwrap_or("agentos-default");
 
     let response = agent_chat(iii, &input, &body, &message).await?;
+    completion_response(&response, &body)
+}
 
+fn completion_response(response: &Value, body: &Value) -> Result<Value, Error> {
+    let requested_model = body["model"].as_str().unwrap_or("agentos-default");
     let content = response.get("content").cloned().unwrap_or(Value::Null);
     let model = response["model"].as_str().unwrap_or(requested_model);
-    let usage = response.get("usage").cloned().unwrap_or_else(
-        || json!({ "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }),
-    );
+    if body["stream"] == true {
+        return Ok(sse_envelope(sse_events(
+            content.as_str().unwrap_or(""),
+            model,
+        )?));
+    }
+    let usage = json!({
+        "prompt_tokens": response["usage"]["input"].as_u64().unwrap_or(0),
+        "completion_tokens": response["usage"]["output"].as_u64().unwrap_or(0),
+        "total_tokens": response["usage"]["total"].as_u64().unwrap_or(0),
+    });
 
     Ok(json!({
         "id": completion_id(),
@@ -253,6 +272,7 @@ fn sse_events(content: &str, model: &str) -> Result<String, Error> {
     let chunks = chunk_markdown_aware(content, 20, 100);
     let chunks_len = chunks.len();
     let created = chrono::Utc::now().timestamp();
+    let id = completion_id();
 
     let mut sse_body = String::new();
     for (index, chunk) in chunks.iter().enumerate() {
@@ -267,7 +287,7 @@ fn sse_events(content: &str, model: &str) -> Result<String, Error> {
             json!({ "content": chunk })
         };
         let event = json!({
-            "id": completion_id(),
+            "id": id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
@@ -403,6 +423,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn chat_response_keeps_session_persistence_warnings() {
+        let response = json!({"content": "answer", "sessionPersisted": false,
+            "persistenceWarnings": ["history unavailable"]});
+        let body = stream_chat_response(&response);
+        assert_eq!(body["sessionPersisted"], false);
+        assert_eq!(body["persistenceWarnings"], response["persistenceWarnings"]);
+    }
+
+    #[test]
+    fn completion_payload_preserves_the_clients_transcript() {
+        let body = json!({"messages": [{"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hello"}]});
+        let payload = agent_chat_payload(&body, &body, "hello");
+        assert_eq!(payload["messages"], body["messages"]);
+    }
+
+    #[test]
+    fn completion_response_maps_usage_and_supports_buffered_sse() {
+        let answer = json!({"content": "hello", "model": "m", "usage": {"input": 7, "output": 4, "total": 11}});
+        let response = completion_response(&answer, &json!({})).unwrap();
+        assert_eq!(
+            response["usage"],
+            json!({"prompt_tokens": 7, "completion_tokens": 4, "total_tokens": 11})
+        );
+        let stream = completion_response(&answer, &json!({"stream": true})).unwrap();
+        assert_eq!(stream["headers"]["Content-Type"], "text/event-stream");
+        assert!(
+            stream["body"]
+                .as_str()
+                .unwrap()
+                .ends_with("data: [DONE]\n\n")
+        );
+    }
 
     #[test]
     fn every_chat_hop_carries_the_full_turn_budget() {
@@ -546,6 +601,16 @@ mod tests {
     fn sse_framing_closes_the_last_chunk_of_a_long_answer() {
         let long = "word ".repeat(200);
         let body = sse_events(&long, "test-model").expect("events");
+        let ids: Vec<String> = body
+            .lines()
+            .filter_map(|line| {
+                let data = line.strip_prefix("data: ")?;
+                let event: Value = serde_json::from_str(data).ok()?;
+                event["id"].as_str().map(str::to_owned)
+            })
+            .collect();
+        assert!(ids.len() > 1);
+        assert!(ids.iter().all(|id| id == &ids[0]));
         let events: Vec<&str> = body
             .split("\n\n")
             .filter(|event| !event.is_empty() && *event != "data: [DONE]")

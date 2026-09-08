@@ -1198,6 +1198,7 @@ dependencies = [
  "agentos-http-adapter",
  "anyhow",
  "chrono",
+ "futures-util",
  "hex",
  "iii-sdk",
  "serde",

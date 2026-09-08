@@ -17,6 +17,15 @@ SPEC.loader.exec_module(STACK)
 
 
 class OciStackTests(unittest.TestCase):
+    def test_exec_has_no_deadline_but_doctor_remains_bounded(self):
+        for action, extra, timeout in [("exec", ["agentos", "tui"], None), ("doctor", [], 600)]:
+            with patch.object(STACK, "runtime", return_value="podman"), \
+                 patch.object(STACK, "prepare_home", return_value=self.home), \
+                 patch.object(STACK, "owned_container", return_value=self.value()), \
+                 patch.object(STACK.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+                STACK.main([action, *extra])
+            self.assertEqual(run.call_args.kwargs["timeout"], timeout)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.home = Path(self.temporary.name)

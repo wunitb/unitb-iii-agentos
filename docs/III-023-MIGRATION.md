@@ -43,6 +43,42 @@ It rejects OCI-era pins before replacing installed payload or operator state.
 The published native AgentOS v0.2.0 release is historical evidence for iii 0.22.1,
 not a release of this migration. This change does not retag or republish it.
 
+## Chat and memory correctness updates
+
+Compaction retains the session index when reading, summarizing, or updating it
+fails. Session mutations are serialized per agent/session inside the single memory
+worker. This is not a distributed lock: multiple independent memory writers would
+require a storage-level conditional update. Summaries sort before the retained
+recent messages, and history uses the role of each session occurrence even when
+its content is deduplicated.
+
+Fallback embeddings use deterministic SHA-256 hashing and identify their algorithm
+as `hash-sha256-v1`. New memory entries persist `embeddingModel`. Recall compares
+vectors only when both model IDs and dimensions match. Existing unlabelled or
+incompatible vectors remain stored and searchable through keyword, recency,
+importance and confidence scoring; they need re-embedding with a recorded model
+ID to regain semantic scoring. Startup does not rewrite operator data or relabel
+old randomized vectors as compatible.
+
+Parallel/fanout batches settle all dispatched children before reporting failure.
+Retries apply only to failed children and obtain authorization again. A timeout
+does not prove a remote operation had no effect; workflows that retry side effects
+still need an idempotent target. Consumed completion tokens are metered before
+the next tool/provider call, including turns that subsequently fail.
+
+`POST /v1/chat/completions` accepts bounded text-only `system`, `user`, and
+`assistant` messages ending in the current user message. Explicit transcripts
+replace automatically recalled context for that request. JSON usage fields are
+`prompt_tokens`, `completion_tokens`, and `total_tokens`, accumulated across the
+turn. `stream: true` returns buffered SSE after the answer is complete. This is
+not full OpenAI API compatibility: multimodal content, client tool transcripts,
+sampling controls, structured-output options, and streamed usage are not supported.
+The AgentOS `/api/chat/stream` route remains session-based JSON and carries
+`sessionPersisted`/`persistenceWarnings`; the TUI shows incomplete persistence.
+
+`oci-stack.sh exec` has no launcher deadline, allowing long interactive TUI
+sessions. The diagnostic `doctor` command retains its bounded deadline.
+
 ## Reproducing the checks
 
 Run the ordinary Rust format, workspace Clippy, workspace tests, locked build and

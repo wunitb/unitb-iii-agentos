@@ -3,6 +3,7 @@ import inspect
 import math
 import sys
 import os
+import subprocess
 from unittest.mock import patch, MagicMock
 
 
@@ -17,6 +18,21 @@ with patch.dict(os.environ, {}, clear=True):
     import main as mod
 
 import pytest
+
+
+def test_hash_embedding_is_stable_across_process_seeds():
+    code = inspect.getsource(mod._hash_embed) + '\nprint(_hash_embed("สรุป release date"))'
+    outputs = [subprocess.check_output(
+        [sys.executable, "-c", code], env={**os.environ, "PYTHONHASHSEED": seed}
+    ) for seed in ("1", "2")]
+    assert outputs[0] == outputs[1]
+
+
+def test_fallback_embeddings_identify_the_algorithm_for_persisted_vectors():
+    with patch.dict(sys.modules, {"sentence_transformers": None}):
+        single = asyncio.run(mod.generate_embedding({"text": "hello"}))
+        batch = asyncio.run(mod.generate_embedding({"batch": ["hello"]}))
+    assert single["model"] == batch["model"] == "hash-sha256-v1"
 
 
 # ---------------------------------------------------------------------------

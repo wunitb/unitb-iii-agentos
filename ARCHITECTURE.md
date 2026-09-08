@@ -251,7 +251,7 @@ push with `AGENTOS_FULL_E2E_ENABLED`. The workflow starts from
 
 | job | gate |
 |---|---|
-| `rust` | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` (dev profile, 2,161 test attributes; 3 live-engine checks ignored by default) + `cargo build --workspace --release` + `cargo audit` + `cargo deny check` (advisories, bans, licences, sources — policy in `deny.toml`) |
+| `rust` | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` (dev profile, 2,178 test attributes; 3 live-engine checks ignored by default) + `cargo build --workspace --release` + `cargo audit` + `cargo deny check` (advisories, bans, licences, sources — policy in `deny.toml`) |
 | `boot-smoke` | `scripts/boot-smoke.sh` builds the OCI image and runs scratch fixture acceptance: registry, product identities, access views, a deterministic chat/protocol, worker calls, restart preservation and owned teardown; no real provider credential |
 | `node-unit` | `bun run typecheck`, `bun run test:unit` (tests of the software), `bun run test:governance` (build-evidence and documentation contracts), `bun run counts:check` (every published number recomputed from the tree) |
 | `dependency-review` | `actions/dependency-review-action` with `fail-on-severity: moderate`, pull requests only |

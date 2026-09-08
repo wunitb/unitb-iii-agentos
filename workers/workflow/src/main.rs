@@ -52,8 +52,9 @@ fn interpolate(template: &str, vars: &Map<String, Value>) -> String {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let character = template[i..].chars().next().expect("remaining template");
+        out.push(character);
+        i += character.len_utf8();
     }
     out
 }
@@ -758,35 +759,68 @@ async fn run_step(
         StepMode::Parallel | StepMode::Fanout => {
             let group_end = concurrent_group_end(workflow, *i, completed);
             let concurrent_steps = &workflow.steps[*i..=group_end];
-            let mut handles = Vec::with_capacity(concurrent_steps.len());
+            // Finish authorization for the entire batch before starting any work.
+            let mut payloads = Vec::with_capacity(concurrent_steps.len());
             for concurrent_step in concurrent_steps {
                 let payload = step_payload(concurrent_step, vars, run.fallback_agent_id)?;
-                // This branch dispatches without going through `trigger_step`,
-                // so it has to authorize the step itself.
-                let agent_id = authorize_step(iii, run, concurrent_step, &payload).await?;
-                let payload = dispatch_payload(concurrent_step, payload, &agent_id);
-                let iii = Arc::clone(iii);
-                let function_id = concurrent_step.function_id.clone();
-                let timeout_ms = concurrent_step.timeout_ms;
-                handles.push(tokio::spawn(async move {
-                    iii.trigger(TriggerRequest {
-                        function_id,
-                        payload,
-                        action: None,
-                        timeout_ms: Some(timeout_ms),
-                    })
-                    .await
-                    .map_err(|error| Error::Handler(error.to_string()))
-                }));
+                let agent = authorize_step(iii, run, concurrent_step, &payload).await?;
+                payloads.push(dispatch_payload(concurrent_step, payload, &agent));
             }
+            let outcomes =
+                futures_util::future::join_all(concurrent_steps.iter().zip(payloads).map(
+                    |(step, payload)| {
+                        let vars = &*vars;
+                        async move {
+                            let retries = if step.error_mode == ErrorMode::Retry {
+                                step.max_retries.unwrap_or(3)
+                            } else {
+                                0
+                            };
+                            let mut outcome = iii
+                                .trigger(TriggerRequest {
+                                    function_id: step.function_id.clone(),
+                                    payload,
+                                    action: None,
+                                    timeout_ms: Some(step.timeout_ms),
+                                })
+                                .await;
+                            for _ in 0..retries {
+                                if outcome.is_ok() {
+                                    break;
+                                }
+                                outcome = trigger_step(iii, run, step, vars).await;
+                            }
+                            outcome
+                        }
+                    },
+                ))
+                .await;
 
-            let mut concurrent_results = Vec::with_capacity(handles.len());
-            for handle in handles {
-                concurrent_results.push(
-                    handle
-                        .await
-                        .map_err(|error| Error::Handler(error.to_string()))??,
-                );
+            let mut failure = None;
+            let mut concurrent_results = Vec::with_capacity(outcomes.len());
+            for (concurrent_step, outcome) in concurrent_steps.iter().zip(outcomes) {
+                let (output, error) = match outcome {
+                    Ok(output) => (output, None),
+                    Err(error) => {
+                        let message = error.to_string();
+                        if concurrent_step.error_mode != ErrorMode::Skip && failure.is_none() {
+                            failure = Some(error);
+                        }
+                        (Value::Null, Some(message))
+                    }
+                };
+                if error.is_none()
+                    && let Some(var) = &concurrent_step.output_var
+                {
+                    vars.insert(var.clone(), output.clone());
+                }
+                concurrent_results.push(output.clone());
+                results.push(StepResult {
+                    step_name: concurrent_step.name.clone(),
+                    output,
+                    duration_ms: now_ms().saturating_sub(start_ms),
+                    error,
+                });
             }
 
             let result_key = if step.mode == StepMode::Fanout {
@@ -794,22 +828,11 @@ async fn run_step(
             } else {
                 "__parallel"
             };
-            vars.insert(
-                result_key.to_string(),
-                Value::Array(concurrent_results.clone()),
-            );
-            for (concurrent_step, output) in concurrent_steps.iter().zip(concurrent_results) {
-                if let Some(var) = &concurrent_step.output_var {
-                    vars.insert(var.clone(), output.clone());
-                }
-                results.push(StepResult {
-                    step_name: concurrent_step.name.clone(),
-                    output,
-                    duration_ms: now_ms().saturating_sub(start_ms),
-                    error: None,
-                });
-            }
+            vars.insert(result_key.to_string(), Value::Array(concurrent_results));
             *i = group_end;
+            if let Some(error) = failure {
+                return Err(error);
+            }
         }
         StepMode::Collect => {
             let mut collect_vars = vars.clone();
@@ -1012,7 +1035,13 @@ async fn run_workflow(iii: &Bus, input: Value) -> Result<Value, Error> {
 
         if let Err(err) = step_outcome {
             let err_msg = err.to_string();
-            match step.error_mode {
+            // Concurrent execution already applied each child's error policy.
+            let error_mode = if matches!(step.mode, StepMode::Parallel | StepMode::Fanout) {
+                ErrorMode::Fail
+            } else {
+                step.error_mode
+            };
+            match error_mode {
                 ErrorMode::Skip => {
                     results.push(StepResult {
                         step_name: step.name.clone(),
@@ -1021,7 +1050,7 @@ async fn run_workflow(iii: &Bus, input: Value) -> Result<Value, Error> {
                         error: Some(err_msg),
                     });
                 }
-                ErrorMode::Retry => {
+                ErrorMode::Retry if !matches!(step.mode, StepMode::Parallel | StepMode::Fanout) => {
                     let max_retries = step.max_retries.unwrap_or(3);
                     let mut last_error = err;
                     let mut retried = false;
@@ -1070,8 +1099,31 @@ async fn run_workflow(iii: &Bus, input: Value) -> Result<Value, Error> {
                         return Err(last_error);
                     }
                 }
-                ErrorMode::Fail => {
-                    set_step_status(&mut step_states, &step, "failed", Some(&err_msg));
+                ErrorMode::Fail | ErrorMode::Retry => {
+                    for batch_step in &workflow.steps[batch_start..=batch_end] {
+                        let result = results
+                            .iter()
+                            .rev()
+                            .find(|r| r.step_name == batch_step.name);
+                        let error = result.and_then(|r| r.error.as_deref());
+                        let status = if result.is_some() && error.is_none() {
+                            "completed"
+                        } else if error.is_some() && batch_step.error_mode == ErrorMode::Skip {
+                            "skipped"
+                        } else {
+                            "failed"
+                        };
+                        set_step_status(
+                            &mut step_states,
+                            batch_step,
+                            status,
+                            if status == "completed" {
+                                None
+                            } else {
+                                Some(error.unwrap_or(&err_msg))
+                            },
+                        );
+                    }
                     mark_run_failed(
                         iii,
                         &safe_run_id,
@@ -1465,6 +1517,168 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interpolate_preserves_unicode_literals_and_values() {
+        let vars = Map::from_iter([("input".into(), json!("ไทย"))]);
+        assert_eq!(interpolate("สรุป 🐈 {{input}}", &vars), "สรุป 🐈 ไทย");
+    }
+
+    #[tokio::test]
+    async fn parallel_dispatch_uses_each_approval_once() {
+        let (fake, _) = workflow_bus();
+        fake.on_value("security::check_capability", json!({"allowed": true}));
+        fake.on_value("security::scan_injection", json!({"safe": true}));
+        let approved = std::sync::atomic::AtomicBool::new(false);
+        fake.on("approval::check", move |_| {
+            if approved.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                Err(Error::Handler("approval already consumed".into()))
+            } else {
+                Ok(json!({"decision": "approved"}))
+            }
+        });
+        let mut step = step_with("scan", "security::scan_injection", Some("a-1"));
+        step.mode = StepMode::Parallel;
+        let workflow = workflow_with(vec![step.clone()], Some("a-1"));
+        let caller = Principal::Agent("a-1".into());
+        let run = Run {
+            workflow: &workflow,
+            caller: &caller,
+            fallback_agent_id: Some("a-1"),
+        };
+        let mut results = Vec::new();
+        run_step(
+            &as_bus(&fake),
+            &run,
+            &step,
+            &mut Map::new(),
+            &mut results,
+            now_ms(),
+            &mut 0,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(results[0].output["safe"], true);
+    }
+
+    #[tokio::test]
+    async fn reordered_parallel_steps_keep_each_child_error_policy() {
+        let (fake, state) = workflow_bus();
+        fake.on_error("memory::fail", "failed child");
+        let mut a = step_with("A", "memory::fail", Some("a-1"));
+        a.mode = StepMode::Parallel;
+        a.error_mode = ErrorMode::Skip;
+        let mut b = step_with("B", "memory::recall", Some("a-1"));
+        b.depends_on = vec!["C".into()];
+        let mut c = step_with("C", "memory::fail", Some("a-1"));
+        c.mode = StepMode::Parallel;
+        let workflow = workflow_with(vec![a, b, c], Some("a-1"));
+        validate_workflow(&workflow).unwrap();
+        state
+            .lock()
+            .entry("workflows".into())
+            .or_default()
+            .insert("wf-1".into(), serde_json::to_value(workflow).unwrap());
+        assert!(
+            run_workflow(
+                &as_bus(&fake),
+                json!({"workflowId": "wf-1",
+            "principal": principal::as_agent("a-1")})
+            )
+            .await
+            .is_err()
+        );
+        let state = state.lock();
+        let run = state["workflow_runs"].values().next().unwrap();
+        assert_eq!(run["stepStates"]["A"]["status"], "skipped");
+        assert_eq!(run["stepStates"]["C"]["status"], "failed");
+        assert_eq!(run["stepStates"]["B"]["status"], "pending");
+        assert_eq!(run["results"].as_array().unwrap().len(), 2);
+    }
+
+    struct ConcurrentBus {
+        inner: Arc<FakeBus>,
+        attempts: std::sync::atomic::AtomicUsize,
+        siblings: std::sync::atomic::AtomicUsize,
+        finished: std::sync::atomic::AtomicBool,
+    }
+
+    impl TriggerBus for ConcurrentBus {
+        fn trigger(&self, request: TriggerRequest) -> agentos_http_adapter::bus::BusFuture<'_> {
+            use std::sync::atomic::Ordering::SeqCst;
+            Box::pin(async move {
+                match request.function_id.as_str() {
+                    "memory::flaky" => {
+                        if self.attempts.fetch_add(1, SeqCst) == 0 {
+                            Err(Error::Handler("temporary failure".into()))
+                        } else {
+                            Ok(json!("retried"))
+                        }
+                    }
+                    "memory::slow" => {
+                        self.siblings.fetch_add(1, SeqCst);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        self.finished.store(true, SeqCst);
+                        Ok(json!("finished"))
+                    }
+                    _ => self.inner.trigger(request).await,
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_failure_settles_siblings_and_retries_only_failed_steps() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for mode in [ErrorMode::Fail, ErrorMode::Retry, ErrorMode::Skip] {
+            let (inner, store) = workflow_bus();
+            let steps = ["memory::flaky", "memory::slow"]
+                .into_iter()
+                .map(|id| {
+                    let mut step = step_with(id, id, Some("a-1"));
+                    step.mode = StepMode::Parallel;
+                    step.error_mode = mode;
+                    step.max_retries = Some(1);
+                    step
+                })
+                .collect();
+            let workflow = workflow_with(steps, Some("a-1"));
+            store
+                .lock()
+                .entry("workflows".into())
+                .or_default()
+                .insert("wf-1".into(), serde_json::to_value(workflow).unwrap());
+            let fake = Arc::new(ConcurrentBus {
+                inner,
+                attempts: 0.into(),
+                siblings: 0.into(),
+                finished: false.into(),
+            });
+            let bus: Bus = fake.clone();
+            let result = run_workflow(
+                &bus,
+                json!({
+                    "workflowId": "wf-1", "principal": principal::as_agent("a-1")
+                }),
+            )
+            .await;
+            assert_eq!(result.is_ok(), mode != ErrorMode::Fail);
+            assert!(
+                fake.finished.load(SeqCst),
+                "run returned with a sibling still running"
+            );
+            assert_eq!(
+                fake.siblings.load(SeqCst),
+                1,
+                "successful sibling ran twice"
+            );
+            assert_eq!(
+                fake.attempts.load(SeqCst),
+                if mode == ErrorMode::Retry { 2 } else { 1 }
+            );
+        }
+    }
 
     #[test]
     fn interpolate_replaces_string() {
