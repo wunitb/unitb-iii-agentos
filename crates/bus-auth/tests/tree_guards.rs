@@ -94,7 +94,7 @@ fn oci_boots_use_product_generated_private_machine_keys() {
     let entry =
         std::fs::read_to_string(root.join("scripts/container-entrypoint.py")).expect("entrypoint");
     let smoke = std::fs::read_to_string(root.join("scripts/oci-smoke.py")).expect("smoke");
-    assert!(entry.contains(r#"["agentos", "up", "--no-tui"]"#));
+    assert!(entry.contains(r#"["agentos", "up", "--no-tui", "--timeout", "240"]"#));
     assert!(smoke.contains("AGENTOS_API_KEY="));
     assert!(smoke.contains("AUDIT_HMAC_KEY="));
     assert!(smoke.contains("read_api_key(home)"));
